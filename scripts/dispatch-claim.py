@@ -22655,6 +22655,72 @@ def _starvation_row(number, *, packages, parked=False, inactive=True, decision="
             "detail" if parked else "not-parked", inactive, cause)
 
 
+# ---- [registry #1028] LIVENESS: which parsed statements actually RUN -------------------------
+# `ast.walk` answers "does this node EXIST anywhere under here", which is NOT the question a
+# call-site checker asks. A statement buried under `if False:` exists and never runs; a statement
+# moved into a nested `def` that nothing calls exists and never runs. Either shape lets a checker
+# certify a production seam that has been silently disabled — the exact vacuity class this repo
+# keeps measuring — so the checker's ACCEPTANCE evidence is read through `_live_nodes` instead.
+#
+# Deferred callable scopes: a `def`/`async def`/`lambda` BODY runs only when something calls it,
+# and "something calls it" is not a property provable from this tree, so the walk stops at the
+# boundary. `ast.ClassDef` is deliberately ABSENT — a class body executes IN PLACE at the point of
+# definition, so a statement written directly in one does run and must stay visible.
+_SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _constant_truth(test):
+    """`True`/`False` when `test`'s truth is decidable from the literal source alone, else `None`.
+
+    Deliberately tiny: a literal constant, and `not <literal constant>`. Everything else is
+    UNDECIDABLE here and reported as `None`, which every caller treats as LIVE. State the limit
+    plainly rather than overclaim: `if _DISABLED:` with a module constant of `False` is NOT pruned
+    and would still be certified. What `_live_nodes` buys is that the refusals it DOES make are
+    sound — a pruned branch provably never executes — not that it prunes every dead branch."""
+    if isinstance(test, ast.Constant):
+        return bool(test.value)
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        inner = _constant_truth(test.operand)
+        return None if inner is None else (not inner)
+    return None
+
+
+def _live_children(node):
+    """`node`'s DIRECT children that execute whenever `node` itself executes."""
+    if isinstance(node, ast.If):
+        decided = _constant_truth(node.test)          # the test itself always evaluates
+        if decided is True:
+            return [node.test, *node.body]            # the `else:` of `if True:` is dead
+        if decided is False:
+            return [node.test, *node.orelse]          # the body of `if False:` is dead
+        return [node.test, *node.body, *node.orelse]
+    if isinstance(node, ast.While):
+        decided = _constant_truth(node.test)
+        if decided is False:
+            return [node.test, *node.orelse]          # zero iterations; the `else:` still runs
+        if decided is True:
+            return [node.test, *node.body]            # `while True:`'s `else:` needs a `break`
+        return [node.test, *node.body, *node.orelse]
+    return list(ast.iter_child_nodes(node))
+
+
+def _live_nodes(root):
+    """Yield `root` and every descendant that RUNS when `root` runs, in `ast.walk` order.
+
+    `root` is always descended into — the question is which of its DESCENDANTS execute — so
+    `_live_nodes(some_functiondef)` walks that function's body even though a function body nested
+    INSIDE it is a boundary the walk stops at. Breadth-first in document order, matching
+    `ast.walk`, so a caller that returns its first match keeps the match it had before."""
+    todo, index = [root], 0
+    while index < len(todo):
+        node = todo[index]
+        index += 1
+        yield node
+        if node is not root and isinstance(node, _SCOPE_BOUNDARIES):
+            continue                                  # deferred; nothing here is proof of a run
+        todo.extend(_live_children(node))
+
+
 def _escalation_call_site(source):
     """[registry #772] STRUCTURAL proof that some PRODUCTION function both iterates
     `starvation_provenance_escalation(...)` and counts each result into the shared
@@ -22701,14 +22767,23 @@ def _park_call_site(source):
       - any SLICE in the loop's iterable            -> `[:1]` is the defect wearing a loop;
       - a `cap=` keyword at the call site           -> the bound must be the DERIVED constant,
                                                        not a number retyped at the call site.
+
+    [registry #1028] Ancestry alone was not enough. `ast.walk` cannot tell a statement that RUNS
+    from one that never does, so the batch `for` — or the `park_starved_partition_holder` call
+    inside it — could sit under `if False:` / `while False:` / the `else:` of a constant-true
+    guard, or be moved into a nested uncalled `def`/`async def`/class-body method, and this
+    checker still answered `"dispatch"` while the tick parked NOTHING. Every scan that supplies
+    ACCEPTANCE evidence therefore reads `_live_nodes`, never `ast.walk`. The one scan that
+    supplies a REFUSAL — the slice hunt — stays on `ast.walk` deliberately: narrowing an
+    acceptance scan refuses more, but narrowing a refusal scan would blind it, and no edit here
+    may make this checker easier to satisfy.
     """
-    import ast
     tree = ast.parse(source)
-    for func in ast.walk(tree):
+    for func in _live_nodes(tree):
         if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
             continue
         bound = set()
-        for node in ast.walk(func):
+        for node in _live_nodes(func):
             if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
                 continue
             if getattr(node.value.func, "id", None) != "starvation_park_targets":
@@ -22719,16 +22794,16 @@ def _park_call_site(source):
                          if isinstance(target, ast.Name))
         if not bound:
             continue
-        for loop in ast.walk(func):
+        for loop in _live_nodes(func):
             if not isinstance(loop, ast.For):
                 continue
-            iter_names = {node.id for node in ast.walk(loop.iter)
+            iter_names = {node.id for node in _live_nodes(loop.iter)
                           if isinstance(node, ast.Name)}
             if not (iter_names & bound):
                 continue
             if any(isinstance(node, ast.Slice) for node in ast.walk(loop.iter)):
                 continue                  # `targets[:1]` is the per-tick cap of 1, re-typed
-            for stmt in ast.walk(loop):
+            for stmt in _live_nodes(loop):
                 if (isinstance(stmt, ast.Call)
                         and getattr(stmt.func, "id", None)
                         == "park_starved_partition_holder"):
@@ -24043,6 +24118,185 @@ def _starvation_sweep_self_test():
         f"— otherwise the 1-holder-per-tick defect is back at 10 min/holder (found {park_seam!r})")
     print("  ok   #822 park call-site seam (AST): the production tick PARKS EVERY selected "
           "holder — a re-scalarised call site, a `[:1]`, or a call-site cap= reds here")
+
+    # ---- [registry #1028] THE PARK SEAM MUST PROVE THE SITE *RUNS*, NOT THAT IT EXISTS --------
+    # Ancestry decided with `ast.walk` cannot separate a statement that RUNS from one that never
+    # does, so the assertion above certified `"dispatch"` for a tick that parks NOTHING: the batch
+    # `for` (or the park call inside it) buried under `if False:` / `while False:` / the `else:` of
+    # a constant-true guard, or moved into a nested `def`/`async def`/`lambda`/class-body method
+    # that nothing ever calls. Both shapes restore the 1-holder-per-tick defect #822 removed — or
+    # remove parking entirely — while every other assertion in this file stays green.
+    #
+    # The LIVE CONTROL runs FIRST and on purpose: a checker that refuses EVERYTHING would kill all
+    # of the mutants below for the wrong reason, and so would a fixture template that parses to
+    # something the checker was never going to certify. Nothing here is measured until the
+    # un-mutated shape is shown to be ACCEPTED. Each mutant is that same shape with exactly ONE
+    # structural edit, written out in full rather than templated — a template bug is itself a way
+    # for these assertions to pass without testing anything.
+    _park_seam_live = (
+        "def dispatch():\n"
+        "    targets = starvation_park_targets(items, starved, occupancy)\n"
+        "    for number in targets:\n"
+        "        park_starved_partition_holder(repo, number, starved, labels)\n")
+    assert _park_call_site(_park_seam_live) == "dispatch", (
+        "LIVE CONTROL: the un-mutated batch shape must still be CERTIFIED. If it is not, every "
+        "refusal asserted below is vacuous — it proves only that this checker refuses everything")
+    # A class body EXECUTES IN PLACE, so a park call written directly in one does run. This is the
+    # positive half of the nested-scope rule and the assertion that reds if `ast.ClassDef` is ever
+    # added to `_SCOPE_BOUNDARIES` — which would make the traversal refuse live code instead.
+    assert _park_call_site(
+        "def dispatch():\n"
+        "    targets = starvation_park_targets(items, starved, occupancy)\n"
+        "    for number in targets:\n"
+        "        class _Row:\n"
+        "            applied = park_starved_partition_holder(repo, number, starved, labels)\n"
+    ) == "dispatch", (
+        "a class body runs where it is written — refusing it would make _live_nodes reject live "
+        "production code, which is a different (and equally bad) way for this seam to be wrong")
+    # `while` has three arms and only the constant-FALSE one is a refusal. Both live arms are
+    # asserted here so the pruning cannot quietly widen into "any loop body is dead": a `while`
+    # whose test is TRUE runs its body, and a `while` whose test is UNDECIDABLE may run it.
+    for _live_while in (
+        "def dispatch():\n"
+        "    targets = starvation_park_targets(items, starved, occupancy)\n"
+        "    while True:\n"
+        "        for number in targets:\n"
+        "            park_starved_partition_holder(repo, number, starved, labels)\n",
+        "def dispatch():\n"
+        "    targets = starvation_park_targets(items, starved, occupancy)\n"
+        "    while pending:\n"
+        "        for number in targets:\n"
+        "            park_starved_partition_holder(repo, number, starved, labels)\n",
+    ):
+        assert _park_call_site(_live_while) == "dispatch", \
+            "a `while` body that CAN run is live — pruning it would refuse live production code"
+    for _why, _mutant in (
+        # --- dead branches: the statement exists and can never execute ---
+        ("the batch loop under `if False:`",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    if False:\n"
+         "        for number in targets:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the park call under `if False:` inside a live loop",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        if False:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the batch loop in the `else:` of `if True:`",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    if True:\n"
+         "        pass\n"
+         "    else:\n"
+         "        for number in targets:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the park call in the `else:` of `if True:`",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        if True:\n"
+         "            pass\n"
+         "        else:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the batch loop under `while False:`",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    while False:\n"
+         "        for number in targets:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the batch loop in the `else:` of `while True:` — reached only by a `break`",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    while True:\n"
+         "        pass\n"
+         "    else:\n"
+         "        for number in targets:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the batch loop under `if not True:`",   # pins _constant_truth's `not` arm
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    if not True:\n"
+         "        for number in targets:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the `starvation_park_targets` assignment itself under `if False:`",
+         "def dispatch():\n"
+         "    if False:\n"
+         "        targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        park_starved_partition_holder(repo, number, starved, labels)\n"),
+        # --- nested uncalled scopes: the body is deferred to a call that never comes ---
+        ("the park call moved into a nested `def` under the loop",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        def _park():\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the park call moved into a nested `async def` under the loop",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        async def _park():\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the park call moved into a `lambda` under the loop",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        _park = lambda: park_starved_partition_holder("
+         "repo, number, starved, labels)\n"),
+        ("the park call moved into a class-body METHOD under the loop",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        class _Parker:\n"
+         "            def park(self):\n"
+         "                park_starved_partition_holder(repo, number, starved, labels)\n"),
+        # The loop's ITERABLE is evidence too: the batch named only inside a deferred callable
+        # there says nothing about what the `for` actually iterates — it may well be one item.
+        ("the batch named only inside a `lambda` in the loop iterable",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in helper(lambda: targets):\n"
+         "        park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the whole batch moved into a nested uncalled `def`",
+         "def dispatch():\n"
+         "    def _sweep():\n"
+         "        targets = starvation_park_targets(items, starved, occupancy)\n"
+         "        for number in targets:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        # --- the pre-#1028 refusals, re-asserted: rewiring the scans must not blind them ---
+        ("a `[:1]` slice on the loop iterable",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets[:1]:\n"
+         "        park_starved_partition_holder(repo, number, starved, labels)\n"),
+        # ...including the slice hunt, which stays on `ast.walk` precisely so that it still sees a
+        # `[:1]` written inside a deferred callable. Narrowing THIS scan to `_live_nodes` would
+        # blind the refusal — this is the assertion that reds if anyone does it.
+        ("a `[:1]` slice hidden inside a lambda in the loop iterable",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in pick(targets, lambda: rows[:1]):\n"
+         "        park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("a `cap=` retyped at the call site",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy, cap=1)\n"
+         "    for number in targets:\n"
+         "        park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("no `for` over the batch at all — the re-scalarised call site",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    park_starved_partition_holder(repo, targets[0], starved, labels)\n"),
+    ):
+        _certified = _park_call_site(_mutant)
+        assert _certified is None, (
+            f"#1028 park seam: {_why} — the tick parks nothing (or one holder per tick), yet the "
+            f"call-site checker certified it as {_certified!r}. A structural proof that reads "
+            "EXISTENCE instead of REACHABILITY is not a proof")
+    print("  ok   #1028 park call-site seam is REACHABILITY, not existence: the live shapes are "
+          "certified, and 18 dead-branch / nested-uncalled-scope / re-scalarised mutants are each "
+          "REFUSED by name")
 
     # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
     _starvation_park_batch_seam_self_test()
