@@ -105,6 +105,18 @@ OBS_HISTOGRAM_KEY_RE = re.compile(r"\d{1,2}\+?")
 OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#%-]{1,220}")
 OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
                       "queue_age_clamp_minutes", "merge_stall_minutes"}
+# [#1557] THE CACHE GROUP HAS NO PRODUCER, and the file the docs named as its source never had one
+# either: `data/cache-affinity.json` is documented as "a rolling {account -> [{package,role,model,
+# at}]} affinity", but nothing in this repo has ever written it (README.md / data/README.md now say
+# so). Cache affinity is DERIVED at claim time from the lease ledger by
+# select-and-claim.choose_account, which keeps no history, so `warm_drain_rate_1h`, `drained_1h` and
+# `chain_length_histogram` have no source in the tree today and the prompt-cache read fraction has
+# to come from the provider usage responses the account-usage probe already reads.
+# The consumer contract is deliberately NOT narrowed to what exists — a collector that grows any
+# one of these fields is still published. What changed is that a `cache` key with nothing readable
+# in it no longer publishes zeros: see `_normalize_observability`.
+OBS_CACHE_DROP = ("dashboard-gen: dropped the observability cache group (type {}) — "
+                  "no field it publishes was measured")
 
 # Usage-probe outcome sidecar (issue #219). dashboard.yml's secret-materialization and probe steps
 # are `continue-on-error`, and a failed probe used to be replaced by `{}` — indistinguishable from
@@ -1941,14 +1953,30 @@ def _normalize_observability(document):
                 count = _obs_count(raw_histogram.get(key))
                 if OBS_HISTOGRAM_KEY_RE.fullmatch(key) and count is not None:
                     histogram[key] = count
-        cache = {
-            "prompt_cache_read_fraction_1h":
-                _obs_fraction(cache_source.get("prompt_cache_read_fraction_1h")),
-            "usage_samples_1h": _obs_count(cache_source.get("usage_samples_1h")) or 0,
-            "warm_drain_rate_1h": _obs_fraction(cache_source.get("warm_drain_rate_1h")),
-            "drained_1h": _obs_count(cache_source.get("drained_1h")) or 0,
-            "chain_length_histogram": histogram,
-        }
+        read_fraction = _obs_fraction(cache_source.get("prompt_cache_read_fraction_1h"))
+        usage_samples = _obs_count(cache_source.get("usage_samples_1h"))
+        warm_drain = _obs_fraction(cache_source.get("warm_drain_rate_1h"))
+        drained = _obs_count(cache_source.get("drained_1h"))
+        # [#1557] An UNMEASURED group must not publish as a MEASURED ZERO. `usage_samples_1h` and
+        # `drained_1h` are coerced to 0 below, so a `cache` key carrying nothing this seam can read
+        # used to render a confident "Warm drains — of 0 drained / 1h" card built entirely out of
+        # that coercion. Publication therefore requires at least ONE field to have parsed; parsed
+        # is not truthy, so a genuine all-zero hour (0.0 fractions, 0 counts) still publishes (a
+        # census must always emit its zero row — AGENTS.md pre-flight item 8). The drop is
+        # ANNOUNCED for the same reason #982 announced a dropped queue row: `cache: {}` and "no
+        # collector at all" render identically as a hidden panel, so a producer/consumer shape
+        # mismatch would otherwise be visible nowhere.
+        if (read_fraction is not None or usage_samples is not None or warm_drain is not None
+                or drained is not None or histogram):
+            cache = {
+                "prompt_cache_read_fraction_1h": read_fraction,
+                "usage_samples_1h": usage_samples or 0,
+                "warm_drain_rate_1h": warm_drain,
+                "drained_1h": drained or 0,
+                "chain_length_histogram": histogram,
+            }
+    if cache is None and cache_source is not None:
+        print(OBS_CACHE_DROP.format(type(cache_source).__name__))
 
     thresholds_source = document.get("thresholds")
     thresholds = None
@@ -5422,6 +5450,147 @@ esac
           obs_normalized(obs_fixture), obs_expected)
     check("absent observability snapshot stays hidden (None)",
           _normalize_observability(None), None)
+    # ---- [#1557] THE CACHE GROUP IS THE ONE OBSERVABILITY GROUP WITH NO PRODUCER ANYWHERE: the
+    # file the docs named as its source (`data/cache-affinity.json`) has never been written by
+    # anything in this repo, and affinity itself is derived from the lease ledger at claim time and
+    # kept nowhere. Two of the group's five fields are coerced to 0 on the way out, so a collector
+    # that shipped the KEY without the measurements rendered `Prompt-cache read —` beside a
+    # confident `of 0 drained / 1h`: an unmeasured group wearing a measured zero. Publication now
+    # requires at least one field to have PARSED — parsed, NOT truthy, so a genuinely quiet hour
+    # still emits its zero row — and the drop is ANNOUNCED, because `cache: {}` and "no collector
+    # at all" are the same hidden panel otherwise (#982's lesson, same seam).
+    # Every input below is a JSON literal and the message is a literal too: reading either back off
+    # the module under test is the tautology AGENTS.md pre-flight 2(b) names.
+    _CACHE_DROP = ("dashboard-gen: dropped the observability cache group (type {}) — "
+                   "no field it publishes was measured")
+
+    def obs_cache(source, present=True):
+        """(published `cache` group, the cache-drop warnings this build printed)."""
+        fixture = copy.deepcopy(obs_fixture)
+        if present:
+            fixture["cache"] = source
+        else:
+            del fixture["cache"]
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        return (document["cache"],
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen: dropped the observability cache group")])
+
+    check("[#1557] a MEASURED all-zero hour still PUBLISHES: 0.0 and 0 are readings, not absences. "
+          "Guarding on truthiness instead of on `is not None` hides exactly the quiet hour an "
+          "operator interrogates (AGENTS.md pre-flight item 8)",
+          obs_cache({"prompt_cache_read_fraction_1h": 0.0, "usage_samples_1h": 0,
+                     "warm_drain_rate_1h": 0.0, "drained_1h": 0}),
+          ({"prompt_cache_read_fraction_1h": 0.0, "usage_samples_1h": 0,
+            "warm_drain_rate_1h": 0.0, "drained_1h": 0, "chain_length_histogram": {}}, []))
+    # Each row below is the ONLY row that reds if its own disjunct is dropped from the publication
+    # guard, so no field of the group can quietly stop counting as a measurement. The contract stays
+    # OPEN to a collector that grows just one of them — narrowing it to what exists today would
+    # close the seam this issue asked to keep honest, not fix it.
+    for case, source, published in (
+        ("a lone usage-sample count", {"usage_samples_1h": 3},
+         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 3,
+          "warm_drain_rate_1h": None, "drained_1h": 0, "chain_length_histogram": {}}),
+        ("a lone drain count", {"drained_1h": 4},
+         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 0,
+          "warm_drain_rate_1h": None, "drained_1h": 4, "chain_length_histogram": {}}),
+        ("a lone prompt-cache read fraction", {"prompt_cache_read_fraction_1h": 0.25},
+         {"prompt_cache_read_fraction_1h": 0.25, "usage_samples_1h": 0,
+          "warm_drain_rate_1h": None, "drained_1h": 0, "chain_length_histogram": {}}),
+        ("a lone warm-drain rate", {"warm_drain_rate_1h": 0.5},
+         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 0,
+          "warm_drain_rate_1h": 0.5, "drained_1h": 0, "chain_length_histogram": {}}),
+        ("a lone chain-length histogram", {"chain_length_histogram": {"2": 6}},
+         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 0,
+          "warm_drain_rate_1h": None, "drained_1h": 0, "chain_length_histogram": {"2": 6}}),
+    ):
+        check(f"[#1557] {case} is measurement enough to publish the group, SILENTLY (the warning "
+              "marks a real drop, so it can never fire on the accept path)",
+              obs_cache(source), (published, []))
+    for case, source, container in (
+        ("an EMPTY cache group", {}, "dict"),
+        ("a group in which every field is unreadable", {"prompt_cache_read_fraction_1h": "abc",
+                                                        "usage_samples_1h": -2,
+                                                        "warm_drain_rate_1h": 1.5,
+                                                        "drained_1h": True}, "dict"),
+        ("a histogram whose every key/count is malformed",
+         {"chain_length_histogram": {"bogus": 2, "3": -1}}, "dict"),
+        ("a cache group sent as a list", ["prompt_cache_read_fraction_1h", 0.62], "list"),
+        ("a cache group sent as a JSON string", "0.62", "str"),
+    ):
+        check(f"[#1557] {case} publishes NOTHING and names itself once — never a fabricated "
+              "`0 drained / 1h` on a panel no producer has ever filled",
+              obs_cache(source), (None, [_CACHE_DROP.format(container)]))
+    # ...and the whole snapshot still normalizes around the hole: this is a drop diagnostic, not a
+    # new fatality. Turning the drop into a raise turns this row red.
+    with contextlib.redirect_stdout(io.StringIO()):
+        cache_dropped = obs_normalized({**copy.deepcopy(obs_fixture), "cache": {}})
+    check("[#1557] a snapshot whose cache group is dropped is still TOLERATED — every other panel "
+          "is published unchanged and the build stays green",
+          (cache_dropped["cache"], cache_dropped["thresholds"]["merge_stall_minutes"],
+           [row["lane"] for row in cache_dropped["lanes"]]),
+          (None, 90, ["review-fix", "worker"]))
+    # ...and the PAGE is what the drop has to DELIVER INTO (AGENTS.md pre-flight item 11): a group
+    # normalized to None must leave the panel with no cache CARD at all — not a card whose numbers
+    # merely read `—` beside the `of 0 drained / 1h` sub-label this issue is about. Executed against
+    # dashboard/app.js under the shared DOM shim, never asserted lexically (the #612 round-4 lesson).
+    _OBS_CACHE_PAGE_BODY = r"""
+  const out = {};
+  for (const [name, document] of Object.entries(input.documents)) {
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      scope.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    out[name] = {
+      error,
+      cards: ids["obs-grid"].children
+        .filter((card) => card.tagName === "article")
+        .map((card) => card.children[0].textContent),
+      drained: text(ids["obs-grid"]).includes("drained / 1h"),
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+    with contextlib.redirect_stdout(io.StringIO()):
+        obs_measured = obs_normalized(copy.deepcopy(obs_fixture))
+        obs_unmeasured = obs_normalized({**copy.deepcopy(obs_fixture), "cache": {}})
+    try:
+        obs_page = _node_json(_page_harness("renderObservability", _OBS_CACHE_PAGE_BODY),
+                              {"documents": {"measured": obs_measured,
+                                             "unmeasured": obs_unmeasured}})
+    except DashboardError as exc:
+        # A page that throws while rendering IS the finding; reporting it as the row's value keeps
+        # the row named and red instead of aborting the suite mid-run.
+        obs_page = {"page script raised": str(exc)[:160]}
+
+    def obs_rendered(name):
+        rendered = obs_page.get(name)
+        return ((rendered.get("cards"), rendered.get("drained"), rendered.get("error"))
+                if isinstance(rendered, dict) else obs_page)
+
+    check("[#1557] the measured group still renders its card, and the DROPPED one leaves the panel "
+          "with no Cache-effectiveness card at all — the `of 0 drained / 1h` sub-label this issue "
+          "is about is gone from the page, not merely blanked",
+          (obs_rendered("measured"), obs_rendered("unmeasured")),
+          ((["Cache effectiveness", "Agent-run health", "Queue & flow"], True, None),
+           (["Agent-run health", "Queue & flow"], False, None)))
+    # The two ABSENCES are silent: a collector that has no cache group yet is the expected state
+    # (there is no producer), and only a SUPPLIED-but-unreadable group is the mismatch worth naming.
+    for case, args in (("no cache key at all", (None, False)),
+                       ("an explicit null cache key", (None,))):
+        check(f"[#1557] {case} hides the panel SILENTLY — the warning names a producer/consumer "
+              "mismatch, and 'the collector has not landed' is not one",
+              obs_cache(*args), (None, []))
     # ---- [#982] A DROPPED QUEUE ROW MUST BE ANNOUNCED. `flow.queue: []` renders identically to
     # an idle queue, so the pre-#982 silent `continue` turned a producer/consumer shape mismatch
     # into a green build, a green self-test and a panel reading `no backlog` — the loss visible

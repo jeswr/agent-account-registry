@@ -240,7 +240,17 @@ opaque claim (which secret to use) or `none-free`:
 ## Cache-affinity metadata
 
 Which skills/roles/packages ran recently on each account is tracked **here** (as receipt comments +
-a rolling `data/cache-affinity.json`), never in the public repos.
+the lease ledger), never in the public repos.
+
+Affinity is **derived, not stored** (issue #1557): `select-and-claim.choose_account` reads the
+`package` / `role` / `model` / claim time off the LIVE LEASES it is handed and prefers the account
+that most recently served the same `package`+`role`. There is no separate affinity store and no
+history — a lease that has been released leaves nothing behind but its receipt comment. Earlier
+revisions of this section promised "a rolling `data/cache-affinity.json`"; **no code has ever
+written that file**, and the frozen master copy is an empty placeholder (see `data/README.md`).
+The consequence for the dashboard is recorded with the observability contract in
+`scripts/dashboard-gen.py`: the cache-effectiveness group's chain/drain fields have no source in
+this repo until something durably records affinity chains.
 
 ## Standing routing rules (inherited by onboarded target repos)
 
