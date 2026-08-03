@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1831,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1c59f2aeea3040694e40ff30da1cad2125c635d9",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ELEMENT_KEYS remains shared across all element types and unconditionally includes id and validations. After recognizing markdown, the validator also runs the validations and id checks without restricting them by etype. A markdown element with attributes.value plus validations: {required: true}, or with a syntactically valid id, therefore passes even though the closed-world markdown element shape contains only type and attributes. The new tests exercise ordinary markdown but add no negative markdown-id or markdown-validations fixture, so they mirror the implementation gap and would stay green if these invalid documents continue to be accepted.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Define allowed element-level keys per element type: markdown should allow only type and attributes, while interactive types may allow id and validations according to GitHub's schema. Add independent negative fixtures proving markdown with id is rejected and markdown with validations is rejected, while retaining a positive ordinary-markdown control.",
+    "severity": "major",
+    "title": "Markdown elements still accept interactive-only element fields"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 major finding remains unchanged. The validator still uses one shared ELEMENT_KEYS tuple for every element type and then processes validations and id for every recognized type, including markdown. Consequently markdown elements carrying id or validations are accepted even though the intended closed-world markdown element schema permits only type and attributes. The expanded self-test still has no negative markdown fixture for either forbidden field, so it cannot detect this gap. Because the same finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
