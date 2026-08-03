@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5841,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "56b14bfb8e5872d48042ee36748a130abf8e46bc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved: deleted paths are now excluded from the set of artifacts present at PR head, so deleted README and test files cannot satisfy either crate or npm-package completeness checks. The added focused and end-to-end regressions exercise the status parser, crate evaluation, package evaluation, and main exit behavior; all 23 focused G1 tests pass. No new correctness, soundness, test-validity, or security issues were found in the diff.",
+  "verdict": "approve"
+ }
+}
