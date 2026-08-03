@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1831,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1c59f2aeea3040694e40ff30da1cad2125c635d9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`ELEMENT_KEYS` is shared by every element type and permits both `id` and `validations` unconditionally. The subsequent validation also validates those fields for every `etype`, including `markdown`. GitHub's markdown element shape defines `type` and `attributes` (with `attributes.value`); `id` and `validations` belong to interactive form elements, not markdown. Thus a document such as `type: markdown` with valid `attributes.value` plus `validations: {required: true}` is accepted even though it is outside the closed-world per-type schema this validator says it enforces. There is no negative markdown fixture for either field, so the tests mirror the omission.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Make element-level allowed keys type-specific: permit only `type` and `attributes` for markdown, and permit `id`/`validations` only for the interactive types for which GitHub defines them. Add independent negative fixtures for markdown `id` and markdown `validations`, plus a positive ordinary markdown fixture (the existing all-types control can serve the latter).",
+    "severity": "major",
+    "title": "Markdown elements still accept fields outside their schema"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round adds substantial shape validation and targeted negative/positive coverage for the fields identified previously, but the closed-world element validation is still not type-specific at the element level. In particular, markdown elements are allowed to carry `id` and `validations`, although GitHub's markdown element schema defines only `type` and `attributes`. That leaves the same major renderability gap: the gate can approve a touched document outside the schema it claims to enforce. Because the prior major finding persists in a narrower form at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
