@@ -248,9 +248,13 @@ that most recently served the same `package`+`role`. There is no separate affini
 history — a lease that has been released leaves nothing behind but its receipt comment. Earlier
 revisions of this section promised "a rolling `data/cache-affinity.json`"; **no code has ever
 written that file**, and the frozen master copy is an empty placeholder (see `data/README.md`).
-The consequence for the dashboard is recorded with the observability contract in
-`scripts/dashboard-gen.py`: the cache-effectiveness group's chain/drain fields have no source in
-this repo until something durably records affinity chains.
+The consequence for the dashboard is settled (issue #1839): the observability cache group's three
+chain/drain fields — `warm_drain_rate_1h`, `drained_1h`, `chain_length_histogram` — are **retired**,
+because a field no producer can ever fill is a promise rather than a seam. The panel keeps only the
+usage-derived `prompt_cache_read_fraction_1h` / `usage_samples_1h`, and a snapshot still carrying a
+retired key has it ignored and NAMED in the build log. Re-opening the group is **producer-first**:
+durably record the chain transitions (through the same CAS discipline as the other ledger writers),
+then re-add the field it feeds. The contract itself is `scripts/dashboard-gen.py`.
 
 ## Standing routing rules (inherited by onboarded target repos)
 
