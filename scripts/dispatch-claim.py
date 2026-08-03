@@ -22664,9 +22664,27 @@ def _starvation_row(number, *, packages, parked=False, inactive=True, decision="
 # disabled — the exact vacuity class this repo keeps measuring — so the checker's ACCEPTANCE
 # evidence is read through `_live_nodes` instead.
 #
-# Modelled: `if`/`while` statements, `IfExp`, and short-circuiting `BoolOp`. Everything else keeps
-# ALL of its children, which is the fail-closed direction (unproven-dead is treated as live) but
-# is NOT complete: a `for` over a decidably-empty iterable still has a "live" body here.
+# Modelled: `if`/`while`/`for`/`async for` statements, `IfExp`, and short-circuiting `BoolOp`.
+# Everything else keeps ALL of its children.
+#
+# [registry #1028, review round 2] "UNDECIDABLE => LIVE" IS NOT FAIL-CLOSED HERE, and the first
+# cut of this traversal got that backwards. For a REFUSAL scan, treating an unproven branch as
+# live is conservative; for the ACCEPTANCE scan this is, live means CERTIFIED, so every gap in the
+# evaluator was a bypass wearing different syntax: `_constant_truth` did not model `BinOp` or
+# `Compare`, so `for n in (([] * 1) and targets):` and `targets if 1 == 0 else []` were both read
+# as possibly-evaluating the batch when each provably iterates an empty list. Enumerating more
+# literal forms only moves the bypass, so the rule is structural instead:
+#
+#   * a condition that reads RUNTIME STATE is undecidable for a real reason, and its branches stay
+#     LIVE — the production seam is itself runtime-gated (`targets if bot_login and token else []`)
+#     and a checker that refused that would refuse every honest call site;
+#   * a condition built ONLY from literals was decided by the AUTHOR when they typed it. Its truth
+#     is not a fact about the tick, so it can never be EVIDENCE about the tick: proved true, the
+#     arm is live; proved false, dead; NOT PROVED, its arms supply nothing (`_control_arms`).
+#
+# So the residual gap is now "an author disabled the seam with a condition over runtime state that
+# is nonetheless always falsy" (`if _DISABLED:` with a module-level constant `False`) — a gap that
+# needs a whole-module value analysis to close, not one more literal shape.
 #
 # Deferred callable scopes: a `def`/`async def`/`lambda` BODY runs only when something calls it,
 # and "something calls it" is not a property provable from this tree, so the walk stops at the
@@ -22678,11 +22696,11 @@ _SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 def _constant_truth(test):
     """`True`/`False` when `test`'s truth is decidable from the literal source alone, else `None`.
 
-    Deliberately tiny: a literal constant, and `not <literal constant>`. Everything else is
-    UNDECIDABLE here and reported as `None`, which every caller treats as LIVE. State the limit
-    plainly rather than overclaim: `if _DISABLED:` with a module constant of `False` is NOT pruned
-    and would still be certified. What `_live_nodes` buys is that the refusals it DOES make are
-    sound — a pruned branch provably never executes — not that it prunes every dead branch."""
+    Deliberately tiny — a literal constant, a display, `not <decidable>`, and the two `BoolOp`
+    identities — because completeness is NOT what makes this sound. `None` here does not mean
+    "live": `_control_arms` sends an undecidable condition down one of two different paths
+    depending on whether it can read runtime state at all. Every `True`/`False` this returns is a
+    PROOF (`[] and x` is falsy however `x` behaves); everything else defers that decision."""
     if isinstance(test, ast.Constant):
         return bool(test.value)
     if isinstance(test, (ast.List, ast.Tuple, ast.Set)):
@@ -22700,7 +22718,51 @@ def _constant_truth(test):
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
         inner = _constant_truth(test.operand)
         return None if inner is None else (not inner)
+    if isinstance(test, ast.BoolOp):
+        # `a and b` evaluates to the first FALSY operand or else to the last one, so ONE decidably
+        # falsy operand ANYWHERE makes the whole expression falsy however the others behave, and
+        # it is truthy only when every operand is. `or` is the mirror. This is the arm that
+        # decides `bot_login and False` — an expression that reads runtime state and is still
+        # dead, so `_control_arms`' runtime path must never see it.
+        settles_on = isinstance(test.op, ast.Or)
+        truths = [_constant_truth(value) for value in test.values]
+        if any(truth is settles_on for truth in truths):
+            return settles_on
+        if all(truth is (not settles_on) for truth in truths):
+            return not settles_on
+        return None
     return None
+
+
+# Runtime state can only reach an expression through one of these leaves; their ABSENCE is what
+# makes a condition's value the author's choice rather than the tick's. Deny-list, not allow-list,
+# on purpose: a node type not named here (a future syntax, a `Subscript` of two literals) counts
+# as STATIC, which sends it down the refusing path rather than the certifying one.
+_RUNTIME_VALUED_NODES = (ast.Name, ast.Call, ast.Attribute, ast.Lambda, ast.ListComp, ast.SetComp,
+                         ast.DictComp, ast.GeneratorExp, ast.Await, ast.Yield, ast.YieldFrom)
+
+
+def _static_control(test):
+    """True when `test`'s value is fixed by the SOURCE, whatever that value turns out to be."""
+    return not any(isinstance(node, _RUNTIME_VALUED_NODES) for node in ast.walk(test))
+
+
+def _control_arms(test):
+    """`(body_runs, orelse_runs)` — which arms of a control conditioned on `test` supply evidence.
+
+    THE ASYMMETRY IS THE WHOLE GUARD (registry #1028, review round 2). Undecidable is not one
+    state but two, and they must not share an answer: a condition that reads runtime state is
+    undecidable for a reason no evaluator can fix, so both arms stay live and honest gated
+    production code still certifies; a condition made only of literals that this evaluator cannot
+    decide is an AUTHORED constant, and an authored constant is never evidence about a tick — so
+    neither arm supplies any. That is what stops `1 == 0`, `[] * 1` and every other unmodelled
+    literal form from certifying a seam that provably never runs."""
+    decided = _constant_truth(test)
+    if decided is not None:
+        return (decided, not decided)
+    if _static_control(test):
+        return (False, False)
+    return (True, True)
 
 
 def _live_children(node):
@@ -22709,38 +22771,44 @@ def _live_children(node):
         # `a if test else b` is a STATEMENT-free `if` and is dead-code shaped the same way: the
         # test always evaluates, exactly one arm follows it. Unmodelled, `for n in (targets if
         # False else []):` names the batch in an arm Python never evaluates.
-        decided = _constant_truth(node.test)
-        if decided is True:
-            return [node.test, node.body]
-        if decided is False:
-            return [node.test, node.orelse]
-        return [node.test, node.body, node.orelse]
+        body_runs, orelse_runs = _control_arms(node.test)
+        return [node.test,
+                *([node.body] if body_runs else []),
+                *([node.orelse] if orelse_runs else [])]
     if isinstance(node, ast.BoolOp):
         # `and`/`or` SHORT-CIRCUIT: `values[0]` always evaluates, and each later operand evaluates
         # only if no earlier one settled the result. `and` stops at the first provably FALSY
-        # operand, `or` at the first provably TRUTHY one; an operand whose truth is undecidable
-        # settles nothing, so the whole tail stays live — unproven means LIVE, never pruned.
+        # operand, `or` at the first provably TRUTHY one — and ALSO at the first operand whose
+        # truth is an authored constant this evaluator cannot decide, because that operand may
+        # settle the result (`([] * 1) and targets` never evaluates `targets`) and an unproved
+        # authored constant certifies nothing. An operand that reads runtime state settles
+        # nothing provable, so there the tail stays live.
         settles_on = isinstance(node.op, ast.Or)
         live = []
         for value in node.values:
             live.append(value)
-            if _constant_truth(value) is settles_on:
+            decided = _constant_truth(value)
+            if decided is settles_on:
                 break                                 # `[] and targets` never evaluates `targets`
+            if decided is None and _static_control(value):
+                break                                 # unproved authored constant: no evidence
         return live
-    if isinstance(node, ast.If):
-        decided = _constant_truth(node.test)          # the test itself always evaluates
-        if decided is True:
-            return [node.test, *node.body]            # the `else:` of `if True:` is dead
-        if decided is False:
-            return [node.test, *node.orelse]          # the body of `if False:` is dead
-        return [node.test, *node.body, *node.orelse]
-    if isinstance(node, ast.While):
-        decided = _constant_truth(node.test)
-        if decided is False:
-            return [node.test, *node.orelse]          # zero iterations; the `else:` still runs
-        if decided is True:
-            return [node.test, *node.body]            # `while True:`'s `else:` needs a `break`
-        return [node.test, *node.body, *node.orelse]
+    if isinstance(node, (ast.If, ast.While)):
+        # `if False:`'s body is dead, `if True:`'s `else:` is dead, and `while True:`'s `else:`
+        # needs a `break` to run — the same two arms either way. The test itself always evaluates.
+        body_runs, orelse_runs = _control_arms(node.test)
+        return [node.test,
+                *(node.body if body_runs else ()),
+                *(node.orelse if orelse_runs else ())]
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        # The iterable is the loop's condition: a decidably EMPTY one (`for _ in []:`, and after
+        # the `BoolOp` identity above also `for n in (targets and []):`) never runs the body, and
+        # a decidably non-empty literal runs it at least once. Pruning `orelse` on the non-empty
+        # arm is the refusing direction — a `for ... else:` with no `break` does run.
+        body_runs, orelse_runs = _control_arms(node.iter)
+        return [node.target, node.iter,
+                *(node.body if body_runs else ()),
+                *(node.orelse if orelse_runs else ())]
     return list(ast.iter_child_nodes(node))
 
 
@@ -22819,6 +22887,13 @@ def _park_call_site(source):
     supplies a REFUSAL — the slice hunt — stays on `ast.walk` deliberately: narrowing an
     acceptance scan refuses more, but narrowing a refusal scan would blind it, and no edit here
     may make this checker easier to satisfy.
+
+    Review round 2 measured the cost of the first cut's "undecidable means live" rule on exactly
+    this seam: `([] * 1) and targets`, `targets if 1 == 0 else []`, `targets and []`, `if 1 == 0:`
+    and `for _ in []:` each certified `"dispatch"` for a tick that parks nothing, because the
+    literal forms `_constant_truth` happened to enumerate were the only ones pruned. An AUTHORED
+    constant now certifies nothing unless it is PROVED true (`_control_arms`), so the bypass no
+    longer has a spelling.
     """
     tree = ast.parse(source)
     for func in _live_nodes(tree):
@@ -24212,6 +24287,33 @@ def _starvation_sweep_self_test():
     ):
         assert _park_call_site(_live_while) == "dispatch", \
             "a `while` body that CAN run is live — pruning it would refuse live production code"
+    # [round 2] The two arms `_control_arms` must keep LIVE, one per statement kind, asserted
+    # before the refusals that share them. A runtime-state `if` guards honest production code (the
+    # real seam is gated on `bot_login and _target_token(repo)`), and a `for` over anything but a
+    # decidably-empty iterable runs its body — refusing either would refuse the production tick.
+    for _why_live, _live_stmt in (
+        ("an `if` on runtime state guards, it does not disable",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    if pending:\n"
+         "        for number in targets:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("a nested `for` over a runtime iterable runs its body",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        for _row in rows:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("a nested `for` over a NON-EMPTY literal runs its body at least once",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        for _row in [1]:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+    ):
+        assert _park_call_site(_live_stmt) == "dispatch", (
+            f"LIVE CONTROL: {_why_live} — pruning it would make `_control_arms` refuse live "
+            "production code, which is a different (and equally bad) way for this seam to be wrong")
     # Conditional EXPRESSIONS prune the same way, and the live halves are asserted first for the
     # same reason: `IfExp` keeps the arm the test selects (and BOTH arms when the test is
     # undecidable), and a short circuit only prunes when the operand that would settle it is a
@@ -24229,6 +24331,19 @@ def _starvation_sweep_self_test():
         "for number in ([] or targets):",                    # falsy literal does not settle `or`
         "for number in ([*rows] or targets):",               # a spread may be empty OR not
         "for number in ({**extra} or targets):",             # ...so it cannot settle an `or`
+        # [round 2] the two ways the new static/runtime split could over-prune. A `Subscript` is
+        # not in `_RUNTIME_VALUED_NODES`, so what keeps `rows[0]` runtime is the NAME inside it —
+        # this reds if the split ever keys on the outermost node instead of the whole subtree. And
+        # the `BoolOp` identity decides `pending and False` FALSY, which must prune the tail of an
+        # `and` and NOT the tail of the `or` that operand merely fails to settle.
+        "for number in (targets if rows[0] else []):",       # a name under a subscript is runtime
+        "for number in ((pending and False) or targets):",   # a falsy operand cannot settle `or`
+        # An authored constant PROVED TRUE keeps the arm it selects — these are the only two
+        # observable directions of the `BoolOp` identity, because "proved false" and "static but
+        # unproved" both refuse, so the `or`-all-falsy direction is an equivalent survivor by
+        # construction and is declared as one rather than pinned with a test that cannot fail.
+        "for number in (targets if [1] and [2] else []):",   # every operand truthy => `and` true
+        "for number in (targets if [] or [1] else []):",     # one operand truthy => `or` true
     ):
         assert _park_call_site(
             "def dispatch():\n"
@@ -24238,6 +24353,7 @@ def _starvation_sweep_self_test():
         ) == "dispatch", (
             f"an operand that CAN be evaluated is live — pruning {_live_expr!r} would make this "
             "checker refuse a live production seam, which is a different way for it to be wrong")
+    _park_mutants_refused = 0
     for _why, _mutant in (
         # --- dead branches: the statement exists and can never execute ---
         ("the batch loop under `if False:`",
@@ -24372,6 +24488,74 @@ def _starvation_sweep_self_test():
          "    targets = starvation_park_targets(items, starved, occupancy)\n"
          "    for number in targets:\n"
          "        [] and park_starved_partition_holder(repo, number, starved, labels)\n"),
+        # --- [round 2] UNPROVED AUTHORED CONSTANTS. Every mutant here was CERTIFIED by the first
+        # cut of this traversal: its evaluator modelled `Constant`/display/`not` and nothing else,
+        # so any other literal syntax read as "undecidable" and undecidable read as LIVE. Each
+        # tick below provably parks NOTHING, and none of them needs a new literal form modelled —
+        # they red because an authored constant that is not PROVED true now certifies nothing. One
+        # mutant per arm of that rule, so deleting any single arm reds by name.
+        ("the batch named only in the dead operand of `([] * 1) and targets` — a `BinOp` the "
+         "evaluator does not model, and `[] * 1` is always empty",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in (([] * 1) and targets):\n"
+         "        park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the batch named only in the dead arm of `targets if 1 == 0 else []` — a `Compare` the "
+         "evaluator does not model, and `1 == 0` is never true",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in (targets if 1 == 0 else []):\n"
+         "        park_starved_partition_holder(repo, number, starved, labels)\n"),
+        # `(0, 1)[0]` and NOT `'ab'[0:0]`: both are falsy authored constants, but a slice would be
+        # refused by the pre-existing `[:1]` hunt, so a mutant written that way is a FALSE KILL —
+        # it reds whether or not the rule under test exists. This one carries no `ast.Slice`, so
+        # the only thing refusing it is the static/runtime split.
+        ("the batch named only in the dead arm of `targets if (0, 1)[0] else []` — a subscript of "
+         "two literals reads no runtime state, so it is an authored constant too",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in (targets if (0, 1)[0] else []):\n"
+         "        park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the batch loop under `if 1 == 0:` — the statement form of the same unproved constant",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    if 1 == 0:\n"
+         "        for number in targets:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the batch loop under `while 1 == 0:` — the `while` form of it",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    while 1 == 0:\n"
+         "        for number in targets:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("the park call itself as the dead operand of `(1 == 0) and ...` in a live loop",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        (1 == 0) and park_starved_partition_holder(repo, number, starved, labels)\n"),
+        # --- [round 2] and the mirror gap: a condition that DOES read runtime state and is still
+        # provably dead, because one `and` operand is a decidable falsehood. The `BoolOp` identity
+        # in `_constant_truth` is the only thing that reds these two.
+        ("the batch named only in the dead arm of `targets if pending and False else []` — an "
+         "`and` with a falsy operand is falsy however `pending` behaves",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in (targets if pending and False else []):\n"
+         "        park_starved_partition_holder(repo, number, starved, labels)\n"),
+        ("a batch loop over `targets and []` — the loop RUNS the batch name and still iterates "
+         "the empty literal, so the tick parks nothing",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in (targets and []):\n"
+         "        park_starved_partition_holder(repo, number, starved, labels)\n"),
+        # --- [round 2] the loop ITERABLE decides whether a body runs at all, so a `for` over a
+        # decidably empty one is a dead branch wearing a loop.
+        ("the park call inside a nested `for _ in []:` — a loop body that never runs",
+         "def dispatch():\n"
+         "    targets = starvation_park_targets(items, starved, occupancy)\n"
+         "    for number in targets:\n"
+         "        for _row in []:\n"
+         "            park_starved_partition_holder(repo, number, starved, labels)\n"),
         # --- the pre-#1028 refusals, re-asserted: rewiring the scans must not blind them ---
         ("a `[:1]` slice on the loop iterable",
          "def dispatch():\n"
@@ -24401,9 +24585,13 @@ def _starvation_sweep_self_test():
             f"#1028 park seam: {_why} — the tick parks nothing (or one holder per tick), yet the "
             f"call-site checker certified it as {_certified!r}. A structural proof that reads "
             "EXISTENCE instead of REACHABILITY is not a proof")
-    print("  ok   #1028 park call-site seam is REACHABILITY, not existence: the live shapes are "
-          "certified, and 25 dead-branch / dead-operand / nested-uncalled-scope / re-scalarised "
-          "mutants are each REFUSED by name")
+        _park_mutants_refused += 1
+    # Counted, not retyped: a hand-written total drifts the moment a mutant is added or DELETED,
+    # and a deleted mutant is exactly the edit this section exists to make visible.
+    print(f"  ok   #1028 park call-site seam is REACHABILITY, not existence: the live shapes are "
+          f"certified, and {_park_mutants_refused} dead-branch / dead-operand / dead-iterable / "
+          "unproved-authored-constant / nested-uncalled-scope / re-scalarised mutants are each "
+          "REFUSED by name")
 
     # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
     _starvation_park_batch_seam_self_test()
