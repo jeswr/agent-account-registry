@@ -20,8 +20,13 @@ function parseTime(value) {
 function utc(value) {
   const date = parseTime(value);
   if (!date) return "unknown";
+  // Issue #1343: `hourCycle: "h23"`, NEVER `hour12: false`. The latter resolves to the **h24**
+  // cycle for many locales (en-US on the pinned node 20 among them), which prints the hour after
+  // midnight as hour 24 of the previous day's clock — `00:30Z` rendered as "Jul 18, 2026, 24:30".
+  // Every absolute stamp on this page goes through this one helper, so that read one hour a day
+  // as sitting on the wrong side of a day boundary. h23 is the only spelling that pins 00–23.
   return new Intl.DateTimeFormat(undefined, {
-    timeZone: "UTC", dateStyle: "medium", timeStyle: "short", hour12: false,
+    timeZone: "UTC", dateStyle: "medium", timeStyle: "short", hourCycle: "h23",
   }).format(date) + " UTC";
 }
 

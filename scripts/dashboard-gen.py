@@ -4959,7 +4959,14 @@ esac
   for (const [name, row] of Object.entries(input.quotaRows || {})) {
     resets[name] = text(scope.providerQuotaCard(row));
   }
-  process.stdout.write(JSON.stringify({ cards, warnings, resets }));
+  // [#1343] the one absolute-stamp helper every timestamp on the page goes through, called
+  // directly on pinned instants — the hour glyph it prints is the whole finding, so the rows
+  // read the RENDERED string rather than anything app.js was grepped for.
+  const stamps = {};
+  for (const [name, value] of Object.entries(input.stamps || {})) {
+    stamps[name] = scope.utc(value);
+  }
+  process.stdout.write(JSON.stringify({ cards, warnings, resets, stamps }));
 """
     # A LIVE `now`: the page's own staleness notice fires on a year-old fixture stamp, and that
     # notice would then mask the probe notice this block is about.
@@ -5029,7 +5036,7 @@ esac
             return f"probe raised: {type(exc).__name__}: {exc}"[:120]
 
     _thrown_probe = _guard_probe(
-        "usageProbeCard, updateFreshness, render, providerQuotaCard",
+        "usageProbeCard, updateFreshness, render, providerQuotaCard, utc",
         "  throw new Error('deliberate-1341-page-failure');",
         lambda page: ("deliberate-1341-page-failure" in page,
                       page.startswith("page script raised:"),
@@ -5038,7 +5045,7 @@ esac
                       page["cards"]["absent"] is None,
                       "NOT MEASURED" in page["cards"]["failed"]["text"]))
     _rendered_probe = _guard_probe(
-        "usageProbeCard, updateFreshness, render, providerQuotaCard",
+        "usageProbeCard, updateFreshness, render, providerQuotaCard, utc",
         "  console.log(JSON.stringify({ loaded: typeof scope.render }));",
         lambda page: (page, isinstance(page, _RaisedPage)))
     check("[#1341] a page script that THROWS is reported as the rows' value rather than raised: "
@@ -5062,7 +5069,7 @@ esac
     # finding, and reporting it as the value of every row below keeps those rows named and red
     # instead of aborting the suite mid-run with its later checks unexecuted (issue #1341).
     page = _executed_page(
-        _page_harness("usageProbeCard, updateFreshness, render, providerQuotaCard", page_body),
+        _page_harness("usageProbeCard, updateFreshness, render, providerQuotaCard, utc", page_body),
         {"probes": {"measured": measured_document["usage_probe"],
                     "failed": failed_document["usage_probe"],
                     "absent": None},
@@ -5074,7 +5081,58 @@ esac
          # per-CARD staleness flag gets wrong: the first window has refilled while the last known
          # refill is still ahead, so the two stamps must be judged INDEPENDENTLY.
          "quotaRows": {"future": reset_row(5400, 86400), "elapsed": reset_row(-360, -60),
-                       "split": reset_row(-360, 5400)}})
+                       "split": reset_row(-360, 5400)},
+         # [#1343] FIXED instants, never a clock reading: the hour cycle is what is under test, so
+         # the input has to name the hour. `midnight`/`midnightExact` are the bug's own hour;
+         # `noon`/`afternoon` are the controls that keep the fix from over-shooting into h11/h12.
+         "stamps": {"midnight": "2026-07-18T00:30:00Z",
+                    "midnightExact": "2026-07-18T00:00:00Z",
+                    "noon": "2026-07-18T12:00:00Z",
+                    "afternoon": "2026-07-18T13:05:00Z",
+                    "unparseable": "not-a-timestamp"}})
+    # --- [#1343] `utc()` EXECUTED on pinned instants. `hour12: false` resolves to the **h24** hour
+    # cycle for many locales (en-US on the pinned node 20 among them), so the hour after midnight
+    # printed as hour 24 of the PREVIOUS day's clock: `00:30Z` rendered "Jul 18, 2026, 24:30". Every
+    # absolute stamp on the page — freshness, last sweep, probe attempt, health/metrics/observability
+    # collection, the outcome rows, the reset notes — goes through this one helper.
+    #
+    # The rows read the CLOCK TOKEN out of the rendered string rather than the whole string, because
+    # `dateStyle: "medium"` is locale-shaped; the hour and minute glyphs are the entire finding. Both
+    # directions are pinned, and each rejected spelling moves a DIFFERENT row: h24 (the bug) prints
+    # `24` at midnight, h12 prints `12`/`1`, h11 prints `0` at midnight and `0` at noon, and dropping
+    # the option altogether lands on the locale default (h12 here). A non-latin-digit default locale
+    # finds no token at all and goes red by name — this row never passes by failing to look.
+    def _clock(rendered):
+        """`(hour, minute, ends-in-UTC)` as the page SHOWS them — or a diagnostic, never a pass."""
+        if not isinstance(rendered, str):
+            return f"not a rendered stamp: {rendered!r}"[:120]
+        token = re.search(r"(\d{1,2}):(\d{2})", rendered)
+        if not token:
+            return f"no clock token in {rendered!r}"[:120]
+        return (token.group(1), token.group(2), rendered.endswith(" UTC"))
+
+    # `.get` off a truthy fallback, never `page["stamps"]["…"]`: an emptied or deleted stamps block
+    # would otherwise `KeyError` out of the suite and score as a kill with every later row unrun
+    # (#1341 / pre-flight item 4). A raised page keeps `_RaisedPage`'s self-returning lookups.
+    stamps = page.get("stamps") or _RaisedPage("the executed page emitted no `stamps` block")
+    check("[#1343] EXECUTED page script: utc() prints the midnight hour as 00, not h24's 24 — the "
+          "one hour a day every absolute stamp on the page read across a day boundary",
+          (_clock(stamps.get("midnight")), _clock(stamps.get("midnightExact"))),
+          (("00", "30", True), ("00", "00", True)))
+    check("[#1343] ...and the rest of the day still reads as a 24-hour clock: noon is 12 (not h11's "
+          "0) and the afternoon is 13 (not h12's 1), so the fix cannot overshoot the other way",
+          (_clock(stamps.get("noon")), _clock(stamps.get("afternoon"))),
+          (("12", "00", True), ("13", "05", True)))
+    check("[#1343] ...and an unparseable stamp is still refused rather than formatted",
+          stamps.get("unparseable"), "unknown")
+    # A control on the extractor itself: it must be able to SEE the h24 rendering and the two
+    # 12-hour ones, or the three rows above are satisfiable by an instrument that reads nothing.
+    check("[#1343] the clock-token extractor distinguishes the spellings the rows above reject",
+          (_clock("Jul 18, 2026, 24:30 UTC"), _clock("Jul 18, 2026, 12:30 AM UTC"),
+           _clock("Jul 18, 2026, 0:30 AM UTC"), _clock("unknown"), _clock(None)),
+          (("24", "30", True), ("12", "30", True), ("0", "30", True),
+           "no clock token in 'unknown'", "not a rendered stamp: None"))
+
     check("[#612] EXECUTED page script: the probe card degrades exactly when nothing was measured",
           (page["cards"]["measured"]["degraded"],
            "NOT MEASURED" in page["cards"]["measured"]["text"],
