@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1939,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6cf68d95a829c94e17f96ff7d42a3c79cb9ab940",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The GraphQL retry carve-out is narrow, fail-closed, and consistently applied at the existing read-scope decision point. The argv policy requires the exact `api graphql` position, exactly one parseable `query=` field, no input body, and no explicit method; all ambiguous shapes remain single-attempt. The document policy strips literals/comments before scanning, rejects mutation/subscription tokens, validates balanced delimiters and every top-level definition start, and requires an actual query operation. The accompanying tests exercise admission and refusal at document, argv, retry-loop, and shell-entrypoint layers, including the pre-existing multiline attached-field fail-open. I found no diff-supported correctness, security, or non-vacuity issue requiring changes.",
+  "verdict": "approve"
+ }
+}
