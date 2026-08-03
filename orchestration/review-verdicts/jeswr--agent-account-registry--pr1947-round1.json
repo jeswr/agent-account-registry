@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1947,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "871b99aadea73d0284c860cb82f5daef91b43bc1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe added self-test directly exercises `_apply_cli`'s fail-closed `RoleInvariantError` path and independently pins all material outcomes: exit status 1, no edit calls, unchanged live labels, and the exact issue-scoped error annotation including the exception reason. The monkeypatch is restored in `finally`, output is captured, and unexpected exceptions are converted into a failing observed result rather than aborting later checks. The fixture reason is independent of production constants. This is a focused, non-vacuous regression test for the previously uncovered entry-point branch, with no trust-check weakening or security regression in the diff.",
+  "verdict": "approve"
+ }
+}
