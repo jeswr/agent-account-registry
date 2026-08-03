@@ -2175,16 +2175,20 @@ def _test_alert_route_contract(chk):
          what the router verifies; the same clause states the routing rule honestly beside it. So
          the module is scanned in two disjoint halves: everything outside `render_alert` must be
          CLEAN, and `render_alert` itself is pinned to EXACTLY that one phrasing together with its
-         scoping clause. A second occurrence, a different phrasing, or the same phrasing appearing
-         anywhere else in the module all red — which an allowlist keyed on the phrase alone could
-         not do.
+         scoping clause. The two halves read the scan DIFFERENTLY on purpose — the outside half
+         asserts an empty SET, where membership is the whole property, while the hint half asserts
+         the counted occurrence LIST, because "exactly one" is a claim about multiplicity that a
+         deduped set cannot make. A second occurrence, a different phrasing, or the same phrasing
+         appearing anywhere else in the module all red — which an allowlist keyed on the phrase
+         alone could not do.
 
     Both scans exclude THIS FUNCTION'S OWN LINES, so the banned phrases and the detector fixtures
     can be written literally below without the census matching itself; the exclusion is derived
     from the parsed AST and its own row reds if it cannot find this function. Every row below is
     independently killable: edit the pinned docstring on one side only, weaken the pin back to
     containment, blunt the claim detector so it cannot fire, drop a phrasing or one scoping
-    direction from it, widen its scope so it fires on unrelated prose, move the maintainer hint out
+    direction from it, widen its scope so it fires on unrelated prose, collapse the hint half's
+    counted occurrences back into a set so a duplicated guard reads as one, move the hint out
     of `render_alert`, paste a second router into this file, drop the visibility test, or make the
     visibility probe run under the wrong credential. The SAME-REPO half of the route is deliberately
     NOT restated here: `_self_test`'s own routing rows already kill it, and a second copy of one
@@ -2237,10 +2241,11 @@ def _test_alert_route_contract(chk):
                  "authorised to create", "able to create", "can create issues",
                  "allowed to write", "rights to write", "writable by")
 
-    def claims_about_the_route(text):
-        """Every ENUMERATED write-capability phrasing `text` uses ABOUT THE ALERT ROUTE, deduped
-        and sorted. A tripwire over the list above — NOT a decision procedure for "does this text
-        claim write capability", which is why the canonical-contract row is the load-bearing guard.
+    def route_claim_matches(text):
+        """Every ENUMERATED write-capability phrasing OCCURRENCE in `text` that is ABOUT THE ALERT
+        ROUTE, WITH MULTIPLICITY. A tripwire over the list above — NOT a decision procedure for
+        "does this text claim write capability", which is why the canonical-contract row is the
+        load-bearing guard.
 
         `text` is flattened to one whitespace-collapsed lowercase string first, so a claim broken
         across a wrapped comment or docstring line is still found; a hit then counts only when
@@ -2256,7 +2261,25 @@ def _test_alert_route_contract(chk):
                 if "alert_token" in blob[max(0, cursor - 160):cursor + len(claim) + 160]:
                     found.append(claim)
                 cursor = blob.find(claim, cursor + 1)
-        return sorted(set(found))
+        return found
+
+    def claims_about_the_route(text):
+        """The SET view of the above, sorted: WHICH phrasings occur, not how many times. Used ONLY
+        for the half of the module that must contain NONE of them, where set membership IS the
+        property asserted. The maintainer-hint half pins EXACTLY ONE occurrence, so it reads
+        `route_claim_matches` instead — collapsing duplicates there would let a SECOND copy of the
+        expected sentence sail through the row that exists to forbid it, since `sorted(set(...))`
+        reports `["can write to"]` for one occurrence and for ten alike (review round 1 of #1667).
+        """
+        return sorted(set(route_claim_matches(text)))
+
+    def exactly_the_maintainer_hint(text):
+        """THE predicate the maintainer-hint row pins with — named so the non-vacuity row below
+        drives the SAME one the live pin uses, rather than a re-typed `==` that could stay green
+        while the pin degraded (AGENTS.md AUTHOR pre-flight #2b). Exactly ONE enumerated
+        occurrence, and it is the expected phrasing: a second copy of it, a different phrasing, or
+        an extra phrasing beside it each make this False."""
+        return route_claim_matches(text) == ["can write to"]
 
     # VALIDATE THE DETECTOR BEFORE TRUSTING ITS SILENCE. On a clean tree every `find` returns -1,
     # so without these fixtures the whole scoping loop above never executes even once and the
@@ -2293,6 +2316,21 @@ def _test_alert_route_contract(chk):
          [claims_about_the_route(f"the route needs an ALERT_TOKEN {claim} it")
           for claim in phrasings]),
         (16, [[claim] for claim in phrasings]))
+
+    # MULTIPLICITY is the property the maintainer-hint pin below rests on, so validate it here:
+    # the exactly-one predicate must REJECT a second scoped copy of the very phrasing it expects.
+    # The deduped view is measured on the same fixture to show WHY that pin cannot use it — it
+    # reports the same `["can write to"]` for one occurrence and for two, so a duplicated guard
+    # inside `render_alert` would have stayed green (review round 1 of #1667).
+    doubled_hint = ("configure a private ALERT_REPO with an ALERT_TOKEN secret that can write to "
+                    "it; the alert lands only when that ALERT_TOKEN can write to the destination")
+    chk("#1667: ... and OCCURRENCES are counted, not collapsed: the exactly-one predicate the "
+        "maintainer-hint row pins with REJECTS a second scoped copy of the expected phrasing, "
+        "which the deduped set view cannot distinguish from the first",
+        (route_claim_matches(doubled_hint), exactly_the_maintainer_hint(doubled_hint),
+         claims_about_the_route(doubled_hint),
+         exactly_the_maintainer_hint("an ALERT_TOKEN that can write to it")),
+        (["can write to", "can write to"], False, ["can write to"], True))
 
     source = open(__file__, encoding="utf-8").read()
     definitions = [node for node in ast.walk(ast.parse(source))
@@ -2355,12 +2393,13 @@ def _test_alert_route_contract(chk):
         (claims_about_the_route(outside), "def _alert_route(" in outside,
          "claims_about_the_route" in outside, "def render_alert(" in outside),
         ([], True, False, False))
-    chk("#1667: ... and the ONE expected occurrence is pinned EXACTLY where it belongs — "
-        "render_alert's redacted public body, as operator configuration guidance stated beside "
-        "the honest routing rule, never as a claim about what the router verified",
-        (claims_about_the_route(hint),
+    chk("#1667: ... and EXACTLY ONE occurrence — counted, not deduped — is pinned exactly where "
+        "it belongs: render_alert's redacted public body, as operator configuration guidance "
+        "stated beside the honest routing rule, never as a claim about what the router verified. "
+        "A duplicated guard, a reworded one, or a second phrasing beside it all red",
+        (exactly_the_maintainer_hint(hint), route_claim_matches(hint),
          "(the private route is used only when BOTH are set)" in hint),
-        (["can write to"], True))
+        (True, ["can write to"], True))
     # Behavioural statement of the contract the prose is pinned to. These literals appear nowhere
     # else in this harness, so a substituted value cannot collide with another fixture's. The
     # REJECT directions are the ones that matter: this route gates a credential verdict, so every
