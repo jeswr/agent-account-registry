@@ -97,9 +97,16 @@ OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 SKIP_STREAK_THRESHOLD = 4
 
 # One request per validated run, and one page of it. groom uploads exactly ONE marker per run (a
-# re-run adds one more), so a full page is orders of magnitude above the live shape; a run somehow
-# holding more than this many artifacts contributes no tick, which shortens the provable history
-# and can never fabricate one.
+# re-run adds one more), so a full page is orders of magnitude above the live shape.
+#
+# But "above the live shape" is a size argument, not a check, and the page cap is a silent one: the
+# endpoint answers a truncated page with a 200 (review round 1). A run holding more artifacts than
+# one page returns has a marker this reader CANNOT SEE, and the page it did get can carry an OLDER
+# re-run's marker — so trusting it would score a stale outcome as that tick's, and dropping the run
+# quietly would splice the ticks on either side of it together as if they were adjacent. Both
+# directions can fabricate a streak. So a page that cannot PROVE it holds the whole run
+# (`artifacts_complete`) is handled exactly like a refused one — a HOLE the crawl stops at, which
+# can only ever shorten the provable history.
 ARTIFACT_PAGE_SIZE = 100
 
 # PROVENANCE — AN ARTIFACT NAME IS NOT EVIDENCE OF WHO WROTE IT (review round 1).
@@ -210,6 +217,29 @@ def _artifacts(payload):
     if not isinstance(entries, list):
         return []
     return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def artifacts_complete(payload):
+    """Does this artifacts page PROVE it lists EVERY artifact of the run it answers for?
+
+    The endpoint states `total_count` for the whole run and returns at most one page of them, so
+    `total_count <= len(artifacts)` is the only proof of completeness available without paging
+    further — and a truncated page arrives as a plain 200, indistinguishable from a whole one
+    unless this is asked.
+
+    An ABSENT or non-integer `total_count` is NOT complete. Treating an unstated count as zero (or
+    as the page length) would make every truncated page read as whole, which is the fail-OPEN
+    answer: the caller's whole hole-handling would then never trigger on the one shape it exists
+    for. Fewer artifacts than stated is only ever answered by refusing to score the run."""
+    if not isinstance(payload, dict):
+        return False
+    total = payload.get("total_count")
+    if not isinstance(total, int) or isinstance(total, bool):
+        return False
+    entries = payload.get("artifacts")
+    if not isinstance(entries, list):
+        return False
+    return total <= len(entries)
 
 
 def tick_runs(payload, default_branch):
@@ -495,17 +525,19 @@ def read_ticks(repo, runner=None, threshold=SKIP_STREAK_THRESHOLD):
     workflow-scoped runs listing: every artifact it returns is put through `tick_records` against
     the SINGLE run it was requested for, so a payload naming any other run contributes nothing.
 
-    A REFUSED per-run read is a HOLE, not a short tail: the runs behind it are OLDER, and carrying
-    them forward would present non-adjacent ticks as consecutive — which could FABRICATE a
-    threshold-length streak out of a blip. So the crawl stops at the hole, keeps only the
-    contiguous newest prefix it has actually validated, and reports `truncated` so a bounded read
-    is stated in the log rather than silently read as a short history.
+    A per-run read that is REFUSED — or that comes back a PARTIAL page it cannot prove whole
+    (`artifacts_complete`) — is a HOLE, not a short tail: the runs behind it are OLDER, and
+    carrying them forward would present non-adjacent ticks as consecutive — which could FABRICATE a
+    threshold-length streak out of a blip. Nor may the partial page itself contribute: its newest
+    marker may simply not be on it. So the crawl stops at the hole, keeps only the contiguous
+    newest prefix it has actually validated, and reports `truncated` so a bounded read is stated in
+    the log rather than silently read as a short history.
 
     `runner` is resolved at CALL time, not bound as a default: a default argument captures the
     function object at definition, which makes the live path unpatchable and every stubbed-flow
     assertion below quietly exercise the real `gh`. -> (None, False) if any read that would leave
-    the evidence unvalidated is refused; without them there is no evidence at all and the caller
-    must fail loud, not read "healthy"."""
+    the evidence unvalidated is refused or unprovable; without them there is no evidence at all and
+    the caller must fail loud, not read "healthy"."""
     runner = runner or _gh_json
     default_branch = read_default_branch(repo, runner)
     if default_branch is None:
@@ -518,7 +550,7 @@ def read_ticks(repo, runner=None, threshold=SKIP_STREAK_THRESHOLD):
         payload = runner(["api", "-H", GH_JSON_ACCEPT,
                           f"/repos/{repo}/actions/runs/{run_id}/artifacts"
                           f"?per_page={ARTIFACT_PAGE_SIZE}"])
-        if payload is None:
+        if payload is None or not artifacts_complete(payload):
             return (None, False) if index == 0 else (ordered_ticks(records), True)
         tick_records(payload, {run_id: created}, into=records)
     return ordered_ticks(records), False
@@ -600,14 +632,15 @@ def main():
         # is no VALIDATED evidence at all, so neither a page nor a close is defensible. The step's
         # continue-on-error keeps the alarm isolated.
         print("::warning::groom-mint: a listing this watchdog needs to VALIDATE mint evidence was "
-              "refused (repo, groom runs, or artifacts) — no mint evidence this tick (next tick "
-              "retries)")
+              "refused, or answered a partial page it could not prove whole (repo, groom runs, or "
+              "artifacts) — no mint evidence this tick (next tick retries)")
         return 1
     if truncated:
         print("::warning::groom-mint: the artifacts of a groom run behind the newest "
-              f"{len(ticks)} tick(s) were refused, so only those {len(ticks)} are reachable this "
-              f"tick (wanted {SKIP_STREAK_THRESHOLD + 1}) — a longer streak than that cannot be "
-              "proved, and the ticks behind that hole are deliberately NOT carried forward")
+              f"{len(ticks)} tick(s) were refused or could not be proved whole, so only those "
+              f"{len(ticks)} are reachable this tick (wanted {SKIP_STREAK_THRESHOLD + 1}) — a "
+              "longer streak than that cannot be proved, and the ticks behind that hole are "
+              "deliberately NOT carried forward")
 
     alerts, hard, soft = _open_alerts(repo, token)
     if hard:
@@ -1081,11 +1114,20 @@ def _test_paging(chk):
     list of URLs the crawl actually asks for, which each row asserts by exact equality."""
     wanted = SKIP_STREAK_THRESHOLD + 1
 
-    def crawler(markers, runs, refuse=()):
+    # What an OVER-CAP run states in `total_count`: more artifacts than the page it answered with
+    # carried. A literal, deliberately NOT derived from ARTIFACT_PAGE_SIZE — an over-cap fixture
+    # computed from the constant the code reads moves with it and can stop being over-cap at all
+    # (AGENTS.md item 2c). The stub shortens the page rather than emitting a hundred rows; the only
+    # thing a reader can act on is that the run STATES more than it was handed.
+    OVERFULL_TOTAL = 137
+
+    def crawler(markers, runs, refuse=(), overfull=(), countless=()):
         """A `gh api` stub for every read the crawl makes. `markers[run_id]` is what THAT run's own
         artifacts endpoint answers with; the runs listing answers only the run ids in `runs`, so
         every fixture is filtered through the real provenance gate rather than past it. `refuse`
-        may name `"repo"`, `"runs"`, or any run id."""
+        may name `"repo"`, `"runs"`, or any run id. `overfull` names runs whose page states more
+        artifacts than it returned (the silent truncation the live endpoint answers 200 to), and
+        `countless` names runs whose page states no `total_count` at all."""
         asked = []
 
         def runner(args):
@@ -1094,15 +1136,23 @@ def _test_paging(chk):
             if scoped:
                 run_id = int(scoped.group(1))
                 asked.append(run_id)
-                return None if run_id in refuse else {"artifacts": markers.get(run_id, [])}
+                if run_id in refuse:
+                    return None
+                entries = markers.get(run_id, [])
+                page = {"artifacts": entries}
+                if run_id not in countless:
+                    page["total_count"] = OVERFULL_TOTAL if run_id in overfull else len(entries)
+                return page
             if "/actions/workflows/" in url:
                 return None if "runs" in refuse else {"workflow_runs": [
                     _run_row(run_id, created) for run_id, created in sorted(runs.items())]}
             if "/actions/artifacts" in url:
-                # The repository-WIDE listing. Answered generously on purpose — asking it AT ALL is
-                # the defect, so it is recorded rather than refused.
+                # The repository-WIDE listing. Answered generously — and as a COMPLETE page, so the
+                # row below stays about the fact that it is never ASKED for rather than passing
+                # because a truncation check happened to reject it.
                 asked.append("REPO-WIDE")
-                return {"artifacts": [_artifact("publish-bundle", 900)] * ARTIFACT_PAGE_SIZE}
+                storm = [_artifact("publish-bundle", 900)] * ARTIFACT_PAGE_SIZE
+                return {"total_count": len(storm), "artifacts": storm}
             return None if "repo" in refuse else {"default_branch": FIXTURE_BRANCH}
         return runner, asked
 
@@ -1114,6 +1164,26 @@ def _test_paging(chk):
         """One `skip-jeswr` marker per run, in that run's OWN artifacts payload."""
         return {run_id: [_artifact("groom-mint-tick.skip-jeswr", run_id, created)]
                 for run_id, created in runs.items()}
+
+    # THE COMPLETENESS PROOF ITSELF. The accept rows come first on purpose: without them the reject
+    # rows are all satisfied by a predicate that simply never returns True, which would take the
+    # whole watchdog offline while reading as a tightened check.
+    chk("page: a run that states exactly what its page returned is proved whole (and an empty run "
+        "is whole too — it died before the mint stage, which is a real, evidence-free tick)",
+        (artifacts_complete({"total_count": 2, "artifacts": [_artifact("a"), _artifact("b")]}),
+         artifacts_complete({"total_count": 0, "artifacts": []})), (True, True))
+    for label, page in (
+            ("a page that returned FEWER artifacts than its run states",
+             {"total_count": 2, "artifacts": [_artifact("a")]}),
+            ("a page that states no total_count at all", {"artifacts": [_artifact("a")]}),
+            ("a total_count that is not a number", {"total_count": "2", "artifacts": []}),
+            ("a bool total_count (True is an int, and 1 <= 1 would read as whole)",
+             {"total_count": True, "artifacts": [_artifact("a")]}),
+            ("a page with no artifact list at all", {"total_count": 0}),
+            ("a non-list artifact list", {"total_count": 0, "artifacts": "nope"}),
+            ("a non-dict payload", "nope"),
+    ):
+        chk(f"page: {label} proves nothing", artifacts_complete(page), False)
 
     # THE BOUND, THE SCOPE AND THE ORDER, against far more validated runs than the crawl may ask
     # for. The expected id list is arithmetic over the FIXTURE's own construction and never a call
@@ -1238,6 +1308,41 @@ def _test_paging(chk):
         "one refused read",
         (streak, gap_verdict(streak, len(ticks))), (2, "flapping"))
 
+    # A PARTIAL page is a HOLE TOO (review round 1). `total_count` is the run's own count of its
+    # artifacts while the page carries at most ARTIFACT_PAGE_SIZE of them, so an over-cap run
+    # answers 200 with a page whose NEWEST marker may simply not be on it — and whose visible
+    # marker may be an older re-run's, i.e. that tick's stale outcome. Neither may be scored, and
+    # the run may not be stepped over as if it were markerless either.
+    #
+    # THE NEWEST run over-cap, with a stale `ok` marker on the page it did return: the shape that
+    # silently retires a live alert, because a reader that trusted the page scores streak 0 and
+    # closes on `recovered`.
+    stale = dict(skips(run_ids))
+    stale[newest_id] = [_artifact("groom-mint-tick.ok-jeswr", newest_id, "2026-07-29T18:04:00Z")]
+    for label, kwargs in (
+            ("states more artifacts than its page returned", {"overfull": (newest_id,)}),
+            ("states no total_count at all", {"countless": (newest_id,)})):
+        runner, asked = crawler(stale, run_ids, **kwargs)
+        chk(f"crawl: a page on the NEWEST validated run that {label} leaves nothing validated — a "
+            "marker on a page that cannot be proved whole is not that run's outcome, so it can "
+            "neither be scored nor close a live alert",
+            (read_ticks("o/r", runner=runner), asked), ((None, False), [newest_id]))
+
+    # ... and MID-crawl it is exactly the hole a refusal is: stop, keep the contiguous prefix,
+    # flag it. Every run here carries a `skip` marker, so a reader that trusted the partial page —
+    # or that stepped over it and spliced the ticks behind it forward — reaches a full
+    # THRESHOLD-length streak and pages for a credential gap the evidence does not show.
+    for label, kwargs in (("states more artifacts than its page returned", {"overfull": (hole,)}),
+                          ("states no total_count at all", {"countless": (hole,)})):
+        runner, asked = crawler(skips(run_ids), run_ids, **kwargs)
+        ticks, truncated = read_ticks("o/r", runner=runner)
+        streak = skip_streaks(ticks, {"jeswr"})["jeswr"]
+        chk(f"crawl: a mid-crawl page that {label} stops the crawl, contributes no tick of its "
+            "own, is flagged short, and cannot fabricate a threshold-length streak",
+            (asked, [sorted(skip) for _ok, skip in ticks], truncated, streak,
+             gap_verdict(streak, len(ticks))),
+            ([newest_id, newest_id - 1, hole], [["jeswr"], ["jeswr"]], True, 2, "flapping"))
+
 
 def _test_readers(chk):
     """The two LIVE readers, exercised for real rather than stubbed past.
@@ -1296,7 +1401,9 @@ def _test_readers(chk):
             if "/actions/workflows/" in url:
                 return json.dumps({"workflow_runs": [_run_row(700, "2026-07-29T18:00:00Z")]})
             if "/actions/runs/" in url:
-                return json.dumps({"artifacts": [
+                # `total_count` as the live endpoint states it: this run holds exactly the one
+                # artifact this page returned, which is what makes the page provably whole.
+                return json.dumps({"total_count": 1, "artifacts": [
                     _artifact("groom-mint-tick.skip-jeswr", 700, "2026-07-29T18:00:00Z")]})
             return json.dumps({"default_branch": FIXTURE_BRANCH})
 
