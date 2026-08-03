@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1848,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "075d41b0efe5367a56313d538dc476b942d8fd75",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_confirm_area_strip` restores `needs:area` with `edit`, so the workflow bot creates the newest `labeled needs:area` timeline event. On the next ordinary `labeled` workflow invocation, `area_park_clearance` applies newest-application-wins, sees that bot restoration as newest, and authorizes deletion even though the human whose raced application caused the repair never withdrew the hold. The code explicitly calls the restored park machine-owned and clearable on the next event, and the new race tests end after the first `_apply_cli` call; they prove only transient restoration, not durable human ownership across the next trigger. This is the same trust defect reported in round 3.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Preserve durable evidence that the restoration represents the raced human application, or mark the repaired hold non-clearable until a later human removal/reapplication establishes a new ownership state. Add a binding-layer test that performs the repair, then invokes a second ordinary labeled-event `_apply_cli` run and asserts that `needs:area` remains and `status:ready` is not published until the human explicitly changes the hold.",
+    "severity": "major",
+    "title": "Repair still launders the raced human hold into machine ownership"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 still restores a raced human `needs:area` hold by applying the label through the workflow bot, while clearance continues to use newest-application-wins. The restoration therefore becomes the newest application and is classified as machine-owned. A later ordinary `labeled` run can clear the restored park without any subsequent human withdrawal or reapplication. The added tests stop after repair and explicitly assume the restored label is safely clearable next time; they do not exercise the next real trigger. The round-3 trust-plane defect remains materially unchanged, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
