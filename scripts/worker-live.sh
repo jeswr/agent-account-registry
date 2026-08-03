@@ -4034,9 +4034,74 @@ _purge_before_target_code() {
   fi
 }
 
+# PURE (self-tested): classify every REGISTRY_SECRETS_PAT expansion in a workflow by the YAML SCOPE
+# it is bound at, printing one `<line> <scope>` record per occurrence, in file order. Scope is:
+#   step        — the occurrence is inside an item of some job's `steps:` list, so GitHub makes the
+#                 PAT live in that ONE step;
+#   step-export — inside a step, but that same step also writes a CROSS-STEP channel
+#                 ($GITHUB_ENV / $GITHUB_OUTPUT) in code, so whatever it holds can reach every LATER
+#                 step of the job however early the step itself runs;
+#   outer       — NOT inside any step: a job-level or workflow-level `env:` (or any other key
+#                 outside the step list), which GitHub hands to EVERY step of the job.
+#
+# [issue #300 review r1] WHY SCOPE AND NOT JUST THE LINE NUMBER. The first cut of the ordering check
+# below compared each expansion's LINE against the first target-controlled step's, and that is
+# unsound for exactly one shape: `REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}` written
+# in the JOB-level `env:` sits near the TOP of the job — an early line, so the comparison passes —
+# while GitHub inherits it into every step of that job, the rustup provisioning and the gate
+# included. A line number cannot distinguish job-, step- or command-level binding; this can.
+#
+# Structure is read off INDENTATION, which is what block YAML encodes nesting in: a step list opens
+# at a `steps:` key, its items are the `- ` lines one level in, and a step ends at the next item at
+# that same indent or at the first line back out at (or above) the `steps:` key's own column. So a
+# job-level `env:` written AFTER the step list closes the list too, and its children read `outer`.
+# SCOPE of the scan: it reads the WORKFLOW text. A step that hands the PAT onward from inside a
+# SCRIPT it invokes is beyond any YAML-level scan — the `run:`-side channel is what
+# `_run_headless_harness`'s containment and the post-gate no-token property cover.
+# Comment lines are excluded from the export test only (a `#` line cannot write a command file) and
+# still count as occurrences; a PAT mention in a comment is a false ALARM, never a false pass.
+_pat_binding_scopes() {
+  local file=$1
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  awk '
+    function indent_of(s) { match(s, /^[ ]*/); return RLENGTH }
+    function flush(  i, scope) {
+      scope = (exporting ? "step-export" : "step")
+      for (i = 1; i <= pending; i++) print occ[i] " " scope
+      pending = 0; exporting = 0
+    }
+    BEGIN { in_steps = 0; steps_col = -1; step_col = -1; pending = 0; exporting = 0 }
+    /^[[:space:]]*$/ { next }
+    {
+      col = indent_of($0)
+      # A line back out at (or above) the `steps:` key closes the step list — including a job-level
+      # key written BELOW the steps, which YAML permits and which is job scope all the same.
+      if (in_steps && col <= steps_col) { flush(); in_steps = 0; step_col = -1 }
+      if ($0 ~ /^[[:space:]]*steps:[[:space:]]*$/) {
+        flush(); in_steps = 1; steps_col = col; step_col = -1; next
+      }
+      if (in_steps) {
+        # The first `- ` one level in fixes the item column; every later `- ` at that column (never a
+        # deeper one, which is a nested list inside the step) opens the next step.
+        if ($0 ~ /^[[:space:]]*-[[:space:]]/ && (step_col < 0 || col <= step_col)) {
+          flush(); step_col = col
+        }
+        if (step_col >= 0 && col >= step_col) {
+          if ($0 !~ /^[[:space:]]*#/ && $0 ~ /GITHUB_ENV|GITHUB_OUTPUT/) exporting = 1
+          if (index($0, "secrets.REGISTRY_SECRETS_PAT")) occ[++pending] = NR
+          next
+        }
+      }
+      if (index($0, "secrets.REGISTRY_SECRETS_PAT")) print NR " outer"
+    }
+    END { flush() }
+  ' "$file"
+}
+
 # PURE (self-tested): verdict on whether a live worker lane makes REGISTRY_SECRETS_PAT live ONLY in
-# steps that run BEFORE any target-controlled code. `ordered` is the only passing value; a lane with
-# no PAT at all, or no target-controlled step, is a NAMED refusal rather than a vacuous pass.
+# ONE step, and only in a step that runs BEFORE any target-controlled code. `ordered` is the only
+# passing value; a lane with no PAT at all, or no target-controlled step, is a NAMED refusal rather
+# than a vacuous pass.
 #
 # [issue #300] The rotation write-back is the one step of these lanes that holds a secrets-capable
 # credential, and it executes `registry/scripts/worker-live.sh` — a checkout that sits beside the
@@ -4050,28 +4115,34 @@ _purge_before_target_code() {
 # not see it: it scans for `GH_TOKEN:` only.
 #
 # EVERY occurrence is checked, not the first: a second PAT-bearing step appended after the gate is
-# precisely the regression, and a first-match test would report `ordered` while it sat there. The
-# needle is the SECRET EXPANSION (`secrets.REGISTRY_SECRETS_PAT`), not an env key at one indent, so a
-# job-wide `env:` — which hands the PAT to every step in the job, gate included — is caught too. A
-# mention inside a comment below the gate counts as an occurrence; that direction is a false ALARM,
-# never a false pass, and it is one comment reword to clear.
+# precisely the regression, and a first-match test would report `ordered` while it sat there.
+# [review r1] And every occurrence is checked for the SCOPE it binds at before its position is even
+# consulted — `_pat_binding_scopes` above has the argument. A binding outside any step, or one a
+# step re-exports through $GITHUB_ENV/$GITHUB_OUTPUT, reaches the gate no matter how early its own
+# line is, so each is its own named refusal rather than an `ordered` the line comparison would give.
 _pat_before_target_code() {
   local file=$1
   [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
-  local hits target_ln hit late=0
-  # `|| true`: no match is a normal empty result here, and the pipeline-free form keeps grep's own
-  # status from aborting the caller under `set -e` (same reasoning as `_first_match_line`).
-  hits=$(grep -Fn -e 'secrets.REGISTRY_SECRETS_PAT' -- "$file" || true)
-  [[ -n "$hits" ]] || { printf 'no-pat-step\n'; return 0; }
+  local scopes target_ln ln scope late=0 outer=0 exported=0
+  scopes=$(_pat_binding_scopes "$file") || return 1
+  [[ -n "$scopes" ]] || { printf 'no-pat-step\n'; return 0; }
   target_ln=$(_first_target_code_line "$file") || { printf 'no-target-code-step\n'; return 0; }
-  while IFS= read -r hit; do
-    [[ -n "$hit" ]] || continue
-    [[ "${hit%%:*}" -lt "$target_ln" ]] || late=$((late + 1))
-  done <<< "$hits"
-  if [[ "$late" -eq 0 ]]; then
-    printf 'ordered\n'
-  else
+  while read -r ln scope; do
+    [[ -n "$ln" ]] || continue
+    case "$scope" in
+      outer) outer=$((outer + 1)) ;;
+      step-export) exported=$((exported + 1)) ;;
+    esac
+    [[ "$ln" -lt "$target_ln" ]] || late=$((late + 1))
+  done <<< "$scopes"
+  if [[ "$outer" -gt 0 ]]; then
+    printf 'pat-outside-step-scope\n'
+  elif [[ "$exported" -gt 0 ]]; then
+    printf 'pat-exported-to-later-steps\n'
+  elif [[ "$late" -gt 0 ]]; then
     printf 'pat-after-target-code\n'
+  else
+    printf 'ordered\n'
   fi
 }
 
@@ -5690,7 +5761,13 @@ WFFIX
   # in the file: this fixture reverses their live order, which is the only input that exercises that
   # comparison's other branch. Both rows read the SAME fixture and move only the PAT's position.
   local wf_pat_rev="$tmp/pat-reversed-lane.yml"
+  # [review r1] The fixture carries the `jobs:` / job / `steps:` frame a real lane has, because the
+  # verdict it is built to exercise is about the ORDER of two step-scoped bindings: a bare step list
+  # that never opens under a `steps:` key holds nothing inside a step at all, and would be refused on
+  # SCOPE before its ordering was ever compared — a red tick for the wrong reason.
+  local -a pat_lane_head=('jobs:' '  worker:' '    steps:')
   {
+    printf '%s\n' "${pat_lane_head[@]}"
     printf '      - name: Run policy-selected local gate\n'
     printf '        run: bash ../registry/scripts/worker-live.sh gate\n'
     printf '%s\n' "${pat_step[@]}"
@@ -5699,6 +5776,7 @@ WFFIX
   chk "#300: a PAT between a lane's FIRST and second target-controlled steps is still REPORTED" \
     "$(_pat_before_target_code "$wf_pat_rev")" "pat-after-target-code"
   {
+    printf '%s\n' "${pat_lane_head[@]}"
     printf '%s\n' "${pat_step[@]}"
     printf '      - name: Run policy-selected local gate\n'
     printf '        run: bash ../registry/scripts/worker-live.sh gate\n'
@@ -5706,6 +5784,57 @@ WFFIX
   } > "$wf_pat_rev"
   chk "#300: ...and the same fixture with the PAT ahead of both reads ordered (verdict tracks input)" \
     "$(_pat_before_target_code "$wf_pat_rev")" "ordered"
+
+  # --- [issue #300 review r1] THE SHAPE A LINE COMPARISON CANNOT SEE. Everything above measures
+  # WHERE the expansion sits; who can READ it is decided by the SCOPE it is bound at. Both mutants
+  # below MOVE the lane's one legitimate binding rather than adding a second, so each carries exactly
+  # one expansion, on an EARLY line — the ordering test alone calls both `ordered` while the gate
+  # inherits the PAT. `_pat_binding_scopes` is what refuses them. ---
+  chk "#300 r1 (LIVE): each lane binds its PAT inside ONE step — classified, never assumed" \
+    "$(_pat_binding_scopes "$wf" | awk '{ print $2 }'):$(_pat_binding_scopes "$rf_wf" | awk '{ print $2 }')" \
+    "step:step"
+  # MUTANT 1 — the finding verbatim: the sole binding moved into the gate-running job's JOB-level
+  # `env:`, above every step, which GitHub hands to rustup and to the gate. Built from the PAT-free
+  # mutant plus a block written out HERE, so the mutant's input is not lifted from the file under
+  # test (AGENTS.md AUTHOR pre-flight item 2c).
+  # The job key is written ONCE and both the hygiene row and the mutation read that one variable:
+  # a second copy of the anchor would make each copy individually unkillable (pre-flight item 4).
+  local wf_pat_job="$tmp/worker-pat-job-scoped.yml" pat_job_key='  worker:'
+  chk "#300 r1 (mutation hygiene): the gate-running job's key is a unique anchor in the PAT-free tree" \
+    "$(grep -Fxc -e "$pat_job_key" "$wf_pat_gone" || true)" "1"
+  awk -v anchor="$pat_job_key" '{ print }
+       $0 == anchor { print "    env:"
+                      print "      REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}" }' \
+    "$wf_pat_gone" > "$wf_pat_job"
+  chk "#300 r1 (mutation hygiene): it MOVED the one expansion into job scope, it did not add a second" \
+    "$(grep -Fc -e "$pat_expr" "$wf_pat_job" || true)" "1"
+  chk "#300 r1 (mutation hygiene): ...and that expansion is EARLY, so the line comparison alone passes it" \
+    "$([[ "$(_first_match_line "$pat_expr" < "$wf_pat_job")" -lt "$(_first_target_code_line "$wf_pat_job")" ]] \
+      && printf early || printf late)" "early"
+  chk "#300 r1: a JOB-level PAT binding, inherited by every step of the job, is REPORTED (non-vacuous)" \
+    "$(_pat_before_target_code "$wf_pat_job")" "pat-outside-step-scope"
+  chk "#300 r1: ...and the scan names WHY — the binding sits outside every step" \
+    "$(_pat_binding_scopes "$wf_pat_job" | awk '{ print $2 }')" "outer"
+  # MUTANT 2 — indirect propagation: the binding stays step-scoped and early, but the step re-exports
+  # it through $GITHUB_ENV, which the runner applies to every LATER step. Same false `ordered` under a
+  # pure ordering test.
+  local wf_pat_export="$tmp/worker-pat-exported.yml"
+  local pat_wb_run='        run: bash registry/scripts/worker-live.sh write-back'
+  local pat_export_line='          echo "PAT=$REGISTRY_SECRETS_PAT" >> "$GITHUB_ENV"'
+  chk "#300 r1 (mutation hygiene): the write-back's run line is a unique whole-line anchor" \
+    "$(grep -Fxc -e "$pat_wb_run" "$wf" || true)" "1"
+  awk -v anchor="$pat_wb_run" -v add="$pat_export_line" '
+      $0 == anchor { print "        run: |"
+                     print "          bash registry/scripts/worker-live.sh write-back"
+                     print add; next }
+      { print }' "$wf" > "$wf_pat_export"
+  chk "#300 r1 (mutation hygiene): the export mutant differs from the shipped workflow, one PAT still" \
+    "$( (cmp -s "$wf" "$wf_pat_export" && printf same) || printf changed):$(grep -Fc -e "$pat_expr" "$wf_pat_export" || true)" \
+    "changed:1"
+  chk "#300 r1: a PAT-bearing step that re-exports it to \$GITHUB_ENV is REPORTED (non-vacuous)" \
+    "$(_pat_before_target_code "$wf_pat_export")" "pat-exported-to-later-steps"
+  chk "#300 r1: _pat_binding_scopes fails CLOSED on an unreadable workflow" \
+    "$(_pat_binding_scopes "$tmp/no-such-workflow.yml" 2>/dev/null; printf '%s' "$?")" "1"
 
   local verify_ln mint_ln
   verify_ln=$(_first_match_line 'worker-live\.sh verify-bundle' < "$wf")
