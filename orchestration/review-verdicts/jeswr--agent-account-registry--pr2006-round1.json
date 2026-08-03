@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2006,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e934e3ef6b09442456e8a32a9486de0d292787eb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The diff only consolidates and clarifies the existing `main()` docstring. It preserves the documented production behavior of `clock=None`, explains both the time-dependent false failure and vacuous-pass modes, and migrates the touched legacy model-qualified provenance marker to the required model-agnostic `[SPARQ agent]` marker. No executable control flow, trust check, workflow seam, permissions, or tests are changed, and the added prose contains no instruction directed at the reviewer.",
+  "verdict": "approve"
+ }
+}
