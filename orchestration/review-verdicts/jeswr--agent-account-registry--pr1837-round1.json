@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1837,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "db13f359addf06508a24faf14789cbf24699681f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly distinguishes an absent or wholly unreadable cache group from measured zero values, announces supplied-but-unreadable input, and preserves all independently parseable cache fields. The new tests exercise each publication-guard disjunct, zero-valued measurements, malformed container/field cases, warning behavior, continued normalization of other panels, and the rendered-page result. The documentation now matches the implemented lease-derived affinity behavior and clearly separates the unused placeholder from the live data plane. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
