@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1949,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3b0dc4546303b46593b2c007aa3d742ed71fafe4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 8.1 says identical rows deliberately produce one receipt because they are the same decision over the same evidence. That is false for the routing function being measured. `excluded_tiers(records, now)` applies a six-hour cutoff, so with an unchanged retained window a row can initially exclude tier A and produce `retry-other-tier`, then age past the cutoff and produce `proceed`; exhaustion can likewise change as rows age. Both ticks have the same proposed digest. The proposed `if key already exists, post nothing` rule therefore erases the later arm, and the claimed count of distinct `key=` receipts is neither a count of decisions nor a faithful arm history. Recording a reason-driven/exhaustion-driven flag does not repair this because the second receipt is never written.",
+    "file": "research/1828-no-change-routing-outcome-correlation.md",
+    "fix_hint": "Bind the decision to all inputs that can change its result, not only the row list. Include a bounded evaluation-time/cutoff representation and the resolved chain (or a non-sensitive canonical digest of the chain and the computed recent-tier projection) in the decision identity. Define idempotence around that complete decision input, then revise the repeated-decision semantics and denominators so a cutoff transition that changes the arm necessarily yields a distinct receipt. Address the disclosure tradeoff explicitly if the required tier/chain binding cannot be public.",
+    "severity": "major",
+    "title": "Evidence-only idempotence collapses distinct time-dependent decisions"
+   },
+   {
+    "body": "The marker key is specified as a digest over the exact validated ledger rows, including fields such as `account`, `provider`, and `model_alias`, while its entries deliberately retain only `ts`, `run_id`, and `why_no_diff`. Once the 48-hour health window is pruned, the issue-timeline reader has no copy of the omitted fields and cannot recompute the key from the durable artifact. Consequently the statement that membership is verifiable against the digest is not true: the digest is an opaque assertion, and two receipts cannot be independently checked to represent the listed rows or the claimed evidence window.",
+    "file": "research/1828-no-change-routing-outcome-correlation.md",
+    "fix_hint": "Define a canonical public evidence projection containing exactly the validated fields the receipt is allowed to expose, and compute a separately named membership digest over that projection so readers can recompute it from the comment. If a second private/full-row binding is necessary, distinguish it explicitly and state where its preimage remains durably available; do not claim offline verification from the issue timeline without a reconstructible preimage.",
+    "severity": "major",
+    "title": "The public receipt cannot verify its full-row digest"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The revision materially addresses the prior review by defining row membership, multiplicity, per-row reasons, and distinct-evidence denominators. However, option C still does not provide an auditable decision binding. `retry_decision` depends on time-sensitive tier exclusion as well as the retained rows, so identical evidence can yield different arms before and after the six-hour cutoff; the proposed evidence-only key would suppress the later receipt as a duplicate. In addition, the digest is over full ledger rows while the durable receipt intentionally publishes only a projection, so a later reader cannot recompute the digest after the health window expires. These gaps preserve the central completeness problem and introduce a newly specified idempotence failure, so this round is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
