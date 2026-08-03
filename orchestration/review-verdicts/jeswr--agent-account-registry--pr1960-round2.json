@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1960,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "076c60482683dc251f463c4c774c25bad41d87e7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_model_target_checkout_ref` exits as soon as it sees the first pinned `actions/checkout` step whose `with:` contains `path: target`. It never rejects multiple matching steps or proves that the selected step is the checkout consumed by the later model/routing reads. A workflow can add a pinned decoy `path: target` checkout before the real step and revert the real step to the moving default branch; the extractor reports the decoy's expected ref, the producer checks remain green, and valid YAML/action pinning checks do not detect the unbound checkout. The step-name count assertion only counts the original name and does not establish uniqueness of matching target checkouts. Thus the marquee regression guard remains non-vacuous only for mutations of the single current step, not for a mutually masking duplicate.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Make the extractor fail closed when the job contains anything other than exactly one `actions/checkout` step materializing `path: target` (or bind selection to a stable semantic consumer and separately assert uniqueness). Add a mutant that inserts a correctly pinned decoy target checkout before the real checkout while changing the real checkout to the default branch, and require the guard to reject the workflow rather than return the expected ref.",
+    "severity": "major",
+    "title": "First-match extraction lets a pinned decoy hide an unbound model checkout"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 `uses:` binding is now implemented and directly exercised, but the new extractor still does not uniquely identify the checkout that supplies the model working tree. It accepts the first checkout step in the job with `path: target`; a second, correctly pinned decoy can therefore satisfy every new guard while the later checkout actually used by the model is reverted to a moving ref. Because this is a new major non-vacuity gap after the prior finding was addressed, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
