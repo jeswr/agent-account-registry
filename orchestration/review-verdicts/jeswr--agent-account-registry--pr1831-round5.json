@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1831,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1c59f2aeea3040694e40ff30da1cad2125c635d9",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ELEMENT_KEYS remains shared across every element type and unconditionally permits id and validations. Once markdown is recognized, the validator also runs the generic validations and id checks without restricting either field by etype. Consequently markdown with attributes.value plus validations: {required: true}, or with a syntactically valid id, passes even though the intended closed-world markdown element shape contains only type and attributes. The new tests include ordinary markdown but still have no negative markdown-id or markdown-validations fixture, so they mirror rather than detect the implementation gap.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Define allowed element-level keys per element type: markdown should allow only type and attributes, while interactive types may allow id and validations according to GitHub's schema. Add independent negative fixtures proving markdown with id is rejected and markdown with validations is rejected, while retaining a positive ordinary-markdown control.",
+    "severity": "major",
+    "title": "Markdown elements still accept interactive-only element fields"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 major finding remains unresolved. The validator still uses the shared ELEMENT_KEYS set for markdown and still executes the generic id and validations checks after recognizing markdown. Thus markdown elements carrying a syntactically valid id or validations mapping are accepted, despite the validator's closed-world claim and markdown's element shape permitting only type and attributes. The added self-tests still provide no negative markdown-id or markdown-validations cases, so they cannot expose this gap. Because the same finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
