@@ -5254,58 +5254,99 @@ def arm_freshness_decision(freshness):
 # (`arm_freshness_report`, #940: "the mitigation in force for it was a human remembering") had
 # neither. So this classifier is that CAS, asked from where the human stands.
 #
-# THE EVIDENCE IS THE PR BODY's `sparq-reviewed-sha` marker — the SAME assertion `disarm` reads
-# for the #42 invariant, not a second spelling of it. It is bound as the LAST mutation of a
-# completed review round (review-fix.yml's bind step), including on the `needs-user` park that
-# #1688 is about, so the human-arm park carries it; and the paths that cannot honestly assert it
-# retract it to `UNBOUND_REVIEWED_SHA` rather than leave a stale claim.
+# WHO CAN WRITE THE THING THIS READS (AGENTS.md pre-flight item 5) — and the answer is what the
+# evidence had to become. The first cut of this guard read the PR BODY's `sparq-reviewed-sha`
+# marker, and review round 1 killed it: a PR BODY is AUTHOR-WRITABLE, so the author of the very
+# push that outran the approval can edit the marker to name their new head and DELETE this
+# refusal. "The guard is monotone, so a forgery only restores the pre-#1688 silence" is true and
+# beside the point — the refusal IS the mitigation #1688 ships, and a mitigation the attacked
+# party can switch off has not shipped. That would have made it the FOURTH arm-capable hole in
+# this estate read out of author-controlled text (#681 parsed per-provider review markers from
+# `pull["body"]`; #937 read closing references from title/body; sparq #4743 trusted a marker in
+# ANY comment with no login check).
 #
-# WHO CAN WRITE THAT MARKER, ASKED EXPLICITLY (AGENTS.md pre-flight item 5), because a PR BODY is
-# author-visible text and three arm-capable holes in this estate came from exactly that. The
-# answer here is that this guard is MONOTONE and therefore unforgeable in the direction that
-# matters: it can only ADD a refusal to a surface that today has none, so the best a forged marker
-# can do is return the report to its pre-#1688 silence — it can never manufacture an authority,
-# raise a round budget, or clear another guard's refusal (`refused=` stays #940's alone). And
-# `covers-head` is stated as the ABSENCE OF THIS OBJECTION, never as an attestation that the
-# review was sound: nothing here prints "safe to arm". The strictly better evidence is the
-# BOT-AUTHORED `sparq-park-reason:v1` receipt's `head=` — author-filtered, quoted-contexts
-# stripped, line-anchored by `park_policy.parse_park_reason` — but it exists only on a PARKED PR,
-# and requiring it would refuse every unparked PR in this report's #940 population, i.e. convert
-# the guard into the blanket hold `arm_freshness_summary` exists to detect. Corroborating the two
-# where both exist is follow-up work, not a hole this leaves open.
+# SO THE EVIDENCE IS THE BOT-AUTHORED `sparq-park-reason:v1` RECEIPT's `head=`, read through
+# `park_policy.park_reason_records` → `parse_park_reason`: filtered to the EXACT App login (with
+# no `bot_login` there are no records at all), quoted-contexts stripped so a marker the bot merely
+# ECHOED is not a receipt, and line-anchored so one embedded inside another line is not either.
+# `needs_user` writes that `head=` from the sha the review actually completed on, on the same
+# write that lands the park — a PR author can neither author that comment nor edit its head.
+#
+# THE CAUSE IS NARROWED TO `human-arm`, the taxonomy's own entry for "a human ... asked to arm by
+# hand", because that is the ONLY receipt asserting a completed review whose remaining authority
+# to merge is a human's — and it is exactly this report's population: `decide_review` sends one
+# class to a human arm (an approved self-attested PR) and `ready_and_arm`'s post-undraft arm
+# failure parks the other, and both call `needs_user(park_cause="human-arm", head_sha=...)`.
+#
+# ABSENCE IS NOT PERMISSION — `park_policy.capacity_park_admission`'s words, for the same reason.
+# A PR carrying no such receipt reads APPROVAL_UNATTESTED and is REFUSED, never waved through:
+# "nothing the loop itself wrote binds a review to any head" is precisely the state a forged body
+# used to be able to manufacture, and precisely the state a human must not arm out of. It is
+# censused as its OWN verdict rather than folded into `head-moved` so that the blanket-hold
+# failure mode `arm_freshness_summary` exists to detect stays measurable: an operator whose every
+# row reads `approval=unattested` is looking at a guard that has stopped discriminating, and can
+# see that it has. And `covers-head` remains the ABSENCE OF THIS OBJECTION, never an attestation
+# that the review was sound — nothing here prints "safe to arm".
 #
 # NOT A RE-ADMISSION. `human-arm` is one of park_policy.PARK_HUMAN_ONLY_CAUSES — no machine path
 # may convert that park out of the human terminal — so this SAYS the approval is stale where the
 # arm decision is made; it does not unpark, relabel, comment, or re-review. That is #1688's
 # minimum disposition, and its disposition 2 is deliberately left to a human.
-APPROVAL_COVERS_HEAD = "covers-head"   # a review is bound to exactly the head being armed
-APPROVAL_HEAD_MOVED = "head-moved"     # a review is bound to a DIFFERENT commit — it is stale
-APPROVAL_UNBOUND = "unbound"           # no reviewed head is asserted at all (or it is unreadable)
+APPROVAL_COVERS_HEAD = "covers-head"   # the loop's OWN receipt binds a review to exactly this head
+APPROVAL_HEAD_MOVED = "head-moved"     # it binds a DIFFERENT commit — the approval is stale
+APPROVAL_UNATTESTED = "unattested"     # no bot-authored, head-bound review receipt exists at all
+APPROVAL_UNBOUND = "unbound"           # a receipt or a head exists but names no readable commit
 APPROVAL_UNREAD = "unread"             # this caller did not ask (never rendered as an answer)
 
 
-def approval_coverage(reviewed_sha, head_sha):
-    """PURE (registry #1688): does the loop's recorded review cover `head_sha`?
+def attested_review_head(comments, bot_login, log=print):
+    """The head sha the LOOP ITSELF bound its newest `human-arm` park receipt to, or "" when it
+    never wrote one (registry #1688).
 
-    APPROVAL_COVERS_HEAD only when BOTH are well-formed 40-hex shas AND equal. Anything else is
-    APPROVAL_HEAD_MOVED (both readable, different commits) or APPROVAL_UNBOUND — which is where
-    every unprovable input lands: `UNBOUND_REVIEWED_SHA` (`none`, the honest "no review is
-    asserted"), an unreadable/absent live head, a non-string, and any malformed value. The fail
-    direction is `arm_freshness_decision`'s and for the same reason: "we cannot tell which commit
-    this approval is about" is not evidence that it is about this one."""
-    if not isinstance(reviewed_sha, str) or not isinstance(head_sha, str):
+    This is the ONLY input `approval_coverage` trusts, and every trust property it has comes from
+    `park_policy.park_reason_records`, which is reused rather than re-spelled: bot-login filtered
+    (an empty `bot_login` yields NO records — a caller that cannot name the App identity proves
+    nothing), quoted/fenced lines stripped, the marker line-anchored, and a `class=` that
+    contradicts its cause rejected outright. Only `cause=human-arm` counts: a capacity park, an
+    `injection` park and an unclassified park each say something OTHER than "a review completed
+    here and only a human may arm it", and reading them as coverage would attest to a review that
+    never approved anything. Newest receipt wins — an older park's head is a superseded claim.
+
+    Returns "" for every unprovable shape, which `approval_coverage` reads as UNATTESTED and
+    REFUSES; the sha itself is not validated here, so a receipt naming an unreadable commit stays
+    distinguishable (UNBOUND) from one that does not exist."""
+    for record in reversed(_park_policy().park_reason_records(comments, bot_login, log=log)):
+        if record.get("cause") == "human-arm":
+            return record.get("head") or ""
+    return ""
+
+
+def approval_coverage(attested_sha, head_sha):
+    """PURE (registry #1688): does the loop's OWN head-bound review receipt cover `head_sha`?
+
+    `attested_sha` is `attested_review_head`'s output — an authenticated, bot-authored binding,
+    never author-writable text. APPROVAL_COVERS_HEAD only when it and the live head are both
+    well-formed 40-hex shas AND equal. Everything else refuses, in three distinguishable ways:
+    APPROVAL_HEAD_MOVED (both readable, different commits — the #1661 shape), APPROVAL_UNATTESTED
+    (no receipt at all, or an unreadable comment history), and APPROVAL_UNBOUND (a receipt or a
+    live head that names no readable commit). The fail direction is `arm_freshness_decision`'s and
+    for the same reason: "we cannot tell which commit this approval is about" is not evidence that
+    it is about this one."""
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         return APPROVAL_UNBOUND
-    if (not re.fullmatch(r"[0-9a-f]{40}", reviewed_sha)
-            or not re.fullmatch(r"[0-9a-f]{40}", head_sha)):
+    if not isinstance(attested_sha, str) or not attested_sha:
+        return APPROVAL_UNATTESTED
+    if not re.fullmatch(r"[0-9a-f]{40}", attested_sha):
         return APPROVAL_UNBOUND
-    return APPROVAL_COVERS_HEAD if reviewed_sha == head_sha else APPROVAL_HEAD_MOVED
+    return APPROVAL_COVERS_HEAD if attested_sha == head_sha else APPROVAL_HEAD_MOVED
 
 
 def approval_coverage_refused(coverage):
-    """PURE: does `coverage` withhold a by-hand arm? Everything except APPROVAL_COVERS_HEAD does,
-    APPROVAL_UNREAD included — a caller that never asked has proved nothing, so it must not be
-    able to buy an arm by omitting the question. Spelled as its own predicate because the census
-    row and the exit code must partition the population identically."""
+    """PURE: does `coverage` withhold a by-hand arm? Everything except APPROVAL_COVERS_HEAD does —
+    APPROVAL_UNATTESTED because absence is not permission, and APPROVAL_UNREAD because a caller
+    that never asked has proved nothing and must not be able to buy an arm by omitting the
+    question. Spelled as its own predicate because the census row and the exit code must partition
+    the population identically."""
     return coverage != APPROVAL_COVERS_HEAD
 
 
@@ -5367,9 +5408,14 @@ def arm_freshness_summary(rows):
 
     [registry #1688] `refused_approval` / `approval_stale_prs` are counted and listed SEPARATELY
     from `refused_stale`, because they answer a different question about a different population —
-    "which arms would have merged a commit no review covers" vs "which greens graded a superseded
-    base". Summing them would produce a number that means neither. Both are zero-sealed, so "no
-    approval outran its head this tick" and "this stopped being counted" cannot look the same."""
+    "which arms could not be PROVED to be covered by a review of this head" vs "which greens
+    graded a superseded base". Summing them would produce a number that means neither. Both are
+    zero-sealed, so "no approval outran its head this tick" and "this stopped being counted"
+    cannot look the same. The approval count deliberately pools `head-moved` with the unprovable
+    verdicts (`unattested` / `unbound` / `unread`): they refuse for the same reason and the ROWS
+    carry the distinction, so this is also the number that makes the blanket hold above visible —
+    a tick where `refused_approval == attempted` and every row reads `approval=unattested` is a
+    guard that has stopped discriminating, not an estate that has stopped reviewing."""
     refused = [row for row in rows if row.get("refused")]
     gaps = [str(row.get("gap_seconds")) if row.get("gap_seconds") is not None else "none"
             for row in refused]
@@ -5382,7 +5428,7 @@ def arm_freshness_summary(rows):
             f"approval_stale_prs={[row.get('pr') for row in stale_approval] or 'none'}")
 
 
-def arm_freshness_report(repo, pr_numbers, log=print):
+def arm_freshness_report(repo, pr_numbers, log=print, bot_login=""):
     """The ORCHESTRATOR-side arm-time guard: the same freshness question `ready_and_arm` asks,
     asked from where a human stands when they are about to arm by hand.
 
@@ -5408,20 +5454,31 @@ def arm_freshness_report(repo, pr_numbers, log=print):
     [registry #1688] And it answers the question one step to the left of #940's: does a review
     cover this head AT ALL? A `human-arm` park (approved, awaiting a human to arm) presents
     identically before and after its head advances past the reviewed sha, so the human standing
-    here is exactly the person with no signal. The reviewed sha is read from the SAME live PR
-    payload the head comes from — one read, no second API call — and `approval_coverage` decides
-    it. A refusal on EITHER guard exits non-zero; they are reported and counted apart."""
+    here is exactly the person with no signal. The reviewed head is taken from the loop's OWN
+    bot-authored park receipt (`attested_review_head`) and NEVER from the author-writable PR body,
+    which is why `bot_login` is required: without the App identity nothing is authenticated, every
+    row reads `unattested`, and every by-hand arm is refused. A refusal on EITHER guard exits
+    non-zero; they are reported and counted apart."""
     rows = []
     for pr_number in pr_numbers:
         live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
         head = str((live.get("head") or {}).get("sha", "")) if isinstance(live, dict) else ""
         base_ref = str((live.get("base") or {}).get("ref", "")) if isinstance(live, dict) else ""
         draft = bool(live.get("draft")) if isinstance(live, dict) else True
-        # [#1688] The loop's own assertion about which commit a review completed on, read off the
-        # PR BODY — `disarm`'s evidence for the #42 invariant, not a second spelling of it. An
-        # unreadable payload yields None, which `approval_coverage` treats as UNBOUND (refuse).
-        reviewed = reviewed_sha_of(live.get("body") if isinstance(live, dict) else "")
-        coverage = approval_coverage(reviewed, head)
+        # [#1688] The loop's OWN head-bound assertion about the review — the bot's `human-arm`
+        # park receipt. Deliberately NOT the PR body's `sparq-reviewed-sha` marker: that text is
+        # author-writable, so the author of the push that outran the approval could edit it to
+        # name their new head and delete this very refusal (round-1 finding). An unreadable
+        # comment history is not evidence either — it degrades to UNATTESTED, which refuses,
+        # rather than aborting the report for the PRs after it.
+        try:
+            attested = attested_review_head(_paginated_comments(repo, pr_number), bot_login,
+                                            log=log)
+        except WorkerPrError as exc:
+            log(f"::warning::{repo}#{pr_number}: the comment history is unreadable ({exc}), so no "
+                "review receipt can be proved — the by-hand arm is refused as `unattested`")
+            attested = ""
+        coverage = approval_coverage(attested, head)
         gate = _dispatch_claim()._live_repair_gate(repo, head, draft)
         freshness = _dispatch_claim().live_gate_freshness(repo, head, base_ref, draft, pr_number)
         refused = bool(arm_freshness_decision(freshness))
@@ -5435,12 +5492,13 @@ def arm_freshness_report(repo, pr_numbers, log=print):
                 "`gh run rerun` cannot clear this — it re-tests the same tree; move the head "
                 "(update-branch / rebase) so a new pull_request event gates the real merge base.")
         if approval_coverage_refused(coverage):
-            log(f"  REFUSE arming {repo}#{pr_number}: the recorded review is `{coverage}` — it "
-                f"is bound to {reviewed[:12] if reviewed else '(nothing)'} and the live head is "
+            log(f"  REFUSE arming {repo}#{pr_number}: the review coverage of this head is "
+                f"`{coverage}` — the loop's own `human-arm` park receipt binds a review to "
+                f"{attested[:12] if attested else '(nothing)'} and the live head is "
                 f"{head[:12] or '(unreadable)'}. Arming merges a commit no reviewer has seen; a "
                 "park that reads `approved, awaiting a human to arm` says nothing about a push "
-                "that landed after it (registry #1688). The approval is void — a new review "
-                "round is owed. Do not arm this by hand.")
+                "that landed after it, and the PR BODY cannot answer this because its author can "
+                "write it (registry #1688). A new review round is owed. Do not arm by hand.")
         rows.append({"pr": pr_number, "refused": refused, "approval": coverage,
                      "gap_seconds": freshness.get("gap_seconds")})
     log(arm_freshness_summary(rows))
@@ -12417,17 +12475,35 @@ def _self_test():
         report_lines, report_gh, report_dc, report_grades = [], [], [], []
         real_dc = globals()["_dispatch_claim"]
         real_gh = globals()["_gh_json"]
+        # [#1688] The bot identity every receipt in these fixtures is filtered against, and the
+        # `human-arm` park receipt shape `needs_user` writes (park_reason_marker's rendering).
+        _arm_bot = "sparq-app[bot]"
+
+        def _arm_receipt(head):
+            return ("> 🤖 SPARQ agent — the autonomous review loop stopped: the review approved "
+                    "this PR and a human arms it.\n\n"
+                    f"<!-- sparq-park-reason:v1 class=question cause=human-arm head={head} -->")
+
+        def _report_gh_json(argv, **_kwargs):
+            # [#1688] The FORGERY IS BAKED INTO THIS FIXTURE: BOTH PR bodies carry a
+            # `sparq-reviewed-sha` marker naming the LIVE head, because a PR author can write
+            # exactly that. Only the BOT-AUTHORED receipts differ — 752's names the live head,
+            # 900's names the commit its head outran (#1661). A reader that went back to the body
+            # would grade both `covers-head` and red every approval assertion below.
+            target = argv[-1]
+            report_gh.append(target)
+            if target.endswith("/comments?per_page=100"):
+                receipt_head = ("f" if "/752/" in target else "a") * 40
+                return [[{"user": {"login": _arm_bot}, "created_at": "2026-08-01T00:00:00Z",
+                          "body": _arm_receipt(receipt_head)}]]
+            return {"head": {"sha": "f" * 40}, "base": {"ref": "master"}, "draft": False,
+                    "body": "prose\n\n<!-- sparq-reviewed-sha:" + "f" * 40 + " -->"}
         try:
             # [#1688] The two dimensions are ORTHOGONAL in this fixture, which is what makes the
             # assertions below able to tell them apart: 752's review is bound to the live head
             # (approval covers it) and its GATE is stale; 900's gate is fresh and its review is
             # bound to a commit the head has since outrun — the #1661 shape.
-            globals()["_gh_json"] = lambda a, **k: (
-                report_gh.append(a[1]) or {"head": {"sha": "f" * 40}, "base": {"ref": "master"},
-                                           "draft": False,
-                                           "body": "<!-- sparq-reviewed-sha:"
-                                                   + ("f" if a[1].endswith("752") else "a") * 40
-                                                   + " -->"})
+            globals()["_gh_json"] = _report_gh_json
             globals()["_dispatch_claim"] = lambda: types.SimpleNamespace(
                 live_gate_freshness=lambda repo, head, base, draft, pr: (
                     report_dc.append((repo, head, base, draft, pr))
@@ -12439,7 +12515,8 @@ def _self_test():
                 _live_repair_gate=lambda repo, head, draft: (
                     report_grades.append((repo, head, draft))
                     or ("green:merge-required" if len(report_grades) == 1 else _GATE_ABSENT)))
-            rc = arm_freshness_report("o/r", [752, 900], log=report_lines.append)
+            rc = arm_freshness_report("o/r", [752, 900], log=report_lines.append,
+                                      bot_login=_arm_bot)
         finally:
             globals()["_dispatch_claim"] = real_dc
             globals()["_gh_json"] = real_gh
@@ -12450,10 +12527,11 @@ def _self_test():
                any("REFUSE arming o/r#752" in line for line in report_lines),
                any("attempted=2 refused_stale=1" in line for line in report_lines)),
               (1, 1, 1, True, True))
-        check("...it reads the LIVE head and base ref of each PR (never a cached one) and "
-              "reports the PR's own draft tier",
+        check("...it reads the LIVE head and base ref of each PR (never a cached one), reports "
+              "the PR's own draft tier, and reads each PR's OWN comment history for the receipt",
               (report_gh, report_dc),
-              (["repos/o/r/pulls/752", "repos/o/r/pulls/900"],
+              (["repos/o/r/pulls/752", "repos/o/r/issues/752/comments?per_page=100",
+                "repos/o/r/pulls/900", "repos/o/r/issues/900/comments?per_page=100"],
                [("o/r", "f" * 40, "master", False, 752),
                 ("o/r", "f" * 40, "master", False, 900)]))
         # [#853] THE BY-HAND ARM SURFACE. This report is where a human asks "is CI green?", so a
@@ -12473,23 +12551,54 @@ def _self_test():
         # field is what an operator greps for, so reading the expected values out of the module's
         # own constants would assert nothing about what is printed.
         _live_head, _outrun_head = "f" * 40, "a" * 40
-        check("[#1688] approval_coverage admits ONLY a review bound to the EXACT live head; "
-              "every unprovable input is `unbound`, never coverage",
-              [approval_coverage(reviewed, head) for reviewed, head in (
-                  (_live_head, _live_head),            # the review is about this commit
+        check("[#1688] approval_coverage admits ONLY an ATTESTED review bound to the EXACT live "
+              "head; an absent attestation is `unattested` and an unreadable one `unbound` — "
+              "never coverage",
+              [approval_coverage(attested, head) for attested, head in (
+                  (_live_head, _live_head),            # the loop's receipt names this commit
                   (_outrun_head, _live_head),          # #1661: the head advanced past it
-                  (UNBOUND_REVIEWED_SHA, _live_head),  # the loop asserts no reviewed head
-                  (None, _live_head),                  # unreadable PR payload
+                  ("", _live_head),                    # no receipt — absence is not permission
+                  (None, _live_head),                  # unreadable comment history
+                  (UNBOUND_REVIEWED_SHA, _live_head),  # a receipt naming no readable commit
+                  ("f" * 39, _live_head),              # truncated receipt value
                   (_live_head, ""),                    # unreadable live head
-                  (_live_head, "F" * 40),              # malformed (not 40 lower-hex)
-                  ("f" * 39, _live_head))],            # truncated marker value
-              ["covers-head", "head-moved", "unbound", "unbound", "unbound", "unbound",
-               "unbound"])
+                  (_live_head, "F" * 40))],            # malformed head (not 40 lower-hex)
+              ["covers-head", "head-moved", "unattested", "unattested", "unbound", "unbound",
+               "unbound", "unbound"])
         check("...and only `covers-head` admits an arm — an UNASKED question least of all, or a "
               "caller could buy one by omitting it",
               [approval_coverage_refused(verdict) for verdict in
-               ("covers-head", "head-moved", "unbound", "unread", "", None)],
-              [False, True, True, True, True, True])
+               ("covers-head", "head-moved", "unattested", "unbound", "unread", "", None)],
+              [False, True, True, True, True, True, True])
+        # [#1688 round 1] WHO CAN WRITE THE THING THIS READS. The attested head is the ONE input
+        # `approval_coverage` trusts, so every way a non-reviewer could put a well-formed receipt
+        # in front of it must attest NOTHING. Each row below carries a receipt naming the LIVE
+        # head — the value that would clear the refusal — so a reader that dropped any one of the
+        # four filters (login, quoted-context, cause, newest-wins) reds this check.
+        check("[#1688] the attested head comes ONLY from the BOT's OWN unquoted `human-arm` "
+              "receipt, newest first: a third party's identical comment, one the bot merely "
+              "ECHOED, an off-cause receipt and an unnamed App identity all attest nothing",
+              [attested_review_head(comments, login, log=lambda _m: None)
+               for comments, login in (
+                   # the genuine article: the bot's own receipt, in its own voice
+                   ([{"user": {"login": _arm_bot}, "body": _arm_receipt(_live_head)}], _arm_bot),
+                   # the PR AUTHOR posts a byte-identical receipt — the login filter drops it
+                   ([{"user": {"login": "pr-author"}, "body": _arm_receipt(_live_head)}],
+                    _arm_bot),
+                   # the bot QUOTES the author's text — echoing is not asserting
+                   ([{"user": {"login": _arm_bot},
+                      "body": "the author wrote:\n\n> <!-- sparq-park-reason:v1 class=question "
+                              f"cause=human-arm head={_live_head} -->"}], _arm_bot),
+                   # a real bot receipt, but for a park that asserts no completed approval
+                   ([{"user": {"login": _arm_bot},
+                      "body": "<!-- sparq-park-reason:v1 class=question cause=injection "
+                              f"head={_live_head} -->"}], _arm_bot),
+                   # NEWEST human-arm receipt wins: the older park's head is superseded
+                   ([{"user": {"login": _arm_bot}, "body": _arm_receipt(_outrun_head)},
+                     {"user": {"login": _arm_bot}, "body": _arm_receipt(_live_head)}], _arm_bot),
+                   # no App identity to filter against — nothing is authenticated
+                   ([{"user": {"login": _arm_bot}, "body": _arm_receipt(_live_head)}], ""))],
+              [_live_head, "", "", "", _live_head, ""])
         # THE FIXTURE'S TWO PRs SEPARATE THE TWO GUARDS: 752 is gate-stale with a review bound to
         # its live head, 900 is gate-FRESH with a review bound to a commit the head outran. So a
         # census that folded the approval refusal into `refused=`/`refused_stale=` reds the #940
@@ -12504,31 +12613,67 @@ def _self_test():
                any("refused_approval=1 approval_stale_prs=[900]" in line
                    for line in report_lines)),
               (1, 1, True, True))
-        # THE EXIT CODE IS THE ACT. Everything else about this PR is provably fresh — green
-        # merge-required gate, fresh freshness verdict — so the moved head is the ONLY term that
-        # can decide the code, and the `covers` half proves the guard is not a blanket hold.
+        # THE EXIT CODE IS THE ACT, END TO END. Everything else about this PR is provably fresh —
+        # green merge-required gate, fresh freshness verdict — so the review coverage is the ONLY
+        # term that can decide the code. EVERY case below serves a PR BODY whose author-writable
+        # `sparq-reviewed-sha` marker names the LIVE head: that is the forgery review round 1
+        # found, and it must buy nothing. Only the AUTHENTICATED evidence varies, and the `covers`
+        # row proves the guard is not a blanket hold.
         approval_rc, approval_lines = {}, []
+        _forged_body = f"prose\n\n<!-- sparq-reviewed-sha:{_live_head} -->"
+
+        def _approval_gh(argv, receipt_head, receipt_login):
+            if argv[-1].endswith("/comments?per_page=100"):
+                if receipt_head == "unreadable":
+                    return "not a comments payload"   # _paginated_comments raises on this
+                if not receipt_head:
+                    return [[]]
+                return [[{"user": {"login": receipt_login}, "created_at": "2026-08-01T00:00:00Z",
+                          "body": _arm_receipt(receipt_head)}]]
+            return {"head": {"sha": _live_head}, "base": {"ref": "master"}, "draft": True,
+                    "body": _forged_body}
         try:
             globals()["_dispatch_claim"] = lambda: types.SimpleNamespace(
                 live_gate_freshness=lambda repo, head, base, draft, pr: {
                     "state": "fresh", "gap_seconds": 3600, "run_base_sha": "e" * 40,
                     "base_tip_sha": "e" * 40},
                 _live_repair_gate=lambda repo, head, draft: "green:merge-required")
-            for case, reviewed in (("moved", _outrun_head), ("covers", _live_head)):
-                globals()["_gh_json"] = lambda a, _r=reviewed, **k: {
-                    "head": {"sha": _live_head}, "base": {"ref": "master"}, "draft": True,
-                    "body": f"prose\n\n<!-- sparq-reviewed-sha:{_r} -->"}
+            for case, receipt_head, receipt_login in (
+                    # the bot's receipt names the commit the head outran — the #1661 shape
+                    ("moved", _outrun_head, _arm_bot),
+                    # the bot's receipt names the live head — the ONLY admitting case
+                    ("covers", _live_head, _arm_bot),
+                    # THE ROUND-1 FINDING: the author claims the live head in the body AND posts a
+                    # byte-identical receipt themselves. No authenticated evidence exists.
+                    ("author-forged", _live_head, "pr-author"),
+                    # the author claims the live head in the body and nothing else exists at all
+                    ("body-only", "", _arm_bot),
+                    # the comment history will not read: an unprovable receipt is not a receipt,
+                    # and the row still has to be emitted rather than aborting the whole report
+                    ("unreadable", "unreadable", _arm_bot)):
+                globals()["_gh_json"] = (
+                    lambda argv, _h=receipt_head, _l=receipt_login, **_k:
+                    _approval_gh(argv, _h, _l))
                 approval_rc[case] = arm_freshness_report("o/r", [1661],
-                                                         log=approval_lines.append)
+                                                         log=approval_lines.append,
+                                                         bot_login=_arm_bot)
         finally:
             globals()["_dispatch_claim"] = real_dc
             globals()["_gh_json"] = real_gh
-        check("[#1688] a head that outran its approval alone REFUSES the by-hand arm (exit 1), "
-              "and an approval that still covers the head is NOT held",
-              (approval_rc, sum(1 for line in approval_lines if "REFUSE arming o/r#1661" in line)),
-              ({"moved": 1, "covers": 0}, 1))
+        check("[#1688] a head that outran its ATTESTED approval REFUSES the by-hand arm (exit 1), "
+              "an author-forged claim of the live head refuses too — in BOTH the body and a "
+              "look-alike comment — an UNREADABLE history refuses while still emitting its row, "
+              "and only the bot's own live-head receipt is not held",
+              (approval_rc,
+               sum(1 for line in approval_lines if "REFUSE arming o/r#1661" in line),
+               sum(1 for line in approval_lines if "approval=unattested" in line),
+               sum(1 for line in approval_lines
+                   if line.startswith("::warning::o/r#1661: the comment history is unreadable"))),
+              ({"moved": 1, "covers": 0, "author-forged": 1, "body-only": 1, "unreadable": 1},
+               4, 3, 1))
         check("...and it is READ-ONLY: an all-fresh tick exits 0 and mutates nothing",
-              (arm_freshness_report("o/r", [], log=lambda _line: None), raa_latches()),
+              (arm_freshness_report("o/r", [], log=lambda _line: None, bot_login=_arm_bot),
+               raa_latches()),
               (0, []))
         run_raa(benign_diff=True)
         check("benign-path diff with NO security posture ARMS with NO audit (#153 control)",
@@ -13492,6 +13637,14 @@ def main():
     fresh.add_argument("--repo", required=True)
     fresh.add_argument("--pr", required=True, type=int, action="append",
                        help="PR number to check (repeatable)")
+    # [registry #1688] Mandatory for the same reason `disarm --bot-login` is (issue #570): the
+    # review-coverage verdict is derived from BOT-AUTHORED park receipts only, so a caller that
+    # forgets the trusted identity must fail LOUDLY at argv rather than silently report every PR
+    # as `unattested`. An explicitly EMPTY value still fails closed inside the report.
+    fresh.add_argument("--bot-login", required=True,
+                       help="the exact App login whose park receipts are the only review "
+                            "evidence trusted (any other author, including another [bot], "
+                            "attests nothing)")
 
     arm = subparsers.add_parser("ready-and-arm", parents=[common])
     arm.add_argument("--reviewed-sha", required=True)
@@ -13670,7 +13823,7 @@ def main():
                    preserve_review_state=args.preserve_review_state,
                    bot_login=args.bot_login)
         elif args.command == "arm-freshness":
-            return arm_freshness_report(args.repo, args.pr)
+            return arm_freshness_report(args.repo, args.pr, bot_login=args.bot_login)
         elif args.command == "ready-and-arm":
             ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.impl_provider,
                           args.impl_account_h, args.reviewer_provider,
