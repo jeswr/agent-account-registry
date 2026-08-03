@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5773,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b94b7cc1cf3f4eefa52e14b40d873542533052ca",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes the Solid SPARQL query-semantics case floor in sparq-conformance-floors, makes both the real conformance runner and scoreboard consume that shared constant, pins the value against silent lowering, updates the generated scoreboard totals, and documents the new central row. The relevant test remains non-vacuous: it executes every manifest case, requires every case to pass, and separately enforces the shared minimum count. The sparq-solid crate already declares the required dev-dependency, and the feature-gated runner behavior matches the scoreboard note. No correctness, soundness, security, or test-validity issue is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
