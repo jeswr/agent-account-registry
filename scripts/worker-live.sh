@@ -1809,7 +1809,9 @@ _assert_dockerfile_pinned() {
 # deleted, emptied, or given an element type the renderer does not know is perfectly valid YAML and
 # still does not render — and a form that does not render is not a loud failure, it is an operator
 # submitting a free-form body against a MINT path (an account record, a broker request) that no
-# schema shaped. Returns non-zero and names every fault on stderr; an unreadable or unparseable file
+# schema shaped. The shape is checked by TYPE, not by truthiness: `label: [x]`, `options: text`, a
+# checkbox option with no `label`, and a duplicate element `id` are each truthy-and-present and each
+# render nothing. Returns non-zero and names every fault on stderr; an unreadable or unparseable file
 # is a refusal too, never "no faults found".
 #
 # `config.yml` is the issue CHOOSER config, a deliberately different schema
@@ -1819,16 +1821,54 @@ _assert_issue_form_valid() {
   local file="$1"
   [[ -f "$file" ]] || { printf 'worker-live: issue form missing: %s\n' "$file" >&2; return 1; }
   python3 - "$file" <<'PY'
-import sys, yaml
+import re, sys, yaml
 
-# The renderer's element types, each mapped to the `attributes` keys it REQUIRES.
-ELEMENT_REQUIRED = {
-    "markdown": ("value",),
-    "input": ("label",),
-    "textarea": ("label",),
-    "dropdown": ("label", "options"),
-    "checkboxes": ("label", "options"),
+
+def _text(value):
+    """A renderer-required scalar: a non-empty string. `label: [x]` is TRUTHY and renders nothing."""
+    if not isinstance(value, str) or not value.strip():
+        return "must be a non-empty string"
+    return None
+
+
+def _dropdown_options(value):
+    """dropdown options are a non-empty list of choice STRINGS."""
+    if not isinstance(value, list) or not value:
+        return "must be a non-empty list of choice strings"
+    for index, option in enumerate(value):
+        if _text(option):
+            return f"[{index}] must be a non-empty string"
+    return None
+
+
+def _checkbox_options(value):
+    """checkbox options are a non-empty list of MAPPINGS, each carrying its own required `label`."""
+    if not isinstance(value, list) or not value:
+        return "must be a non-empty list of {label: ...} mappings"
+    for index, option in enumerate(value):
+        if not isinstance(option, dict):
+            return f"[{index}] must be a mapping carrying a label"
+        problem = _text(option.get("label"))
+        if problem:
+            return f"[{index}].label {problem}"
+    return None
+
+
+# The renderer's element types, each mapped to the `attributes` keys it REQUIRES *and the shape it
+# requires of them*. A truthiness check is not enough: `label: [x]`, `options: text`, and a checkbox
+# option with no `label` are all truthy and all render nothing.
+ELEMENT_SCHEMA = {
+    "markdown": {"value": _text},
+    "input": {"label": _text},
+    "textarea": {"label": _text},
+    "dropdown": {"label": _text, "options": _dropdown_options},
+    "checkboxes": {"label": _text, "options": _checkbox_options},
 }
+
+# `id` is OPTIONAL in GitHub's form schema — do not "fix" this to required, a form whose elements
+# carry no id renders fine and refusing one would fail the gate closed on a legitimate file. But
+# WHERE PRESENT it is constrained: alpha-numerics, `-` and `_` only, and unique within the form.
+ID_SYNTAX = re.compile(r"^[A-Za-z0-9_-]+$")
 
 path = sys.argv[1]
 try:
@@ -1852,22 +1892,37 @@ else:
     if not isinstance(body, list) or not body:
         faults.append("body: must be a non-empty list of form elements")
     else:
+        seen_ids = {}
         for index, element in enumerate(body):
             if not isinstance(element, dict):
                 faults.append(f"body[{index}]: is not a mapping")
                 continue
             etype = element.get("type")
-            if etype not in ELEMENT_REQUIRED:
+            if etype not in ELEMENT_SCHEMA:
                 faults.append(f"body[{index}]: unknown element type {etype!r} "
-                              f"(known: {', '.join(sorted(ELEMENT_REQUIRED))})")
+                              f"(known: {', '.join(sorted(ELEMENT_SCHEMA))})")
                 continue
+            if "id" in element:
+                eid = element["id"]
+                if not isinstance(eid, str) or not ID_SYNTAX.match(eid):
+                    faults.append(f"body[{index}] ({etype}): id {eid!r} may use only alpha-numerics, "
+                                  "'-' and '_'")
+                elif eid in seen_ids:
+                    faults.append(f"body[{index}] ({etype}): id {eid!r} duplicates body[{seen_ids[eid]}] "
+                                  "(ids must be unique within a form)")
+                else:
+                    seen_ids[eid] = index
             attributes = element.get("attributes")
             if not isinstance(attributes, dict):
                 faults.append(f"body[{index}] ({etype}): has no attributes mapping")
                 continue
-            for required in ELEMENT_REQUIRED[etype]:
-                if not attributes.get(required):
+            for required, is_valid in ELEMENT_SCHEMA[etype].items():
+                if required not in attributes:
                     faults.append(f"body[{index}] ({etype}): attributes.{required} is required")
+                    continue
+                problem = is_valid(attributes[required])
+                if problem:
+                    faults.append(f"body[{index}] ({etype}): attributes.{required} {problem}")
 
 for fault in faults:
     print(f"worker-live: issue form {path}: {fault}", file=sys.stderr)
@@ -5443,6 +5498,86 @@ PY
     "$(_assert_issue_form_valid "$formfix/cfg-broken/config.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
   chk "a MISSING issue form is refused (fail closed)" \
     "$(_assert_issue_form_valid "$formfix/no-such.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  # SHAPE, not presence. Every row above moves a key's PRESENCE — none of them can see an attribute
+  # that is present, truthy, and still unrenderable. These do: one accepted form carrying EVERY
+  # supported element type, then that same form with exactly one shape mutation. Each mutant is
+  # accepted by a truthiness-only `attributes.get(required)` check, so each row goes red the moment
+  # the type / nested-option / id rules are dropped.
+  _ff_compose() {  # $1 = destination, $2.. = body element blocks
+    local dest="$1"; shift
+    { printf '%s\n%s\nbody:\n' "$ff_name" "$ff_desc"; printf '%s\n' "$@"; } > "$dest"
+  }
+  local ff_md='  - type: markdown
+    attributes:
+      value: "Everything the broker reads is a LABEL."'
+  local ff_input='  - type: input
+    id: handle
+    attributes:
+      label: Account handle'
+  local ff_area='  - type: textarea
+    id: spec
+    attributes:
+      label: Account spec (YAML)'
+  local ff_drop='  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - anthropic
+        - openai'
+  local ff_check='  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirm the label contract
+      options:
+        - label: "One grant label per authorized repository is applied."
+          required: true'
+  _ff_compose "$formfix/all-types.yml" "$ff_md" "$ff_input" "$ff_area" "$ff_drop" "$ff_check"
+  # `id` is OPTIONAL in GitHub's schema, so the SAME form with every id stripped must stay accepted:
+  # an over-tight id rule would fail the gate closed on a legitimate form.
+  _ff_compose "$formfix/no-ids.yml" "$ff_md" "${ff_input/$'\n    id: handle'/}" \
+    "${ff_area/$'\n    id: spec'/}" "${ff_drop/$'\n    id: provider'/}" "${ff_check/$'\n    id: confirm'/}"
+  _ff_compose "$formfix/bad-id.yml" "$ff_md" "${ff_input/id: handle/id: account handle}" \
+    "$ff_area" "$ff_drop" "$ff_check"
+  _ff_compose "$formfix/dup-id.yml" "$ff_md" "$ff_input" "${ff_area/id: spec/id: handle}" \
+    "$ff_drop" "$ff_check"
+  _ff_compose "$formfix/label-not-string.yml" "$ff_md" \
+    "${ff_input/label: Account handle/label: [Account handle]}" "$ff_area" "$ff_drop" "$ff_check"
+  _ff_compose "$formfix/markdown-value-not-string.yml" \
+    "${ff_md/value: \"Everything the broker reads is a LABEL.\"/value: [broken]}" \
+    "$ff_input" "$ff_area" "$ff_drop" "$ff_check"
+  _ff_compose "$formfix/dropdown-options-scalar.yml" "$ff_md" "$ff_input" "$ff_area" \
+    "${ff_drop/$'options:\n        - anthropic\n        - openai'/options: anthropic}" "$ff_check"
+  _ff_compose "$formfix/dropdown-option-not-string.yml" "$ff_md" "$ff_input" "$ff_area" \
+    "${ff_drop/- anthropic/- anthropic: true}" "$ff_check"
+  _ff_compose "$formfix/checkbox-option-no-label.yml" "$ff_md" "$ff_input" "$ff_area" "$ff_drop" \
+    "${ff_check/- label: /- text: }"
+  _ff_compose "$formfix/checkbox-options-bare-strings.yml" "$ff_md" "$ff_input" "$ff_area" "$ff_drop" \
+    "${ff_check/$'- label: "One grant label per authorized repository is applied."\n          required: true'/- One grant label per authorized repository is applied.}"
+  chk "a form using EVERY supported element type passes (the base of every shape mutant below)" \
+    "$(_assert_issue_form_valid "$formfix/all-types.yml" >/dev/null 2>&1 && echo valid || echo refused)" "valid"
+  # the id-strip is the ONE mutation whose failure to apply would pass VACUOUSLY (the unmutated base
+  # is accepted too), so assert the fixture really carries no id before reading its verdict.
+  chk "the no-id fixture really has every id stripped (the mutation applied)" \
+    "$(grep -c '^    id:' "$formfix/no-ids.yml" || true)" "0"
+  chk "elements with NO id stay accepted (id is optional in GitHub's schema — not an over-tight rule)" \
+    "$(_assert_issue_form_valid "$formfix/no-ids.yml" >/dev/null 2>&1 && echo valid || echo refused)" "valid"
+  chk "an element id outside GitHub's id syntax is refused" \
+    "$(_assert_issue_form_valid "$formfix/bad-id.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a DUPLICATE element id is refused (ids must be unique within a form)" \
+    "$(_assert_issue_form_valid "$formfix/dup-id.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a truthy non-string label is refused (\`label: [x]\` renders nothing)" \
+    "$(_assert_issue_form_valid "$formfix/label-not-string.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a truthy non-string markdown value is refused" \
+    "$(_assert_issue_form_valid "$formfix/markdown-value-not-string.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "dropdown options given as a bare scalar are refused (truthy, unrenderable)" \
+    "$(_assert_issue_form_valid "$formfix/dropdown-options-scalar.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a dropdown option that is not a choice string is refused" \
+    "$(_assert_issue_form_valid "$formfix/dropdown-option-not-string.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a checkbox option missing its own label is refused" \
+    "$(_assert_issue_form_valid "$formfix/checkbox-option-no-label.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "checkbox options given as bare strings are refused (they must be {label: ...} mappings)" \
+    "$(_assert_issue_form_valid "$formfix/checkbox-options-bare-strings.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
   # Parity on the REAL tree: every shipped form must pass today, or the gate this PR adds refuses
   # the next unrelated touch of one. The scanned count is asserted too, so an empty glob cannot make
   # the parity claim vacuous. Both extensions, matching the classifier's pair.
