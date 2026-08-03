@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1885,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f1a25afffb73366f786a85485d17f03b5fdb66fe",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4c states that backfill-provenance.parse_head_ref reads the same shape as worker-pr.WORKER_HEAD_RE and recommends importing WORKER_HEAD_RE as the sole worker-PR identifier. That is factually false in this checkout: worker-pr.WORKER_HEAD_RE accepts any safe suffix after `sparq-agent/issue-<N>-`, while backfill-provenance.py defines its own anchored HEAD_RE requiring exactly `issue-<N>-<run_id>-<attempt>`. A same-repository PR can therefore match WORKER_HEAD_RE without belonging to the provenance-producing worker population. The document's own argument against duplicated grammars does not establish that the broader classifier is the authoritative producer predicate. Using it can add non-record-bearing PRs to the manifest and cause permanent false gaps/refusals, so the recommended generator is not correct or complete as specified.",
+    "file": "research/1027-expected-record-manifest-generation.md",
+    "fix_hint": "Define the expected population from the actual provenance producer/recovery admission contract. Reconcile the two existing regexes explicitly (and any required same-repo/actor or run-binding conditions), identify one authoritative predicate only if it exactly characterizes record-bearing worker PRs, and add positive/negative cases showing that every admitted PR should have a provenance record while lookalike branches are excluded. If conservative over-enumeration is intentional, state and justify that operational tradeoff rather than claiming the shapes are identical.",
+    "severity": "major",
+    "title": "Proposed worker-PR population uses the wrong branch grammar"
+   }
+  ],
+  "progress": null,
+  "summary": "The central independence argument is sound, but the proposed population predicate is not grounded in the actual producer grammar. The record says worker PRs should be identified solely with worker-pr.WORKER_HEAD_RE and claims backfill reads the same shape; the checkout shows that backfill uses a separate, materially narrower HEAD_RE requiring issue/run/attempt numeric components. The broader regex is also used as a general worker-lane classifier, not proof that a PR was produced by the provenance-writing workflow. Because this predicate defines the expected-record population, the design must reconcile the real producer/recovery predicates before it is safe to implement.",
+  "verdict": "request_changes"
+ }
+}
