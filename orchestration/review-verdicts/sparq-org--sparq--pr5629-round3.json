@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5629,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b14f2a8b3b6e991ff9cb4d8c7151ac66e46545f5",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_normalize_path_entry` strips `./` but does not canonicalize internal `.` or `..` segments. An upload path such as `target/../coverage-cone-divergence-shard-1.json` resolves at runtime to the workspace-root divergence log, while `_glob_to_re` compares the unnormalized text to the relative target and returns false. The existing traversal-looking fixture contains `${{ matrix.shard }}`, so it is rejected only as dynamic and does not exercise this static bypass. A future broad or exact upload using a statically resolvable parent segment could therefore retain the file while the promised regression test stays green.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Normalize static path entries lexically against a synthetic workspace root before glob matching, rejecting any path that escapes that root; preserve glob metacharacters while resolving only `.` and `..` path segments. Add positive fixtures for `target/../coverage-cone-divergence-shard-1.json`, `foo/./../coverage-cone-divergence-shard-1.json`, and a directory form that normalizes to the workspace root, plus an escaping-path fixture handled conservatively.",
+    "severity": "major",
+    "title": "Static parent-directory paths bypass the artifact matcher"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes the prior expression-based and absolute-workspace-path bypasses, but the artifact-retention matcher still compares non-dynamic paths without resolving dot segments. GitHub Actions resolves upload paths against the workspace, so a static path containing `..` can name the divergence log while this test reports that it cannot. Because this is a new bypass of the load-bearing regression check, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
