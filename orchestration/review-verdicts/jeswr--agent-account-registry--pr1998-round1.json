@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1998,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "99c5b36afd987c6ee588cd5c207698e9dc4289ed",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is correct and complete for its stated purpose. `refuses` now converts unexpected `Exception` subclasses into a diagnostic value that cannot compare equal to the expected `True`, so an unrelated crash makes the observing row fail while allowing later rows to execute. The new helper-level check independently pins all three relevant outcomes (no exception, wrong-message `GrantError`, and non-`GrantError`), and the extractor-specific check verifies the real TypeError path without depending on interpreter-specific message text. Removing the redundant local wrapper preserves the six existing exact-result assertions and centralizes the behavior without weakening a trust check. I found no hostile instruction in the diff and no correctness, security, or test-vacuity issue.",
+  "verdict": "approve"
+ }
+}
