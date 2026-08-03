@@ -2,7 +2,9 @@
 
 > 🤖 **SPARQ agent** — findings-only design record. **Nothing in this PR changes behaviour**, and
 > that is deliberate: #1828 asks for the design record *before* any code. #738 §7 M4 has two halves.
-> (a) *which reason dominates* is delivered by #1595's `model-health.no_change_reason_census`.
+> (a) *which reason dominates* is delivered by a reason census — written here as #1595's proposed
+> `model-health.no_change_reason_census`, but what merged is #1827's
+> `dashboard-gen._no_change_reason_census`, whose shape differs where §6 depends on it (§6.1).
 > (b) *does the routing each reason drives match what happens next* is what this record scopes.
 >
 > **Headline: (b) is NOT derivable from the public health ledger, and the reason is structural, not
@@ -204,6 +206,45 @@ M4(b) cannot ask "does the *no-signal* population route differently?" from this 
 no-signal population is not separable from a seam failure. Filed as a follow-up against #1595's
 change rather than repaired here: it is a producer-side edit on the envelope seam, out of scope for
 a design record, and `worker-live.sh` is a gate-profile script.
+
+### 6.1 Re-checked against what actually merged (#2004) — the two bullets above describe an object that does not exist
+
+§10 asks for this finding to be re-checked against whatever merged, because the two bullets
+immediately above are written against #1595's census **as proposed**. #1595's shape never merged.
+What is on `master` is #1827's `_no_change_reason_census` (`scripts/dashboard-gen.py:1495`),
+published as `no_change_reasons` on the model-health payload, and it differs in the one way that
+decides both bullets: it has **no `undeclared` key at all**, and `reasons` is a *list* of
+`{"reason", "count"}` rows rather than a mapping, so `census["reasons"]["unspecified"]` does not
+index it either. Every `no_change` row is folded by
+`counts[reason if reason in counts else unspecified] += 1` — an absent `why_no_diff`, and any value
+the reader does not recognise, lands in the `unspecified` row. So on the merged census neither
+bullet holds: `unspecified` is not a structural zero but a **real measurement of the
+absent-declaration population** — non-zero exactly when that population is — and there is no second
+key for it to be conflated with. Read those
+two bullets as a record of a shape that was proposed and abandoned, not as a defect on `master`.
+
+The **producer** finding is untouched by this and is correct: the live producer never emits `why:0`,
+so a *stored* `why_no_diff == "unspecified"` remains unreachable. #1950's disposition was to
+document and pin that, and to leave the producer deliberately unchanged. It is documented at the
+census (`scripts/dashboard-gen.py:1520-1535`, which states that the fold is total and must not be
+re-split) and at the decoder (`scripts/model-health.py:3133-3143`, which names its index-0 row as
+fixture-side coverage of an arm production never writes); and it is pinned in both directions —
+`worker-live.sh`'s own self-test asserts that all three ingresses for index 0 (absent, unparseable,
+and an explicit in-vocabulary `{"why": "unspecified"}`) yield **no** `why` field, and
+`dashboard-gen.py`'s asserts that an absent declaration and a hand-written stored `unspecified` land
+in **one** bucket of 2. The producer stays as it is because the envelope's wire format is
+append-only and index 0 is load-bearing on the routing side: `UNSPECIFIED` is deliberately not in
+`DECOMPOSE_REASONS`, so it is the arm that sends a no-signal or malformed declaration down
+`retry_decision`'s ordinary ladder instead of its reason-driven terminal `decompose` route (tier
+exhaustion can still decompose such a run; the *declaration* never forces it).
+Making index 0 storable would let a garbage declaration become a real declared value and would split
+the census row back into two populations.
+
+What this leaves of M4(b): the question is now askable of a real population, with one caveat the
+census states itself — a seam that *dropped* a declared reason would also land in `unspecified`, so
+that row **bounds** "no signal" from above rather than measuring it exactly. The producer self-test
+is what makes that a tested-against failure mode rather than an assumption. The stronger claim above
+("not separable from a seam failure") no longer applies to the merged shape.
 
 ## 7. Retention: 48 h of evidence against an outcome horizon of days
 
@@ -469,7 +510,10 @@ Stated plainly, because an over-claimed design record gets cited as a decision:
   before those questions have an honest answer.
 - **#1595 is not on `master` at the time of writing** (its change is on the `#1595` PR branch;
   `no_change_reason_census` does not exist in this checkout). §6's finding is stated against that
-  change as proposed and should be re-checked against whatever merges.
+  change as proposed and should be re-checked against whatever merges. **That re-check has since
+  been done — §6.1.** #1595's shape never merged; #1827's did, without the `undeclared` key §6's
+  bullets assume, so those two bullets no longer describe anything on `master`. The producer half of
+  the finding survives and is now documented and pinned (#1950).
 - **§8's option C is a sketch, not a spec.** §8.1 pins the one part that cannot be left open —
   what the marker must carry for §1's join to close — but the *cost* is unresolved: one comment per
   decision on the issue timeline, on a plane four consumers already parse. A `proceed`-arm comment
