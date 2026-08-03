@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5798,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ef1dae9f61457a11a4e9f6658fd8152d214c2dac",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`check_pinned_steps` accepts each `requires_run` entry whenever it is a substring of the raw `run` scalar. Replacing `python3 scripts/triage-area.py --self-test` with `# python3 scripts/triage-area.py --self-test`, or echoing the same text, therefore passes S1 even though the self-test no longer runs. This directly contradicts the registry and documentation claim that the checker detects a step that stops invoking its suites. The self-test only deletes the line entirely, so it is vacuous with respect to this bypass.",
+    "file": "scripts/check-workflow-step-guards.py",
+    "fix_hint": "Parse the shell body conservatively enough to require each command on an executable command line (at minimum reject comment-only and data/echo occurrences), and add negative mutation fixtures that comment out and echo each required command while preserving its text. If robust shell recognition is intentionally out of scope, narrow the public claim and use an exact pinned `run` representation instead of substring matching.",
+    "severity": "major",
+    "title": "S1 does not verify that required guard commands are executed"
+   },
+   {
+    "body": "`check_undeclared_guard_lanes` builds `covered` only from `(workflow, job_id)` and skips the whole job when that tuple exists. A job with one registered guard/write sequence can gain a second self-test-before-write sequence without a corresponding pin; S3 remains green, and that second guard can later be deleted silently. The fixture named `SECOND self-test-before-write lane` places the lane in a second job, so it does not test this same-job hole. This violates the stated S3 guarantee that every new lane must be declared.",
+    "file": "scripts/check-workflow-step-guards.py",
+    "fix_hint": "Match coverage at lane/step granularity, using at least the pinned guard step name and its protected write step, and report every discovered guard-before-write pair that lacks a matching pin. Add a fixture with two independent guard/write sequences in the same job where only the first is registered; it must fail until the second pin is added.",
+    "severity": "major",
+    "title": "S3 suppresses unregistered lanes inside any already-pinned job"
+   }
+  ],
+  "progress": null,
+  "summary": "The checker adds useful coverage, but two claimed invariants are not actually enforced. S1 accepts required command text in comments or unrelated shell text, so a pinned self-test can stop executing while the gate remains green. S3 treats an entire job as covered after any one pin, so additional self-test-before-write lanes in that job can remain unpinned. The mutation suite does not exercise either bypass.",
+  "verdict": "request_changes"
+ }
+}
