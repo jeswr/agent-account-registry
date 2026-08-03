@@ -149,7 +149,9 @@ later:
 2. **A missing recorder biases the rate DOWN.** No row is written if the record step fails; the
    attempt is still counted. The metric under-reports, which is the *safe* direction for a
    "wasted-run" alarm (it under-fires rather than over-fires), but it is a real fail-open and
-   should be named as such.
+   should be named as such. Note what it is **not**: this path produces no row at all, so the §7
+   attribution-coverage control — which can only compare rows that joined against rows that did
+   not — cannot see it, and no version of that ratio closes it.
 3. **Retention.** `prune` (`model-health.py:602`) keeps a 48 h window with a 7 h *time-based*
    retention floor (`RETENTION_FLOOR_SECONDS`, `:112`) that overrides the `MAX_RECORDS = 200` count
    cap — so a 1 h window is **not** at risk from the count cap. It *is* still bounded by the
@@ -210,15 +212,40 @@ was meant to do, in the direction that matters: an hour with 4 attempts that wer
 clears a 3-row numerator guard while still being a 4-observation sample — precisely the spiky tick
 the guard exists to suppress.
 
-**Attribution completeness is a separate property and needs its own control.** A target with 20
-attempts and 1 attributable row is not a small sample; it is a rate of 0.05, which a high-side
-alert would not fire on anyway. The hazard there is the §5.2/§4 one — dropped rows bias the rate
-DOWN, so the alert under-fires — and no minimum-sample guard can see it, because a silent join miss
-and a genuine absence of no-change runs are numerically identical. Carry it separately instead:
-emit the unattributed-row count **always** (a real zero, not an omitted key) alongside a coverage
-ratio, and **refuse to evaluate** the alert for that tick when coverage is below a declared bar,
-rather than evaluating a rate known to be incomplete. Deferring is the fail-closed direction:
-it withholds a verdict instead of publishing a confidently wrong low one.
+**Attribution completeness is a separate property — and it cannot be a per-target one.** A target
+with 20 attempts and 1 attributable row is not a small sample; it is a rate of 0.05, which a
+high-side alert would not fire on anyway. The hazard there is the §4 one — dropped rows bias the
+rate DOWN, so the alert under-fires — and no minimum-sample guard can see it, because a silent join
+miss and a genuine absence of no-change runs are numerically identical.
+
+But a row whose `run_id` prefix did not join **has no target identity** — that is what unattributed
+means — so its count cannot honestly be written into any target's row as *that target's* miss. The
+only sound encoding is FLEET-scoped: one count of this tick's unjoined rows, mirrored verbatim into
+every target row under a `fleet_`-prefixed name so the ring accessors (`_recent_rows`,
+`metrics.py:221-229`) still reach it without widening `PUBLIC_SNAPSHOT_KEYS` (§4 Option C's cost).
+A nonzero value defers **every** target for that tick, because the unjoined rows could belong to
+any of them. That is coarse — one miss anywhere suppresses the whole fleet's verdict — and §8 bead
+2 carries the tunable and the "an always-deferring alert is a dead alert" caveat that follows.
+
+**Where the defer has to sit is decided by the shared predicate, and it is not the fire path.**
+Unattributed rows can only push the observed rate DOWN, and the rule is a *ceiling* (§8 bead 2), so
+incomplete coverage can never cause a false fire — only a missed one. The verdict it can actually
+corrupt is the **recovery**: `_CLASS_PRED` (`metrics.py:1122-1127`) is one predicate used for both
+fire and recover, and `compute_recoveries` closes a live alert when that predicate is false across
+`recover_snapshots` (`metrics.py:1141-1151`). So ANDing a coverage term into the fire predicate
+does not defer anything — it makes the predicate *false*, which auto-CLOSES the alert on data known
+to be incomplete: the exact inversion of the intent. The defer belongs in `compute_recoveries`,
+alongside the collected-targets guard that already lives there for the same reason (skipped target
+= no evidence = do not close). Firing keeps the raw predicate, whose bias is toward silence.
+
+**This bar measures JOIN completeness only — it does not see a dropped record.** A no_change run
+whose recorder job never ran (§5.2) writes no ledger row at all, so it lands in neither the
+attributed nor the unattributed count: the ratio reads 1.0 while the rate is biased down. Bead 2
+must not claim otherwise. Closing that path needs an independent observable — reconciling each
+worker run's `model_health` job conclusion (`/actions/runs/{id}/jobs`) against the run list
+metrics.py already holds — at one extra API call per worker run per tick, and confounded by runs
+that legitimately record nothing (`worker.yml:2151` skips the recorder unless the claim was
+acquired and `exit_class` is non-empty). Explicitly OUT of scope for #987; filed as follow-up.
 
 Every rule in this file is SUSTAINED over K snapshots with `recover_snapshots` hysteresis
 (`_sustained`, `metrics.py:231-238`). A no-change rate is *exactly* the kind of metric that flaps
@@ -233,11 +260,31 @@ point-in-time.
    the `run_id` prefix, emit `worker_no_change_1h` (int) and `worker_no_change_rate_1h`
    (float|null, `None` at zero attempts) plus `worker_no_change_by_reason_1h` (a dict over all six
    `NO_CHANGE_REASONS`, absent folded to `unspecified`, always fully populated so a zero is a real
-   zero). Emit `worker_no_change_unattributed_1h` (int, always present) as a snapshot field, not
-   only as a `::warning::` — bead 2's coverage bar (§7) has to read it from the ring, and a log line
-   is not in the ring. Warn on it as well, per the no-silent-caps convention. **No new alert
-   class.** This alone satisfies #466 AC3's "observable" and gives the ring the history a threshold
-   needs to be chosen from evidence rather than guessed.
+   zero).
+
+   Emit the completeness signal too, **fleet-scoped and mirrored** (§7). Compute it once per tick
+   in `build_snapshot`, then copy the identical pair into every target row in `out["targets"]`
+   (`metrics.py:1188-1195`) — mirroring into the rows, rather than adding a top-level key, is what
+   keeps `PUBLIC_SNAPSHOT_KEYS` (`metrics.py:90`) closed, leaves run()'s `_ts`-strip proof at
+   `metrics.py:2193-2196` untouched, and lets a plain `_recent_rows` predicate read it:
+
+   ```
+   A = in-window no_change rows whose run-id prefix joined to a target in this tick's run map
+   U = in-window no_change rows whose run-id prefix did not join to any target
+
+   fleet_no_change_unattributed_1h = U            # int, ALWAYS present; a real zero, never omitted
+   fleet_no_change_join_coverage_1h = round(A / (A + U), 4) if (A + U) > 0 else None
+   ```
+
+   The `None` at `A + U == 0` is the house idiom (`metrics.py:188-190`) and is honest here: with no
+   in-window rows at all, nothing *could* have missed the join, so coverage is undefined rather than
+   bad. `U` is the primitive the gate reads; the ratio is the human-readable derivative for the
+   dashboard, and its name says join — it is not a record-delivery ratio (§5.2). Warn on `U > 0` as
+   well, per the no-silent-caps convention. Every one of these fields is per-tick and fleet-wide, so
+   the same value repeats across targets by construction; that duplication is the price of keeping
+   the ring accessors row-shaped, and the `fleet_` prefix is what stops a reader mistaking it for a
+   target-scoped miss count. **No new alert class.** This alone satisfies #466 AC3's "observable"
+   and gives the ring the history a threshold needs to be chosen from evidence rather than guessed.
 2. **Bead 2 — alert, once bead 1 has ring history.** Add the classification, the threshold key,
    and the mutation-check. The key is a **ceiling**, not a floor: a no-change alert fires when the
    rate is too HIGH, the opposite direction to `worker_success_floor` (`wsr < floor`,
@@ -254,6 +301,36 @@ point-in-time.
    the rule. Being a float, it must join `worker_success_floor` in the `_thresholds_of` float branch
    (`metrics.py:372-374`) or it is rejected as "must be a positive integer" (`:376`) — the same
    trap flagged in §7's table.
+
+   The completeness gate is a **second, separate** change in the same bead, and it does NOT go in
+   that predicate (§7). Add one threshold, `worker_no_change_max_unattributed` (int, default `0`,
+   so it needs no float-branch edit), and one row-level test:
+
+   ```
+   complete(row) = isinstance(row.get("fleet_no_change_unattributed_1h"), int)
+                   and row["fleet_no_change_unattributed_1h"] <= th["worker_no_change_max_unattributed"]
+   ```
+
+   Then in `compute_recoveries` (`metrics.py:1130-1152`), skip the no-change class for a target
+   when `complete(row)` is false for **any** of the last `recover_snapshots` rows — leaving the
+   issue open rather than closing it on evidence known to be partial, exactly as the
+   collected-targets guard already does. The non-int arm is deliberate and fail-closed: rows
+   written by a pre-bead-1 collector, still in the 24-row ring during the upgrade tick, carry no
+   such key and must count as unknown-coverage, not as zero.
+
+   Boundary cases to write into the tests, not discover later: `U = 0` → recovery proceeds
+   normally; `U > 0` on ONE of the K rows → recovery deferred, firing unaffected; coverage `None`
+   with `U = 0` (no rows in window at all) → complete, because a window with nothing in it has
+   nothing to have lost; a target SKIPPED this tick → already excluded upstream by
+   `collected_targets`, and the two guards must not be collapsed into one (they defer for
+   different reasons and clear independently).
+
+   Raising `worker_no_change_max_unattributed` above 0 trades a bounded bias for liveness: with `U`
+   unattributed rows the true count is at most `attributed + U`, so the published rate is a LOWER
+   bound and the alert can only under-fire. The reason to raise it is that a gate at 0 on a join
+   with an unmeasured hit-rate (§9) can defer every tick forever, and an alert that never recovers
+   is as useless as one that never fires. The value should be chosen from bead 1's observed `U`
+   history — which is the other reason bead 1 ships first.
 
    Picking the ceiling's *value* before any snapshot exists means picking it from the #466-era ~75%
    recollection, which is a measurement of a different lane at a different time. That is what bead 1
@@ -277,6 +354,9 @@ second consumer ever needs per-repo health attribution.
 * **The attribution hit-rate of the Option A join.** It is unmeasured. #1130's precedent —
   0 of 100 titles matching for eight days, silently — is the reason bead 1 must ship the
   unattributed-row warning *before* anything alerts on the counts.
+* **How often the recorder fails to write a row at all** (§5.2). Nothing measures it, and nothing
+  proposed here would: it is the one bias direction the §7 coverage bar is blind to. Its size is
+  the size of the residual fail-open that bead 2 ships with.
 * **Whether `why_no_diff` is populated often enough to be useful.** The field is optional and
   model-authored; if most rows fold to `unspecified`, the `already_done` vs `underspecified` split
   #987 asks for does not exist yet, and the honest first finding of bead 1 would be "the
@@ -293,3 +373,17 @@ second consumer ever needs per-repo health attribution.
 | "a fixture health window containing N no_change rows produces the new fields" | needs a fixture *pair*: health rows **and** the orchestration runs they join to, or the fixture proves nothing about attribution (§4) |
 | "a window with zero attempts leaves the rate null (not 0.0)" | as written — mirrors `metrics.py:1414-1418` |
 | "mutation-check that the threshold flips the alert" | bead 2 only; there is no threshold in bead 1 |
+
+Plus these, which #987 does not list and §7/§8 now require:
+
+| bead | criterion |
+|---|---|
+| 1 | a fixture whose health rows include one whose run-id prefix is absent from the run map emits `fleet_no_change_unattributed_1h = 1` **and** the same value in EVERY target row, with the ratio excluding that row from the numerator |
+| 1 | a fixture with zero in-window no_change rows emits `fleet_no_change_unattributed_1h = 0` (present, a real zero) and `fleet_no_change_join_coverage_1h = None` |
+| 2 | recovery is DEFERRED — the live alert stays open — when any of the last `recover_snapshots` rows has `fleet_no_change_unattributed_1h` above the bar, or lacks the key entirely (the pre-upgrade ring row) |
+| 2 | firing is UNAFFECTED by unattributed rows: the same fixture with `U > 0` and a rate over the ceiling still fires (the bias is downward, so a fire is never false on this account) |
+| 2 | a mutation that moves the coverage gate into the fire predicate must FAIL a test — that inversion auto-closes the alert instead of deferring it (§7), and it is the failure mode most likely to be "simplified" back in |
+
+Explicitly NOT an acceptance criterion for either bead: detecting a no_change run whose recorder
+never wrote a row (§5.2). No proposed field here can observe it; claiming coverage covers it would
+be the design's own fail-open.
