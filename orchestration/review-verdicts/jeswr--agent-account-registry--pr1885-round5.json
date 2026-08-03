@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1885,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "76202c93f28cf38f862f582969082660e80363fc",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4c still calls strict HEAD_RE + same-repo head + an \"App-bot author\" the authoritative producer conjunction, and its condition table still points to backfill-provenance.py:828's login.endswith(\"[bot]\") check. That line is only a coarse prefilter. The actual recovery path later calls run_identity_from_log, which extracts the provenance job's anchored bot_login and requires anchored[\"bot_login\"] == live_author; the source explicitly states that any *[bot] is not enough. Thus a PR opened by different-bot[bot] on a strict numeric same-repo branch satisfies the recommended manifest predicate but cannot be recovered as a worker record. Enumerating it creates a permanent, unrepairable expected-record gap and contradicts the claimed exact population.",
+    "file": "research/1027-expected-record-manifest-generation.md",
+    "fix_hint": "Define a sound independent way for the generator to identify the exact expected App-bot login and require equality, or incorporate the run-bound author validation through another complete mechanism. Correct the condition table and recommendations so line 828 is not presented as the full author contract. Add a negative self-test using a strict-shaped, same-repo PR authored by a different [bot] login; the existing generic non-bot case does not exercise this boundary.",
+    "severity": "major",
+    "title": "Worker author predicate still admits records the producer rejects"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 major finding remains unresolved. The document still defines the worker population as strict HEAD_RE + same-repo head + an unspecified \"App-bot author\", and still cites backfill-provenance.py:828's coarse login.endswith(\"[bot]\") prefilter as the author condition. But a worker record is admitted only after run_identity_from_log extracts the provenance job's exact bot_login and requires it to equal the live PR author. A different installed App bot can therefore author a strict-shaped same-repo PR that the proposed generator enumerates even though backfill must refuse it, creating the permanent partial-evidence gap the design aims to avoid. Because the same major finding persists at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
