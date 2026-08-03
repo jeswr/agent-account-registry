@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1866,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9bbdc0f9d6d7be07748c2a1da12128498b1ae0e1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The histogram loop still slices raw keys before it validates them: `for key in sorted(str(k) for k in raw_histogram)[:12]`. Therefore a malformed bucket sorted after twelve other keys is never inspected or announced, and a malformed bucket inside the first twelve consumes a display slot and can silently displace a later valid bucket. That contradicts the stated contract that every unreadable bucket is announced and that the silent cap truncates only well-formed buckets. The new tests cover one bad bucket and absence, but never exercise more than twelve mixed valid/malformed buckets, so they cannot detect this ordering error.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Validate and announce every supplied bucket first, collect only readable buckets, then apply the 12-bucket display cap to the validated collection. Add literal tests with a malformed 13th raw key and with malformed early keys plus valid later keys, asserting both the bounded diagnostic output and that the cap is applied to valid published buckets rather than raw inputs.",
+    "severity": "major",
+    "title": "Histogram cap silently drops unreadable buckets before validation"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 lease-container/row/measurement finding is fixed with loud, bounded diagnostics and literal accept/reject coverage. However, the cache-histogram implementation applies its 12-entry display cap before validating buckets, despite the new contract and comments saying only well-formed display rows are silently truncated. This leaves malformed supplied buckets beyond the first 12 entirely unannounced and lets malformed early buckets displace valid later evidence. Because this is a new major completeness and test-validity gap, the required progress grade is regressing.",
+  "verdict": "request_changes"
+ }
+}
