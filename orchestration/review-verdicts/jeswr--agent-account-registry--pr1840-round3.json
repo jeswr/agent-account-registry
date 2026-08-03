@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1840,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f0922c89ffa2fdbbb4458123f5e6e0190b918b54",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 approval remains supported. The shared deprecation register gates the retired fable probe fail-closed while preserving and testing the un-retirement path; the opus5 observation is conditional, namespaced, bounded, and demonstrated inert at both admission and alert consumers. Literal tests cover request shape, three distinct probe outcomes, hostile header names, caps, merge-site scope, malformed model data, and the exact two-request cost for a legacy-fable + opus5 row. I found no blocker, major, or lower-severity defect in the diff.",
+  "verdict": "approve"
+ }
+}
