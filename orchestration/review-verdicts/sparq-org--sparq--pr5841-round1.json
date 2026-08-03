@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5841,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fc49ee86c524505b701e8a08f22b4c42d994be8c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`evaluate_packages` checks only whether the README path occurs in `changed`, and `package_has_test` likewise accepts any matching changed path. `parse_status_lines` puts `D` destinations into `changed`, so a PR that adds `packages/x/package.json` while deleting `packages/x/README.md` and a matching test file is reported complete even though neither required artifact exists at HEAD. This is possible when a previously non-package directory is converted into a package, and it defeats the proactive gate's core invariant.",
+    "file": "scripts/gate-new-crate.py",
+    "fix_hint": "Preserve change status or verify that each candidate artifact is a regular file in the PR-head checkout before accepting it. Add an end-to-end regression using `D\\tpackages/x/README.md` and `D\\tpackages/x/test/basic.ts` alongside an added manifest, asserting both requirements remain violations. Keep hermetic tests possible by adding explicit existence overrides or a status-aware helper rather than treating all changed paths alike.",
+    "severity": "major",
+    "title": "Deleted README and test paths satisfy the completeness gate"
+   }
+  ],
+  "progress": null,
+  "summary": "The npm-package extension is well scoped and its focused tests pass, but the new gate can be bypassed by deleted README or test paths because it discards file status and treats every changed path as an artifact that the PR provides. This violates the gate's stated completeness invariant and needs a fail-closed existence/status check plus regression coverage.",
+  "verdict": "request_changes"
+ }
+}
