@@ -12475,6 +12475,17 @@ def _self_test():
         report_lines, report_gh, report_dc, report_grades = [], [], [], []
         real_dc = globals()["_dispatch_claim"]
         real_gh = globals()["_gh_json"]
+        # [#1688] `run_raa` above leaves `_paginated_comments` bound to its OWN stub
+        # (`lambda repo, pr: list(comments)`, empty on the last call), and that stub is restored
+        # only at the end of the whole block. `arm_freshness_report` reads the review receipt
+        # THROUGH that reader, so leaving the leak in place would have fed it an empty history for
+        # every fixture below — every row `unattested`, the seam assertion never reaching
+        # `_report_gh_json`, and the whole approval truth table graded against a harness artefact
+        # instead of the code. Rebind the genuine reader for these two blocks so the `_gh_json`
+        # fixtures ARE the comment source, and hand the stub back afterwards for the `run_raa`
+        # checks that follow. The `report_gh` assertion below is what makes the rebinding
+        # load-bearing: it pins the comments endpoint by exact match, so a re-leak reds it.
+        real_pag = globals()["_paginated_comments"]
         # [#1688] The bot identity every receipt in these fixtures is filtered against, and the
         # `human-arm` park receipt shape `needs_user` writes (park_reason_marker's rendering).
         _arm_bot = "sparq-app[bot]"
@@ -12504,6 +12515,7 @@ def _self_test():
             # (approval covers it) and its GATE is stale; 900's gate is fresh and its review is
             # bound to a commit the head has since outrun — the #1661 shape.
             globals()["_gh_json"] = _report_gh_json
+            globals()["_paginated_comments"] = real_raa["_paginated_comments"]
             globals()["_dispatch_claim"] = lambda: types.SimpleNamespace(
                 live_gate_freshness=lambda repo, head, base, draft, pr: (
                     report_dc.append((repo, head, base, draft, pr))
@@ -12520,6 +12532,7 @@ def _self_test():
         finally:
             globals()["_dispatch_claim"] = real_dc
             globals()["_gh_json"] = real_gh
+            globals()["_paginated_comments"] = real_pag
         check("arm-freshness (orchestrator CLI) refuses the stale PR, passes the fresh one, "
               "and exits non-zero",
               (rc, sum(1 for line in report_lines if "refused=true" in line),
@@ -12633,6 +12646,7 @@ def _self_test():
             return {"head": {"sha": _live_head}, "base": {"ref": "master"}, "draft": True,
                     "body": _forged_body}
         try:
+            globals()["_paginated_comments"] = real_raa["_paginated_comments"]
             globals()["_dispatch_claim"] = lambda: types.SimpleNamespace(
                 live_gate_freshness=lambda repo, head, base, draft, pr: {
                     "state": "fresh", "gap_seconds": 3600, "run_base_sha": "e" * 40,
@@ -12660,6 +12674,7 @@ def _self_test():
         finally:
             globals()["_dispatch_claim"] = real_dc
             globals()["_gh_json"] = real_gh
+            globals()["_paginated_comments"] = real_pag
         check("[#1688] a head that outran its ATTESTED approval REFUSES the by-hand arm (exit 1), "
               "an author-forged claim of the live head refuses too — in BOTH the body and a "
               "look-alike comment — an UNREADABLE history refuses while still emitting its row, "
