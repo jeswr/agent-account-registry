@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5629,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3a4bea28c054810865ada99b38f46c4c22b52fa5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new record says the ENFORCE flip stands on `pull_request` + push-to-`main` observation, but later in the same paragraph identifies every non-PR event as a full-run trigger. A push run therefore has an empty cone/full measurement and cannot produce an outside-cone divergence sample or validate narrowing. The retained selection evidence described here is from pull-request cone runs (plus full nightly/push runs only as drift backstops), not a PR + push changed-cone window. This overstates the evidence supporting the flip and is repeated in the research note.",
+    "file": "docs/branch-protection.md",
+    "fix_hint": "Rewrite the decision and the matching research note/workflow comment to distinguish pull-request shadow cone evidence from push/full-run backstop evidence. If push events actually selected cones during the historical shadow window, cite and pin the specific historical wiring that establishes that instead of relying on the current full-run-trigger description.",
+    "severity": "major",
+    "title": "Push-to-main full runs are mischaracterized as changed-cone evidence"
+   },
+   {
+    "body": "`test_the_divergence_log_is_not_retained_as_an_artifact` only searches artifact `name` and `path` for the literal prefix `coverage-cone-divergence-shard-`. An upload with `path: .`, `path: '*.json'`, or another containing directory would retain the divergence file while this test remains green. That makes the test vacuous for common artifact-upload patterns and contradicts its stated guarantee that any silent start at retaining the log must RED.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Model the artifact upload paths conservatively: reject broad paths/globs that can include the runner-root divergence file, or move the divergence output into a dedicated directory and assert that no upload-artifact path can include that directory. Add a negative fixture/test showing that a wildcard or directory upload is detected.",
+    "severity": "major",
+    "title": "Artifact-retention test is bypassed by wildcard or directory uploads"
+   }
+  ],
+  "progress": null,
+  "summary": "The decision record is internally inconsistent about what the shadow evidence actually covered, and the new regression test does not enforce its stated retention invariant. In particular, the same document identifies every non-PR event as a full-run trigger, so push-to-main runs cannot provide changed-cone/outside-cone observations; describing the evidence as a pull_request + push-to-main window overstates it. Also, artifact retention can be introduced through a directory or wildcard upload without the proposed test noticing.",
+  "verdict": "request_changes"
+ }
+}
