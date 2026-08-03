@@ -2535,6 +2535,10 @@ def _self_test_throughput_worker(check):
             # The #987 family served on BOTH targets, with the two alerts naming one target each:
             # worker-failing names delta, worker-no-change names gamma. Each card must take the
             # tone of ITS OWN alert and neither of the other's — asserted in both directions.
+            # delta ALSO carries a FIRING near-match classification on its OWN target
+            # (`worker-no-change-sustained` — a name no rule publishes). A tone that tested
+            # containment rather than the exact classification would turn delta's no-change cell
+            # bad on it, so this row is the control that keeps the exact match load-bearing.
             "no-change-served": snapshot(
                 {"owner/delta": target(
                     worker_attempts_1h=5, worker_success_rate_1h=0.2,
@@ -2549,6 +2553,7 @@ def _self_test_throughput_worker(check):
                      worker_no_change_by_reason_1h={"already-done": 2, "blocked_on_decision": 1},
                      worker_no_change_repeat_issues_1h=[1174, 1509, 396, 987, 1585])},
                 [alert("owner/delta", "worker-failing"),
+                 alert("owner/delta", "worker-no-change-sustained"),
                  alert("owner/gamma", "worker-no-change")]),
             # The family served with NO signal in it: every value null.
             "nulls-served": snapshot({"owner/zeta": target(
@@ -2593,7 +2598,9 @@ def _self_test_throughput_worker(check):
           "issue numbers — CAPPED with the overflow stated on gamma (no silent cap), listed whole "
           "on delta. Each card takes the tone of ITS OWN alert in BOTH directions: worker-failing "
           "names delta, so delta's success cell is bad and gamma's is plain; worker-no-change "
-          "names gamma, so gamma's no-change cell is bad and delta's is plain",
+          "names gamma, so gamma's no-change cell is bad and delta's is plain — and delta's stays "
+          "plain under a FIRING near-match classification on delta itself, so only the EXACT "
+          "classification tones",
           page["no-change-served"],
           [{"repo": "owner/delta", "rows": 1,
             "cells": [["Worker success / 1h", "20%", "5 attempts", "metric-value bad"],

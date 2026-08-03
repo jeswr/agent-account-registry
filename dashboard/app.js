@@ -476,10 +476,12 @@ const NO_CHANGE_KEYS = ["worker_no_change_1h", "worker_no_change_rate_1h",
 // (metrics.py DEFAULT_THRESHOLDS, per-target overridable in policy/repos.toml [repos.*].throughput)
 // and the public snapshot does not carry it. A number copied into this file would be a second
 // definition of a threshold this page cannot see, and it would disagree with the alert row beside
-// it the moment one target overrides it. `NO_CHANGE_ALERT` is matched as a SUBSTRING because the
-// #987 rule's classification names the lane it fires for; the alert is authoritative either way.
+// it the moment one target overrides it. Both names are matched EXACTLY: a classification is one
+// closed constant on metrics.py's side (BACKLOG_GROWING, ..., WORKER_FAILING), so a substring test
+// would tone off an unrelated or malformed value that merely contains the name and would quietly
+// stop the two files sharing one auditable vocabulary.
 const WORKER_FAILING_ALERT = "worker-failing";
-const NO_CHANGE_ALERT = "no-change";
+const NO_CHANGE_ALERT = "worker-no-change";
 // A truncated list must SAY it was truncated (AGENTS.md: no silent caps).
 const REPEAT_ISSUE_LIMIT = 4;
 
@@ -658,7 +660,7 @@ function workerRow(m, firing) {
   ].filter((part) => part !== null);
   grid.append(metricCell("No-change / 1h", fmtPct(m.worker_no_change_rate_1h), {
     sub: parts.length ? parts.join(" · ") : "no signal",
-    tone: [...firing].some((c) => c.includes(NO_CHANGE_ALERT)) ? "bad" : "",
+    tone: firing.has(NO_CHANGE_ALERT) ? "bad" : "",
   }));
   grid.append(metricCell("Repeat no-change",
     fmtIssueList(m.worker_no_change_repeat_issues_1h)));
