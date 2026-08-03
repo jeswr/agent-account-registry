@@ -2070,6 +2070,55 @@ _workflow_steps_referencing() {
   ' "$file"
 }
 
+# PURE (self-tested): _model_target_checkout_ref <workflow-file> <job> — print the VERBATIM `ref:`
+# expression of the actions/checkout step that materializes the model's target working tree inside
+# JOB, i.e. the step whose `with:` block says `path: target` exactly.
+#
+# [issues #143, #441] Both lanes resolve routing/model_chain/agent in a `resolve` job from a
+# `target-routing` checkout and then run the model on a SECOND checkout of the same repository.
+# When that second checkout names a moving ref, the two are different revisions and a routing
+# update landing between the jobs runs a stale/out-of-policy model+prompt on an already-claimed
+# lease. The property is therefore about ONE line, so the caller pins it by EXACT MATCH
+# (AGENTS.md item 6) rather than by containment.
+#
+# Two absences are named rather than printed as the empty string an exact-match row would compare
+# against nothing: `<none>` when the step exists with NO `ref:` and `<missing>` when there is no
+# such step in the job. `ref:` absent is the fail-OPEN shape specifically — actions/checkout reads
+# an empty `ref` as "the repository's default branch", which is the exact defect being removed, so
+# it must read as a defect here too.
+#
+# The job is matched EXACTLY as a string (never a regex) and its two-space-indented key closes the
+# scan, because each lane has a SECOND `path: target` checkout in its isolated publish job that
+# legitimately pins a different revision (the pre-gate bundle base / the dispatched PR head).
+_model_target_checkout_ref() {
+  local file="$1" job="$2"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  awk -v job="$job" '
+    function endstep() {
+      if (started && is_target) { print (ref == "" ? "<none>" : ref); found=1; exit }
+      started=0; is_target=0; ref=""
+    }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      if (injob) endstep()
+      key=$0; sub(/^  /,"",key); sub(/:[[:space:]]*$/,"",key)
+      injob = (key == job); started=0; is_target=0; ref=""
+      next
+    }
+    !injob { next }
+    /^[[:space:]]*-[[:space:]]+name:/ { endstep(); started=1; next }
+    started && /^[[:space:]]*path:[[:space:]]*target[[:space:]]*$/ { is_target=1 }
+    started && /^[[:space:]]*ref:[[:space:]]/ {
+      ln=$0; sub(/^[[:space:]]*ref:[[:space:]]*/,"",ln); sub(/[[:space:]]+$/,"",ln); ref=ln
+    }
+    END {
+      if (!found) {
+        if (injob && started && is_target) print (ref == "" ? "<none>" : ref)
+        else print "<missing>"
+      }
+    }
+  ' "$file"
+}
+
 # [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
 # unavailable — so the worker lane must be able to provision actionlint itself, or every legitimate
 # workflow change dies at `command -v`. Provisioning mirrors .github/workflows/pr-gate.yml: the
@@ -5497,6 +5546,91 @@ WFFIX
         && printf before || printf after-or-missing)" "before"
   chk "#575 (LIVE): the publisher takes its base from the PRE-GATE record, not the worker worktree" \
     "$(grep -Fc 'ref: ${{ needs.worker.outputs.bundle_base_sha }}' "$wf" || true)" "1"
+
+  # --- [issues #143, #441] ONE TARGET REVISION PER RUN, asserted on BOTH lanes. Each lane resolves
+  # routing/model_chain/agent in its `resolve` job from a `target-routing` checkout, and its model
+  # job then checks the SAME repository out again and RE-READS the routing metadata from it. Those
+  # were two unbound revisions: a routing update landing between the jobs runs a stale or
+  # out-of-policy model+prompt on an already-claimed lease. The binding is one exported SHA plus one
+  # `ref:`, and BOTH ends are pinned below — an export nothing consumes, and a consumer with nothing
+  # to read, are each half a fix and each individually silent. ---
+  local pinned_ref='${{ needs.resolve.outputs.target_sha }}'
+  chk "#143 (LIVE worker.yml): the model's target checkout is pinned to the resolved routing sha" \
+    "$(_model_target_checkout_ref "$wf" worker)" "$pinned_ref"
+  chk "#441 (LIVE review-fix.yml): ...and the review/fix lane's run job is pinned to the same output" \
+    "$(_model_target_checkout_ref "$rf_wf" run)" "$pinned_ref"
+  # The PRODUCER half. An empty `needs.resolve.outputs.target_sha` expands the `ref:` above to the
+  # empty string, which actions/checkout reads as "the repository's default branch" — so the two
+  # rows above would still match while the lane silently ran unbound again. Hence: the job output is
+  # wired, the step that fills it derives the sha from the routing checkout the route was resolved
+  # against, and it REFUSES anything that is not a 40-hex commit sha rather than exporting a value
+  # the consumer fails OPEN on.
+  local rev_wiring='target_sha: ${{ steps.target_rev.outputs.target_sha }}'
+  chk "#441: both lanes wire the resolve job's target_sha output exactly once" \
+    "$(grep -Fc "$rev_wiring" "$wf" || true):$(grep -Fc "$rev_wiring" "$rf_wf" || true)" "1:1"
+  chk "#441: both target_rev steps derive the sha from the target-routing checkout" \
+    "$(_workflow_step_body "$wf" target_rev | grep -Fc 'git -C target-routing rev-parse HEAD' || true):$(_workflow_step_body "$rf_wf" target_rev | grep -Fc 'git -C target-routing rev-parse HEAD' || true)" \
+    "1:1"
+  chk "#441: ...and each REFUSES a non-40-hex revision instead of exporting an empty sha" \
+    "$(_workflow_step_body "$wf" target_rev | grep -Fc '^[0-9a-f]{40}$' || true):$(_workflow_step_body "$rf_wf" target_rev | grep -Fc '^[0-9a-f]{40}$' || true)" \
+    "1:1"
+  # ...and neither producer is CONDITIONAL. A skipped step's output is the empty string, i.e. the
+  # fail-open default-branch checkout again, from a lane whose every other row above still reads
+  # green (AGENTS.md item 3 — the conditionally-inert mutant, which is not the deleted one).
+  chk "#441: neither target_rev step carries an if: (a skipped producer exports an empty sha)" \
+    "$(_workflow_step_if "$wf" target_rev):$(_workflow_step_if "$rf_wf" target_rev)" ":"
+
+  # NON-VACUITY on the REAL review-fix.yml, in the three regression directions that matter: the ref
+  # reverted to the moving default branch (the exact shape #441 reported), the ref DELETED (the same
+  # unbound checkout written as an omission, invisible to any containment check), and the producer
+  # made conditionally inert (every text assertion above stays green while the consumer's ref
+  # expands to nothing). Each mutant is built by whole-LINE match off an anchor whose count is
+  # asserted first, and each is proven to have changed the tree.
+  local rf_anchor_ref="          ref: \${{ needs.resolve.outputs.target_sha }}"
+  chk "#441: the pinned ref line occurs exactly once in review-fix.yml (mutation anchor)" \
+    "$(grep -Fxc "$rf_anchor_ref" "$rf_wf" || true)" "1"
+  local rf_unpinned="$tmp/review-fix-unpinned.yml" rf_refless="$tmp/review-fix-refless.yml"
+  local rf_inert="$tmp/review-fix-inert-producer.yml"
+  local rf_inert_if="        if: \${{ inputs.mode == 'fix' }}"
+  awk -v old="$rf_anchor_ref" \
+    '$0 == old { print "          ref: ${{ steps.target.outputs.default_branch }}"; next } { print }' \
+    "$rf_wf" > "$rf_unpinned"
+  awk -v old="$rf_anchor_ref" '$0 == old { next } { print }' "$rf_wf" > "$rf_refless"
+  awk -v ifline="$rf_inert_if" '{ print } /^        id: target_rev$/ { print ifline }' \
+    "$rf_wf" > "$rf_inert"
+  chk "#441: a ref reverted to the moving default branch is REPORTED (non-vacuous)" \
+    "$(_model_target_checkout_ref "$rf_unpinned" run)" '${{ steps.target.outputs.default_branch }}'
+  chk "#441: a DELETED ref reads as <none>, never as a silently-empty match (fail closed)" \
+    "$(_model_target_checkout_ref "$rf_refless" run)" "<none>"
+  chk "#441: a CONDITIONAL target_rev producer is REPORTED (non-vacuous)" \
+    "$(_workflow_step_if "$rf_inert" target_rev)" "\${{ inputs.mode == 'fix' }}"
+  chk "#441: the three mutants each really differ from the shipped workflow (mutation hygiene)" \
+    "$(for _m in "$rf_unpinned" "$rf_refless" "$rf_inert"; do
+         cmp -s "$rf_wf" "$_m" && printf 'same ' || printf 'diff '; done)" \
+    "diff diff diff "
+  # ...and the extractor is JOB-SCOPED rather than "the first `path: target` in the file". Each lane
+  # has a SECOND target checkout in its isolated publish job that legitimately pins a DIFFERENT
+  # revision; without these rows the assertions above could pass by measuring the wrong step.
+  chk "#441: the publish jobs' own target checkouts are distinct, and are NOT what was measured" \
+    "$(_model_target_checkout_ref "$wf" publish):$(_model_target_checkout_ref "$rf_wf" publish)" \
+    '${{ needs.worker.outputs.bundle_base_sha }}:${{ needs.resolve.outputs.head_sha }}'
+  chk "#441: a job with no target checkout is NAMED, never answered with a neighbour's ref" \
+    "$(_model_target_checkout_ref "$rf_wf" resolve)" "<missing>"
+  chk "#441: _model_target_checkout_ref fails CLOSED on an unreadable workflow" \
+    "$(_model_target_checkout_ref "$tmp/no-such-workflow.yml" run 2>/dev/null; printf '%s' "$?")" "1"
+  # ...and the step that ENDS its job is read from the extractor's END path rather than from a
+  # closing `- name:` that never arrives — the boundary #575 records as a source of confidently
+  # wrong reads. Both verdicts have to survive it, or a checkout moved to the end of a job would
+  # silently stop being measured at all.
+  local rf_last_pinned="$tmp/rf-last-pinned.yml" rf_last_refless="$tmp/rf-last-refless.yml"
+  printf 'jobs:\n  run:\n    steps:\n      - name: Checkout target\n        with:\n          ref: ${{ needs.resolve.outputs.target_sha }}\n          path: target\n' \
+    > "$rf_last_pinned"
+  printf 'jobs:\n  run:\n    steps:\n      - name: Checkout target\n        with:\n          path: target\n' \
+    > "$rf_last_refless"
+  chk "#441: a target checkout that ENDS its job is read from the END path, never skipped" \
+    "$(_model_target_checkout_ref "$rf_last_pinned" run)" "$pinned_ref"
+  chk "#441: ...and a missing ref still reads <none> on that path too (fail closed)" \
+    "$(_model_target_checkout_ref "$rf_last_refless" run)" "<none>"
 
   # --- [issue #568] publish only ever runs from a snapshot re-attested IN THE FRESH PUBLISHER.
   # The pre-model `trust` step ran before the (tens-of-minutes) model + gate, so the publish/PR
