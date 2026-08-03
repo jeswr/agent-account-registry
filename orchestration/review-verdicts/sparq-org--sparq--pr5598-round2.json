@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5598,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e4aa49aadf9e263d3f474b2c8920dd046b170c83",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The untracked-crate check is correctly implemented in the pure evaluate() comparison without weakening the existing disappeared-crate, floor-regression, or integration-directory checks. The committed floor file covers the full scanned crate tree, including zero-test crates, and the added tests exercise every decision direction, combined failures, live repository coverage, and vacuity guards. The targeted 13-test suite passes at the PR head. No correctness, soundness, test-validity, or security issue was found.",
+  "verdict": "approve"
+ }
+}
