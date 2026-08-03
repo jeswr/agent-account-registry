@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1855,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8ba2ae629686aabc27fb58f02a22d78d6d167371",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`attested_review_head` iterates records newest-first but skips every record whose cause is not `human-arm`, then returns an older `human-arm` head. This contradicts the function's own `Newest receipt wins` invariant. For example, authenticated bot history `[human-arm(head=live), injection(head=live)]` returns the old human-arm head and `approval_coverage` admits `covers-head`, even though the newest park episode asserts an injection stop rather than a completed approval awaiting arm. The existing off-cause test contains only the off-cause receipt, so it does not exercise this supersession seam. Historical review evidence must not be resurrected across a newer park episode.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Select the newest authenticated well-formed park-reason record first; attest a head only if that newest record has `cause=human-arm`, otherwise return no attestation/refuse. Add a literal end-to-end case with an older matching human-arm receipt followed by a newer authenticated off-cause receipt, and assert that it cannot produce `covers-head` or exit 0.",
+    "severity": "major",
+    "title": "A later off-cause park does not supersede an older human-arm attestation"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 author-forgery fix remains intact, but the new receipt selector does not implement its stated newest-receipt authority rule. It selects the newest `human-arm` receipt while silently stepping past any later authenticated park-reason receipt for another cause. That can resurrect a superseded approval binding from an older park episode and report `covers-head`, so this round introduces a new major trust-plane finding and is regressing relative to round 2's clean approval.",
+  "verdict": "request_changes"
+ }
+}
