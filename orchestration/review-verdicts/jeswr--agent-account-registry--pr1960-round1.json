@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1960,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "30b89288d0aaab2028e02722eb122133ce72b626",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_model_target_checkout_ref` claims to select the `actions/checkout` step that materializes the model working tree, but it only looks for a named step with a line matching `path: target`; it never inspects `uses:`. Replacing `uses: actions/checkout@...` with another pinned action (or removing `uses:` and adding an unrelated step body that contains the same `path` and `ref` lines) leaves the new `#143`/`#441` exact-ref rows green even though the pinned target checkout no longer exists. The repository-wide action-reference pinning check does not establish that the action is `actions/checkout`, so it does not close this gap. This is the marquee trust binding being asserted against a proxy rather than the action that supplies the model's working tree.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Have the extractor parse the selected step's exact `uses:` value and require the repository's pinned `actions/checkout@<sha>` reference (or return a named failure when it is absent/wrong). Add a non-vacuity mutant that changes/removes that `uses:` line while retaining `path: target` and the pinned `ref:`, and assert that the shipped guard rejects it rather than merely reporting the ref.",
+    "severity": "major",
+    "title": "Target-revision guard does not prove it is inspecting an actions/checkout step"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe workflow change itself binds the review/fix target checkout to the resolve job's SHA, but the new regression guard does not actually verify the evidence path it claims to verify. Its extractor recognizes any named step containing `path: target`, regardless of whether that step is `actions/checkout`, so a trust-significant replacement/removal of the checkout action can leave the marquee pin assertion green. Round 1; no progress comparison is available.",
+  "verdict": "request_changes"
+ }
+}
