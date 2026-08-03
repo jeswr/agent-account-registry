@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5856,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "189ee919246425b77cc0c9e19c4140b681cc6e03",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`apply_set()` only recognizes a logical line that consists of a `set` command, and `analyse_run_body()` evaluates gate hits using the pre-line `errexit_here` state. Consequently `set +e; cargo test` (or `set +e && cargo test`) is not reported: `SET_FLAGS_RE` does not match the compound line, `errexit_here` remains true, and there is no D1/D3 trigger. Bash does run the verification with errexit disabled, so this is an undeclared failure swallow that the new gating check accepts.",
+    "file": "scripts/check-workflow-run-swallow.py",
+    "fix_hint": "Parse shell statements within a logical line (at minimum, account for a leading `set +e` before a gate invocation) and determine errexit state at each command position. Add a negative fixture for `set +e; cargo test` and a corresponding re-arm case on a compound line.",
+    "severity": "major",
+    "title": "Same-line `set +e` does not disable errexit in the analysis"
+   },
+   {
+    "body": "The effective line is comment-stripped, but `force_green` applies `BARE_EXIT0_RE` to the original raw line. Therefore a body ending with `exit 0 # force success` is not classified as D3 even though the shell behavior is identical to bare `exit 0`. Any gate command above it is accepted without a waiver.",
+    "file": "scripts/check-workflow-run-swallow.py",
+    "fix_hint": "Preserve leading-indentation information separately, but match the exit syntax against the comment-stripped text. Add negative fixtures for an unindented trailing `exit 0 # comment` (and optionally `exit 0; # comment`) while retaining the indented early-exit clean fixture.",
+    "severity": "major",
+    "title": "A comment on the final `exit 0` bypasses D3"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposed gate has two straightforward false-negative paths in its core shell-state analysis. Both let a verifying command discard failure without a waiver, contradicting R1 and the documentation. The self-tests do not exercise either spelling, so the change is not yet complete enough to approve.",
+  "verdict": "request_changes"
+ }
+}
