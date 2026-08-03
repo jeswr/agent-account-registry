@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5796,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "935ce217a80e00cc9573a62ec13eb1d3ac031af2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes the registry lane's structural reachability predicate and disposition mapping, wires both sparse-checkout workflows to all required imports, and makes verdict-bridge label writes CAS-sensitive to the selected label set. The tests exercise each reachability gate, the four measured PR shapes, stale multi-label repair, release-guard refusal, GraphQL shape parsing, census behavior, and shared-object identity; the controls prevent the principal assertions from passing vacuously. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
