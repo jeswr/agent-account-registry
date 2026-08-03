@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5641,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f9ab5e67c8fa4f75b82038e201747dd2dbe607d8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The release-lane audit now uses an explicit per-workflow REQUIRED_GUARDS mapping, requires every mapped guard to exist and actually reference its workflow, and fails closed unless that guard is invoked by a non-selector-gated workflow. The discovery sweep likewise rejects guards with no runners and enforces per-entry non-vacuity. The focused ReleaseLaneSafeTests pass, and the mapped guards are invoked from docs-quality.yml, which is outside the selector-gated consumer set. No new correctness, soundness, test-validity, or security issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
