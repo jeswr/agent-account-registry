@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5898,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "44a35e49e02d19df2222d13eccaf5255a90d22cc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The verdict state now records whether a head-moving timeline row occurs after the newest review:pass grant independently of the commit's self-reported author/committer timestamp, and every preserve route checks that combined tree-integrity predicate before re-arming. The end-to-end tests exercise the real timeline parser with both a backdated post-grant commit and an undated post-grant commit, and also pin the legitimate re-grant case where the commit precedes the newest grant. No new correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
