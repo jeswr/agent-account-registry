@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1961,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e5745190671e7ba0480b7c12259044cc074c0000",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-two change closes the prior major provenance hole. A receipt from the designated reporting step is admitted only after a GitHub-metadata comparison shows that the run's PR changed neither the entire scripts/ execution and import surface nor the workflow that defines the step; unreadable, malformed, truncated-at-cap, or touched-surface comparisons refuse the row. The live workflow places the reporting step immediately after pinned checkout/setup actions, before any PR-authored command executes. The adversarial self-test now exercises a well-formed forged equal receipt from the designated step and proves it remains unprovable and cannot contribute to the population threshold. Parsing, comparison direction, ambiguity handling, evidence thresholds, per-row failures, and CLI failure behavior are independently covered and fail closed. No reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
