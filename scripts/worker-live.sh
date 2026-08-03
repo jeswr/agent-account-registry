@@ -1662,7 +1662,16 @@ PY
 # mode is silent. GitHub does not report a broken form anywhere this repo can observe — it simply
 # stops rendering it, and the operator opens a free-form issue that no schema shaped. So the checks
 # are the ones that decide RENDERABILITY: the required top-level keys, a non-empty `body`, a KNOWN
-# element `type` (an unknown one renders nothing), the attributes each type needs, and unique ids.
+# element `type` (an unknown one renders nothing), the attributes each type needs — each judged by
+# its SHAPE, not merely by being non-empty — and ids that github will accept.
+#
+# ⚠️ `id` IS OPTIONAL, DELIBERATELY, FOR EVERY TYPE. GitHub's form schema lists `id` as
+# `Required: false` in each of the input/textarea/dropdown/checkboxes tables: it is the key used to
+# prefill/address a field by URL query parameter, not a render requirement, and a form with no ids
+# at all renders fine. So an ABSENT id is not a fault here and must not become one — that would
+# refuse documents github.com renders, which is the opposite failure from the one this closes. What
+# IS a fault is an id github REJECTS: the documented charset (letters, digits, `-`, `_`) and
+# uniqueness within the form. Both directions are pinned in the self-test.
 #
 # `config.yml` / `config.yaml` are RESERVED by GitHub for the issue CHOOSER — a different schema
 # entirely (`blank_issues_enabled`, `contact_links`), with no `name`/`body`. It is judged by that
@@ -1679,7 +1688,7 @@ _assert_issue_form_valid() {
   local file="$1"
   [[ -f "$file" ]] || { printf 'worker-live: issue form missing: %s\n' "$file" >&2; return 1; }
   python3 - "$file" <<'PY'
-import os, sys
+import os, re, sys
 
 path = sys.argv[1]
 
@@ -1699,10 +1708,43 @@ REQUIRED_ATTRS = {
     "checkboxes": ("label", "options"),
 }
 
+# github's documented id charset: "Can only contain numbers, letters, - and _".
+ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
 def empty(value):
     return (value is None
             or (isinstance(value, str) and not value.strip())
             or (isinstance(value, (list, dict)) and not value))
+
+def text(value):
+    """A renderable text attribute: a non-empty STRING. A number/bool/list is not one."""
+    return isinstance(value, str) and bool(value.strip())
+
+def option_faults(etype, options):
+    """Fault strings for a dropdown/checkboxes `options` value.
+
+    A non-empty LIST is not enough to be renderable: a dropdown's options are distinct non-empty
+    STRINGS, and a checkboxes' options are MAPPINGS each carrying a non-empty `label` (`required`
+    is the only other key). `[null]`, `[{required: true}]` and a bare-string checkbox item all
+    satisfy "non-empty list" and none of them render.
+    """
+    if not isinstance(options, list) or not options:
+        return ["`options` is missing or not a non-empty list"]
+    out, seen = [], set()
+    for j, opt in enumerate(options):
+        if etype == "dropdown":
+            if not text(opt):
+                out.append(f"`options[{j}]` is not a non-empty string")
+            elif opt in seen:
+                out.append(f"`options[{j}]` repeats choice {opt!r} (choices must be distinct)")
+            else:
+                seen.add(opt)
+        elif not isinstance(opt, dict):
+            out.append(f"`options[{j}]` is not a mapping "
+                       "(checkbox options are `- label: ...` items)")
+        elif not text(opt.get("label")):
+            out.append(f"`options[{j}]` has no non-empty `label`")
+    return out
 
 try:
     with open(path, encoding="utf-8") as fh:
@@ -1751,14 +1793,23 @@ else:
             faults.append(f"body[{i}] ({etype}) has no `attributes` mapping")
         else:
             for attr in REQUIRED_ATTRS[etype]:
-                if empty(attrs.get(attr)):
-                    faults.append(f"body[{i}] ({etype}) is missing required "
-                                  f"attribute `{attr}`")
-        element_id = element.get("id")
-        if element_id is not None:
-            if element_id in seen_ids:
+                if attr == "options":
+                    faults += [f"body[{i}] ({etype}) {f}"
+                               for f in option_faults(etype, attrs.get(attr))]
+                elif not text(attrs.get(attr)):
+                    faults.append(f"body[{i}] ({etype}) required attribute `{attr}` is "
+                                  f"missing or not a non-empty string")
+        # An ABSENT id is legal for every type (see the header) -- only a github-INVALID one is a
+        # fault, so this checks the charset and uniqueness and never the presence.
+        if "id" in element:
+            element_id = element.get("id")
+            if not text(element_id) or not ID_RE.match(element_id):
+                faults.append(f"body[{i}] has id {element_id!r}, which is not a non-empty string "
+                              f"of letters, digits, `-` and `_`")
+            elif element_id in seen_ids:
                 faults.append(f"body[{i}] repeats id {element_id!r} (ids must be unique)")
-            seen_ids.add(element_id)
+            else:
+                seen_ids.add(element_id)
 
 for fault in faults:
     print(f"worker-live: issue form {path}: {fault}", file=sys.stderr)
@@ -5139,13 +5190,19 @@ PY
   chk "every REAL issue form (account.yml, set-up-account.yml) is a renderable document" \
     "$form_rejected" "0"
   _form() { _assert_issue_form_valid "$1" >/dev/null 2>&1 && echo renders || echo broken; }
+  # POSITIVE CONTROL, one element of EVERY supported type: a refusal that fires on a valid document
+  # is as broken as one that never fires, and per-type accept rows are what keep the per-type shape
+  # rules below (options items, string attributes, id charset) from being blanket refusals.
   { printf 'name: ok\ndescription: a form\nbody:\n'
     printf '  - type: markdown\n    attributes:\n      value: hello\n'
+    printf '  - type: input\n    id: handle\n    attributes:\n      label: Handle\n'
     printf '  - type: textarea\n    id: spec\n    attributes:\n      label: Spec\n'
     printf '  - type: dropdown\n    id: pick\n    attributes:\n      label: Pick\n'
     printf '      options: [a, b]\n'
+    printf '  - type: checkboxes\n    id: ack-1_2\n    attributes:\n      label: Ack\n'
+    printf '      options:\n        - label: I confirm\n          required: true\n'
   } > "$tmp/form-ok.yml"
-  chk "a well-formed issue form is accepted (the refusals below are not always-refused)" \
+  chk "a well-formed issue form of every supported type is accepted (refusals are not blanket)" \
     "$(_form "$tmp/form-ok.yml")" "renders"
   # The #1110 headline: a file that does not even parse used to reach github.com unremarked.
   { printf 'name: broken\ndescription: x\nbody:\n'
@@ -5179,6 +5236,55 @@ PY
     > "$tmp/form-nooptions.yml"
   chk "a dropdown with no options is REJECTED (label alone is not renderable)" \
     "$(_form "$tmp/form-nooptions.yml")" "broken"
+  # A required attribute that is PRESENT but the wrong SHAPE. Non-emptiness alone accepts every one
+  # of these, and github renders none of them — this is the gap that made "the form is valid"
+  # weaker than it reads.
+  printf 'name: n\ndescription: d\nbody:\n  - type: input\n    attributes:\n      label: 42\n' \
+    > "$tmp/form-scalar-label.yml"
+  chk "a non-STRING label is REJECTED (a present-but-wrong-type attribute is not renderable)" \
+    "$(_form "$tmp/form-scalar-label.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: dropdown\n    attributes:\n      label: L\n      options: [null]\n'
+  } > "$tmp/form-nullopt.yml"
+  chk "a dropdown option that is null is REJECTED (a non-empty LIST is not valid options)" \
+    "$(_form "$tmp/form-nullopt.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: dropdown\n    attributes:\n      label: L\n      options: [a, a]\n'
+  } > "$tmp/form-dupopt.yml"
+  chk "repeated dropdown choices are REJECTED (github requires them distinct)" \
+    "$(_form "$tmp/form-dupopt.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: checkboxes\n    attributes:\n      label: L\n'
+    printf '      options:\n        - a bare string\n'
+  } > "$tmp/form-checkbox-scalar.yml"
+  chk "a checkbox option that is not a mapping is REJECTED (they are \`- label:\` items)" \
+    "$(_form "$tmp/form-checkbox-scalar.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: checkboxes\n    attributes:\n      label: L\n'
+    printf '      options:\n        - required: true\n'
+  } > "$tmp/form-checkbox-nolabel.yml"
+  chk "a checkbox option with no label is REJECTED (the box would render blank)" \
+    "$(_form "$tmp/form-checkbox-nolabel.yml")" "broken"
+  # BOTH DIRECTIONS ON `id`. It is `Required: false` in github's schema for every element type — the
+  # prefill query-parameter key, not a render requirement — so a form with NO ids must be ACCEPTED;
+  # requiring one would refuse documents github.com renders, which is the opposite of this gate's
+  # job. What github does reject is an id outside its documented charset, so that IS refused.
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: textarea\n    attributes:\n      label: Spec\n'
+    printf '  - type: input\n    attributes:\n      label: Handle\n'
+  } > "$tmp/form-noids.yml"
+  chk "a form with NO element ids is ACCEPTED (github's \`id\` is optional for every type)" \
+    "$(_form "$tmp/form-noids.yml")" "renders"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: input\n    id: "has space"\n    attributes:\n      label: L\n'
+  } > "$tmp/form-badid.yml"
+  chk "an id outside github's charset is REJECTED (letters, digits, \`-\`, \`_\` only)" \
+    "$(_form "$tmp/form-badid.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: input\n    id:\n    attributes:\n      label: L\n'
+  } > "$tmp/form-emptyid.yml"
+  chk "an id that is present but EMPTY is REJECTED (absent and blank are not the same)" \
+    "$(_form "$tmp/form-emptyid.yml")" "broken"
   { printf 'name: n\ndescription: d\nbody:\n'
     printf '  - type: input\n    id: dup\n    attributes:\n      label: A\n'
     printf '  - type: input\n    id: dup\n    attributes:\n      label: B\n'
