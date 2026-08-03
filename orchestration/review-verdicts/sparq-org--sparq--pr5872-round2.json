@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5872,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "13278d963304e8e30dc9d63579e5f052ae49f21d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "load_allowlist() coerces every value with str(v), and evaluate() exempts a package based only on key membership. Consequently `{\"x\": \"\"}`, `{\"x\": null}`, or `{\"x\": false}` silently disables both invariant clauses for packages/x. The documented escape hatch requires a written reason, but the implementation does not enforce one, so the repo-wide gate can be defeated by a vacuous entry. The existing test covers only a non-empty reason and therefore misses this path.",
+    "file": "scripts/check-package-test-execution.py",
+    "fix_hint": "Validate that every allowlist key is a package basename and every value is a non-empty, non-whitespace string; reject invalid entries with exit status 2 (or return them as violations). Add negative tests for empty, whitespace-only, null, boolean, and non-string reasons, plus a positive non-empty-string case. Consider also reporting stale allowlist keys so exemptions remain reviewable.",
+    "severity": "major",
+    "title": "Allowlist entries bypass the guard without a written reason"
+   }
+  ],
+  "progress": null,
+  "summary": "The detector and live tests pass, but the allowlist escape hatch is not fail-closed: any JSON value, including an empty string or null, exempts a package from both workspace membership and CI test execution. This contradicts the documented requirement for a written, reviewable reason and permits a vacuous bypass of the new gate.",
+  "verdict": "request_changes"
+ }
+}
