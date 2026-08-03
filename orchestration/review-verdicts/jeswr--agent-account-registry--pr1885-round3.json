@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1885,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "76202c93f28cf38f862f582969082660e80363fc",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4d defines the second record-bearing population as same-repository ordinary-branch PRs authored by a human in `review_enrolment_authors`, then recommends that the generator enumerate that class. That is a strict superset of what the producer can record. `pr_mint_refusal` rejects draft PRs, and auto-mint must also derive a source issue and pass `issue_mint_refusal` (open issue, safe labels/partition, no human hold or machine park, and related binding checks) before a record is owed. A draft or an enrolled author's ordinary PR with no valid source-issue binding can therefore never receive an orchestrator record, yet the proposed predicate would put it in the manifest forever. This contradicts the document's exact-population requirement and makes the audit permanently `partial-evidence`.",
+    "file": "research/1027-expected-record-manifest-generation.md",
+    "fix_hint": "Either make refusal mandatory for every target with non-empty `review_enrolment_authors` until the orchestrator producer population is fully specified, or derive and document the exact population from the mint/auto-mint admission path, including non-draft status and source-issue eligibility. Add negative self-test cases for at least a draft enrolled-author PR and an ordinary enrolled-author PR that cannot produce a valid source-issue binding.",
+    "severity": "major",
+    "title": "Orchestrator manifest population omits mint eligibility gates"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-2 worker-population correction remains sound, but this revision newly recommends enumerating the orchestrator population without defining the producer's full admission contract. `mint-provenance.py` does not mint every same-repository ordinary-branch PR by an enrolled human: it refuses drafts, and the sweep can mint only when it can derive and validate a source issue through the additional issue/label/hold/partition gates. Including those never-record-bearing PRs would create permanent manifest gaps and retire the audit, exactly the over-enumeration failure this record says must be avoided. The safe fallback of refusing enrolled targets is valid, but the document also presents enumeration as an implementation-ready alternative and must either specify its complete predicate or require refusal unconditionally until that predicate is established.",
+  "verdict": "request_changes"
+ }
+}
