@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5805,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5880757fa79e439bb61b6f720134c037f07b251c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The write budget is correctly applied as a deterministic prefix of the issue-number-sorted classified plan, pacing occurs only between actual writes, and deferred classified issues remain visible both in stdout and the workflow summary. The implementation preserves dry-run and JSON behavior, rejects non-positive budgets, and leaves unclassified residue semantically separate. The focused tests exercise the real main/apply path with only external effects stubbed, covering bounds, pacing, reporting, convergence, argument validation, and cron-derived budget arithmetic. No correctness, soundness, security, or vacuous-test defect was found.",
+  "verdict": "approve"
+ }
+}
