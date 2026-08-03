@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1860,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4e54030bf3abc383c18d3196f1614769d9861742",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly bounds both observability drop-diagnostic seams without changing row validation, normalized output, or build/refusal behavior. Counters are scoped independently per seam, suppressed and total counts are computed consistently, and collector-controlled queue-class text remains sanitized before logging. The added self-tests are non-vacuous and use literal boundary/overflow sizes and expected messages; they cover below/at/above-cap behavior, real totals, per-build evidence accounting, seam independence, accepted data, and silent no-drop paths. No trust check, workflow permission, or untrusted-input handling is weakened.",
+  "verdict": "approve"
+ }
+}
