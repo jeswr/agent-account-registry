@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1969,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b719e87c72be1316ee50b5753871639c360c3b16",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly derives a closed-vocabulary, zero-sealed no-change reason census from the already validated canonical health ledger, folds absent declarations to the shared unspecified bucket, publishes no model-authored labels, and distinguishes an unavailable census from a measured zero population. The dashboard renders the census before the empty-check return, so all-no-change and quiet-ledger snapshots remain observable. The self-tests exercise the production normalization path and the executed page renderer, pin independent expected names/counts/order, cover zero, null, malformed display values, timestamp span, singular wording, and the placement seam. No trust check, permission boundary, token handling, or workflow surface is weakened. No reviewer-directed instruction was present in the diff.",
+  "verdict": "approve"
+ }
+}
