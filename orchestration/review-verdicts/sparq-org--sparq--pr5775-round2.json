@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5775,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2ce64ed9644872ebbd359ccd9b469abd710b351c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved: the scanner now parses cargo-install arguments independent of option order, skips values belonging to recognized options, and validates both --version VALUE and --version=VALUE forms. The added tests cover unpinned, correct, and incorrect pins with options before wasm-pack. Both the hermetic self-test and the full repository scan pass, finding 18 consistently pinned install sites. No correctness, soundness, test-validity, or security issue remains in the reviewed diff.",
+  "verdict": "approve"
+ }
+}
