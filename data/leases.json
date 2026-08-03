@@ -9,6 +9,16 @@
    "model": "opus5",
    "issued_at": 1785753982,
    "expires_at": 1785760282
+  },
+  {
+   "account": "58b7c92faa5b5ca5",
+   "claim_id": "a65d8e9fd71e4c6f80e1d83ec354be49",
+   "holder": "jeswr/agent-account-registry#1109@dispatch-30807329516.1",
+   "package": "usage",
+   "role": "research",
+   "model": "opus5",
+   "issued_at": 1785754679,
+   "expires_at": 1785757379
   }
  ]
 }
