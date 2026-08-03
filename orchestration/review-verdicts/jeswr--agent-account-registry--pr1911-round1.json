@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1911,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1101538d6996ec15f30751e94ff7072b53f7f22f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_live_children` only models `ast.If` and `ast.While`; every other node falls back to all children even when Python provably does not evaluate them. Consequently `_park_call_site` still returns `dispatch` for a loop such as `for number in (targets if False else []): park_starved_partition_holder(...)`: `_live_nodes(loop.iter)` sees the dead `targets` name, no slice is present, and `_live_nodes(loop)` sees the call, although the loop parks nothing. The same bypass exists with short-circuit expressions such as `[] and targets`. This contradicts the required proof that the production function iterates the returned batch, and it is exactly the dead-code acceptance class this change is intended to close.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Model the relevant expression control flow fail-closed (at minimum `IfExp` and short-circuit `BoolOp` with literal-decidable operands), or make the loop-iterable proof structurally require an unconditionally evaluated path from the bound batch name. Add a live control and named red tests for `targets if False else []`, `[] and targets`, and corresponding live branches so the checker neither accepts dead operands nor refuses valid ones vacuously.",
+    "severity": "major",
+    "title": "Acceptance traversal treats dead conditional-expression operands as live"
+   }
+  ],
+  "progress": null,
+  "summary": "The new traversal closes the specific statement-level if/while and nested-callable cases covered by the tests, but it still certifies provably non-running park seams through other Python control-flow expressions. Because this is the acceptance evidence for the production batch seam, that leaves the trust check bypassable and the liveness claim incomplete.",
+  "verdict": "request_changes"
+ }
+}
