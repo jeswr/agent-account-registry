@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5656,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cea65a9e07a9ce526325cc46f74eb7af5f081075",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's major finding is resolved. The structural guard check now treats Actions-cache credential export as an sccache arm step, asserts that the matcher is non-vacuous, and includes a targeted in-memory mutation test proving that removal of the credential-export guard is detected. The targeted posture suite passes all 14 tests, and the workflow, research note, and safety assertions remain consistent.",
+  "verdict": "approve"
+ }
+}
