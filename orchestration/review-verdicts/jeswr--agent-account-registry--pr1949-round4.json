@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1949,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9852a32149eec34bf921e5fa38085eaa1663aa0f",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-3 major is resolved. Section 8.1 now binds the ordered resolved chain and ordered remaining chain into the idempotence key via canonical digests, explicitly distinguishes the fully bound design from the scoped-down outcome-projection variant, and consistently limits the latter's denominator to a lower bound. It also states the auditability and disclosure limits without claiming that the unpublished alias preimages are timeline-verifiable. The resulting semantic identity covers every input on which retry_decision's arm or next-tier selection depends: evidence membership and reasons, the recency partition induced by evaluation time, and the ordered chain and remaining-chain projections. No blocker or major correctness, soundness, test-validity, or security issue remains in this findings-only design record.",
+  "verdict": "approve"
+ }
+}
