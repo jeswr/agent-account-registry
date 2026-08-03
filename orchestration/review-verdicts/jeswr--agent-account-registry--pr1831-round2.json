@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1831,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b6fb7c20c210c2e9739f7c2fd2672de95531599b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_assert_issue_form_valid` validates only `type`, selected required attributes, options, and ids; it ignores every element's `validations` value and optional type-specific attributes. For example, an otherwise valid input with `validations: required` (a scalar rather than the required mapping), a dropdown with `attributes: {label: L, options: [a], multiple: yes}` (string rather than boolean), or a checkbox option with `required: yes` is accepted. GitHub's issue-form schema assigns shapes to these fields, and a malformed present field can invalidate the document rather than being harmlessly ignored. The chooser branch likewise checks only that `url` is a non-empty string, not that it is a URL. Consequently the gate can still approve a touched document that GitHub cannot render, so the headline fail-closed guarantee remains incomplete. The tests contain no malformed `validations`, `multiple`, option `required`, or chooser-URL fixture, and therefore mirror the omission.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Validate all accepted per-type fields and their types, including the `validations` mapping and boolean `required`, dropdown boolean `multiple`, checkbox-option boolean `required`, and chooser URL format; reject unknown or malformed present fields as required by the authoritative schema. Add independent negative fixtures for each of these cases and positive controls for valid optional fields. Prefer a pinned authoritative schema validator so future schema fields and constraints do not create another partial reimplementation gap.",
+    "severity": "major",
+    "title": "Validator still accepts schema-invalid element fields"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round two fixes the concrete option-item omissions and adds useful positive/negative coverage, but the validator still does not validate the full shapes of issue-form elements it claims are renderable. In particular, it ignores `validations` and optional type-specific attributes, so schema-invalid values can pass and still make GitHub reject the form. The same major renderability gap therefore remains, although its surface is narrower.",
+  "verdict": "request_changes"
+ }
+}
