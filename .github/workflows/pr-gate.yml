@@ -214,9 +214,25 @@ jobs:
           # manifest at all is not an error but the extreme of the same case — the branch predates
           # the manifest's introduction, so nothing was enrolled there and every baseline entry is
           # correctly attributed to the base branch.
+          #
+          # [PR #1865 r1] The branch point is computed from the PR HEAD, never from `HEAD`. This job
+          # runs on `pull_request`, where actions/checkout's default ref is `refs/pull/N/merge` — a
+          # SYNTHETIC MERGE COMMIT whose two parents are the PR head and the base branch, which is
+          # exactly the tree the report above says this suite grades. `$base` is therefore an
+          # ANCESTOR of `HEAD`, so `git merge-base HEAD "$base"` returns `$base` itself, the
+          # merge-base manifest is a byte copy of the base manifest, and every behind-base entry is
+          # found there and re-diagnosed as the unapproved removal it is not — the classifier reads
+          # green in fixtures and does nothing in production. `head` is validated the same way
+          # `$base` is, and for the same reason: a branch point this job cannot resolve is a verdict
+          # it must refuse to guess, not fall back to a tree that answers a different question.
+          head='${{ github.event.pull_request.head.sha }}'
+          if ! git cat-file -e "$head^{commit}" 2>/dev/null; then
+            echo "::error::head commit $head is unresolvable; refusing to derive the self-test suite"
+            exit 1
+          fi
           mb_manifest="$RUNNER_TEMP/mergebase-selftest-suite.txt"
-          if ! merge_base=$(git merge-base HEAD "$base") || [ -z "$merge_base" ]; then
-            echo "::error::the merge base of this run's tree and $base is unresolvable; refusing to derive the self-test suite"
+          if ! merge_base=$(git merge-base "$head" "$base") || [ -z "$merge_base" ]; then
+            echo "::error::the merge base of $head and $base is unresolvable; refusing to derive the self-test suite"
             exit 1
           fi
           if git cat-file -e "$merge_base:scripts/selftest-suite.txt" 2>/dev/null; then

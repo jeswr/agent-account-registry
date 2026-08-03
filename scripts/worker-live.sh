@@ -1508,6 +1508,34 @@ _pr_gate_suite_preflight() {
   ' "$file"
 }
 
+# [PR #1865 r1] PURE (self-tested): print pr-gate.yml's MANIFEST DERIVATION -- every line from
+# `base_manifest=` up to (not including) the `suite=` call the preflight pin above anchors on --
+# normalised to stripped, comment-free lines.
+#
+# This one is extracted to be EXECUTED, not eyeballed: the self-test substitutes real SHAs for the
+# two `${{ }}` payload expressions and runs the block inside a synthetic repository reproducing the
+# `refs/pull/N/merge` topology actions/checkout hands a `pull_request` job, then asserts WHICH
+# COMMIT's manifest came out. Nothing weaker catches the defect this was added for: `git merge-base
+# HEAD "$base"` is well-formed shell, it satisfies every containment or exact-line pin one could
+# write, and every fixture-level test of the classifier passes beside it -- yet on a merge ref,
+# whose parents are the PR head and the base branch, `$base` is an ANCESTOR of `HEAD`, so it returns
+# `$base` and the merge-base manifest is a byte copy of the base manifest. The behaviour is only
+# observable through the TOPOLOGY, so the topology is what the self-test builds.
+#
+# Prints nothing when the file or the block is absent; an empty script writes no manifest, so the
+# execution rows fail closed rather than pass over a derivation that never ran.
+_pr_gate_manifest_derivation() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    !on && line ~ /^base_manifest=/ { on = 1 }
+    on && line ~ /^suite=/ { exit }
+    on { print line }
+  ' "$file"
+}
+
 # [issue #824] Dependencies the enrolled suite EXECUTES but this repo does not ship. They are
 # preinstalled on the ubuntu-latest runner the gate actually runs on, but ABSENT from the
 # unprivileged model container (no root, no sudo, no pip) -- where roughly a THIRD of the suite then
@@ -8812,6 +8840,88 @@ CHANNEL
   chk "preflight check fails CLOSED on an unreadable workflow" \
     "$([[ "$(_pr_gate_suite_preflight "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_preflight" ]] \
        && printf missed || printf caught)" "caught"
+
+  # ---- [PR #1865 r1] WHICH COMMIT'S MANIFEST, MEASURED ON THE REAL TOPOLOGY. The #1834 fixtures
+  # far above drive the CLASSIFIER as a pure function and say nothing about which commit's manifest
+  # the workflow hands it -- and that is where the defect lived. This job runs on `pull_request`,
+  # where actions/checkout resolves `refs/pull/N/merge`: a merge commit whose parents are the PR
+  # head and the base branch. `$base` is therefore an ANCESTOR of `HEAD`, `git merge-base HEAD
+  # "$base"` returns `$base`, the merge-base manifest is a byte copy of the base manifest, and the
+  # behind-base branch is found there and re-accused of the removal it did not make. So the
+  # workflow's OWN derivation lines are extracted and RUN -- only the two `${{ }}` payload
+  # expressions substituted -- against a repository built to exactly that shape, in both directions
+  # and through to the message the author would read. ----
+  local mbfix="$tmp/mergebase-topology" mbrun="$tmp/mergebase-run" mbscript="$tmp/mergebase-derive.sh"
+  local mb_head mb_base mb_rc mb_verdict
+  git init -q -b main "$mbfix"
+  _mbgit() { git -C "$mbfix" -c user.name=t -c user.email=t@example.invalid "$@"; }
+  mkdir -p "$mbfix/scripts" "$mbrun"
+  printf '%s\n' advertised.py > "$mbfix/scripts/selftest-suite.txt"
+  : > "$mbfix/scripts/selftest-retirements.txt"
+  _mbgit add -A && _mbgit commit -qm branch-point
+  # The PR branch forks HERE and never touches the manifest: it removed nothing, and it cannot hold
+  # an entry whose enrolling commit is on the base branch.
+  _mbgit switch -qc pr-head
+  printf 'work\n' > "$mbfix/scripts/unrelated.txt"
+  _mbgit add -A && _mbgit commit -qm 'pr work'
+  mb_head=$(_mbgit rev-parse HEAD)
+  # ... and the base branch enrolls a NEW self-test AFTER that fork point.
+  _mbgit switch -q main
+  printf '%s\n' advertised.py advertised.sh > "$mbfix/scripts/selftest-suite.txt"
+  _mbgit add -A && _mbgit commit -qm 'base enrolls advertised.sh'
+  mb_base=$(_mbgit rev-parse HEAD)
+  # What the job is actually checked out at: base tip and PR head as the two parents of one commit.
+  _mbgit checkout -q --detach "$mb_base"
+  _mbgit merge -q --no-ff -m 'pull/N/merge' "$mb_head"
+  # Run the workflow's own lines with ONLY the head payload varying. Feeding it the literal `HEAD`
+  # is not an approximation of the pre-fix code -- it IS the pre-fix expression, reconstructed
+  # through the one value under test, so the pair below shares every other line with production.
+  _mb_derive() {
+    local head_value=$1 out_dir=$2 block
+    block=$(_pr_gate_manifest_derivation "$SCRIPT_DIR/../.github/workflows/pr-gate.yml")
+    block=${block//'${{ github.event.pull_request.base.sha }}'/$mb_base}
+    block=${block//'${{ github.event.pull_request.head.sha }}'/$head_value}
+    rm -rf -- "$out_dir" && mkdir -p "$out_dir"
+    { printf 'set -euo pipefail\n'; printf '%s\n' "$block"; } > "$mbscript"
+    (cd "$mbfix" && RUNNER_TEMP="$out_dir" bash "$mbscript" > "$out_dir/derive.log" 2>&1)
+  }
+  _mb_derive "$mb_head" "$mbrun/fixed" && mb_rc=0 || mb_rc=$?
+  chk "merge-base seam: pr-gate.yml's derivation RUNS against the pull/N/merge topology" "$mb_rc" "0"
+  chk "merge-base seam: the merge-base manifest is the BRANCH POINT's copy" \
+    "$(paste -sd, - < "$mbrun/fixed/mergebase-selftest-suite.txt" 2>/dev/null)" "advertised.py"
+  chk "merge-base seam control: the BASE manifest of the same run is the base TIP's copy" \
+    "$(paste -sd, - < "$mbrun/fixed/base-selftest-suite.txt" 2>/dev/null)" \
+    "advertised.py,advertised.sh"
+  # NON-VACUITY, and the defect itself: resolve the branch point from the checkout HEAD and the
+  # merge-base manifest collapses onto the base tip, entry for entry -- there is nothing left to
+  # classify with. If the workflow still read `HEAD`, the row above would print this same value.
+  _mb_derive HEAD "$mbrun/from-head" && mb_rc=0 || mb_rc=$?
+  chk "merge-base seam NON-VACUOUS: from the checkout HEAD the merge base is the BASE TIP itself" \
+    "$mb_rc:$(paste -sd, - < "$mbrun/from-head/mergebase-selftest-suite.txt" 2>/dev/null)" \
+    "0:advertised.py,advertised.sh"
+  # THROUGH TO THE MESSAGE (AGENTS pre-flight item 9): the marquee claim is enforced through the
+  # EVIDENCE path, so assert on the diagnosis the author reads, driven by the manifests the workflow
+  # actually produced -- not by hand-written fixtures.
+  local mbdir="$tmp/mergebase-scripts"
+  mkdir -p "$mbdir"
+  printf '%s\n' 'import sys' 'if "--self-test" in sys.argv:' '    pass' > "$mbdir/advertised.py"
+  printf '%s\n' advertised.py > "$mbdir/manifest.txt"
+  mb_verdict=$(_derive_full_selftest_suite "$mbdir" "$mbdir/manifest.txt" \
+    "$mbrun/fixed/base-selftest-suite.txt" "$mbrun/fixed/base-selftest-retirements.txt" \
+    "$mbrun/fixed/mergebase-selftest-suite.txt" 2>&1 >/dev/null || true)
+  chk "END TO END: the workflow's own manifests make the gate say BEHIND BASE" \
+    "$(grep -c 'BEHIND BASE, it did not remove a self-test' <<< "$mb_verdict")" "1"
+  mb_verdict=$(_derive_full_selftest_suite "$mbdir" "$mbdir/manifest.txt" \
+    "$mbrun/from-head/base-selftest-suite.txt" "$mbrun/from-head/base-selftest-retirements.txt" \
+    "$mbrun/from-head/mergebase-selftest-suite.txt" 2>&1 >/dev/null || true)
+  chk "END TO END NON-VACUOUS: the HEAD-derived manifests restore the WRONG accusation" \
+    "$(grep -c 'was removed without prior base-branch retirement approval' <<< "$mb_verdict")" "1"
+  # And a head the job cannot resolve is a REFUSAL, not a fallback to the tree it happens to sit on.
+  _mb_derive 0000000000000000000000000000000000000000 "$mbrun/unresolvable" && mb_rc=0 || mb_rc=$?
+  chk "merge-base seam: an UNRESOLVABLE PR head refuses instead of falling back" \
+    "$([[ "$mb_rc" -ne 0 ]] && printf refused || printf ran)" "refused"
+  chk "and the refusal NAMES the head commit it could not resolve" \
+    "$(grep -c '^::error::head commit 0\{40\} is unresolvable' "$mbrun/unresolvable/derive.log")" "1"
 
   # THE ARM, EXECUTED. The REAL requirement table's verdict depends on what this runner happens to
   # have installed -- that is the entire point of the table -- so neither direction could be driven
