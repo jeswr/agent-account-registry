@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5814,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "31180a56b73060a9f3ec5e023eceb845067bac0b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The advisory workflow is correctly registered as non-gating, measures the same workspace/targets/features as the load-aware CI archive, and fails loudly when the declared HEAVY set or timing stream is unusable. The parser compares exact declared test names with terminal nextest timings, preserves the slowest retry, and detects undeclared, missing, and demoted entries. The hermetic self-test exercises the classification boundaries, parser behavior, ambiguity handling, anti-vacuity failures, and clean/drift exit paths; it passes at the PR head. No correctness, soundness, test-validity, or security defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
