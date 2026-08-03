@@ -5919,7 +5919,17 @@ def _test_firing_supersede(chk):
     marker), and pins both the surviving issue AND the absence of a close/comment against it —
     retiring that copy would retire the only open alert. `open_marker_routes` states the operator-
     visible invariant directly, per route rather than per repository state list: exactly ONE route
-    carries an open marker for one (condition, provider)."""
+    carries an open marker for one (condition, provider).
+
+    Phases 5b and 5c close issue #1704: both ERROR/degenerate arms of _close_superseded_alert were
+    at ZERO line coverage across the whole suite, so the dedup's fail-safe behaviour was unpinned
+    in both directions. 5b drives the UNREADABLE fallback tracker (a raising _find_marker_issue)
+    and pins that a failed dedup stays out of `undelivered`, closes nothing, and is announced;
+    5c drives the enumerated-but-VANISHED marker and pins that it is a silent no-op rather than a
+    create or a close. Both are reached through the real _deliver_alerts caller AND asserted on
+    the helper's own documented return value, which the caller deliberately discards."""
+    import contextlib
+    import io
     import types
     global _gh
     real_gh = _gh
@@ -6042,6 +6052,49 @@ def _test_firing_supersede(chk):
         fail_close["repos"] = set()
         chk("supersede: the next tick closes the still-open duplicate",
             (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["closed"]))
+
+        # phase 5b (issue #1704): the ERROR arm of the dedup. The primary write CONFIRMED and the
+        # marker was enumerated, but the fallback tracker read FAILS (its token is unusable), so
+        # _find_marker_issue raises rather than report a failed/possibly-truncated read as "not
+        # found" (#203). The dedup is best-effort: the alert already reached the maintainer on the
+        # primary, so this must stay OUT of `undelivered` — folding it in turns a cosmetic dedup
+        # failure into a red run, and via _cmd_decide into a nonzero exit on every tick the
+        # fallback token is unusable. It must also close NOTHING: the read that would identify the
+        # copy is the read that just failed, so any close from here is blind. The duplicate is left
+        # open, which is what makes the next tick retry it.
+        bad_tokens.add("priv")
+        chk("supersede: the retry REOPENS the fallback copy (unreadable-tracker precondition)",
+            (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["open"]))
+        bad_tokens.clear()
+        bad_tokens.add("amb")
+        calls[:] = []
+        chk("supersede: an UNREADABLE fallback tracker keeps the alert DELIVERED, copy still open",
+            (_deliver_alerts([fire], "m", {key}), states(priv_repo), states(reg_repo)),
+            ([], ["open"], ["open"]))
+        chk("supersede: an unreadable fallback tracker closes/comments on NOTHING (no blind close)",
+            [c for c in calls if c[0] in ("close", "comment")], [])
+        heard = io.StringIO()
+        with contextlib.redirect_stdout(heard):
+            unreadable = _close_superseded_alert(fire, reg_repo, "amb")
+        chk("supersede: an unreadable fallback tracker reports the duplicate still open, LOUDLY",
+            (unreadable, "::warning::" in heard.getvalue(),
+             fire["condition"] in heard.getvalue()), (False, True, True))
+
+        # phase 5c (issue #1704): the DEGENERATE arm. `fallback_open` is a snapshot taken a tick
+        # ago by a reader that fails OPEN to the empty set, so an enumerated marker can already be
+        # gone — closed by the recovery path, or by hand. Finding nothing here is the dedup's goal
+        # state, so it is a SILENT no-op: nothing is minted to close, nothing is closed by number,
+        # nothing is commented on, and the fallback repository is left exactly as found.
+        bad_tokens.clear()
+        repos[reg_repo] = {}
+        calls[:] = []
+        chk("supersede: a VANISHED fallback copy is a no-op — no create, no close, still delivered",
+            (_deliver_alerts([fire], "m", {key}), states(priv_repo), repos[reg_repo]),
+            ([], ["open"], {}))
+        chk("supersede: the vanished copy draws one READ on the fallback and no mutation",
+            [c[0] for c in calls if c[1] == reg_repo], ["list"])
+        chk("supersede: nothing open on the fallback reports the dedup as already satisfied",
+            _close_superseded_alert(fire, reg_repo, "amb"), True)
 
         # phase 6 (review round 1 of #1455): ALERT_REPO == REGISTRY_REPO with a DISTINCT
         # ALERT_TOKEN. The credential fallback stays armed (the pairs differ), but both routes name
