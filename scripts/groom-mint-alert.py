@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-5] A DURABLE CREDENTIAL GAP ON ONE OWNER MUST NOT LOOK LIKE A GREEN TICK (issue #269).
+# [SPARQ agent] A DURABLE CREDENTIAL GAP ON ONE OWNER MUST NOT LOOK LIKE A GREEN TICK (issue #269).
 #
 # THE DEFECT THIS EXISTS FOR. The issue #168 fix made each per-owner target App-token mint in
 # groom.yml `continue-on-error`, and that is correct: policy enables targets under two distinct
@@ -44,7 +44,9 @@
 # own marker may not be uploaded yet and detection can lag by one tick (~15 min against a
 # multi-hour credential gap). _test_threshold_vs_cadence asserts the resulting page latency band.
 #
-# PAGING POLICY / AUTHORITY CEILING: identical to scripts/dispatch-stall-alert.py. This script may
+# AUTHORITY CEILING: identical to scripts/dispatch-stall-alert.py. Its PAGING policy is NOT — that
+# one still pages the repository-wide artifacts listing, while this reader asks each VALIDATED
+# groom run for its own artifacts (`read_ticks`, issue #1245). This script may
 # create/edit/comment/close ONE `ops-alert` issue per OWNER and nothing else — no arming path, no
 # merge path, no PR path, and no code path that can write a `needs:`/`status:`/`role:` label
 # (enforced by _test_authority_ceiling below, not by convention). Alerts auto-close on an explicit
@@ -94,15 +96,23 @@ OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 # _test_threshold_vs_cadence asserts both against the LIVE cron in groom.yml.
 SKIP_STREAK_THRESHOLD = 4
 
+# One request per validated run, and one page of it. groom uploads exactly ONE marker per run (a
+# re-run adds one more), so a full page is orders of magnitude above the live shape; a run somehow
+# holding more than this many artifacts contributes no tick, which shortens the provable history
+# and can never fabricate one.
 ARTIFACT_PAGE_SIZE = 100
-ARTIFACT_MAX_PAGES = 3
 
 # PROVENANCE — AN ARTIFACT NAME IS NOT EVIDENCE OF WHO WROTE IT (review round 1).
-# `/repos/{repo}/actions/artifacts` is REPOSITORY-WIDE: it lists what every workflow in this repo
-# uploaded, and a `pull_request` run executes the PR branch's OWN workflow files. So any
-# contributor who can open a PR could otherwise publish an artifact named
+# An artifact name is author-controlled text: a `pull_request` run executes the PR branch's OWN
+# workflow files, so any contributor who can open a PR could otherwise publish an artifact named
 # `groom-mint-tick.ok-<owner>` to reset a real streak and auto-close a live alert, or a `.skip-`
 # marker on four ticks to fabricate one. Name grammar is a parser, not an authenticator.
+#
+# The RUN SET below is what makes a name evidence, and it stays load-bearing now that the crawl is
+# scoped to it (issue #1245): asking `/actions/runs/{run_id}/artifacts` only moves the question to
+# WHICH run ids are asked for, and a server-side scoping this reader cannot see the effect of is
+# not a check it may rely on — so `tick_records` re-checks every artifact against the single run it
+# was requested for, exactly as `tick_runs` re-checks every row of the workflow-scoped listing.
 #
 # A marker therefore only counts when its `workflow_run.id` is in a run set this reader derived
 # INDEPENDENTLY, from the workflow-scoped runs listing, and confirmed to be:
@@ -448,25 +458,54 @@ def read_tick_runs(repo, default_branch, runner):
     return runs
 
 
+def newest_runs(runs, limit):
+    """The `limit` newest validated runs, NEWEST FIRST, as [(run_id, created_at)].
+
+    Ordered on the same `(created_at, run_id)` key as `ordered_ticks`, because these are the runs
+    whose ticks sit at the FRONT of the history: a selection that ordered on the run id, or on
+    whatever order the listing arrived in, could leave the newest tick unread and score a live
+    streak off stale evidence. A non-positive limit asks for NOTHING rather than slicing from the
+    wrong end of the list."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return []
+    ordered = sorted(runs.items(), key=lambda item: (item[1], item[0]), reverse=True)
+    return ordered[:limit]
+
+
 def read_ticks(repo, runner=None, threshold=SKIP_STREAK_THRESHOLD):
     """The listings this watchdog costs -> (ticks_newest_first, truncated).
 
-    Three reads: the repo (for the default branch), the groom workflow's runs (the PROVENANCE set —
-    without it an artifact name is just a string any run in this repo can write), then the
-    repository-wide artifacts listing filtered through that set.
+    Two scoped reads, then ONE PER VALIDATED RUN: the repo (for the default branch), the groom
+    workflow's runs (the PROVENANCE set — without it an artifact name is just a string any run in
+    this repo can write), then `/actions/runs/{run_id}/artifacts` for each of the newest THRESHOLD+1
+    runs in that set. THRESHOLD+1 is one more tick than the streak can consume, so the tick that
+    would BREAK the streak is in view.
 
-    Pages only until it has THRESHOLD+1 ticks — one more than the streak can consume, so the tick
-    that would BREAK the streak is always in view — or the page runs dry. At today's density page
-    one reaches back hours and covers that in a single request; the bound exists so an artifact
-    storm from an unrelated workflow costs a couple more requests instead of an unbounded crawl.
-    `truncated` reports that the crawl stopped short of that many ticks, so a bounded read is
-    stated in the log rather than silently read as a short history.
+    NEVER the repository-wide `/actions/artifacts` listing (issue #1245). The provenance set is
+    known BEFORE any artifact is read, so a repo-wide crawl paid for pages of other workflows'
+    artifacts only to discard them — and, worse, an artifact storm from an unrelated workflow could
+    push the groom markers past the page cap and degrade a provable streak to a short history for a
+    reason that has nothing to do with groom. Per-run, the request count is a function of the
+    THRESHOLD (at most THRESHOLD+1 plus the two scoped reads, ~7 per 15-minute tick against a
+    1000/hour repository limit) rather than of repository activity, and that whole failure mode is
+    gone. The endpoint's `?name=` filter is not an alternative: it is an exact match on a name that
+    encodes the per-tick outcome of EVERY owner, so there is no one name to ask for.
+
+    THE RUN-SCOPED ENDPOINT IS NOT TRUSTED ALONE, for the same reason `tick_runs` re-checks the
+    workflow-scoped runs listing: every artifact it returns is put through `tick_records` against
+    the SINGLE run it was requested for, so a payload naming any other run contributes nothing.
+
+    A REFUSED per-run read is a HOLE, not a short tail: the runs behind it are OLDER, and carrying
+    them forward would present non-adjacent ticks as consecutive — which could FABRICATE a
+    threshold-length streak out of a blip. So the crawl stops at the hole, keeps only the
+    contiguous newest prefix it has actually validated, and reports `truncated` so a bounded read
+    is stated in the log rather than silently read as a short history.
 
     `runner` is resolved at CALL time, not bound as a default: a default argument captures the
     function object at definition, which makes the live path unpatchable and every stubbed-flow
-    assertion below quietly exercise the real `gh`. -> (None, False) if ANY of the three reads that
-    would leave the evidence unvalidated is refused; without them there is no evidence at all and
-    the caller must fail loud, not read "healthy"."""
+    assertion below quietly exercise the real `gh`. -> (None, False) if any read that would leave
+    the evidence unvalidated is refused; without them there is no evidence at all and the caller
+    must fail loud, not read "healthy"."""
     runner = runner or _gh_json
     default_branch = read_default_branch(repo, runner)
     if default_branch is None:
@@ -474,18 +513,15 @@ def read_ticks(repo, runner=None, threshold=SKIP_STREAK_THRESHOLD):
     runs = read_tick_runs(repo, default_branch, runner)
     if runs is None:
         return None, False
-    records, wanted = {}, threshold + 1
-    for page in range(1, ARTIFACT_MAX_PAGES + 1):
+    records = {}
+    for index, (run_id, created) in enumerate(newest_runs(runs, threshold + 1)):
         payload = runner(["api", "-H", GH_JSON_ACCEPT,
-                          f"/repos/{repo}/actions/artifacts"
-                          f"?per_page={ARTIFACT_PAGE_SIZE}&page={page}"])
+                          f"/repos/{repo}/actions/runs/{run_id}/artifacts"
+                          f"?per_page={ARTIFACT_PAGE_SIZE}"])
         if payload is None:
-            return (None, False) if page == 1 else (ordered_ticks(records), True)
-        entries = _artifacts(payload)
-        tick_records(payload, runs, into=records)
-        if len(records) >= wanted or not entries:
-            return ordered_ticks(records), False
-    return ordered_ticks(records), len(records) < wanted
+            return (None, False) if index == 0 else (ordered_ticks(records), True)
+        tick_records(payload, {run_id: created}, into=records)
+    return ordered_ticks(records), False
 
 
 def _open_alerts(repo, token, label="groom-mint"):
@@ -568,9 +604,10 @@ def main():
               "retries)")
         return 1
     if truncated:
-        print(f"::warning::groom-mint: only {len(ticks)} mint-outcome tick(s) were reachable "
-              f"within {ARTIFACT_MAX_PAGES} artifact pages (wanted {SKIP_STREAK_THRESHOLD + 1}) — "
-              "a longer streak than that cannot be proved this tick")
+        print("::warning::groom-mint: the artifacts of a groom run behind the newest "
+              f"{len(ticks)} tick(s) were refused, so only those {len(ticks)} are reachable this "
+              f"tick (wanted {SKIP_STREAK_THRESHOLD + 1}) — a longer streak than that cannot be "
+              "proved, and the ticks behind that hole are deliberately NOT carried forward")
 
     alerts, hard, soft = _open_alerts(repo, token)
     if hard:
@@ -1035,111 +1072,171 @@ def _test_body(chk):
 
 
 def _test_paging(chk):
-    """The listing is repo-wide and shared with dispatch's, dashboard's and worker's artifacts, so
-    a page can be full of something else entirely. The crawl must keep going until the tick that
-    would BREAK the streak is in view — THRESHOLD+1 ticks — and must SAY SO when it cannot."""
-    def pager(pages, runs, refuse=()):
-        """A `gh api` stub for all THREE reads the crawl makes. The runs listing answers only the
-        run ids in `runs`, so every fixture below is filtered through the real provenance gate
-        rather than past it."""
-        calls = []
+    """THE CRAWL IS SCOPED TO THE VALIDATED RUNS (issue #1245), so both its cost and its reach are
+    functions of the THRESHOLD and never of what else this repository uploads.
+
+    Every stub below ALSO answers the repository-wide `/actions/artifacts` listing — with a storm
+    of exactly the shape that used to push the groom markers past the page cap — so a reader that
+    went back to it would still come away with a plausible history. What proves the scope is the
+    list of URLs the crawl actually asks for, which each row asserts by exact equality."""
+    wanted = SKIP_STREAK_THRESHOLD + 1
+
+    def crawler(markers, runs, refuse=()):
+        """A `gh api` stub for every read the crawl makes. `markers[run_id]` is what THAT run's own
+        artifacts endpoint answers with; the runs listing answers only the run ids in `runs`, so
+        every fixture is filtered through the real provenance gate rather than past it. `refuse`
+        may name `"repo"`, `"runs"`, or any run id."""
+        asked = []
 
         def runner(args):
             url = args[-1]
-            if "/actions/artifacts" in url:
-                if "artifacts" in refuse:
-                    return None
-                # `[?&]page=` — a bare `page=(\d+)` matches `per_page=100` first, which silently
-                # collapses every page of this fixture onto one key and makes the crawl untested.
-                page = int(re.search(r"[?&]page=(\d+)", url).group(1))
-                calls.append(page)
-                return pages.get(page, {"artifacts": []})
+            scoped = re.search(r"/actions/runs/(\d+)/artifacts", url)
+            if scoped:
+                run_id = int(scoped.group(1))
+                asked.append(run_id)
+                return None if run_id in refuse else {"artifacts": markers.get(run_id, [])}
             if "/actions/workflows/" in url:
                 return None if "runs" in refuse else {"workflow_runs": [
                     _run_row(run_id, created) for run_id, created in sorted(runs.items())]}
+            if "/actions/artifacts" in url:
+                # The repository-WIDE listing. Answered generously on purpose — asking it AT ALL is
+                # the defect, so it is recorded rather than refused.
+                asked.append("REPO-WIDE")
+                return {"artifacts": [_artifact("publish-bundle", 900)] * ARTIFACT_PAGE_SIZE}
             return None if "repo" in refuse else {"default_branch": FIXTURE_BRANCH}
-        return runner, calls
+        return runner, asked
 
-    def marker(run_id, minute):
-        return _artifact("groom-mint-tick.skip-jeswr", run_id,
-                         f"2026-07-29T18:{minute:02d}:00Z")
+    def scheduled(count, base):
+        """{run_id: created_at} for `count` validated ticks — run `base+i` is the i-th OLDEST."""
+        return {base + i: f"2026-07-29T18:{i:02d}:00Z" for i in range(count)}
 
-    def runs_for(*run_ids):
-        return {run_id: f"2026-07-29T18:{index:02d}:00Z"
-                for index, run_id in enumerate(run_ids)}
+    def skips(runs):
+        """One `skip-jeswr` marker per run, in that run's OWN artifacts payload."""
+        return {run_id: [_artifact("groom-mint-tick.skip-jeswr", run_id, created)]
+                for run_id, created in runs.items()}
 
-    # One dense page: THRESHOLD+1 ticks found, so exactly ONE request.
-    dense_ids = tuple(300 + i for i in range(SKIP_STREAK_THRESHOLD + 1))
-    dense = {1: {"artifacts": [marker(run_id, i) for i, run_id in enumerate(dense_ids)]}}
-    runner, calls = pager(dense, runs_for(*dense_ids))
+    # THE BOUND, THE SCOPE AND THE ORDER, against far more validated runs than the crawl may ask
+    # for. The expected id list is arithmetic over the FIXTURE's own construction and never a call
+    # to `newest_runs`: an expectation read out of the code under test cannot fail (item 2b).
+    plenty = scheduled(3 * wanted, 300)
+    runner, asked = crawler(skips(plenty), plenty)
     ticks, truncated = read_ticks("o/r", runner=runner)
-    chk("paging: a page carrying THRESHOLD+1 ticks costs exactly one request",
-        (len(calls), len(ticks), truncated), (1, SKIP_STREAK_THRESHOLD + 1, False))
+    chk("crawl: exactly THRESHOLD+1 requests, one per validated run, newest first — the cost is a "
+        "function of the threshold and NOT of how many runs the repository has",
+        (asked, len(ticks), truncated),
+        ([300 + 3 * wanted - 1 - step for step in range(wanted)], wanted, False))
+    chk("crawl: an unrelated workflow's artifact storm can no longer truncate the history — the "
+        "repository-wide listing is never asked for at all",
+        ("REPO-WIDE" in asked, truncated), (False, False))
+    # ... and the bound tracks the threshold it was HANDED, not a literal that happens to equal
+    # today's value: every other fixture here sizes itself from SKIP_STREAK_THRESHOLD, so a bound
+    # hard-coded to today's 5 would satisfy all of them (AGENTS.md item 2c/2d).
+    runner, asked = crawler(skips(plenty), plenty)
+    ticks, truncated = read_ticks("o/r", runner=runner, threshold=2)
+    chk("crawl: the run bound is one past the threshold the caller HANDED it, never a baked-in one",
+        (len(asked), len(ticks), truncated), (3, 3, False))
 
-    # The same dense page with NO run in the provenance set: perfect names, zero evidence. Without
-    # this row the crawl could ignore `runs` entirely and every assertion here would still pass.
-    runner, calls = pager(dense, {})
-    ticks, truncated = read_ticks("o/r", runner=runner)
-    chk("paging: a page full of perfectly-named markers from unvalidated runs yields NO ticks",
-        (calls, ticks, truncated), ([1, 2], [], False))
+    # NEWEST IS A TIMESTAMP. Ids ASCEND while creation times DESCEND, so the newest ticks are the
+    # LOWEST ids: a selection keyed on the run id, or on the order the listing arrived in, picks
+    # the opposite end of the history and reds here.
+    inverted = {600 + i: f"2026-07-29T18:{2 * wanted - i:02d}:00Z" for i in range(2 * wanted)}
+    runner, asked = crawler(skips(inverted), inverted)
+    ticks, _truncated = read_ticks("o/r", runner=runner)
+    chk("crawl: 'newest' is the run's own creation TIME, never its id or the listing's order",
+        (asked, len(ticks)), ([600 + step for step in range(wanted)], wanted))
+    chk("crawl: a non-positive limit asks for NOTHING rather than slicing from the wrong end",
+        (newest_runs(plenty, 0), newest_runs(plenty, -1), newest_runs(plenty, True)), ([], [], []))
 
-    # Exactly THRESHOLD ticks on a FULL page is one short of what the crawl wants: the tick that
-    # would BREAK the streak is not yet in view, so it must page on rather than stopping on a
-    # history it cannot prove the edges of. (Measured: without this row, `wanted = threshold`
-    # survived the whole suite.)
-    edge_ids = tuple(700 + i for i in range(SKIP_STREAK_THRESHOLD))
-    edge = {1: {"artifacts": [marker(run_id, i) for i, run_id in enumerate(edge_ids)]
-                + [_artifact("publish-bundle", 800)]}}
-    runner, calls = pager(edge, runs_for(*edge_ids))
-    ticks, truncated = read_ticks("o/r", runner=runner)
-    chk("paging: THRESHOLD ticks is one short of what the crawl wants, so it pages on",
-        (calls, len(ticks), truncated), ([1, 2], SKIP_STREAK_THRESHOLD, False))
+    # THE ORDERING KEY THE CRAWL HANDS ON is each RUN's own creation time, and the crawl is now the
+    # only place that pairing is made — so it needs its own row. Here the OLDEST-id run is the
+    # NEWEST tick and the only successful mint, and its marker carries the OLDEST artifact
+    # timestamp: a crawl that stamped its records with the artifact's upload time, the run id or
+    # arrival order instead would file that recovery at the BACK of the history and page for a
+    # fabricated threshold-length gap on an owner that has already recovered. (Measured: without
+    # this row, a constant in place of the run's own creation time survived the whole suite.)
+    recovered = dict(skips(inverted))
+    recovered[600] = [_artifact("groom-mint-tick.ok-jeswr", 600, "2026-07-29T18:00:00Z")]
+    runner, _asked = crawler(recovered, inverted)
+    ticks, _truncated = read_ticks("o/r", runner=runner)
+    streak = skip_streaks(ticks, {"jeswr"})["jeswr"]
+    chk("crawl: every record is stamped with its RUN's creation time, so the newest tick leads the "
+        "history and a recovery cannot be buried behind older skips",
+        ([sorted(skip) for _ok, skip in ticks], streak, gap_verdict(streak, len(ticks))),
+        ([[]] + [["jeswr"]] * (wanted - 1), 0, "recovered"))
 
-    # An artifact storm: one groom tick per page. The crawl must walk on, and then REPORT that it
-    # stopped short rather than presenting a 3-tick history as the whole truth.
-    storm_ids = tuple(400 + page for page in range(1, ARTIFACT_MAX_PAGES + 1))
-    storm = {page: {"artifacts": [_artifact("publish-bundle", 900 + page)] * 40
-                    + [marker(400 + page, page)]}
-             for page in range(1, ARTIFACT_MAX_PAGES + 1)}
-    runner, calls = pager(storm, runs_for(*storm_ids))
-    ticks, truncated = read_ticks("o/r", runner=runner)
-    chk("paging: under an artifact storm it pages to the cap and REPORTS the short history",
-        (calls, len(ticks), truncated),
-        (list(range(1, ARTIFACT_MAX_PAGES + 1)), ARTIFACT_MAX_PAGES, True))
+    # THE RUN-SCOPED ENDPOINT IS NOT TRUSTED ALONE. Each payload here names the OTHER validated
+    # run, so a crawl that validated against the whole run set instead of the one run it asked for
+    # would count both. Server-side scoping this reader cannot see the effect of is not a check.
+    pair = scheduled(2, 700)
+    cross = {700: [_artifact("groom-mint-tick.skip-jeswr", 701, "2026-07-29T18:00:00Z")],
+             701: [_artifact("groom-mint-tick.ok-jeswr", 700, "2026-07-29T18:01:00Z")]}
+    runner, _asked = crawler(cross, pair)
+    chk("crawl: a run-scoped payload is still validated against the ONE run it was asked for — an "
+        "artifact naming any other run is not that run's evidence",
+        read_ticks("o/r", runner=runner), ([], False))
 
-    # A dry page ends the crawl without claiming truncation — the history really is that short.
-    runner, calls = pager({1: {"artifacts": [marker(500, 1)]}}, runs_for(500))
+    # No validated run at all: nothing to ask, and a repository full of perfect names is still not
+    # evidence. Without this row the crawl could ignore `runs` entirely.
+    runner, asked = crawler(skips(plenty), {})
+    chk("crawl: with NO validated run there is nothing to ask for — no ticks, and not one "
+        "artifact request",
+        (read_ticks("o/r", runner=runner), asked), (([], False), []))
+
+    # Fewer validated runs than the crawl wants is a genuinely short history — the same shape as
+    # the old dry page, and NOT a truncation.
+    short = scheduled(SKIP_STREAK_THRESHOLD - 1, 800)
+    runner, asked = crawler(skips(short), short)
     ticks, truncated = read_ticks("o/r", runner=runner)
-    chk("paging: a page that runs dry ends the crawl and is NOT reported as truncated",
-        (calls, len(ticks), truncated), ([1, 2], 1, False))
+    chk("crawl: fewer validated runs than THRESHOLD+1 is a short history, never a truncated read",
+        (len(asked), len(ticks), truncated),
+        (SKIP_STREAK_THRESHOLD - 1, SKIP_STREAK_THRESHOLD - 1, False))
+
+    # A validated run that died BEFORE the mint stage uploaded no marker. It is not evidence in
+    # either direction: it must not read as a skipped owner, and it must not end the crawl early.
+    gapped = scheduled(wanted, 850)
+    markerless = 850 + wanted - 2
+    payloads = skips(gapped)
+    payloads[markerless] = [_artifact("groom-lease-debug", markerless)]
+    runner, asked = crawler(payloads, gapped)
+    ticks, truncated = read_ticks("o/r", runner=runner)
+    chk("crawl: a validated run that uploaded no marker yields no tick and does not stop the crawl",
+        (len(asked), len(ticks), truncated), (wanted, wanted - 1, False))
 
     # A REFUSED read is no evidence at all -> None, so main() fails loud instead of reading an
-    # empty history as "every owner recovered" and closing live alerts. Each of the three reads
-    # gets its own row: refusing the repo or the runs listing leaves the artifacts UNVALIDATED,
-    # which must be exactly as fatal as having no artifacts at all.
+    # empty history as "every owner recovered" and closing live alerts. Each read gets its own row:
+    # refusing the repo or the runs listing leaves the artifacts UNVALIDATED, which must be exactly
+    # as fatal as having no artifact at all.
     for label, kind in (("repo (so the default branch is unknown)", "repo"),
-                        ("groom runs listing (so nothing can be validated)", "runs"),
-                        ("FIRST artifacts page", "artifacts")):
-        runner, _calls = pager({1: {"artifacts": [marker(500, 1)]}}, runs_for(500),
-                               refuse=(kind,))
-        chk(f"paging: a refused {label} yields no evidence, never an empty history",
+                        ("groom runs listing (so nothing can be validated)", "runs")):
+        runner, _asked = crawler(skips(plenty), plenty, refuse=(kind,))
+        chk(f"crawl: a refused {label} yields no evidence, never an empty history",
             read_ticks("o/r", runner=runner), (None, False))
-    chk("paging: a runner that refuses everything yields no evidence",
+    chk("crawl: a runner that refuses everything yields no evidence",
         read_ticks("o/r", runner=lambda *a, **k: None), (None, False))
-    # A refusal PART WAY through keeps what it has and flags it as short.
-    half = {1: {"artifacts": [marker(600, 1)] * 1 + [_artifact("other", 1)] * 99}}
-    runner, _calls = pager(half, runs_for(600))
 
-    def flaky(args):
-        # `&page=1`, anchored on the separator for the same reason as above: `per_page=100`
-        # contains the substring `page=1`, so a looser test here would answer EVERY page and the
-        # mid-crawl refusal would never actually be exercised. The repo and runs reads must still
-        # be answered or the crawl never reaches page two at all.
-        if "/actions/artifacts" not in args[-1] or "&page=1" in args[-1]:
-            return runner(args)
-        return None
-    chk("paging: a refusal after page one keeps the evidence it has and flags it short",
-        (lambda pair: (len(pair[0]), pair[1]))(read_ticks("o/r", runner=flaky)), (1, True))
+    # THE NEWEST run's artifacts refused: nothing validated at all, so the same hard failure as a
+    # refused first page was — and the crawl stops there rather than reporting the older ticks as
+    # if they were the front of the history.
+    run_ids = scheduled(wanted, 400)
+    newest_id, hole = 400 + wanted - 1, 400 + wanted - 3
+    runner, asked = crawler(skips(run_ids), run_ids, refuse=(newest_id,))
+    chk("crawl: a refused artifacts read on the NEWEST validated run leaves nothing validated — no "
+        "evidence, never a history that starts one tick late",
+        (read_ticks("o/r", runner=runner), asked), ((None, False), [newest_id]))
+
+    # A refusal MID-crawl is a HOLE, not a short tail. Every run here carries a `skip` marker, so
+    # carrying the two runs BEHIND the hole forward would splice non-adjacent ticks into a
+    # four-tick streak and page for a credential gap that the evidence does not show.
+    runner, asked = crawler(skips(run_ids), run_ids, refuse=(hole,))
+    ticks, truncated = read_ticks("o/r", runner=runner)
+    chk("crawl: a refusal mid-crawl keeps only the contiguous newest prefix, stops at the hole, "
+        "and flags the read short",
+        (asked, [sorted(skip) for _ok, skip in ticks], truncated),
+        ([newest_id, newest_id - 1, hole], [["jeswr"], ["jeswr"]], True))
+    streak = skip_streaks(ticks, {"jeswr"})["jeswr"]
+    chk("crawl: ... so the ticks behind the hole cannot FABRICATE a threshold-length streak out of "
+        "one refused read",
+        (streak, gap_verdict(streak, len(ticks))), (2, "flapping"))
 
 
 def _test_readers(chk):
@@ -1196,11 +1293,11 @@ def _test_readers(chk):
 
         def live_router(cmd):
             url = cmd[-1]
-            if "/actions/artifacts" in url:
-                return json.dumps({"artifacts": [
-                    _artifact("groom-mint-tick.skip-jeswr", 700, "2026-07-29T18:00:00Z")]})
             if "/actions/workflows/" in url:
                 return json.dumps({"workflow_runs": [_run_row(700, "2026-07-29T18:00:00Z")]})
+            if "/actions/runs/" in url:
+                return json.dumps({"artifacts": [
+                    _artifact("groom-mint-tick.skip-jeswr", 700, "2026-07-29T18:00:00Z")]})
             return json.dumps({"default_branch": FIXTURE_BRANCH})
 
         scripted["router"] = live_router
@@ -1208,13 +1305,18 @@ def _test_readers(chk):
         scripted["router"] = None
         urls = [cmd[-1] for cmd in seen]
         chk("reader: read_ticks with NO injected runner goes through the real gh api reader for "
-            "the repo, the groom RUNS listing and the artifacts listing",
+            "the repo, the groom RUNS listing and the VALIDATED RUN's own artifacts — asserted by "
+            "EXACT match on the whole argv, written out in full here, so neither a repoint nor a "
+            "thinned query string nor a dropped header can pass (AGENTS.md item 6)",
             (seen and seen[0][:2], urls[0] if urls else None,
              any("/actions/workflows/groom.yml/runs?" in url and f"branch={FIXTURE_BRANCH}" in url
                  for url in urls),
-             any("/repos/o/r/actions/artifacts" in url for url in urls),
+             [cmd for cmd in seen
+              if "/actions/runs/" in cmd[-1] or "/actions/artifacts" in cmd[-1]],
              [sorted(skip) for _ok, skip in ticks]),
-            (["gh", "api"], "/repos/o/r", True, True, [["jeswr"]]))
+            (["gh", "api"], "/repos/o/r", True,
+             [["gh", "api", "-H", "Accept: application/vnd.github+json",
+               "/repos/o/r/actions/runs/700/artifacts?per_page=100"]], [["jeswr"]]))
         # The SAME live path with a run whose provenance does not check out yields nothing.
         seen.clear()
         scripted["router"] = lambda cmd: (
