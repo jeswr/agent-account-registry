@@ -242,7 +242,44 @@ jobs:
           else
             : > "$base_retirements"
           fi
-          suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")
+          # [issue #1834] The MERGE BASE's copy, which is what tells the two causes of a missing
+          # baseline entry apart: deleted on this branch (a real retirement, approval required) vs
+          # added on the base branch after this branch point (the branch is simply BEHIND BASE and
+          # removed nothing). Both still refuse; without this the second is reported as the first,
+          # the author greps a diff that contains no such deletion, and the obvious repair from
+          # inside the PR tree is to retire somebody else's brand-new self-test.
+          # Unresolvable => refuse, exactly as an unresolvable base does above: the classification
+          # is part of a REQUIRED gate's verdict and must not be guessed. A merge base with no
+          # manifest at all is not an error but the extreme of the same case — the branch predates
+          # the manifest's introduction, so nothing was enrolled there and every baseline entry is
+          # correctly attributed to the base branch.
+          #
+          # [PR #1865 r1] The branch point is computed from the PR HEAD, never from `HEAD`. This job
+          # runs on `pull_request`, where actions/checkout's default ref is `refs/pull/N/merge` — a
+          # SYNTHETIC MERGE COMMIT whose two parents are the PR head and the base branch, which is
+          # exactly the tree the report above says this suite grades. `$base` is therefore an
+          # ANCESTOR of `HEAD`, so `git merge-base HEAD "$base"` returns `$base` itself, the
+          # merge-base manifest is a byte copy of the base manifest, and every behind-base entry is
+          # found there and re-diagnosed as the unapproved removal it is not — the classifier reads
+          # green in fixtures and does nothing in production. `head` is validated the same way
+          # `$base` is, and for the same reason: a branch point this job cannot resolve is a verdict
+          # it must refuse to guess, not fall back to a tree that answers a different question.
+          head='${{ github.event.pull_request.head.sha }}'
+          if ! git cat-file -e "$head^{commit}" 2>/dev/null; then
+            echo "::error::head commit $head is unresolvable; refusing to derive the self-test suite"
+            exit 1
+          fi
+          mb_manifest="$RUNNER_TEMP/mergebase-selftest-suite.txt"
+          if ! merge_base=$(git merge-base "$head" "$base") || [ -z "$merge_base" ]; then
+            echo "::error::the merge base of $head and $base is unresolvable; refusing to derive the self-test suite"
+            exit 1
+          fi
+          if git cat-file -e "$merge_base:scripts/selftest-suite.txt" 2>/dev/null; then
+            git show "$merge_base:scripts/selftest-suite.txt" > "$mb_manifest"
+          else
+            : > "$mb_manifest"
+          fi
+          suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements" "$mb_manifest")
           # [issue #1371] THE #824 DEPENDENCY PREFLIGHT, in the lane where the green is
           # load-bearing. registry_selftest_gate OPENS with this check — "an unrunnable row must
           # never be confused with a failing one" — but this step calls the CLI arms directly, so

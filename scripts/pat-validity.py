@@ -251,7 +251,7 @@ def _write_env(token):
     return env
 
 
-def _secret_write(token, repo, run=subprocess.run):
+def _secret_write(token, repo, run=None):
     """The authoritative write probe (review r3 #1): `gh secret set --env dispatch-secrets` on
     the disposable canary secret — the EXACT operation onboarding and the rotation write-back
     perform post-#101, exercising `Environments: write` which the public-key GET (read-only)
@@ -260,7 +260,17 @@ def _secret_write(token, repo, run=subprocess.run):
     throttle-vs-denial discriminator; it never carries the token (the PAT travels via GH_TOKEN
     in the child env and GH_DEBUG is stripped) and is never echoed into details or logs. The
     canary value goes via stdin — never argv — purely to keep the repo's no-secrets-in-argv
-    convention, though the value is not secret."""
+    convention, though the value is not secret.
+
+    `run` defaults to None and resolves `subprocess.run` at CALL time, NOT via a
+    `run=subprocess.run` default argument (issue #992). A default argument is evaluated once, at
+    def time, so it captures the REAL subprocess.run and the module-attribute patch every
+    stubbed row below relies on (`subprocess.run = stub`) cannot reach it. The body of this
+    function is a WRITE — `gh secret set` against the live dispatch-secrets environment — and
+    probe() calls it as `write(token, repo)` with no `run=`, so under the old binding any caller
+    that reached probe()'s default write path from a test would have issued that write for real,
+    unpatchable. Production behaviour is unchanged: an omitted `run` is still subprocess.run."""
+    run = run or subprocess.run
     try:
         result = run(["gh", "secret", "set", CANARY_SECRET, "-R", repo, "--env", CANARY_ENV],
                      input=CANARY_VALUE, capture_output=True, text=True,
@@ -1242,6 +1252,31 @@ def _self_test():
         raise OSError(f"boom {SENTINEL}")
     chk("_secret_write: runner exception reduces to its class name (never the message)",
         _secret_write(SENTINEL, "o/r", run=raise_run), {"status": None, "error": "OSError"})
+
+    # ⚠️ #992: the runner is resolved at CALL time, so the module-attribute patch every stubbed
+    # row below relies on reaches the WRITE too. probe() invokes its default write as
+    # `write(token, repo)` with no `run=`; under a def-time `run=subprocess.run` default that
+    # call captured the real runner at import and no patch could intercept it, so this row would
+    # shell out to a live `gh secret set` instead of the stub. The row asserts the stub IS
+    # reached — a reintroduced default binding leaves `patched_argv` empty and fails here.
+    patched_argv = []
+
+    def patched_run(argv, **_kw):
+        patched_argv.append(list(argv))
+        return _Proc(0)
+
+    real_subprocess_run = subprocess.run
+    fetched.clear(), writes.clear()
+    try:
+        subprocess.run = patched_run
+        r_default_write = probe(SENTINEL, "o/r", fetch=fake_fetch([U_OK, S_OK, R_OK]), now=now)
+    finally:
+        subprocess.run = real_subprocess_run
+    chk("#992: probe()'s DEFAULT write path is patchable — _secret_write resolves subprocess.run "
+        "at call time, so no caller can leak a live `gh secret set` past a stub",
+        (patched_argv, r_default_write["verdict"]),
+        ([["gh", "secret", "set", CANARY_SECRET, "-R", "o/r", "--env", CANARY_ENV]], VALID))
+    fetched.clear(), writes.clear()
 
     # --- upsert: idempotent rolling issue against a stubbed gh (usage-alert.py pattern).
     class _Run:

@@ -105,6 +105,28 @@ OBS_HISTOGRAM_KEY_RE = re.compile(r"\d{1,2}\+?")
 OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#%-]{1,220}")
 OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
                       "queue_age_clamp_minutes", "merge_stall_minutes"}
+# [#1557] THE CACHE GROUP HAS NO PRODUCER, and the file the docs named as its source never had one
+# either: `data/cache-affinity.json` is documented as "a rolling {account -> [{package,role,model,
+# at}]} affinity", but nothing in this repo has ever written it (README.md / data/README.md now say
+# so). Cache affinity is DERIVED at claim time from the lease ledger by
+# select-and-claim.choose_account, which keeps no history, so `warm_drain_rate_1h`, `drained_1h` and
+# `chain_length_histogram` have no source in the tree today and the prompt-cache read fraction has
+# to come from the provider usage responses the account-usage probe already reads.
+# The consumer contract is deliberately NOT narrowed to what exists — a collector that grows any
+# one of these fields is still published. What changed is that a `cache` key with nothing readable
+# in it no longer publishes zeros: see `_normalize_observability`.
+OBS_CACHE_DROP = ("dashboard-gen: dropped the observability cache group (type {}) — "
+                  "no field it publishes was measured")
+
+# [#1570] How many per-row drop warnings ONE seam may print before it stops naming rows and prints
+# a single counting tail instead. The drop diagnostics (#982 on `flow.queue`, and the evidence-link
+# warning that set the precedent) emit ONE LINE PER DROPPED ROW, and NEITHER input list is bounded
+# on the way IN — `queue[:12]` / `rows[:20]` truncate on the way OUT, after the loop. So a collector
+# snapshot on the public `ledger` branch carrying 100k malformed rows writes 100k lines into
+# dashboard.yml's step log, which is the failure the diagnostic exists to FIX: a log nobody can read
+# is a log nobody reads. The cap is on the DIAGNOSTIC only — the drop-the-row tolerance, the
+# published rows and the build's exit status are all unchanged.
+OBS_DROP_WARN_MAX = 12
 
 # Usage-probe outcome sidecar (issue #219). dashboard.yml's secret-materialization and probe steps
 # are `continue-on-error`, and a failed probe used to be replaced by `{}` — indistinguishable from
@@ -194,6 +216,28 @@ FLEET_COMPOSITION_KEYS = frozenset({
 # 2026-07-31T03:04Z, PR #1363, reverted by #1364). Mechanism unknown; tracked in #1353.
 # REMOVE THIS SET the moment #1353 is resolved — it is the weaker of the two states.
 _THRESHOLD_BOUND_EXEMPT = frozenset({"groom.yml", "retriage.yml"})
+
+
+# [#1084] The nominal cadence of every workflow the CROSS-REPO keepalive leg watches, keyed by
+# (repository, workflow-file). A registry leg's bound is READ out of the watched workflow's own
+# `on: schedule:` block (`_workflow_cadence_seconds`), so a re-timed cron and the threshold sized
+# against it cannot drift apart. The cross-repo leg watches a repository that is not checked out
+# beside this one, so there is nothing to read — and with nothing to read, the only reference point
+# its threshold had was ITSELF: every fixture age in the #559 rows is derived from the threshold
+# (`limit ± 600`), so widening `rearm-sweeper.yml:1200` to `:99999` in
+# .github/workflows/dashboard.yml turned that leg into a no-op with the whole suite green. This
+# table is the missing independent statement — two files that must agree, which is the one shape a
+# tautological assertion cannot take.
+#
+# DECLARED, NOT READ — so it can go stale, and nothing offline can detect that. Re-verify against
+# the target repository's `.github/workflows/<workflow>` `on: schedule:` block and update this
+# table whenever that cron is re-timed; a value here that is too LARGE is the dangerous direction,
+# because it is what lets a threshold widen without a row going red. `rearm-sweeper.yml` is the
+# 10-minute cron .github/workflows/dashboard.yml's own cross-repo step comment records (the merge-
+# queue closure backstop in sparq-org/sparq).
+_CROSS_REPO_KEEPALIVE_CADENCE_SECONDS = {
+    ("sparq-org/sparq", "rearm-sweeper.yml"): 600,
+}
 
 
 class DashboardError(RuntimeError):
@@ -1150,6 +1194,39 @@ def _node_json(script, payload):
             f"the page-script harness printed no parseable result: {completed.stdout!r}") from exc
 
 
+class _RaisedPage(str):
+    """Stand-in for a page script that threw: EVERY lookup below yields the diagnostic itself.
+
+    Issue #1341. The sibling harnesses compare the whole page object, or read it through a
+    `.get`-based helper, so a plain-dict fallback is enough there. The executed-page block that
+    consumes `_executed_page` subscripts the page directly (`page["cards"]["measured"]["deg…"]`),
+    where a dict fallback would raise `KeyError` and abort the suite exactly as the unguarded call
+    did. Returning self from every `[...]`/`.get` instead keeps every row below reachable: each one
+    compares this diagnostic against its expected tuple and goes red BY NAME, and the suite still
+    reaches its full check count."""
+
+    def __getitem__(self, key):
+        return self
+
+    def get(self, key, default=None):
+        return self
+
+
+def _executed_page(harness, payload):
+    """`_node_json(harness, payload)`, with a page that THROWS reported as a VALUE, never an abort.
+
+    Issue #1341. A renderer that reaches a DOM API the shim does not implement — or a mutant that
+    drops an exported symbol from the harness's `new Function(... return {...})` list — otherwise
+    raises out of `_self_test` and terminates the run: every check below it never executes, while a
+    mutation run scores the abort as a KILL (AGENTS.md AUTHOR pre-flight item 4,
+    *crash-after-partial-run*). It also loses the diagnostic — an abort names the exception, a red
+    row names WHICH assertion the broken page failed. So the raise becomes the rows' value."""
+    try:
+        return _node_json(harness, payload)
+    except DashboardError as exc:
+        return _RaisedPage(f"page script raised: {str(exc)[:160]}")
+
+
 def _probe_epoch(value):
     """`value` as a UTC epoch second, reusing _utc_iso's tolerant epoch/ISO parsing, or None."""
     iso = _utc_iso(value)
@@ -1301,15 +1378,36 @@ def _run_log_counts(repo, run_id):
 
 
 def _fetch_dispatch_history(repo, count):
+    """`(history, status)` — the newest `count` dispatch runs AND the fetch's own outcome.
+
+    Issue #1106: both failure branches used to return a bare `[]`, which the page renders as
+    "No dispatch history is available." — byte-identical to a fleet that has genuinely never
+    dispatched — and which silently zeroes `fleet.last_sweep_at` as well. That is the #28 shape (an
+    infra failure wearing a quiet tick's clothes) one layer out, on the PUBLIC surface. The outcome
+    now travels with the rows exactly as the usage probe's does (#219/#612), so the consumer can
+    tell "we read the history and it was empty" from "we could not read the history".
+
+    `status` is the RAW claim; `_history_outcome` normalizes it fail-closed."""
     result = subprocess.run(
         ["gh", "api", f"repos/{repo}/actions/workflows/dispatch.yml/runs?per_page={count}"],
         capture_output=True, text=True, timeout=60, check=False)
     if result.returncode != 0:
-        return []
+        return [], {"outcome": "failed", "detail": "gh-exited-nonzero"}
     try:
-        runs = json.loads(result.stdout).get("workflow_runs") or []
-    except (AttributeError, json.JSONDecodeError):
-        return []
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return [], {"outcome": "failed", "detail": "run-listing-unparseable"}
+    # The SCHEMA is part of the read (#1748 review round 2). `gh` answers a throttled or errored
+    # call with a syntactically valid document that carries no runs at all — `{}`, `{"message":
+    # ...}`, `{"workflow_runs": null}` — and the old `.get(...) or []` collapsed every one of those
+    # into an empty list and an `ok` outcome, i.e. the exact "infra failure wearing a quiet tick's
+    # clothes" shape this issue exists to kill. A truthy non-list was worse still: a str was sliced
+    # into characters that were then dropped, and a dict raised TypeError out of the whole build.
+    # So: only an OBJECT whose `workflow_runs` is genuinely a list counts as read. The explicitly
+    # empty list stays the successful quiet-fleet case; everything else fails closed.
+    if not isinstance(document, dict) or not isinstance(document.get("workflow_runs"), list):
+        return [], {"outcome": "failed", "detail": "run-listing-schema-alien"}
+    runs = document["workflow_runs"]
     history = []
     for run in runs[:count]:
         if not isinstance(run, dict):
@@ -1328,7 +1426,27 @@ def _fetch_dispatch_history(repo, count):
             # only inside the model-health alert.
             "lanes": lanes,
         })
-    return history
+    return history, {"outcome": "ok", "detail": ""}
+
+
+def _history_outcome(status):
+    """Normalize the dispatch-history fetch outcome, FAIL-CLOSED (issue #1106).
+
+    `fetched` is True ONLY for an explicit `ok` claim from the fetcher. Every other shape — a
+    `failed` claim, an alien document, and `None` (no claim at all, which is the WEAKEST evidence
+    of the lot — #612 review finding 1, where a `None` default selecting the trusting branch was
+    the bug) — normalizes to "we did not read the history", so an empty `dispatch_outcomes` is
+    never published as though it had been observed. Pure — unit-tested by --self-test.
+
+    `detail` reaches the PUBLIC page, so it is held to the same bounded safe-token shape every
+    other externally-sourced label on this document uses; it is never published as free text."""
+    outcome, detail = "unknown", ""
+    if isinstance(status, dict):
+        raw = str(status.get("outcome") or "").strip().lower()
+        outcome = raw if raw in {"ok", "failed"} else "unknown"
+        text = str(status.get("detail") or "").strip()
+        detail = text if OBS_TOKEN_RE.fullmatch(text) else ""
+    return {"outcome": outcome, "detail": detail, "fetched": outcome == "ok"}
 
 
 def _health_status(value):
@@ -1650,7 +1768,41 @@ def _obs_lease_aggregate(value):
     return {"mean": round(mean, 2), "max": round(maximum, 2)}
 
 
-def _obs_drop_queue(detail):
+class _ObsDropLog:
+    """[#1570] A BOUNDED drop-diagnostic printer for one observability seam.
+
+    One instance per seam per build: `drop()` names the first `OBS_DROP_WARN_MAX` dropped rows and
+    counts the rest, `close()` prints the one tail line carrying the counts an operator actually
+    needs — how many warnings were withheld, and how many rows were dropped in TOTAL. Below the cap
+    nothing changes: the same per-row lines print and no tail is emitted, so a two-row shape
+    mismatch still reads exactly as it did before this cap existed.
+
+    The seams count SEPARATELY. A queue snapshot that floods its own budget must not silence the
+    evidence-link warning on the same document — that would trade one invisible loss for another.
+
+    Callers pass a fully-composed message: every value a message quotes is sanitized at its own call
+    site (`_obs_text`), so no collector value reaches the build log raw. The tail line quotes only
+    integers this build counted itself."""
+
+    def __init__(self, seam):
+        self.seam = seam            # plural noun for the tail line, e.g. "observability queue rows"
+        self.dropped = 0            # every drop, including the ones never printed
+        self.printed = 0
+
+    def drop(self, message):
+        self.dropped += 1
+        if self.printed < OBS_DROP_WARN_MAX:
+            self.printed += 1
+            print(f"dashboard-gen: dropped {message}")
+
+    def close(self):
+        suppressed = self.dropped - self.printed
+        if suppressed:
+            print(f"dashboard-gen: ... {suppressed} further dropped {self.seam} suppressed "
+                  f"({self.dropped} dropped in total)")
+
+
+def _obs_drop_queue(drops, detail):
     """[#982] Announce a dropped observability queue input instead of swallowing it.
 
     `_obs_trigger_rows` already sets this precedent on the same collector document. It matters
@@ -1661,8 +1813,11 @@ def _obs_drop_queue(detail):
 
     Only the SHAPE is named: a type name, a field name, and for a class string the `_obs_text`
     sanitized form. No collector value reaches the build log raw, so a malformed snapshot cannot
-    inject lines into the log it is being diagnosed in."""
-    print(f"dashboard-gen: dropped observability queue input ({detail})")
+    inject lines into the log it is being diagnosed in.
+
+    [#1570] `drops` is this build's queue-seam `_ObsDropLog`: the wording is unchanged, the emission
+    is capped, and the rows past the cap are counted into its tail line rather than printed."""
+    drops.drop(f"observability queue input ({detail})")
 
 
 def _obs_flow(flow):
@@ -1680,30 +1835,34 @@ def _obs_flow(flow):
     # but every drop is now ANNOUNCED, one reason at a time, so a shape mismatch is legible
     # instead of arriving as an empty panel. The container check is part of it: `queue_stats()`
     # keyed by the integer classes is a dict, which loses every row before the loop even starts.
+    # [#1570] `raw_queue` is UNBOUNDED (`queue[:12]` truncates on the way out, below), so the
+    # announcement is capped: the first OBS_DROP_WARN_MAX rows are named and the rest are counted.
+    drops = _ObsDropLog("observability queue rows")
     raw_queue = flow.get("queue")
     if "queue" in flow and not isinstance(raw_queue, list):
         _obs_drop_queue(
-            f"`flow.queue` (type {type(raw_queue).__name__}) is not a list of rows")
+            drops, f"`flow.queue` (type {type(raw_queue).__name__}) is not a list of rows")
     for item in raw_queue if isinstance(raw_queue, list) else []:
         if not isinstance(item, dict):
-            _obs_drop_queue(f"the row (type {type(item).__name__}) is not an object")
+            _obs_drop_queue(drops, f"the row (type {type(item).__name__}) is not an object")
             continue
         queue_class = item.get("class")
         if not isinstance(queue_class, str):
-            _obs_drop_queue(f"row `class` (type {type(queue_class).__name__}) is not a class "
-                            "STRING such as '1'/'2a'/'4'")
+            _obs_drop_queue(drops, f"row `class` (type {type(queue_class).__name__}) is not a "
+                            "class STRING such as '1'/'2a'/'4'")
             continue
         if OBS_QUEUE_CLASS_RE.fullmatch(queue_class) is None:
             _obs_drop_queue(
-                f"row `class` {_obs_text(queue_class, 16)!r} is not one of the queue classes")
+                drops, f"row `class` {_obs_text(queue_class, 16)!r} is not one of the queue classes")
             continue
         depth = _obs_count(item.get("depth"))
         if depth is None:
-            _obs_drop_queue(f"row `depth` (type {type(item.get('depth')).__name__}) is not a "
-                            "non-negative integer")
+            _obs_drop_queue(drops, f"row `depth` (type {type(item.get('depth')).__name__}) is not "
+                            "a non-negative integer")
             continue
         queue.append({"class": queue_class, "depth": depth,
                       "oldest_age_minutes": _obs_minutes(item.get("oldest_age_minutes"))})
+    drops.close()
     queue.sort(key=lambda row: row["class"])
 
     # Issue #374: the per-account lease rows are validated but NOT published. A list of up to 40
@@ -1795,8 +1954,14 @@ def _obs_flow(flow):
 def _obs_trigger_rows(items):
     """Auto-fixer trigger fires (fire-only alarm semantics — the collector records each fire; the
     dashboard only displays). Evidence links are pinned to github.com — anything else is dropped
-    loudly rather than published on the public page."""
+    loudly rather than published on the public page.
+
+    [#1570] `items` is UNBOUNDED here — `rows[:20]` truncates on the way OUT, after every row has
+    been walked — and each row contributes up to 8 evidence drops, so the announcement is capped
+    per BUILD rather than per row: a hoisted-into-the-loop counter would still let N rows write 8N
+    lines."""
     rows = []
+    drops = _ObsDropLog("observability evidence links")
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
             continue
@@ -1808,7 +1973,7 @@ def _obs_trigger_rows(items):
             if isinstance(link, str) and OBS_EVIDENCE_RE.fullmatch(link):
                 evidence.append(link)
             else:
-                print("dashboard-gen: dropped a non-GitHub observability evidence link")
+                drops.drop("a non-GitHub observability evidence link")
         task = item.get("enqueued_task")
         rows.append({
             "rule": rule,
@@ -1818,6 +1983,7 @@ def _obs_trigger_rows(items):
             "enqueued_task": task if isinstance(task, str)
             and OBS_TOKEN_RE.fullmatch(task) else None,
         })
+    drops.close()
     rows.sort(key=lambda row: row["fired_at"] or "", reverse=True)
     return rows[:20]
 
@@ -1845,14 +2011,30 @@ def _normalize_observability(document):
                 count = _obs_count(raw_histogram.get(key))
                 if OBS_HISTOGRAM_KEY_RE.fullmatch(key) and count is not None:
                     histogram[key] = count
-        cache = {
-            "prompt_cache_read_fraction_1h":
-                _obs_fraction(cache_source.get("prompt_cache_read_fraction_1h")),
-            "usage_samples_1h": _obs_count(cache_source.get("usage_samples_1h")) or 0,
-            "warm_drain_rate_1h": _obs_fraction(cache_source.get("warm_drain_rate_1h")),
-            "drained_1h": _obs_count(cache_source.get("drained_1h")) or 0,
-            "chain_length_histogram": histogram,
-        }
+        read_fraction = _obs_fraction(cache_source.get("prompt_cache_read_fraction_1h"))
+        usage_samples = _obs_count(cache_source.get("usage_samples_1h"))
+        warm_drain = _obs_fraction(cache_source.get("warm_drain_rate_1h"))
+        drained = _obs_count(cache_source.get("drained_1h"))
+        # [#1557] An UNMEASURED group must not publish as a MEASURED ZERO. `usage_samples_1h` and
+        # `drained_1h` are coerced to 0 below, so a `cache` key carrying nothing this seam can read
+        # used to render a confident "Warm drains — of 0 drained / 1h" card built entirely out of
+        # that coercion. Publication therefore requires at least ONE field to have parsed; parsed
+        # is not truthy, so a genuine all-zero hour (0.0 fractions, 0 counts) still publishes (a
+        # census must always emit its zero row — AGENTS.md pre-flight item 8). The drop is
+        # ANNOUNCED for the same reason #982 announced a dropped queue row: `cache: {}` and "no
+        # collector at all" render identically as a hidden panel, so a producer/consumer shape
+        # mismatch would otherwise be visible nowhere.
+        if (read_fraction is not None or usage_samples is not None or warm_drain is not None
+                or drained is not None or histogram):
+            cache = {
+                "prompt_cache_read_fraction_1h": read_fraction,
+                "usage_samples_1h": usage_samples or 0,
+                "warm_drain_rate_1h": warm_drain,
+                "drained_1h": drained or 0,
+                "chain_length_histogram": histogram,
+            }
+    if cache is None and cache_source is not None:
+        print(OBS_CACHE_DROP.format(type(cache_source).__name__))
 
     thresholds_source = document.get("thresholds")
     thresholds = None
@@ -1877,7 +2059,7 @@ def _normalize_observability(document):
 
 
 def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt,
-                    observability=None, probe_status=None, serviced=None):
+                    observability=None, probe_status=None, serviced=None, history_status=None):
     accounts, private_values = _catalog(issues)
     # Issue #78. `serviced=None` means "READ THE LIVE POLICY", never "no serviced repositories": an
     # empty seed would silently restore the vanishing census this closes, which is the #612 review
@@ -1956,6 +2138,12 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
     # (#612 review finding 1) — it used to be omitted on exactly the branch that also trusted the
     # usage map unconditionally, so the one state that most needed a warning carried none.
     document["usage_probe"] = probe
+    # Degradation marker (issue #1106), the same shape and for the same reason as `usage_probe`:
+    # `fleet.dispatch_outcomes == []` and `fleet.last_sweep_at == None` are what a failed `gh` read
+    # produces AND what a fleet that has never dispatched produces, so the page cannot tell them
+    # apart without this. ALWAYS present — an omitted-on-one-branch marker is exactly the #612
+    # finding-1 shape, where the one state that most needed the warning carried none.
+    document["dispatch_history"] = _history_outcome(history_status)
     observability = _normalize_observability(observability)
     if observability is not None:
         # Optional key (absent => the dashboard hides the Observability panels), placed INSIDE the
@@ -1995,22 +2183,28 @@ def _optional_usage_path(cli_path):
     return next((path for path in candidates if path and Path(path).is_file()), None)
 
 
-# Issue #78. The per-repository census is only observability if the PAGE renders it, and the #612
-# round-4 lesson is that a lexical assertion about `renderRepositoryAgents` is satisfiable by a
-# comment or a neighbouring occurrence. So the real function is EXECUTED against a stub DOM and the
-# rendered header/rows are compared cell by cell — including the quiet tick, where every count is
-# zero and the pre-#78 page named no repository at all.
-_REPO_AGENTS_PAGE_HARNESS = r"""
+# Issue #1107. ONE DOM shim, not one per harness. The three page-script harnesses below each
+# carried a hand-written copy of `element()`/`document`, and they had already drifted: two of them
+# stubbed `classList` to a no-op whose `contains()` answered `false` unconditionally, so a renderer
+# that degrades a cell BY CLASS was EXECUTED against a DOM physically unable to record the
+# degradation. That reads like a page-level assertion while being blind to the thing it names —
+# which is the same false pass #612 round 4 found in the lexical form, in a costume. The shim kept
+# here is the highest-fidelity of the three (real `classList`, `setAttribute`, `style`); a harness
+# supplies only its export list and its body. `_self_test_page_shim` holds it to both properties:
+# the shim behaves like the DOM, and it is defined exactly once.
+_PAGE_HARNESS = r"""
 const fs = require("fs");
 const source = fs.readFileSync(__APP_JS__, "utf8");
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
 function element(tag) {
   const self = {
-    tagName: tag, children: [], hidden: false, textContent: "", className: "",
+    tagName: tag, children: [], attributes: {}, style: {}, hidden: false, textContent: "",
+    className: "", classes: new Set(),
     append: (...kids) => { for (const kid of kids) self.children.push(kid); },
     replaceChildren: (...kids) => { self.children = [...kids]; },
-    setAttribute: () => {},
-    classList: { add: () => {}, remove: () => {}, contains: () => false },
+    setAttribute: (name, value) => { self.attributes[name] = value; },
+    classList: { add: (name) => self.classes.add(name), remove: (name) => self.classes.delete(name),
+                 contains: (name) => self.classes.has(name) },
   };
   return self;
 }
@@ -2023,9 +2217,41 @@ globalThis.document = {
 };
 globalThis.fetch = () => Promise.reject(new Error("network is not under test"));
 globalThis.setInterval = () => 0;
+const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap(flat)];
+const text = (node) => flat(node).join(" ");
+const degraded = (node) =>
+  (node.classes && node.classes.has("degraded")) ||
+  (node.children || []).some(degraded);
 (async () => {
-  const scope = new Function(source + "; return { renderRepositoryAgents };")();
+  // Loading the page runs its own `refresh()`, whose stubbed fetch rejects into the page's catch
+  // and writes to #warning; the tick below lets that settle so it cannot be mistaken for a notice
+  // under test, and every render below starts from a fresh element.
+  const scope = new Function(source + "; return { __EXPORTS__ };")();
   await new Promise((resolve) => setImmediate(resolve));
+__BODY__
+})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
+"""
+
+
+def _page_harness(exports, body):
+    """A page-script harness for `_node_json`: the shared DOM shim, then `body`.
+
+    `exports` is the comma-separated list of `dashboard/app.js` names the body reaches through
+    `scope` — the ONLY thing that varies besides the body itself. `body` is JavaScript indented two
+    spaces (it runs inside the harness's async IIFE) and must write its result to stdout as JSON."""
+    app_js = Path(__file__).resolve().parent.parent / "dashboard" / "app.js"
+    return (_PAGE_HARNESS
+            .replace("__EXPORTS__", exports)
+            .replace("__BODY__", body.strip("\n"))
+            .replace("__APP_JS__", json.dumps(str(app_js))))
+
+
+# Issue #78. The per-repository census is only observability if the PAGE renders it, and the #612
+# round-4 lesson is that a lexical assertion about `renderRepositoryAgents` is satisfiable by a
+# comment or a neighbouring occurrence. So the real function is EXECUTED against a stub DOM and the
+# rendered header/rows are compared cell by cell — including the quiet tick, where every count is
+# zero and the pre-#78 page named no repository at all.
+_REPO_AGENTS_PAGE_BODY = r"""
   const out = {};
   for (const [name, spec] of Object.entries(input.cases)) {
     for (const id of ["repo-agents-empty", "repo-agents-table", "repo-agents-head",
@@ -2050,37 +2276,10 @@ globalThis.setInterval = () => 0;
     };
   }
   process.stdout.write(JSON.stringify(out));
-})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
 """
 
 
-_LANE_PAGE_HARNESS = r"""
-const fs = require("fs");
-const source = fs.readFileSync(__APP_JS__, "utf8");
-const input = JSON.parse(fs.readFileSync(0, "utf8"));
-function element(tag) {
-  const self = {
-    tagName: tag, children: [], hidden: false, textContent: "", className: "",
-    append: (...kids) => { for (const kid of kids) self.children.push(kid); },
-    replaceChildren: (...kids) => { self.children = [...kids]; },
-    setAttribute: () => {},
-    classList: { add: () => {}, remove: () => {}, contains: () => false },
-  };
-  return self;
-}
-const ids = {};
-globalThis.document = {
-  getElementById: (id) => (ids[id] = ids[id] || element("div#" + id)),
-  createElement: element,
-  createElementNS: (_ns, tag) => element(tag),
-  createTextNode: (text) => ({ textContent: text, children: [] }),
-};
-globalThis.fetch = () => Promise.reject(new Error("network is not under test"));
-globalThis.setInterval = () => 0;
-const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap(flat)];
-(async () => {
-  const scope = new Function(source + "; return { renderOutcomes };")();
-  await new Promise((resolve) => setImmediate(resolve));
+_LANE_PAGE_BODY = r"""
   const out = {};
   for (const [name, outcomes] of Object.entries(input.outcomes)) {
     ids.outcomes = element("tbody#outcomes");
@@ -2099,8 +2298,75 @@ const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap
     });
   }
   process.stdout.write(JSON.stringify(out));
-})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
 """
+
+
+def _self_test_page_shim(check):
+    """Issue #1107 — the ONE DOM shim every page-script harness is built on.
+
+    Scaffolding rather than a guard, so no trust surface rides on it; but a shim that silently
+    swallows what the page does to it makes an EXECUTED assertion quietly weaker than it reads,
+    which is the #612-round-4 false pass wearing a different costume. Two properties, and the
+    pre-#1107 `classList: {add: () => {}, contains: () => false}` copies failed the first: the shim
+    RECORDS what the page does to an element, and there is exactly one of it."""
+    # Composed through `_page_harness` exactly as the real harnesses are, so `loaded` below also
+    # witnesses that the export list substituted and that the app.js path resolved to a real file.
+    probe_body = r"""
+  const el = document.getElementById("cell");
+  el.classList.add("degraded");
+  el.setAttribute("data-lane", "worker");
+  el.append(document.createTextNode("dropped"), document.createElement("span"));
+  const kept = document.createElement("b");
+  kept.textContent = "kept";
+  el.replaceChildren(kept);
+  const parent = document.createElement("td");
+  const child = document.createElement("span");
+  child.classList.add("degraded");
+  parent.append(child);
+  const before = { degraded: degraded(el), contains: el.classList.contains("degraded") };
+  el.classList.remove("degraded");
+  process.stdout.write(JSON.stringify({
+    before,
+    after: { degraded: degraded(el), contains: el.classList.contains("degraded") },
+    attribute: el.attributes["data-lane"] === undefined ? null : el.attributes["data-lane"],
+    replaced: el.children.map((kid) => kid.textContent),
+    inherited: degraded(parent),
+    memoized: document.getElementById("cell") === el,
+    namespaced: document.createElementNS("http://www.w3.org/2000/svg", "svg").tagName,
+    text: text(el).trim(),
+    loaded: typeof scope.render,
+  }));
+"""
+    try:
+        shim = _node_json(_page_harness("render", probe_body), {})
+    except DashboardError as exc:
+        # Same convention as the harnesses below: report the raise as the row's value, so the row
+        # goes red by name instead of aborting the suite with every later check unrun.
+        shim = {"page script raised": str(exc)[:200]}
+    check("[#1107] EXECUTED: the shared DOM shim RECORDS what the page does to an element — a "
+          "class added and removed, an attribute, a child REPLACED rather than appended, and id "
+          "identity all read back, and a class added to a child reaches an ancestor's walk",
+          shim,
+          {"before": {"degraded": True, "contains": True},
+           "after": {"degraded": False, "contains": False},
+           "attribute": "worker", "replaced": ["kept"], "inherited": True, "memoized": True,
+           "namespaced": "svg", "text": "kept", "loaded": "function"})
+    # AGENTS.md pre-flight item 4, *mutually-masking duplicates*: two copies of one thing make each
+    # copy individually unkillable, so the invariant has to be on the COUNT. The needles are
+    # regexes on purpose — a plain-substring needle for a shim line would occur in this assertion
+    # too and could never read 1 — and the `\(`/`\{` escapes mean none of them matches its own
+    # source text here.
+    module_source = _repo_file("scripts", "dashboard-gen.py")
+    check("[#1107] ...and it is defined exactly ONCE. Three harnesses each hand-rolled a copy and "
+          "two had already drifted from the third; a fresh copy is that defect returning",
+          (len(re.findall(r"^function element\(tag\) \{$", module_source, re.M)),
+           len(re.findall(r"^globalThis\.document = \{$", module_source, re.M)),
+           len(re.findall(r"^const ids = \{\};$", module_source, re.M)),
+           # The app.js read, so a second PRELUDE is caught even if its `element()` were reformatted
+           # past the first needle — every harness reaches the page through the one builder.
+           len(re.findall(r'^const source = fs\.readFileSync\(__APP_JS__, "utf8"\);$',
+                          module_source, re.M))),
+          (1, 1, 1, 1))
 
 
 def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar):
@@ -2350,9 +2616,9 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
     saved_run = subprocess.run
     try:
         subprocess.run = fake_gh
-        fetched, fetch_error = _fetch_dispatch_history("owner/registry", 5), None
+        (fetched, fetch_status), fetch_error = _fetch_dispatch_history("owner/registry", 5), None
     except Exception as exc:                    # noqa: BLE001 - reported as a row, never swallowed
-        fetched, fetch_error = [], f"{type(exc).__name__}: {exc}"
+        fetched, fetch_status, fetch_error = [], None, f"{type(exc).__name__}: {exc}"
     finally:
         subprocess.run = saved_run
     check("[#323] the fetched history carries the per-lane rows for the run whose log was read, "
@@ -2368,7 +2634,7 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
           [(2, 2, ["worker", "review", "fix", "disarm"]), (None, None, None), (None, None, None),
            (None, None, None), (None, None, None)])
     published = build_dashboard(issues, leases, usage, fetched, None, now, "fixture-salt",
-                                probe_status=measured_sidecar)
+                                probe_status=measured_sidecar, history_status=fetch_status)
     published_sweeps = published["fleet"]["dispatch_outcomes"]
     published_lanes = next((sweep.get("lanes") or [] for sweep in published_sweeps), [])
     # Stated as LITERALS, not as `fetched[0]["lanes"]`: comparing the payload against the object
@@ -2399,8 +2665,7 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
           _js_code_count(
               lane_body,
               'const state = LANE_STATES.has(lane.state) ? lane.state : "unknown";'), 1)
-    harness = _LANE_PAGE_HARNESS.replace("__APP_JS__", json.dumps(
-        str(Path(__file__).resolve().parent.parent / "dashboard" / "app.js")))
+    harness = _page_harness("renderOutcomes", _LANE_PAGE_BODY)
     fixtures = {
         "lanes": published_sweeps[:1],
         "absent": [dict(history[0], lanes=None)],
@@ -2448,6 +2713,127 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
     check("[#323] EXECUTED page script: a state token that is not one of the four known ones "
           "renders `unknown` — it never reaches the class attribute as written",
           chips("hostile", "dot"), ["lane-dot unknown", "lane-dot unknown"])
+
+
+def _self_test_history_fetch(check, issues, leases, usage, now, measured_sidecar):
+    """Issue #1106 — the dispatch-history FETCH OUTCOME, from the `gh` subprocess that decides it
+    to the document the page reads it out of.
+
+    Measured while implementing #323 with `python3 -m trace --count --missing`: the non-zero-exit
+    `return`, the `except (AttributeError, json.JSONDecodeError)` arm and the non-dict-run
+    `continue` were at ZERO executions across the whole suite, so a mutant in any of them was
+    unkillable — and the bug they were hiding is that all three published a bare `[]`, which the
+    page renders exactly like a fleet that has genuinely never dispatched. `gh` is stubbed per case
+    below, so all three execute."""
+    # --- the pure normalizer, BOTH directions. Only an explicit `ok` may license "we read it".
+    check("[#1106] the fetch-outcome normalizer trusts ONLY an explicit `ok` — a failed claim, an "
+          "alien one, a non-dict one and NO claim at all all refuse",
+          [_history_outcome(status)["fetched"] for status in (
+              {"outcome": "ok"}, {"outcome": "  OK "}, {"outcome": "failed"},
+              {"outcome": "probably-fine"}, {}, None, [], "ok")],
+          [True, True, False, False, False, False, False, False])
+    check("[#1106] ...and it carries the failure DETAIL to the page, bounded to the same safe-token "
+          "shape as every other externally-sourced label on this document",
+          (_history_outcome({"outcome": "failed", "detail": "gh-exited-nonzero"}),
+           _history_outcome({"outcome": "failed",
+                             "detail": "<img src=x onerror=alert(1)>"})["detail"]),
+          ({"outcome": "failed", "detail": "gh-exited-nonzero", "fetched": False}, ""))
+
+    # --- the three branches, EXECUTED against a stubbed `gh`.
+    class _Completed:
+        def __init__(self, returncode, stdout):
+            self.returncode, self.stdout = returncode, stdout
+
+    def fetch_with(listing):
+        """The real fetcher against a stubbed `gh`: `listing` answers the run-listing call and every
+        per-run log call fails, so only the LISTING branches are under test here. An exception is
+        turned into a named red row rather than aborting the suite (pre-flight item 4)."""
+        def fake_gh(command, **kwargs):
+            if "/workflows/dispatch.yml/runs" in command[-1]:
+                return listing
+            return _Completed(1, b"")
+
+        saved_run = subprocess.run
+        try:
+            subprocess.run = fake_gh
+            return _fetch_dispatch_history("owner/registry", 5)
+        except Exception as exc:                # noqa: BLE001 - reported as a row, never swallowed
+            return [], f"raised {type(exc).__name__}: {exc}"
+        finally:
+            subprocess.run = saved_run
+
+    nonzero = fetch_with(_Completed(1, ""))
+    check("[#1106] a run listing whose `gh` exits NON-ZERO reports the failure instead of an empty "
+          "history that reads as a quiet fleet",
+          nonzero, ([], {"outcome": "failed", "detail": "gh-exited-nonzero"}))
+    check("[#1106] ...so does a body that is not JSON at all (the JSONDecodeError arm)",
+          fetch_with(_Completed(0, "{not json")),
+          ([], {"outcome": "failed", "detail": "run-listing-unparseable"}))
+    check("[#1106] ...and one that parses to something that is not an object at all (a bare scalar "
+          "and a bare array both fail the SCHEMA check, not the JSON parse)",
+          (fetch_with(_Completed(0, "3")), fetch_with(_Completed(0, "[]"))),
+          (([], {"outcome": "failed", "detail": "run-listing-schema-alien"}),
+           ([], {"outcome": "failed", "detail": "run-listing-schema-alien"})))
+    # THE ROUND-2 SEAM: `gh` answers a throttled/errored call with a syntactically VALID document
+    # that carries no run list. `.get("workflow_runs") or []` turned every one of these into an
+    # empty history with an `ok` outcome — a quiet fleet on the public page — and the truthy
+    # non-lists were worse: a str was sliced into characters and dropped, a dict raised TypeError
+    # out of the build. Each row states the document as a LITERAL so a mutant that re-widens the
+    # check (e.g. back to `or []`, or to a truthiness test) goes red on a NAMED row rather than
+    # aborting the suite (pre-flight item 4).
+    alien = ([], {"outcome": "failed", "detail": "run-listing-schema-alien"})
+    for label, body in (("no `workflow_runs` field at all", {}),
+                        ("an ERROR document from a throttled call", {"message": "API rate limit"}),
+                        ("a null field", {"workflow_runs": None}),
+                        ("a truthy STRING (was sliced into characters)",
+                         {"workflow_runs": "not-a-list"}),
+                        ("a truthy OBJECT (slicing it raised TypeError)",
+                         {"workflow_runs": {"11": {"id": 11}}}),
+                        ("a truthy NUMBER", {"workflow_runs": 3})):
+        check(f"[#1106] a valid JSON run listing with {label} FAILS CLOSED — not a quiet fleet",
+              fetch_with(_Completed(0, json.dumps(body))), alien)
+    quiet = fetch_with(_Completed(0, json.dumps({"workflow_runs": []})))
+    check("[#1106] THE DISCRIMINATION: a fleet that has genuinely never dispatched returns the same "
+          "empty row set with an `ok` outcome — the rows alone cannot tell the two apart",
+          (quiet, quiet[0] == nonzero[0], quiet[1] == nonzero[1]),
+          (([], {"outcome": "ok", "detail": ""}), True, False))
+    mixed = fetch_with(_Completed(0, json.dumps({"workflow_runs": [
+        {"id": 21, "status": "queued"}, "not-a-run", None, {"id": 22, "status": "waiting"}]})))
+    check("[#1106] a run entry that is not an object is DROPPED, and the real entries either side "
+          "of it still land (the `continue` had never executed)",
+          (mixed[1], [entry["conclusion"] for entry in mixed[0]]),
+          ({"outcome": "ok", "detail": ""}, ["queued", "waiting"]))
+
+    # --- ...and the published document, where the ambiguity was actually visible. The `fleet`
+    # blocks are stated as LITERALS on both sides, so this row goes red if the marker starts
+    # tracking something other than the fetch (pre-flight item 2(b)).
+    empty_fleet = {"active_agents": 1, "capacity": {"anthropic": True},
+                   "last_sweep_at": None, "dispatch_outcomes": []}
+    quiet_document = build_dashboard(issues, leases, usage, [], None, now, "fixture-salt",
+                                     probe_status=measured_sidecar, serviced=("owner/repo",),
+                                     history_status={"outcome": "ok", "detail": ""})
+    lost_document = build_dashboard(issues, leases, usage, [], None, now, "fixture-salt",
+                                    probe_status=measured_sidecar, serviced=("owner/repo",),
+                                    history_status={"outcome": "failed",
+                                                    "detail": "gh-exited-nonzero"})
+    # `.get`, never `[...]`: a mutant that DROPS the marker must land as a named red row here, not
+    # as a KeyError that aborts the suite and records as a kill while every check below it never
+    # ran (AGENTS.md pre-flight item 4, crash-after-partial-run — measured on this very block).
+    check("[#1106] the two published documents are no longer BYTE-IDENTICAL: both zero the sweep "
+          "and the outcome list, and only the marker says which of the two it is",
+          (quiet_document["fleet"], lost_document["fleet"],
+           quiet_document.get("dispatch_history"), lost_document.get("dispatch_history"),
+           json.dumps(quiet_document, sort_keys=True)
+           == json.dumps(lost_document, sort_keys=True)),
+          (empty_fleet, empty_fleet,
+           {"outcome": "ok", "detail": "", "fetched": True},
+           {"outcome": "failed", "detail": "gh-exited-nonzero", "fetched": False},
+           False))
+    check("[#1106] the marker is on EVERY document, including a build that stated no fetch outcome "
+          "at all — which normalizes to NOT fetched rather than being omitted",
+          build_dashboard([], {"leases": []}, {}, [], None, now, "fixture-salt",
+                          serviced=("solo/target",)).get("dispatch_history"),
+          {"outcome": "unknown", "detail": "", "fetched": False})
 
 
 def _self_test():
@@ -2550,7 +2936,8 @@ def _self_test():
     # `serviced` is pinned to the fixture's own repository (#78) so this golden document stays
     # hermetic: the default reads the live policy, which is exercised on its own rows further down.
     got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
-                          probe_status=measured_sidecar, serviced=("owner/repo",))
+                          probe_status=measured_sidecar, serviced=("owner/repo",),
+                          history_status={"outcome": "ok", "detail": ""})
     expected = {
         "schema": SCHEMA,
         "generated_at": "2025-06-15T15:06:40Z",
@@ -2583,13 +2970,19 @@ def _self_test():
         # fixture carries it too — and a measured build must say `measured: True` rather than omit
         # the key, which is what let a sidecar-less build look indistinguishable from a healthy one.
         "usage_probe": measured_marker,
+        # Issue #1106: likewise ALWAYS present, so a build whose `gh` history read failed cannot
+        # publish the same empty `dispatch_outcomes` a quiet fleet publishes with nothing to say
+        # about which of the two it is.
+        "dispatch_history": {"outcome": "ok", "detail": "", "fetched": True},
     }
     check("fixture leases + limits -> expected JSON", got, expected)
     check("dispatch log counts", _parse_dispatch_log(
         "2025-01-01Z dispatched worker owner/repo#1\n"
         "2025-01-01Z defer owner/repo#2: busy\n"
         "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"), (1, 1, None))
+    _self_test_page_shim(check)
     _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar)
+    _self_test_history_fetch(check, issues, leases, usage, now, measured_sidecar)
     check("raw identity absent", handle not in json.dumps(got) and email not in json.dumps(got), True)
     leaky = copy.deepcopy(got)
     leaky["provider_quota"][0]["debug"] = handle
@@ -3001,8 +3394,7 @@ def _self_test():
           _js_code_count(_js_function_body(_repo_file("dashboard", "app.js"), "render"),
                          "renderRepositoryAgents(data.active_by_repository, "
                          "data.fleet.active_agents);"), 1)
-    repo_agents_page = _REPO_AGENTS_PAGE_HARNESS.replace("__APP_JS__", json.dumps(
-        str(Path(__file__).resolve().parent.parent / "dashboard" / "app.js")))
+    repo_agents_page = _page_harness("renderRepositoryAgents", _REPO_AGENTS_PAGE_BODY)
     try:
         rendered_agents = _node_json(repo_agents_page, {"cases": {
             # A fully quiet fleet: no model is live anywhere, so there are no per-model columns and
@@ -3887,6 +4279,243 @@ def _self_test():
           sorted(_THRESHOLD_BOUND_EXEMPT & set(keepalive_cadences)),
           ["groom.yml", "retriage.yml"])
 
+    # --- #1084: the WIDENING direction, on the three thresholds the row above cannot see. The
+    # strict bound covers three registry legs; the #1353 pair is excused from it ENTIRELY (so
+    # `groom.yml:1800` -> `:99999` is invisible), and the CROSS-REPO leg is not in that row's
+    # population at all because sparq-org/sparq is not checked out here for
+    # `_workflow_cadence_seconds` to read. With every fixture age below derived from the threshold
+    # itself, `rearm-sweeper.yml:1200` -> `:99999` left the whole suite green (#1084 measured 187
+    # rows) while that leg of the liveness mesh became a no-op. The two
+    # rows here bound EVERY run-anchored threshold in the mesh against a cadence that is not a
+    # restatement of it — read from the watched workflow for the registry legs, declared in
+    # `_CROSS_REPO_KEEPALIVE_CADENCE_SECONDS` for the cross-repo one. Ceiling and floor are stated
+    # SEPARATELY because a threshold that grows and one that shrinks are different failures with
+    # different consequences, and a single combined row cannot say which one it caught.
+    # ------------------------------------------------------------------------------------------
+    def _cross_repo_targets(script, specs, leg):
+        """{(repository, workflow-file): threshold-seconds} for a cross-repo keepalive leg.
+
+        The repository is read out of the leg's OWN `repos/<owner>/<name>/actions/…` endpoints
+        rather than restated here, so a leg re-pointed at another repository stops matching the
+        cadence declared for the old one instead of silently inheriting its bound. Anything other
+        than exactly one addressed repository is a REFUSAL: a leg whose target cannot be identified
+        must not be sized against a guess. Marker-anchored specs are excluded for the same reason
+        the registry side excludes dispatch.yml — their freshness is not a function of the watched
+        workflow's cron — and the membership row below reds if one ever appears here."""
+        repositories = sorted(set(re.findall(
+            r"repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/actions/", script)))
+        # Resolved BEFORE the refusal, and never by indexing the list under the guard: a guard that
+        # is the only thing standing between an empty list and `repositories[0]` cannot be measured
+        # — deleting it raises IndexError from the mutated line itself, which aborts the suite and
+        # records as a kill while every row below it never ran.
+        repository = repositories[0] if len(repositories) == 1 else None
+        if repository is None:
+            raise DashboardError(
+                f"{leg} addresses {len(repositories)} repositories, expected exactly 1 — refusing "
+                "to bound its thresholds against a cadence declared for some other repository")
+        return {(repository, name): limit
+                for name, (limit, marker) in specs.items() if not marker}
+
+    # The reader's own refusals, EXECUTED — a refusal nothing ever runs is a refusal nothing has
+    # checked, and both of these decide whether a threshold is measured against its own
+    # repository's cadence or another one's. `a-org/a` and `b-org/b` appear nowhere else in this
+    # suite, so the positive control cannot pass on a value the harness already had.
+    _cross_repo_probe_specs = {"probe.yml": (900, ""), "marked.yml": (300, "some-marker")}
+    check("[#1084] the repository a declared cadence is matched to is READ out of the leg's own "
+          "`repos/<owner>/<name>/actions/…` endpoints: a leg addressing none of them, or two "
+          "different ones, REFUSES rather than bounding its thresholds against a cadence declared "
+          "for some other repository — and a marker-anchored spec is not sized against a cron",
+          [_raises_dashboard(lambda: _cross_repo_targets(
+              "gh api -X POST dispatches", _cross_repo_probe_specs, "x")),
+           _raises_dashboard(
+               lambda: _cross_repo_targets(
+                   "repos/a-org/a/actions/workflows/probe.yml/runs?per_page=1\n"
+                   "repos/b-org/b/actions/workflows/probe.yml/dispatches",
+                   _cross_repo_probe_specs, "x")),
+           _cross_repo_targets("repos/a-org/a/actions/workflows/probe.yml/runs?per_page=1",
+                               _cross_repo_probe_specs, "x")],
+          [True, True, {("a-org/a", "probe.yml"): 900}])
+
+    cross_repo_thresholds = _cross_repo_targets(
+        sparq_script, sparq_specs, "the cross-repo cron-keepalive leg")
+    check("[#1084] every workflow the cross-repo leg watches has a DECLARED cadence, and the "
+          "declaration names nothing the leg has stopped watching — both sides pinned by equality, "
+          "so a target added to that leg without a declared cadence (a threshold with no reference "
+          "point at all) goes red here rather than joining the bounds below unmeasured",
+          (sorted(cross_repo_thresholds), sorted(_CROSS_REPO_KEEPALIVE_CADENCE_SECONDS)),
+          ([("sparq-org/sparq", "rearm-sweeper.yml")],
+           [("sparq-org/sparq", "rearm-sweeper.yml")]))
+    # `label -> (threshold, cadence)` for every run-anchored threshold in the mesh. An undeclared
+    # cross-repo target is DROPPED rather than raised on: the row above already names that failure,
+    # and aborting the suite here would stop every row below it from running at all (a mutant that
+    # crashes the harness records as a kill while nothing under it was measured).
+    anchored_thresholds = {name: (keepalive_specs[name][0], cadence)
+                           for name, cadence in keepalive_cadences.items()}
+    anchored_thresholds.update({
+        f"{repository} {name}": (limit, _CROSS_REPO_KEEPALIVE_CADENCE_SECONDS[(repository, name)])
+        for (repository, name), limit in cross_repo_thresholds.items()
+        if (repository, name) in _CROSS_REPO_KEEPALIVE_CADENCE_SECONDS})
+    check("[#1084] NO run-anchored threshold in the mesh exceeds TWO nominal cadences of what it "
+          "watches — the #1353 exempts and the cross-repo leg included (offenders listed as "
+          "label -> (threshold, cadence)): a threshold widened past two cadences costs a whole "
+          "extra cycle per dropped fire, and one widened to hours retires that leg of the mesh "
+          "while every fixture-driven row below it still passes",
+          {label: pair for label, pair in anchored_thresholds.items() if pair[0] > 2 * pair[1]},
+          {})
+    check("[#1084] ...and none sits at or under ONE cadence, where the keepalive kicks a punctual "
+          "cron behind its own fire — the #559 dup-dispatch storm, which on the cross-repo leg "
+          "shows up only in ANOTHER repository's telemetry",
+          {label: pair for label, pair in anchored_thresholds.items() if pair[0] <= pair[1]},
+          {})
+
+    # --- #1085: PER-TARGET JITTER, the optional half of #559 — ANSWERED here, not implemented.
+    #
+    # #559 asked optionally for per-target jitter so independent mesh sources "do not converge on
+    # the same second": two sources watching one target read the same COMPLETED anchor in the same
+    # tick, both conclude stale, and both dispatch. The #559 live-run guard BOUNDS that duplicate
+    # (it can no longer become self-sustaining) but cannot remove it, because neither kick is live
+    # yet at the moment the other reads.
+    #
+    # Jitter costs something on EVERY fire — #559's own sketch was a `sleep` in the keepalive step,
+    # i.e. runner minutes on ~96 fires a day per leg — so #559 required the residual duplicate rate
+    # to be MEASURED before paying it. That measurement cannot run from inside the worker container
+    # (no token, no network), and it does not have to: convergence is a STRUCTURAL property of the
+    # mesh's source -> target map, and that map is readable offline out of the three real step
+    # bodies. A target watched by exactly ONE source has no second source to converge with, whatever
+    # a dispatch-fire histogram would say. Two findings came out of reading it, and the rows below
+    # are what hold each of them in place:
+    #
+    # (1) NO target in this mesh is watched by more than one source. The six registry legs, the
+    #     cross-repo sweeper and metrics.yml's mutual kick of the dashboard partition cleanly, so
+    #     the convergence jitter would dephase does not exist to be dephased. The duplicate this
+    #     mesh really does produce is a keepalive kick racing the target's OWN cron delivery — and
+    #     jitter in the SOURCE cannot dephase that, because the cron is not ours to move. That one
+    #     is already addressed from the other side by the #680 bound above: a threshold strictly
+    #     above one cadence never kicks a punctual cron behind its own fire.
+    #
+    # (2) When a second source does appear, `hash(target) % window` — the derivation #559 itself
+    #     suggested — is the WRONG KEY and would buy nothing: both sources hash the SAME target
+    #     name to the SAME offset and stay exactly as converged as they were. A jitter that
+    #     actually dephases has to be keyed on the (source, target) PAIR.
+    #
+    # So the deliverable is the premise, enforced: the map pinned by equality, plus a collision
+    # detector that reds the moment any target acquires a second watcher — which is precisely the
+    # condition under which jitter stops being speculative and becomes required.
+    # ------------------------------------------------------------------------------------------
+    # Spelled out as a literal in every expected value below rather than interpolated from here:
+    # an expectation that reads its sentinel from the code under test agrees with any value that
+    # code happens to produce, which is the one shape an assertion cannot fail in.
+    _MESH_SELF = "<self>"
+
+    def _keepalive_leg_repository(script, leg):
+        """The ONE repository a keepalive leg addresses, read out of that leg's OWN
+        `repos/<x>/actions/…` endpoints rather than restated here.
+
+        `${GITHUB_REPOSITORY}` normalises to `<self>`, because the two registry legs name their
+        repository only through that variable: without the normalisation every registry target
+        would carry a different key from every other and the collision row below could never fire
+        at all. Anything other than exactly one addressed repository is a REFUSAL — a leg whose
+        target repository cannot be identified must not enter a map that decides whether two legs
+        watch the same thing."""
+        addressed = sorted(set(re.findall(
+            r"repos/(\$\{GITHUB_REPOSITORY\}|[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/actions/", script)))
+        # Resolved BEFORE the refusal, never by indexing the list under the guard: a guard that is
+        # the only thing between an empty list and `addressed[0]` cannot be measured — deleting it
+        # raises IndexError from the mutated line itself, aborting the suite and recording as a
+        # kill while every row below it never ran.
+        repository = addressed[0] if len(addressed) == 1 else None
+        if repository is None:
+            raise DashboardError(
+                f"{leg} addresses {len(addressed)} repositories, expected exactly 1 — refusing to "
+                "place its targets in the mesh map under a guessed repository")
+        return _MESH_SELF if repository == "${GITHUB_REPOSITORY}" else repository
+
+    def _mesh_watchers(legs):
+        """{(repository, workflow-file): [source-leg, …]} over the whole keepalive mesh."""
+        watchers = {}
+        for leg, (script, specs) in sorted(legs.items()):
+            repository = _keepalive_leg_repository(script, leg)
+            for name in sorted(specs):
+                watchers.setdefault((repository, name), []).append(leg)
+        return watchers
+
+    def _mesh_labelled(watchers, only_shared=False):
+        return {f"{repository} {name}": legs
+                for (repository, name), legs in sorted(watchers.items())
+                if not only_shared or len(legs) > 1}
+
+    # The reader's refusals and its normalisation, EXECUTED. `jit-org/*` appears nowhere else in
+    # this suite, so the positive controls cannot pass on a value the harness already had.
+    check("[#1085] the repository a mesh target is keyed by is READ out of the leg's own "
+          "`repos/<owner>/<name>/actions/…` endpoints, and `${GITHUB_REPOSITORY}` normalises to a "
+          "single key so the two registry legs are seen to watch ONE repository — a leg addressing "
+          "no repository, or two different ones, REFUSES rather than entering the map under a guess",
+          [_raises_dashboard(lambda: _keepalive_leg_repository("gh api -X POST dispatches", "x")),
+           _raises_dashboard(lambda: _keepalive_leg_repository(
+               "repos/jit-org/one/actions/workflows/probe.yml/runs?per_page=1\n"
+               "repos/jit-org/two/actions/workflows/probe.yml/dispatches", "x")),
+           _keepalive_leg_repository("repos/jit-org/three/actions/workflows/probe.yml/runs", "x"),
+           _keepalive_leg_repository(
+               "repos/${GITHUB_REPOSITORY}/actions/workflows/probe.yml/runs", "x")],
+          [True, True, "jit-org/three", "<self>"])
+    # The detector driven over a mesh that DOES collide — without this the production row below is
+    # satisfied by a detector that can never report anything, which is the whole failure mode a
+    # zero-row assertion has. `probe-c` watches the same workflow FILE in a different repository
+    # and must NOT be folded in: a detector keyed on the file name alone reports a collision that
+    # is not there, and would have declared this mesh in need of jitter it does not need.
+    _mesh_probe = {
+        "probe-a": ("repos/jit-org/one/actions/workflows/shared.yml/runs?per_page=1",
+                    {"shared.yml": (900, ""), "solo.yml": (900, "")}),
+        "probe-b": ("repos/jit-org/one/actions/workflows/shared.yml/runs?per_page=1",
+                    {"shared.yml": (900, "")}),
+        "probe-c": ("repos/jit-org/two/actions/workflows/shared.yml/runs?per_page=1",
+                    {"shared.yml": (900, "")}),
+    }
+    check("[#1085] the collision detector DETECTS one: over a fixture mesh where two legs watch a "
+          "target it names both watchers, a singly-watched target is not reported, and the same "
+          "workflow file in another repository is a different target",
+          (_mesh_labelled(_mesh_watchers(_mesh_probe), only_shared=True),
+           sorted(_mesh_labelled(_mesh_watchers(_mesh_probe)))),
+          ({"jit-org/one shared.yml": ["probe-a", "probe-b"]},
+           ["jit-org/one shared.yml", "jit-org/one solo.yml", "jit-org/two shared.yml"]))
+
+    # metrics.yml's mutual kick is the mesh's THIRD source and lives in another file entirely, so
+    # nothing above has ever read it. Extracted the same way as the two dashboard legs; its
+    # staleness `for spec in …` list is its watch list. The publish kick beside it in the same step
+    # is deliberately NOT a member: it is causal rather than staleness-driven and is deduped by the
+    # dashboard's own publish decision, so it cannot converge with a stale-anchor reader.
+    metrics_workflow = _repo_file(".github", "workflows", "metrics.yml")
+    metrics_keepalive_script = _workflow_step_script(metrics_workflow, "dashboard-publish")
+    metrics_specs = _keepalive_specs(metrics_keepalive_script,
+                                     "metrics.yml's mutual keepalive leg")
+    mesh_watchers = _mesh_watchers({
+        "dashboard.yml/registry-keepalive": (keepalive_script, keepalive_specs),
+        "dashboard.yml/sparq-keepalive-dispatch": (sparq_script, sparq_specs),
+        "metrics.yml/dashboard-publish": (metrics_keepalive_script, metrics_specs),
+    })
+    check("[#1085] the whole mesh's source -> target map, read out of the three REAL step bodies "
+          "and pinned by equality — a leg that quietly stops watching a workflow, or one that "
+          "stops being extractable at all, goes red HERE rather than letting the single-watcher "
+          "row below pass because there is nothing left to collide",
+          _mesh_labelled(mesh_watchers),
+          {"<self> conflict-resolver.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> curate.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> dashboard.yml": ["metrics.yml/dashboard-publish"],
+           "<self> dispatch.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> groom.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> metrics.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> retriage.yml": ["dashboard.yml/registry-keepalive"],
+           "sparq-org/sparq rearm-sweeper.yml": ["dashboard.yml/sparq-keepalive-dispatch"]})
+    check("[#1085] ...and NO target in it is watched by more than one source (offenders listed as "
+          "target -> watching legs). This is the premise that makes per-target jitter unnecessary "
+          "and the exact condition under which it becomes REQUIRED: two sources on one target read "
+          "the same COMPLETED anchor in the same tick, both conclude stale and both dispatch, and "
+          "the #559 live-run guard cannot see it because neither kick is live yet when the other "
+          "reads. Adding a second watcher reds this row — dephase on the (SOURCE, target) pair, "
+          "never on `hash(target)`, which both sources compute identically",
+          _mesh_labelled(mesh_watchers, only_shared=True),
+          {})
+
     keepalive_gh_stub = r'''#!/usr/bin/env bash
 # Hermetic `gh` for dashboard.yml's cron-keepalive body. Every argv is recorded; the three reads
 # the body makes are served from fixture files; an argv this stub does not model exits 64, so a
@@ -3994,9 +4623,58 @@ esac
         silently is unusable, and attaching the log unconditionally would bury every row."""
         check(name, got if got == want else (got, log), want)
 
+    def _tool_probe(*argv):
+        """Exit status of `argv`, or a NAMED diagnostic string when the binary cannot be executed.
+
+        A bare `subprocess.run` raises `FileNotFoundError` on a host without the tool, and it
+        raises it while building the `check(...)` argument — so the row it was meant to produce
+        never prints and the suite ABORTS mid-run. #1496 measured 178 rows on a worker container
+        without `jq`; re-measured on this checkout, 203 of the suite's 305 rows printed and every
+        check below never executed, with no named FAIL to say why — the count differs because the
+        suite grew, the truncation does not. That is the crash-after-partial-run hazard of pre-flight
+        item 4, baked into the suite itself: any author comparing a mutant's kill count against a
+        pristine run would be comparing a truncated run against a full one. Returning the
+        diagnostic as the row's VALUE keeps the dependency NAMED and red — the #922 contract —
+        while the rest of the suite still runs. `node` is guarded the same way (`_node_json`)."""
+        try:
+            return subprocess.run(argv, capture_output=True, check=False).returncode
+        except OSError as exc:
+            return f"`{argv[0]}` could not be executed: {type(exc).__name__}: {exc}"
+
+    # [#1496] The guard's OWN two directions, before the row that depends on it. A probe that
+    # still raises reds `_probe_raised` here instead of aborting, so the mutant is a KILL with the
+    # suite's full check count intact rather than another truncated run.
+    _probe_raised = False
+    try:
+        _absent_probe = _tool_probe("dashboard-gen-1496-no-such-binary", "--version")
+    except OSError:
+        _absent_probe = None
+        _probe_raised = True
+    check("[#1496] a MISSING binary is reported as the probe's value, never raised: the row below "
+          "goes red by name and every check after it still executes",
+          (_probe_raised, isinstance(_absent_probe, str),
+           "dashboard-gen-1496-no-such-binary" in str(_absent_probe), _absent_probe == 0),
+          (False, True, True, False))
+    check("[#1496] ...and the guard is not blanket exception-swallowing: a binary that EXISTS and "
+          "exits non-zero still reports THAT exit status, so a broken tool cannot be mistaken for "
+          "a working one (nor a working one for a missing one)",
+          (_tool_probe(sys.executable, "-c", "raise SystemExit(37)"),
+           _tool_probe(sys.executable, "-c", "")), (37, 0))
+    # The rows above test the GUARD; this one tests its USE. A call site rewired back to an
+    # unguarded `subprocess.run` on the binary keeps them both green while restoring the abort,
+    # which is the AGENTS.md pre-flight item 6 seam — so pin the shape by exact count, both
+    # directions. (The rejected spelling is deliberately never written out below: its own regex is
+    # backslash-escaped and the prose around it says `jq` and the call separately, so this row
+    # counts real call sites rather than matching the text that describes them.)
+    _probe_source = Path(__file__).resolve().read_text(encoding="utf-8")
+    check("[#1496] the jq probe reaches the binary THROUGH the guard: exactly one guarded call "
+          "site and no bare `subprocess.run` one",
+          (len(re.findall(r'_tool_probe\("jq", "--version"\)', _probe_source)),
+           len(re.findall(r'subprocess\.run\(\["jq"', _probe_source))),
+          (1, 0))
     check("[#922] jq is available for the hermetic harness below (a missing dependency must be "
           "NAMED, never silently skipped into a green run)",
-          subprocess.run(["jq", "--version"], capture_output=True).returncode, 0)
+          _tool_probe("jq", "--version"), 0)
     # THE REGRESSION. Fresh runs everywhere — exactly the steady state #79's ring sources produce —
     # and no executed tick for well past the threshold. The pre-#922 body kicked nothing here.
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(dispatch_limit + 600)])
@@ -4258,7 +4936,12 @@ esac
                            "5h_reset": live_now + 3600, "7d_used": "80", "7d_util": "0.8",
                            "7d_reset": live_now + 86400}}
 
-    def main_document(sidecar):
+    # [#1106] The history stub is now a PAIR (rows, fetch outcome), and the published marker joins
+    # the tuple below: dropping `history_status=history_status` from main()'s build_dashboard call
+    # would publish `unknown` where the fetcher said `failed`, with every other row here green.
+    failed_history_marker = {"outcome": "failed", "detail": "gh-exited-nonzero", "fetched": False}
+
+    def main_document(sidecar, history_stub=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name, payload in (("issues.json", issues), ("usage.json", live_usage),
@@ -4268,7 +4951,8 @@ esac
                 Path(root, name).write_text(json.dumps(payload), encoding="utf-8")
             saved_history = globals()["_fetch_dispatch_history"]
             saved_salt = os.environ.get("PROVENANCE_SALT")
-            globals()["_fetch_dispatch_history"] = lambda repo, count: []
+            globals()["_fetch_dispatch_history"] = history_stub or (
+                lambda repo, count: ([], {"outcome": "failed", "detail": "gh-exited-nonzero"}))
             os.environ["PROVENANCE_SALT"] = "fixture-salt"
             try:
                 main(["--issues-file", str(root / "issues.json"),
@@ -4291,16 +4975,29 @@ esac
                     # [#374] the END-TO-END statement: whatever else main() writes, the file that
                     # actually reaches Pages carries no composition key.
                     sorted(FLEET_COMPOSITION_KEYS
-                           & set(re.findall(r'"([^"]+)":', json.dumps(published)))))
+                           & set(re.findall(r'"([^"]+)":', json.dumps(published)))),
+                    # [#1106] ...and the fetch outcome the stubbed fetcher handed main().
+                    published.get("dispatch_history"))
 
     check("[#612] main() forwards a FRESH sidecar, so a healthy run still publishes capacity",
           main_document({"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
                          "attempted_at": live_now}),
-          (True, "available", {"anthropic": True}, []))
+          (True, "available", {"anthropic": True}, [], failed_history_marker))
     check("[#612] main() forwards a FAILED sidecar, so the same run publishes none",
           main_document({"schema": PROBE_SCHEMA, "outcome": "failed",
                          "detail": "probe-exited-nonzero", "attempted_at": live_now}),
-          (False, "unknown", {"anthropic": False}, []))
+          (False, "unknown", {"anthropic": False}, [], failed_history_marker))
+    # ...and the OTHER polarity through the same entrypoint, so the marker is shown to track the
+    # fetcher's answer rather than being pinned to one constant (pre-flight item 2(d)).
+    check("[#1106] main() publishes `fetched: True` when the history read SUCCEEDED — the marker "
+          "tracks the fetch outcome, it is not pinned to one value",
+          main_document({"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                         "attempted_at": live_now},
+                        history_stub=lambda repo, count: (
+                            [{"at": "2025-06-15T15:05:00Z", "conclusion": "success",
+                              "dispatched": 1, "deferred": 0, "lanes": None}],
+                            {"outcome": "ok", "detail": ""}))[-1],
+          {"outcome": "ok", "detail": "", "fetched": True})
 
     # --- #612 review round 2, finding 5 (MINOR), UI half: the page's call sites. Deleting
     # `summary.append(probe)` or the SECOND argument of `updateFreshness(...)` removes the promised
@@ -4346,49 +5043,13 @@ esac
            _js_code_count("/* summary.append(probe) */\nsummary.append(probe);\n",
                           "summary.append(probe)")),
           (0, 0, 1))
-    # --- ...and the two call sites EXECUTED. The page is loaded into a minimal DOM shim under node
-    # and handed the real generated document, so `if (!measured)` -> `if (measured)`, dropping
-    # `summary.append(probe)`, or dropping updateFreshness's second argument each change an OUTCOME
-    # rather than a substring. `fetch` is stubbed to reject (the page's own load path is not under
-    # test) and `setInterval` to a no-op so node exits.
+    # --- ...and the two call sites EXECUTED. The page is loaded into the shared DOM shim under node
+    # (`_PAGE_HARNESS`, which also stubs `fetch` to reject — the page's own load path is not under
+    # test — and `setInterval` to a no-op so node exits) and handed the real generated document, so
+    # `if (!measured)` -> `if (measured)`, dropping `summary.append(probe)`, or dropping
+    # updateFreshness's second argument each change an OUTCOME rather than a substring.
     # ------------------------------------------------------------------------------------------
-    page_harness = r"""
-const fs = require("fs");
-const source = fs.readFileSync(__APP_JS__, "utf8");
-const input = JSON.parse(fs.readFileSync(0, "utf8"));
-function element(tag) {
-  const self = {
-    tagName: tag, children: [], attributes: {}, style: {}, hidden: false, textContent: "",
-    className: "", classes: new Set(),
-    append: (...kids) => { for (const kid of kids) self.children.push(kid); },
-    replaceChildren: (...kids) => { self.children = [...kids]; },
-    setAttribute: (name, value) => { self.attributes[name] = value; },
-    classList: { add: (name) => self.classes.add(name), remove: (name) => self.classes.delete(name),
-                 contains: (name) => self.classes.has(name) },
-  };
-  return self;
-}
-const ids = {};
-globalThis.document = {
-  getElementById: (id) => (ids[id] = ids[id] || element("div#" + id)),
-  createElement: element,
-  createElementNS: (_ns, tag) => element(tag),
-  createTextNode: (text) => ({ textContent: text, children: [] }),
-};
-globalThis.fetch = () => Promise.reject(new Error("network is not under test"));
-globalThis.setInterval = () => 0;
-const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap(flat)];
-const text = (node) => flat(node).join(" ");
-const degraded = (node) =>
-  (node.classes && node.classes.has("degraded")) ||
-  (node.children || []).some(degraded);
-(async () => {
-  // Loading the page runs its own `refresh()`, whose stubbed fetch rejects into the page's catch
-  // and writes to #warning; the tick below lets that settle so it cannot be mistaken for the
-  // probe notice under test, and every render below starts from a fresh #warning element.
-  const scope = new Function(
-    source + "; return { usageProbeCard, updateFreshness, render, providerQuotaCard };")();
-  await new Promise((resolve) => setImmediate(resolve));
+    page_body = r"""
   const cards = {};
   for (const [name, probe] of Object.entries(input.probes)) {
     const card = scope.usageProbeCard(probe);
@@ -4399,9 +5060,15 @@ const degraded = (node) =>
     ids.warning = element("div#warning");
     ids.summary = element("div#summary");
     ids["provider-quota"] = element("div#provider-quota");
+    ids.outcomes = element("tbody#outcomes");
     scope.render(document_);
     warnings[name] = {
       hidden: ids.warning.hidden,
+      // [#1106] the dispatch-outcomes body as the page SHOWS it. render() is the one call site
+      // that wires `data.dispatch_history` into renderOutcomes, so dropping that second argument
+      // changes this text — it is not satisfiable by an occurrence elsewhere in app.js.
+      outcomes: text(ids.outcomes),
+      outcomesDegraded: (ids.outcomes.children || []).some(degraded),
       // [#374] the rendered quota + summary text, so the assertions below can state what the page
       // SHOWS rather than what app.js contains: a headroom word and a percentage, never a count of
       // accounts. `text()` walks children, which is where every one of those strings lives.
@@ -4427,8 +5094,14 @@ const degraded = (node) =>
   for (const [name, row] of Object.entries(input.quotaRows || {})) {
     resets[name] = text(scope.providerQuotaCard(row));
   }
-  process.stdout.write(JSON.stringify({ cards, warnings, resets }));
-})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
+  // [#1343] the one absolute-stamp helper every timestamp on the page goes through, called
+  // directly on pinned instants — the hour glyph it prints is the whole finding, so the rows
+  // read the RENDERED string rather than anything app.js was grepped for.
+  const stamps = {};
+  for (const [name, value] of Object.entries(input.stamps || {})) {
+    stamps[name] = scope.utc(value);
+  }
+  process.stdout.write(JSON.stringify({ cards, warnings, resets, stamps }));
 """
     # A LIVE `now`: the page's own staleness notice fires on a year-old fixture stamp, and that
     # notice would then mask the probe notice this block is about.
@@ -4446,6 +5119,19 @@ const degraded = (node) =>
         issues, leases, live_usage, history, None, now, "fixture-salt",
         probe_status={"schema": PROBE_SCHEMA, "outcome": "failed",
                       "detail": "secret-materialization-failed", "attempted_at": now})
+    # --- [#1106] the pair the issue is about: NO dispatch history, once because the fleet has
+    # genuinely never dispatched and once because the `gh` run listing failed. Everything the page
+    # had to go on — `dispatch_outcomes: []` and `last_sweep_at: null` — is identical between them.
+    quiet_history_document = build_dashboard(
+        issues, leases, live_usage, [], None, live_now, "fixture-salt",
+        probe_status={"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                      "attempted_at": live_now},
+        history_status={"outcome": "ok", "detail": ""})
+    lost_history_document = build_dashboard(
+        issues, leases, live_usage, [], None, live_now, "fixture-salt",
+        probe_status={"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                      "attempted_at": live_now},
+        history_status={"outcome": "failed", "detail": "gh-exited-nonzero"})
     # --- [#71] reset stamps, on BOTH sides of the wall clock the page renders against. A reset is
     # the only FORWARD-looking instant the page shows, and `relative()` renders any instant, so a
     # stamp that elapsed after the build printed "next reset 6 minutes ago" — a pending refill that
@@ -4462,20 +5148,126 @@ const degraded = (node) =>
                              "soonest_reset": soonest, "oldest_reset": oldest}],
                 "soonest_reset": soonest, "oldest_reset": oldest}
 
-    page = _node_json(
-        page_harness.replace("__APP_JS__",
-                             json.dumps(str(Path(__file__).resolve().parent.parent
-                                            / "dashboard" / "app.js"))),
+    # --- [#1341] the guard the executed-page call below depends on, held to BOTH directions on a
+    # real `node` run: a page that throws becomes the rows' VALUE (every nested lookup they make
+    # resolves to the diagnostic, so each row goes red BY NAME and the suite still reaches its full
+    # check count), and a page that renders reaches them unaltered.
+    def _guard_probe(exports, body, probe):
+        """`probe` applied to what `_executed_page` hands the rows below — or the raise, as a value.
+
+        Own-abort insurance: the regressions this row exists to catch (an unguarded call, or a
+        fallback whose nested lookups cannot be traversed) RAISE, and a raise here would terminate
+        the suite in exactly the way #1341 is about — recording as a kill with every later check
+        unrun. Reporting it as the row's value keeps this row red by name instead.
+
+        `exports` and the non-empty payload come from the caller so that they MATCH the real call
+        site below: a guard made conditionally inert on either (pre-flight item 3 — the mutant that
+        is not a deletion) then goes inert here too, and is caught, instead of surviving because the
+        probe happened to call through a differently-shaped harness."""
+        harness = _page_harness(exports, body)
+        try:
+            return probe(_executed_page(harness, {"probe": "1341"}))
+        except Exception as exc:  # noqa: BLE001 — any raise out of the guard IS the finding
+            return f"probe raised: {type(exc).__name__}: {exc}"[:120]
+
+    _thrown_probe = _guard_probe(
+        "usageProbeCard, updateFreshness, render, providerQuotaCard, utc",
+        "  throw new Error('deliberate-1341-page-failure');",
+        lambda page: ("deliberate-1341-page-failure" in page,
+                      page.startswith("page script raised:"),
+                      page["cards"]["measured"]["degraded"] is page,
+                      page["warnings"].get("quietHistory") is page,
+                      page["cards"]["absent"] is None,
+                      "NOT MEASURED" in page["cards"]["failed"]["text"]))
+    _rendered_probe = _guard_probe(
+        "usageProbeCard, updateFreshness, render, providerQuotaCard, utc",
+        "  console.log(JSON.stringify({ loaded: typeof scope.render }));",
+        lambda page: (page, isinstance(page, _RaisedPage)))
+    check("[#1341] a page script that THROWS is reported as the rows' value rather than raised: "
+          "the diagnostic names the underlying failure, and the nested lookups the rows below make "
+          "resolve to it instead of aborting the suite on a KeyError",
+          _thrown_probe, (True, True, True, True, False, False))
+    check("[#1341] ...and a page that RENDERS reaches those rows untouched — the guard reports a "
+          "failed render, it never stands in for a successful one",
+          _rendered_probe, ({"loaded": "function"}, False))
+    # The two rows above test the GUARD; this one tests its USE. A call site rewired back to a bare
+    # `_node_json` keeps them both green while losing the whole protection, which is the AGENTS.md
+    # pre-flight item 6 seam — so the executed-page call below is pinned by exact shape here.
+    _own_source = Path(__file__).resolve().read_text(encoding="utf-8")
+    check("[#1341] the executed-page block reaches `node` THROUGH the guard: exactly one guarded "
+          "call site and no bare `_node_json` one",
+          (len(re.findall(r'_executed_page\(\s*_page_harness\("usageProbeCard', _own_source)),
+           len(re.findall(r'_node_json\(\s*_page_harness\("usageProbeCard', _own_source))),
+          (1, 0))
+
+    # `_executed_page`, never a bare `_node_json`: a page that throws while rendering IS the
+    # finding, and reporting it as the value of every row below keeps those rows named and red
+    # instead of aborting the suite mid-run with its later checks unexecuted (issue #1341).
+    page = _executed_page(
+        _page_harness("usageProbeCard, updateFreshness, render, providerQuotaCard, utc", page_body),
         {"probes": {"measured": measured_document["usage_probe"],
                     "failed": failed_document["usage_probe"],
                     "absent": None},
          "documents": {"measured": measured_document, "failed": failed_document,
-                       "staleFailed": stale_failed_document},
+                       "staleFailed": stale_failed_document,
+                       "quietHistory": quiet_history_document,
+                       "lostHistory": lost_history_document},
          # -360 is the issue's own reading ("Resets 6 minutes ago"). `split` is the case a single
          # per-CARD staleness flag gets wrong: the first window has refilled while the last known
          # refill is still ahead, so the two stamps must be judged INDEPENDENTLY.
          "quotaRows": {"future": reset_row(5400, 86400), "elapsed": reset_row(-360, -60),
-                       "split": reset_row(-360, 5400)}})
+                       "split": reset_row(-360, 5400)},
+         # [#1343] FIXED instants, never a clock reading: the hour cycle is what is under test, so
+         # the input has to name the hour. `midnight`/`midnightExact` are the bug's own hour;
+         # `noon`/`afternoon` are the controls that keep the fix from over-shooting into h11/h12.
+         "stamps": {"midnight": "2026-07-18T00:30:00Z",
+                    "midnightExact": "2026-07-18T00:00:00Z",
+                    "noon": "2026-07-18T12:00:00Z",
+                    "afternoon": "2026-07-18T13:05:00Z",
+                    "unparseable": "not-a-timestamp"}})
+    # --- [#1343] `utc()` EXECUTED on pinned instants. `hour12: false` resolves to the **h24** hour
+    # cycle for many locales (en-US on the pinned node 20 among them), so the hour after midnight
+    # printed as hour 24 of the PREVIOUS day's clock: `00:30Z` rendered "Jul 18, 2026, 24:30". Every
+    # absolute stamp on the page — freshness, last sweep, probe attempt, health/metrics/observability
+    # collection, the outcome rows, the reset notes — goes through this one helper.
+    #
+    # The rows read the CLOCK TOKEN out of the rendered string rather than the whole string, because
+    # `dateStyle: "medium"` is locale-shaped; the hour and minute glyphs are the entire finding. Both
+    # directions are pinned, and each rejected spelling moves a DIFFERENT row: h24 (the bug) prints
+    # `24` at midnight, h12 prints `12`/`1`, h11 prints `0` at midnight and `0` at noon, and dropping
+    # the option altogether lands on the locale default (h12 here). A non-latin-digit default locale
+    # finds no token at all and goes red by name — this row never passes by failing to look.
+    def _clock(rendered):
+        """`(hour, minute, ends-in-UTC)` as the page SHOWS them — or a diagnostic, never a pass."""
+        if not isinstance(rendered, str):
+            return f"not a rendered stamp: {rendered!r}"[:120]
+        token = re.search(r"(\d{1,2}):(\d{2})", rendered)
+        if not token:
+            return f"no clock token in {rendered!r}"[:120]
+        return (token.group(1), token.group(2), rendered.endswith(" UTC"))
+
+    # `.get` off a truthy fallback, never `page["stamps"]["…"]`: an emptied or deleted stamps block
+    # would otherwise `KeyError` out of the suite and score as a kill with every later row unrun
+    # (#1341 / pre-flight item 4). A raised page keeps `_RaisedPage`'s self-returning lookups.
+    stamps = page.get("stamps") or _RaisedPage("the executed page emitted no `stamps` block")
+    check("[#1343] EXECUTED page script: utc() prints the midnight hour as 00, not h24's 24 — the "
+          "one hour a day every absolute stamp on the page read across a day boundary",
+          (_clock(stamps.get("midnight")), _clock(stamps.get("midnightExact"))),
+          (("00", "30", True), ("00", "00", True)))
+    check("[#1343] ...and the rest of the day still reads as a 24-hour clock: noon is 12 (not h11's "
+          "0) and the afternoon is 13 (not h12's 1), so the fix cannot overshoot the other way",
+          (_clock(stamps.get("noon")), _clock(stamps.get("afternoon"))),
+          (("12", "00", True), ("13", "05", True)))
+    check("[#1343] ...and an unparseable stamp is still refused rather than formatted",
+          stamps.get("unparseable"), "unknown")
+    # A control on the extractor itself: it must be able to SEE the h24 rendering and the two
+    # 12-hour ones, or the three rows above are satisfiable by an instrument that reads nothing.
+    check("[#1343] the clock-token extractor distinguishes the spellings the rows above reject",
+          (_clock("Jul 18, 2026, 24:30 UTC"), _clock("Jul 18, 2026, 12:30 AM UTC"),
+           _clock("Jul 18, 2026, 0:30 AM UTC"), _clock("unknown"), _clock(None)),
+          (("24", "30", True), ("12", "30", True), ("0", "30", True),
+           "no clock token in 'unknown'", "not a rendered stamp: None"))
+
     check("[#612] EXECUTED page script: the probe card degrades exactly when nothing was measured",
           (page["cards"]["measured"]["degraded"],
            "NOT MEASURED" in page["cards"]["measured"]["text"],
@@ -4509,6 +5301,37 @@ const degraded = (node) =>
            page["warnings"]["staleFailed"]["probeNotice"],
            page["warnings"]["staleFailed"]["capacityNote"]),
           (0, False, 1, False, True, False, 2, True, True, True))
+    # --- [#1106] ...and the same executed page on the two histories-that-are-not-there. Both rows
+    # below are red on the pre-#1106 page, where the two documents rendered the SAME string.
+    quiet_page = page["warnings"].get("quietHistory") or {}
+    lost_page = page["warnings"].get("lostHistory") or {}
+    check("[#1106] EXECUTED page script: a fleet that has genuinely never dispatched and one whose "
+          "history could not be READ no longer render the same empty-history row",
+          (quiet_page.get("outcomes", "").strip(), quiet_page.get("outcomesDegraded"),
+           "could not be read" in lost_page.get("outcomes", ""),
+           "gh-exited-nonzero" in lost_page.get("outcomes", ""),
+           lost_page.get("outcomesDegraded"),
+           quiet_page.get("outcomes") == lost_page.get("outcomes")),
+          ("No dispatch history is available.", False, True, True, True, False))
+    check("[#1106] EXECUTED page script: the zeroed Last-dispatch-sweep card says the history "
+          "could not be read, instead of the quiet fleet's `No completed sweep data`",
+          ("No completed sweep data" in quiet_page.get("capacityLines", ""),
+           quiet_page.get("summaryDegraded"),
+           "could not be read" in lost_page.get("capacityLines", ""),
+           "No completed sweep data" in lost_page.get("capacityLines", ""),
+           lost_page.get("summaryDegraded")),
+          (True, False, True, False, True))
+    # The marker is consulted ONLY where the absence of rows is the ambiguous signal: `measured`
+    # carries a real sweep and no fetch outcome at all, and must still read as a normal page rather
+    # than being relabelled unavailable by the fail-closed default.
+    check("[#1106] a document that HAS sweeps is untouched by the marker (the notice is scoped to "
+          "the empty case, not applied to every build that stated no fetch outcome)",
+          (measured_document.get("dispatch_history"),
+           "could not be read" in page["warnings"]["measured"]["capacityLines"],
+           "could not be read" in page["warnings"]["measured"]["outcomes"],
+           page["warnings"]["measured"]["outcomesDegraded"]),
+          ({"outcome": "unknown", "detail": "", "fetched": False}, False, False, False))
+
     # --- [#374] the SAME executed page, on what the fleet section now shows. The measured document
     # is the one-anthropic-account fixture: pre-#374 this section rendered "1 account · 1 free ·
     # 0 capped", a "single account" badge, "0.9 of 1 account-windows free" and a
@@ -4685,6 +5508,147 @@ const degraded = (node) =>
           obs_normalized(obs_fixture), obs_expected)
     check("absent observability snapshot stays hidden (None)",
           _normalize_observability(None), None)
+    # ---- [#1557] THE CACHE GROUP IS THE ONE OBSERVABILITY GROUP WITH NO PRODUCER ANYWHERE: the
+    # file the docs named as its source (`data/cache-affinity.json`) has never been written by
+    # anything in this repo, and affinity itself is derived from the lease ledger at claim time and
+    # kept nowhere. Two of the group's five fields are coerced to 0 on the way out, so a collector
+    # that shipped the KEY without the measurements rendered `Prompt-cache read —` beside a
+    # confident `of 0 drained / 1h`: an unmeasured group wearing a measured zero. Publication now
+    # requires at least one field to have PARSED — parsed, NOT truthy, so a genuinely quiet hour
+    # still emits its zero row — and the drop is ANNOUNCED, because `cache: {}` and "no collector
+    # at all" are the same hidden panel otherwise (#982's lesson, same seam).
+    # Every input below is a JSON literal and the message is a literal too: reading either back off
+    # the module under test is the tautology AGENTS.md pre-flight 2(b) names.
+    _CACHE_DROP = ("dashboard-gen: dropped the observability cache group (type {}) — "
+                   "no field it publishes was measured")
+
+    def obs_cache(source, present=True):
+        """(published `cache` group, the cache-drop warnings this build printed)."""
+        fixture = copy.deepcopy(obs_fixture)
+        if present:
+            fixture["cache"] = source
+        else:
+            del fixture["cache"]
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        return (document["cache"],
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen: dropped the observability cache group")])
+
+    check("[#1557] a MEASURED all-zero hour still PUBLISHES: 0.0 and 0 are readings, not absences. "
+          "Guarding on truthiness instead of on `is not None` hides exactly the quiet hour an "
+          "operator interrogates (AGENTS.md pre-flight item 8)",
+          obs_cache({"prompt_cache_read_fraction_1h": 0.0, "usage_samples_1h": 0,
+                     "warm_drain_rate_1h": 0.0, "drained_1h": 0}),
+          ({"prompt_cache_read_fraction_1h": 0.0, "usage_samples_1h": 0,
+            "warm_drain_rate_1h": 0.0, "drained_1h": 0, "chain_length_histogram": {}}, []))
+    # Each row below is the ONLY row that reds if its own disjunct is dropped from the publication
+    # guard, so no field of the group can quietly stop counting as a measurement. The contract stays
+    # OPEN to a collector that grows just one of them — narrowing it to what exists today would
+    # close the seam this issue asked to keep honest, not fix it.
+    for case, source, published in (
+        ("a lone usage-sample count", {"usage_samples_1h": 3},
+         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 3,
+          "warm_drain_rate_1h": None, "drained_1h": 0, "chain_length_histogram": {}}),
+        ("a lone drain count", {"drained_1h": 4},
+         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 0,
+          "warm_drain_rate_1h": None, "drained_1h": 4, "chain_length_histogram": {}}),
+        ("a lone prompt-cache read fraction", {"prompt_cache_read_fraction_1h": 0.25},
+         {"prompt_cache_read_fraction_1h": 0.25, "usage_samples_1h": 0,
+          "warm_drain_rate_1h": None, "drained_1h": 0, "chain_length_histogram": {}}),
+        ("a lone warm-drain rate", {"warm_drain_rate_1h": 0.5},
+         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 0,
+          "warm_drain_rate_1h": 0.5, "drained_1h": 0, "chain_length_histogram": {}}),
+        ("a lone chain-length histogram", {"chain_length_histogram": {"2": 6}},
+         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 0,
+          "warm_drain_rate_1h": None, "drained_1h": 0, "chain_length_histogram": {"2": 6}}),
+    ):
+        check(f"[#1557] {case} is measurement enough to publish the group, SILENTLY (the warning "
+              "marks a real drop, so it can never fire on the accept path)",
+              obs_cache(source), (published, []))
+    for case, source, container in (
+        ("an EMPTY cache group", {}, "dict"),
+        ("a group in which every field is unreadable", {"prompt_cache_read_fraction_1h": "abc",
+                                                        "usage_samples_1h": -2,
+                                                        "warm_drain_rate_1h": 1.5,
+                                                        "drained_1h": True}, "dict"),
+        ("a histogram whose every key/count is malformed",
+         {"chain_length_histogram": {"bogus": 2, "3": -1}}, "dict"),
+        ("a cache group sent as a list", ["prompt_cache_read_fraction_1h", 0.62], "list"),
+        ("a cache group sent as a JSON string", "0.62", "str"),
+    ):
+        check(f"[#1557] {case} publishes NOTHING and names itself once — never a fabricated "
+              "`0 drained / 1h` on a panel no producer has ever filled",
+              obs_cache(source), (None, [_CACHE_DROP.format(container)]))
+    # ...and the whole snapshot still normalizes around the hole: this is a drop diagnostic, not a
+    # new fatality. Turning the drop into a raise turns this row red.
+    with contextlib.redirect_stdout(io.StringIO()):
+        cache_dropped = obs_normalized({**copy.deepcopy(obs_fixture), "cache": {}})
+    check("[#1557] a snapshot whose cache group is dropped is still TOLERATED — every other panel "
+          "is published unchanged and the build stays green",
+          (cache_dropped["cache"], cache_dropped["thresholds"]["merge_stall_minutes"],
+           [row["lane"] for row in cache_dropped["lanes"]]),
+          (None, 90, ["review-fix", "worker"]))
+    # ...and the PAGE is what the drop has to DELIVER INTO (AGENTS.md pre-flight item 11): a group
+    # normalized to None must leave the panel with no cache CARD at all — not a card whose numbers
+    # merely read `—` beside the `of 0 drained / 1h` sub-label this issue is about. Executed against
+    # dashboard/app.js under the shared DOM shim, never asserted lexically (the #612 round-4 lesson).
+    _OBS_CACHE_PAGE_BODY = r"""
+  const out = {};
+  for (const [name, document] of Object.entries(input.documents)) {
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      scope.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    out[name] = {
+      error,
+      cards: ids["obs-grid"].children
+        .filter((card) => card.tagName === "article")
+        .map((card) => card.children[0].textContent),
+      drained: text(ids["obs-grid"]).includes("drained / 1h"),
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+    with contextlib.redirect_stdout(io.StringIO()):
+        obs_measured = obs_normalized(copy.deepcopy(obs_fixture))
+        obs_unmeasured = obs_normalized({**copy.deepcopy(obs_fixture), "cache": {}})
+    try:
+        obs_page = _node_json(_page_harness("renderObservability", _OBS_CACHE_PAGE_BODY),
+                              {"documents": {"measured": obs_measured,
+                                             "unmeasured": obs_unmeasured}})
+    except DashboardError as exc:
+        # A page that throws while rendering IS the finding; reporting it as the row's value keeps
+        # the row named and red instead of aborting the suite mid-run.
+        obs_page = {"page script raised": str(exc)[:160]}
+
+    def obs_rendered(name):
+        rendered = obs_page.get(name)
+        return ((rendered.get("cards"), rendered.get("drained"), rendered.get("error"))
+                if isinstance(rendered, dict) else obs_page)
+
+    check("[#1557] the measured group still renders its card, and the DROPPED one leaves the panel "
+          "with no Cache-effectiveness card at all — the `of 0 drained / 1h` sub-label this issue "
+          "is about is gone from the page, not merely blanked",
+          (obs_rendered("measured"), obs_rendered("unmeasured")),
+          ((["Cache effectiveness", "Agent-run health", "Queue & flow"], True, None),
+           (["Agent-run health", "Queue & flow"], False, None)))
+    # The two ABSENCES are silent: a collector that has no cache group yet is the expected state
+    # (there is no producer), and only a SUPPLIED-but-unreadable group is the mismatch worth naming.
+    for case, args in (("no cache key at all", (None, False)),
+                       ("an explicit null cache key", (None,))):
+        check(f"[#1557] {case} hides the panel SILENTLY — the warning names a producer/consumer "
+              "mismatch, and 'the collector has not landed' is not one",
+              obs_cache(*args), (None, []))
     # ---- [#982] A DROPPED QUEUE ROW MUST BE ANNOUNCED. `flow.queue: []` renders identically to
     # an idle queue, so the pre-#982 silent `continue` turned a producer/consumer shape mismatch
     # into a green build, a green self-test and a panel reading `no backlog` — the loss visible
@@ -4770,6 +5734,100 @@ const degraded = (node) =>
               obs_queue([{"class": queue_class, "depth": 1}]),
               ([], [_QUEUE_DROP.format(
                   f"row `class` {quoted} is not one of the queue classes")]))
+    # ---- [#1570] THE DIAGNOSTIC ITSELF MUST BE BOUNDED. Both drop warnings above emit ONE LINE
+    # PER DROPPED ROW over a list nothing bounds on the way IN (`queue[:12]` and `rows[:20]` cut on
+    # the way OUT, after the loop), so a snapshot on the public `ledger` branch carrying 100k
+    # malformed rows writes 100k lines into dashboard.yml's step log — the very failure the drop
+    # diagnostic exists to fix. The rows below pin BOTH directions: the cap FIRES, and the tail
+    # line names the REAL total rather than anything derived from the cap.
+    # Every expected string and every input SIZE below is a literal: deriving either from
+    # OBS_DROP_WARN_MAX is pre-flight 2(b)/2(c)'s tautology (#941 set every over-cap input from the
+    # constant it tested, so raising the constant left 76/76 green). Here, moving the constant reds
+    # the over-cap rows, and a cap read off a different seam's counter reds the independence row.
+    _EVIDENCE_DROP = "dashboard-gen: dropped a non-GitHub observability evidence link"
+    _SUPPRESSED = "dashboard-gen: ... {} further dropped {} suppressed ({} dropped in total)"
+    _INT_CLASS = _QUEUE_DROP.format(
+        "row `class` (type int) is not a class STRING such as '1'/'2a'/'4'")
+
+    def obs_drops(queue_rows, trigger_rows):
+        """(published `flow.queue`, published `trigger_fires`, EVERY `dashboard-gen:` line printed).
+
+        Unlike `obs_queue`/`obs_cache` this keeps every diagnostic line, in order and unfiltered —
+        a cap that merely relabelled its warnings, or a tail line printed to the wrong seam, would
+        be invisible to a prefix-filtered capture.
+        """
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["flow"]["queue"] = queue_rows
+        fixture["trigger_fires"] = trigger_rows
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        return (document["flow"]["queue"], document["trigger_fires"],
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen:")])
+
+    # 21 rows in, 20 of them malformed: 12 warnings, then ONE tail carrying the two numbers that
+    # survive the cap. Remove the cap and this row reds with 20 warnings and no tail; count the
+    # suppressed rows as the total (or the total as the cap) and the tail text reds.
+    check("[#1570] 20 malformed queue rows print 12 warnings and ONE tail naming the REAL total — "
+          "an unbounded diagnostic floods the log it exists to make legible",
+          obs_drops([{"class": index, "depth": 1} for index in range(20)]
+                    + [{"class": "2a", "depth": 3}], []),
+          ([{"class": "2a", "depth": 3, "oldest_age_minutes": None}], [],
+           [_INT_CLASS] * 12 + [_SUPPRESSED.format(8, "observability queue rows", 20)]))
+    # The cap is on the DIAGNOSTIC, never on the data: suppressing a warning must not suppress a
+    # row. The good row above publishes, and the build stays green (a refusal would red both).
+    # AT the cap nothing is withheld, so NO tail may print: an unconditional `close()` emission —
+    # or a `<=` comparison — turns this row red, and a "0 further ... suppressed" line on a
+    # 12-row snapshot is exactly the noise this issue is about.
+    check("[#1570] a snapshot exactly AT the cap prints its 12 warnings and NO tail — the tail "
+          "line marks real suppression, so it can never fire when nothing was withheld",
+          obs_drops([{"class": index, "depth": 1} for index in range(12)], []),
+          ([], [], [_INT_CLASS] * 12))
+    check("[#1570] one row PAST the cap: the 13th is withheld and counted, not printed",
+          obs_drops([{"class": index, "depth": 1} for index in range(13)], []),
+          ([], [], [_INT_CLASS] * 12 + [_SUPPRESSED.format(1, "observability queue rows", 13)]))
+    # The evidence seam is the one with the multiplier: each row contributes up to 8 drops, so a
+    # counter scoped to the ROW (the obvious wrong fix) still lets N rows write 8N lines. Three
+    # rows x 8 non-GitHub links = 24 drops; a per-row cap prints all 24 and no tail.
+    _flood_triggers = [{"rule": f"flood-rule-{index}", "fired_at": now - 300,
+                        "summary": "flood", "evidence": ["https://evil.example/exfil"] * 8}
+                       for index in range(3)]
+    _flood_queue, _flood_rows, _flood_lines = obs_drops([], _flood_triggers)
+    check("[#1570] the evidence cap counts per BUILD, not per row: 3 fire rows x 8 non-GitHub "
+          "links each is 24 drops, capped at 12 with the real total in the tail",
+          (_flood_lines, [row["rule"] for row in _flood_rows],
+           [row["evidence"] for row in _flood_rows], _flood_queue),
+          ([_EVIDENCE_DROP] * 12
+           + [_SUPPRESSED.format(12, "observability evidence links", 24)],
+           ["flood-rule-0", "flood-rule-1", "flood-rule-2"], [[], [], []], []))
+    # The two seams count SEPARATELY. One shared counter would let a flooded queue silence the
+    # evidence warning on the same document — trading one invisible loss for another — and would
+    # print a single tail naming the wrong seam. Ordering is fixed: `flow` normalizes before
+    # `trigger_fires`, so the queue seam closes before the evidence line prints.
+    check("[#1570] a flooded queue seam does not consume the evidence seam's budget: the lone "
+          "bad link still names itself, and each seam closes with its own tail",
+          obs_drops([{"class": index, "depth": 1} for index in range(20)],
+                    [{"rule": "lone-rule", "fired_at": now - 300, "summary": "s",
+                      "evidence": ["https://evil.example/exfil"]}])[2],
+          [_INT_CLASS] * 12 + [_SUPPRESSED.format(8, "observability queue rows", 20)]
+          + [_EVIDENCE_DROP])
+    # The accept path of the evidence seam stays SILENT — the branch a `--self-test` line-coverage
+    # run showed had never executed at all (pre-flight 1) is the non-object fire row, so it rides
+    # along here: it is dropped without a diagnostic today and must not grow a tail line either.
+    check("[#1570] a fire row whose links all parse prints NOTHING, and a non-object fire row is "
+          "still dropped silently — a tail line on a build that withheld nothing is noise",
+          obs_drops([{"class": "2a", "depth": 1}],
+                    [None, {"rule": "quiet-rule", "fired_at": now - 300, "summary": "s",
+                            "evidence": ["https://github.com/jeswr/agent-account-registry/"
+                                         "actions/runs/7"]}]),
+          ([{"class": "2a", "depth": 1, "oldest_age_minutes": None}],
+           [{"rule": "quiet-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+             "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/7"],
+             "enqueued_task": None}], []))
     overflow = copy.deepcopy(obs_fixture)
     overflow["flow"]["review_rounds"]["mean"] = 1e309       # JSON 1e309 decodes to +Infinity
     overflow["thresholds"]["workflow_failure_rate"] = 1e309
@@ -5019,11 +6077,11 @@ def main(argv=None):
             probe_status = {}
     model_health = _read_json(args.model_health, default=None)
     observability = _read_json(args.observability, default=None)
-    history = _fetch_dispatch_history(repo, args.history)
+    history, history_status = _fetch_dispatch_history(repo, args.history)
     document = build_dashboard(
         issues, leases, usage, history, model_health, int(time.time()),
         os.environ.get("PROVENANCE_SALT", ""), observability=observability,
-        probe_status=probe_status)
+        probe_status=probe_status, history_status=history_status)
     _write_site(document, args.assets, args.site)
     # Public workflow log: never disclose the account count (issue #184; the codebase norm in
     # model-health.py — "the public workflow log never carries provider counts").
