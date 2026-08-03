@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1875,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2e92b630e8526e45b6bc86885f258238b59e91f1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 6.3 requires both race orders to preserve the newer justified state, but W1 checks only that the live head is still `head` and that the immutable verdict record names it. If W3-W5 retract that same binding while the head remains unchanged, both W1 predicates remain true: the verdict record is create-or-keep and the retraction does not invalidate it. An older W1 that loses the blob CAS can therefore re-read `none`, classify itself as still valid, and write `head` back over the newer retraction. That is exactly the fail-open stale-bind-vs-fresh-retract case the section says must be refused, so the semantic ordering mechanism remains incomplete.",
+    "file": "research/389-reviewed-sha-binding-store.md",
+    "fix_hint": "Give W1 a precondition that changes when a justified retraction lands, not merely head/verdict existence. For example, bind against an expected prior binding/epoch plus a durable generation or invalidation token that the retraction advances, and require the W1 operation to prove it was derived after that token. Spell out the state transitions and demonstrate the same-head race where retraction wins the CAS and the older bind aborts while the retracted record remains byte-identical.",
+    "severity": "major",
+    "title": "W1's precondition still permits a stale bind to overwrite a newer retraction"
+   }
+  ],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 substantially fixes the bootstrap and authority-transition findings: absent state is now UNKNOWN, the cutover is gated by a sealed backfill census, and the body remains the sole authority until one resolver repoint. The stale-operation finding remains in one race direction, however. The proposed W1 precondition cannot distinguish an older bind from a later justified retraction when both concern the same unchanged head, so the required stale-bind-vs-fresh-retract test cannot pass for the specified algorithm without exposing that overwrite.",
+  "verdict": "request_changes"
+ }
+}
