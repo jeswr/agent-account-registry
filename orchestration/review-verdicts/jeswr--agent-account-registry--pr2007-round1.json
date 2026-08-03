@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2007,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e6688dced39a7ed1fd58ecf2db4bd5e0197e59ed",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`obsTruncationNote` validates `total` only through `obsNum`, which accepts any finite number. A tampered or future document with `lanes_total: 12.5` beside 12 rows renders `showing 12 of 12.5 lanes` and a `0.5 more` title. These fields are counts and the generator only emits non-negative integers; treating a malformed fractional value as authoritative violates the function's stated rule that an unreadable total draws nothing and produces an operator-facing lie. The hostile executed-page case covers strings, booleans, null, negatives, equal and smaller values, but omits a non-integral finite number, so it cannot catch this.",
+    "file": "dashboard/app.js",
+    "fix_hint": "Require `Number.isInteger(collected)` (and non-negativity) before rendering. Add a literal fractional total to the executed hostile-page fixture and assert that it produces no note.",
+    "severity": "major",
+    "title": "Fractional totals are trusted as row counts"
+   },
+   {
+    "body": "`obsHealthCard` explicitly supports and documents `shown === 0 && total > 0`, but `renderObservability` calls it only under `if (lanes.length)`. Thus a document with `lanes: []` and `lanes_total: 50` renders no `showing 0 of 50 lanes` note. The same gate also hides non-empty defer/exit slices or their truncation notes whenever lanes is empty. The page tests never supply a positive total with an empty corresponding slice, so the claimed hand-edited-data behavior is not actually tested.",
+    "file": "dashboard/app.js",
+    "fix_hint": "Render the health card when any health rows exist or any valid health total exceeds its shown length, and add an executed-page case with empty lanes plus a positive lane total (and preferably defer/exit data) that asserts the literal note and preserved sibling content.",
+    "severity": "minor",
+    "title": "The lane gate makes the promised zero-row truncation note unreachable"
+   }
+  ],
+  "progress": null,
+  "summary": "The validated-row totals and normal over/under-cap tests are thoughtfully wired, but the browser does not fully enforce the count contract it presents. It accepts non-integral numbers as totals and can therefore render a fabricated fractional row count, contrary to the stated fail-closed handling of unusable/tampered totals. In addition, the health renderer is never invoked when the lane slice is empty, so its documented and intentionally implemented `showing 0 of N` behavior cannot occur for lanes (and defer/exit information can be suppressed by the lane gate). The current executed tests omit both controls.",
+  "verdict": "request_changes"
+ }
+}
