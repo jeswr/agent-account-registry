@@ -5649,6 +5649,130 @@ esac
         check(f"[#1557] {case} hides the panel SILENTLY — the warning names a producer/consumer "
               "mismatch, and 'the collector has not landed' is not one",
               obs_cache(*args), (None, []))
+    # ---- [#1879] AN UNMEASURED LANE WINDOW MUST NOT RENDER AS A HEALTHY ZERO. `_obs_lane_rows`
+    # publishes `None` for a 1h/24h window it could not read — the same shape a window the collector
+    # never sent publishes — but `obsHealthCard()` read it as `obsNum(hour.success, 0)`, so BOTH
+    # collapsed to `0 / 0 / 0` with a `—` fail rate: pixel-identical to a genuinely idle lane. The
+    # generator-side drop announcement is real evidence and nobody reads a green build's log, so the
+    # fix has to land on the layer an operator actually looks at (AGENTS.md pre-flight item 11).
+    # `obsRecordTrend()` had the same shape one function over, folding an unreadable window into the
+    # defer sparkline as a zero. Both are EXECUTED below against dashboard/app.js under the shared
+    # DOM shim — a lexical assertion here is satisfiable by a comment (the #612 round-4 lesson).
+    _OBS_LANE_WINDOW_PAGE_BODY = r"""
+  const out = {};
+  for (const [name, documents] of Object.entries(input.scenarios)) {
+    // A FRESH page per scenario: obsTrend is module state that accumulates across renders, so one
+    // shared scope would carry one scenario's sparkline points into the next.
+    const page = new Function(source + "; return { renderObservability };")();
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers", "warning"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      for (const document of documents) page.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    const card = ids["obs-grid"].children.find((kid) =>
+      kid.tagName === "article" && kid.children[0]
+      && kid.children[0].textContent === "Agent-run health");
+    const table = card ? card.children.find((kid) => kid.tagName === "table") : null;
+    const spark = card ? card.children.find((kid) =>
+      kid.className === "obs-spark-wrap" && flat(kid).join(" ").includes("defers / 1h trend")) : null;
+    out[name] = {
+      error,
+      // The header row is children[0]; every row below it is one lane, cell text beside cell class.
+      rows: table ? table.children.slice(1).map((row) =>
+        row.children.map((cell) => [flat(cell).join("").trim(), cell.className])) : null,
+      defersPlotted: spark ? spark.children.some((kid) => kid.tagName === "svg") : null,
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+
+    def obs_lane_scenario(lanes, inject=None):
+        """Two published snapshots one minute apart carrying `lanes` — two ticks, because the defer
+        sparkline needs two recorded points before it plots anything at all. `inject` post-edits the
+        PUBLISHED document, for window shapes this generator cannot emit but the page must survive;
+        it is skipped on a refusal so a broken fixture reds a named row instead of aborting."""
+        documents = []
+        for offset in (0, 60):
+            fixture = copy.deepcopy(obs_fixture)
+            fixture["generated_at"] = now + offset
+            fixture["lanes"] = copy.deepcopy(lanes)
+            with contextlib.redirect_stdout(io.StringIO()):
+                document = obs_normalized(fixture)
+            if inject is not None and isinstance(document.get("lanes"), list):
+                inject(document)
+            documents.append(document)
+        return documents
+
+    _ZERO_WINDOW = {"success": 0, "failure": 0, "defer": 0}
+    # `unread` carries the SAME zeroed 24h window as `idle`, and `idle`'s own 1h window is a real
+    # measurement of zero runs: the ONLY thing differing between those two rendered rows is whether
+    # the 1h window was readable. Asserting them together is what makes this non-vacuous — a page
+    # that dashes everything, or one that zeroes everything, fails on the other row.
+    _QUIET_LANES = {"idle": {"1h": dict(_ZERO_WINDOW), "24h": dict(_ZERO_WINDOW)}}
+    obs_window_page = _executed_page(
+        _page_harness("renderObservability", _OBS_LANE_WINDOW_PAGE_BODY),
+        {"scenarios": {
+            "measured": obs_lane_scenario(obs_fixture["lanes"]),
+            "quiet": obs_lane_scenario(_QUIET_LANES),
+            "unread": obs_lane_scenario({
+                **copy.deepcopy(_QUIET_LANES),
+                "hot": {"1h": {"success": 0, "failure": 3, "defer": 1},
+                        "24h": dict(_ZERO_WINDOW)},
+                # A string where the collector should have sent an object: `_obs_lane_rows` drops
+                # it to None, which is exactly what an unsent window publishes.
+                "unread": {"1h": "3 ok / 1 failed", "24h": dict(_ZERO_WINDOW)}}),
+            # data.json is a public document and its windows are only ever an object or null from
+            # THIS generator; a hand-edited or future producer's array/number window must still not
+            # read as a measured zero, so the page's own window guard is exercised directly.
+            "hostile": obs_lane_scenario(_QUIET_LANES, inject=lambda document: document["lanes"]
+                                         .append({"lane": "alien", "1h": [], "24h": 0}))}})
+
+    def obs_window(name, field):
+        rendered = obs_window_page.get(name)
+        return rendered.get(field) if isinstance(rendered, dict) else obs_window_page
+
+    check("[#1879] EXECUTED page script: a lane whose 1h window the generator could NOT read renders "
+          "an explicitly unmeasured cell, while a lane that genuinely ran nothing still renders its "
+          "zeroes — the two rows are no longer identical",
+          obs_window("unread", "rows"),
+          [[["hot", "obs-lane"], ["0 / 3 / 1", ""], ["100%", "bad"], ["0 / 0 / 0", ""]],
+           [["idle", "obs-lane"], ["0 / 0 / 0", ""], ["—", ""], ["0 / 0 / 0", ""]],
+           [["unread", "obs-lane"], ["—", "obs-unmeasured"], ["—", ""], ["0 / 0 / 0", ""]]])
+    # ...and the measured lanes are untouched by the fix, including the 24h column that already
+    # dashed an absent window (`review-fix` sends no 24h at all) — a regression there would swap the
+    # bug from "unmeasured reads as zero" to "measured reads as unmeasured".
+    check("[#1879] EXECUTED page script: the golden lanes still render every count, both fail-rate "
+          "tones and the 24h column, with only the window the collector never sent dashed",
+          obs_window("measured", "rows"),
+          [[["review-fix", "obs-lane"], ["1 / 0 / 0", ""], ["0%", "good"], ["—", "obs-unmeasured"]],
+           [["worker", "obs-lane"], ["3 / 1 / 2", ""], ["25%", "good"], ["30 / 4 / 9", ""]]])
+    # The defer sparkline, both directions. `quiet` is the control the non-vacuity rests on: its
+    # fleet-wide defer total is a MEASURED zero and it must still plot, so "plots nothing" cannot be
+    # satisfied by a helper that simply treats every zero as unknown. Pre-fix, `unread` summed its
+    # missing window as 0 and plotted a reassuring line.
+    check("[#1879] EXECUTED page script: an unreadable 1h window makes the fleet defer total "
+          "UNKNOWN and the sparkline plots nothing, while a fleet that genuinely deferred ZERO "
+          "times still plots its flat line",
+          (obs_window("quiet", "defersPlotted"), obs_window("measured", "defersPlotted"),
+           obs_window("unread", "defersPlotted"), obs_window("hostile", "defersPlotted")),
+          (True, True, False, False))
+    check("[#1879] EXECUTED page script: a window of the wrong TYPE altogether is unmeasured too — "
+          "an array is `typeof 'object'`, so a bare truthiness test would read `[]` as a lane that "
+          "successfully ran nothing",
+          obs_window("hostile", "rows"),
+          [[["idle", "obs-lane"], ["0 / 0 / 0", ""], ["—", ""], ["0 / 0 / 0", ""]],
+           [["alien", "obs-lane"], ["—", "obs-unmeasured"], ["—", ""], ["—", "obs-unmeasured"]]])
+    check("[#1879] ...and no scenario raised while rendering — a page that throws is the finding, "
+          "never a silently absent health table",
+          {name: rendered.get("error") if isinstance(rendered, dict) else rendered
+           for name, rendered in (obs_window_page.items()
+                                  if isinstance(obs_window_page, dict) else ())},
+          {"measured": None, "quiet": None, "unread": None, "hostile": None})
     # ---- [#982] A DROPPED QUEUE ROW MUST BE ANNOUNCED. `flow.queue: []` renders identically to
     # an idle queue, so the pre-#982 silent `continue` turned a producer/consumer shape mismatch
     # into a green build, a green self-test and a panel reading `no backlog` — the loss visible
