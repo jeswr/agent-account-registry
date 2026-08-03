@@ -6663,16 +6663,17 @@ esac
     # assertion here is satisfiable by a comment (the #612 round-4 lesson) — and the notes are
     # collected by EXACT className, never by searching the card's text for "showing".
     _OBS_TRUNCATION_PAGE_BODY = r"""
-  const truncations = (root) => {
+  const byClass = (root, wanted) => {
     const found = [];
     const walk = (el) => {
       if (!el) return;
-      if (el.className === "obs-truncated") found.push((el.textContent || "").trim());
+      if (el.className === wanted) found.push(flat(el).join(" ").trim());
       for (const kid of el.children || []) walk(kid);
     };
     walk(root);
     return found;
   };
+  const truncations = (root) => byClass(root, "obs-truncated");
   const out = {};
   for (const [name, document] of Object.entries(input.documents)) {
     for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers"]) {
@@ -6692,6 +6693,10 @@ esac
       health: truncations(card("Agent-run health")),
       flow: truncations(card("Queue & flow")),
       triggers: truncations(ids["obs-triggers"]),
+      // The health card's OWN rows, so a card that renders a note while dropping the content it
+      // sits beside cannot read as a pass — the notes above are identical either way.
+      reasons: byClass(card("Agent-run health"), "obs-reason-row"),
+      chips: byClass(card("Agent-run health"), "obs-chip"),
     };
   }
   process.stdout.write(JSON.stringify(out));
@@ -6714,12 +6719,35 @@ esac
     hostile_page_doc["trigger_fires_total"] = True
     hostile_page_doc["flow"]["queue_total"] = 12
     hostile_page_doc["flow"]["target_ci_queue_total"] = 11
+    # `fractional` is the hostile case the six seams above have no room left to carry, and it is a
+    # DIFFERENT shape from all of them: a finite number, larger than the slice, that is not a count.
+    # Every one of these fields counts ROWS, so `12.5` is malformed whichever way it arrived —
+    # rendering `showing 12 of 12.5 lanes` with a `0.5 more` title would be the fabricated total
+    # the row above exists to forbid, dressed as a readable one. All six seams carry it, so the
+    # check reds for a call site that reaches the note through anything looser than an integer test.
+    fractional_page_doc = copy.deepcopy(over_cap)
+    fractional_page_doc["lanes_total"] = 12.5
+    fractional_page_doc["defer_reasons_1h_total"] = 19.5
+    fractional_page_doc["model_exit_classes_1h_total"] = 18.5
+    fractional_page_doc["trigger_fires_total"] = 23.5
+    fractional_page_doc["flow"]["queue_total"] = 26.5
+    fractional_page_doc["flow"]["target_ci_queue_total"] = 15.5
+    # ...and the zero-row case obsHealthCard documents: `shown === 0 && total > 0` cannot come out
+    # of this generator, but it is exactly what a hand-edited data.json looks like, and gating the
+    # whole card on `lanes.length` made the promised `showing 0 of 50 lanes` unreachable — the same
+    # slice-is-empty silence #1868 was filed about. The defer/exit rows stay populated so the row
+    # below can also witness that widening the gate did not cost the card its sibling content.
+    zero_lane_page_doc = copy.deepcopy(over_cap)
+    zero_lane_page_doc["lanes"] = []
+    zero_lane_page_doc["lanes_total"] = 50
     truncation_page = _executed_page(
         _page_harness("renderObservability", _OBS_TRUNCATION_PAGE_BODY),
         {"documents": {"truncated": copy.deepcopy(over_cap),
                        "healthy": copy.deepcopy(under_cap),
                        "legacy": legacy_page_doc,
-                       "hostile": hostile_page_doc}})
+                       "hostile": hostile_page_doc,
+                       "fractional": fractional_page_doc,
+                       "zero-lane": zero_lane_page_doc}})
 
     def obs_truncation_notes(name):
         rendered = truncation_page.get(name)
@@ -6746,6 +6774,34 @@ esac
           "negative, a null, a boolean, a total EQUAL to the slice and one SMALLER than it are "
           "each 'no truncation known', never a fabricated one",
           obs_truncation_notes("hostile"), ([], [], [], None))
+    check("[#1868] EXECUTED page script: ...and a FRACTIONAL total is unusable too — `12.5` beside "
+          "12 rows is not a row count, and the page states nothing rather than `showing 12 of "
+          "12.5 lanes`. All six seams carry one, so no call site can reach the note through a "
+          "finite-number test",
+          obs_truncation_notes("fractional"), ([], [], [], None))
+    check("[#1868] EXECUTED page script: a hand-edited document whose lane slice is EMPTY beside a "
+          "positive total still states it — `showing 0 of 50 lanes` is the honest render of it, "
+          "and gating the health card on `lanes.length` made that documented case unreachable. "
+          "Its flow and trigger notes are unchanged, so the widened gate is the only thing moving",
+          obs_truncation_notes("zero-lane"),
+          (["showing 0 of 50 lanes", "showing 16 of 19 defer reasons",
+            "showing 16 of 18 model exit classes"],
+           ["showing 12 of 26 queue classes", "showing 12 of 15 target repositories"],
+           ["showing 20 of 23 trigger fires"], None))
+
+    def obs_health_rows(name):
+        rendered = truncation_page.get(name)
+        if not isinstance(rendered, dict):
+            return truncation_page
+        reasons, chips = rendered.get("reasons") or [], rendered.get("chips") or []
+        return (reasons[:1], reasons[-1:], len(reasons), chips[:1], chips[-1:], len(chips))
+
+    check("[#1868] ...and that card still carries the ROWS the notes account for: a gate widened "
+          "far enough to render a lone note over an empty card would pass the row above and fail "
+          "this one. Sixteen defer rows and sixteen exit chips, first and last named literally",
+          obs_health_rows("zero-lane"),
+          (["reason-00 ×40"], ["reason-15 ×25"], 16,
+           ["model-00 · success ×30"], ["model-15 · success ×15"], 16))
     # ---- [#982] A DROPPED QUEUE ROW MUST BE ANNOUNCED. `flow.queue: []` renders identically to
     # an idle queue, so the pre-#982 silent `continue` turned a producer/consumer shape mismatch
     # into a green build, a green self-test and a panel reading `no backlog` — the loss visible

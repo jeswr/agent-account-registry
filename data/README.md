@@ -94,7 +94,10 @@ a display contract rather than the producer/consumer mismatch #982/#1570/#1571 a
 `flow.queue_total`, `flow.target_ci_queue_total`) and `dashboard/app.js` renders `showing 12 of 50`,
 so a fleet with 50 congested target repositories no longer renders identically to one with 12. These
 are OUTPUT-side keys: a collector neither sends them nor is read for them, and each is published on
-every build, including the ones where the cap hid nothing.
+every build, including the ones where the cap hid nothing. The page states a note only where the
+total is a whole NUMBER OF ROWS greater than the slice beside it — a missing, non-numeric, negative,
+fractional or already-satisfied total is "no truncation known" and draws nothing, so a document
+published before #1868 or edited by hand degrades to the old silence instead of a fabricated count.
 
 Validation is otherwise FAIL-CLOSED as before: an absent file hides the panel; a present document
 with the wrong `schema` fails the dashboard build LOUD; malformed rows inside a well-formed

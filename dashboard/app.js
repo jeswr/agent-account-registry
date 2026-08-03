@@ -874,10 +874,21 @@ function obsLaneDefers(lanes) {
 // on a healthy fleet whose array fit under its cap. An absent/unreadable total — a data.json
 // published before #1868, or hand-edited — draws NOTHING: an unknown total is not a truncation, and
 // `showing 12 of undefined` would be a worse lie than the silence this replaces.
+//
+// `Number.isInteger`, not `obsNum`: every one of these fields is a COUNT OF ROWS. `obsNum` accepts
+// any finite number, so a tampered or future `lanes_total: 12.5` beside 12 rows would render
+// `showing 12 of 12.5 lanes` with a `0.5 more` title — a malformed value read as authoritative is
+// the same operator-facing lie the unreadable-total silence exists to prevent. Non-integral,
+// non-finite, non-numeric and negative totals are all "no truncation known".
+function obsTruncated(rows, total) {
+  const collected = obsNum(total);
+  return Number.isInteger(collected) && collected > (Array.isArray(rows) ? rows.length : 0);
+}
+
 function obsTruncationNote(rows, total, noun) {
   const shown = Array.isArray(rows) ? rows.length : 0;
   const collected = obsNum(total);
-  if (collected === null || collected <= shown) return null;
+  if (!obsTruncated(rows, total)) return null;
   const note = node("p", "obs-truncated", `showing ${shown} of ${collected} ${noun}`);
   note.setAttribute("title",
     `${collected - shown} more ${noun} are in the collector snapshot than this panel displays`);
@@ -1176,15 +1187,19 @@ function renderObservability(o) {
   grid.replaceChildren();
   if (o.cache && typeof o.cache === "object") grid.append(obsCacheCard(o.cache));
   const lanes = Array.isArray(o.lanes) ? o.lanes : [];
-  if (lanes.length) {
-    grid.append(obsHealthCard(
-      lanes,
-      Array.isArray(o.defer_reasons_1h) ? o.defer_reasons_1h : [],
-      Array.isArray(o.model_exit_classes_1h) ? o.model_exit_classes_1h : [],
-      thresholds,
-      { lanes: o.lanes_total, deferReasons: o.defer_reasons_1h_total,
-        exitClasses: o.model_exit_classes_1h_total },
-    ));
+  const deferReasons = Array.isArray(o.defer_reasons_1h) ? o.defer_reasons_1h : [];
+  const exitClasses = Array.isArray(o.model_exit_classes_1h) ? o.model_exit_classes_1h : [];
+  const healthTotals = { lanes: o.lanes_total, deferReasons: o.defer_reasons_1h_total,
+    exitClasses: o.model_exit_classes_1h_total };
+  // The gate is EVERY slice this card carries, not just lanes: gating on `lanes.length` alone made
+  // obsHealthCard's documented `shown === 0 && total > 0` note unreachable — a hand-edited document
+  // with `lanes: []` beside `lanes_total: 50` drew nothing at all — and it also dropped non-empty
+  // defer/exit rows on the floor whenever the lane slice happened to be empty.
+  if (lanes.length || deferReasons.length || exitClasses.length
+      || obsTruncated(lanes, healthTotals.lanes)
+      || obsTruncated(deferReasons, healthTotals.deferReasons)
+      || obsTruncated(exitClasses, healthTotals.exitClasses)) {
+    grid.append(obsHealthCard(lanes, deferReasons, exitClasses, thresholds, healthTotals));
   }
   if (o.flow && typeof o.flow === "object") grid.append(obsFlowCard(o.flow, thresholds));
   if (!grid.childElementCount) {
