@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1809,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7b9e3016c4e43f3743278f9f7d9a69100546594a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 approval remains supported. The detector preserves fail-closed polarity across missing scanner, shallow or unreadable history, unresolved ref, scanner self-test failure, scan failure, unreadable alert state, and delivery failure. The workflow remains manual-only while the required scanner is absent, and its parsed-YAML seam tests non-vacuously couple future scheduling to scanner presence, pin full-history checkout and exact call-site arguments, and retain least-privilege permissions and SHA-pinned actions. End-to-end tests exercise clean, exposed, unverified, dedupe, recovery, routing, malformed payload, and public-sink behavior; structural checks constrain mutation authority and prevent stderr publication. No new correctness, soundness, test-validity, or security defect is supported by the diff.",
+  "verdict": "approve"
+ }
+}
