@@ -145,13 +145,34 @@ Keyed by PR (not by sha), because W3–W5 must retract and R7/`dispatch.yml:1415
 ```json
 { "repo": "owner/name", "pr": 42,
   "reviewed_sha": "<40-hex>|none",
-  "bound_by": "review-outcome|carry-forward|retract-fix-lane|retract-stranded|retract-arm-readmit",
+  "bound_by": "seed|census|review-outcome|carry-forward|retract-fix-lane|retract-stranded|retract-arm-readmit",
+  "expects_sha": "<40-hex>|none",
   "epoch": 7 }
 ```
 
-`epoch` is a monotone counter, incremented on every write, so a stale-read overwrite is detectable
-rather than silent — the exact property the PR body cannot offer. Absent record ⇒ `none`, matching
-the `worker-live.sh:2647` seed, so no backfill of existing PRs is required.
+**An absent record is `UNKNOWN`, NOT `none`.** These are different facts and the §6.2 tri-state
+exists to keep them apart: `none` is *a retraction someone performed* — W3–W5, or the seed at PR
+creation, which writes the literal `<!-- sparq-reviewed-sha:none -->` rather than writing nothing —
+whereas `UNKNOWN` is *this store cannot say*. Equating them would make "not migrated yet"
+indistinguishable from "deliberately retracted", which **discards live state at the cutover**: an
+open PR whose body already names a 40-hex reviewed sha, but which happens to take no W1–W5 write
+during step 2, would reach step 3 with no record, read as `none`, and R1/R2 would disarm a valid
+latch while R3–R6 re-admit an already-reviewed head. Under `UNKNOWN` that same PR fails **closed**
+on both lanes (R1/R2 disarm, R3–R6 defer) — still wrong, but loud and recoverable rather than a
+silent grant.
+
+`UNKNOWN` is the safe floor, not the answer: making the cutover *correct* is a coverage problem,
+and §7 solves it as one — step 2½ bootstraps a record for every in-scope open PR and step 3
+refuses to treat the ledger as authoritative until that coverage is sealed. **This migration
+therefore requires a backfill** — the seed's `none` covers PRs opened *after* the cutover work
+begins and says nothing about the ones already bound. `backfill-provenance.py` is the precedent
+for both halves: a one-shot, idempotent, dry-run-unless-`--apply` backfill, and a population that
+stays fail-closed invisible and human-listed when it cannot be resolved.
+
+`epoch` is a monotone write counter for **audit**, and that is the whole of its value: it orders
+the writes that landed, not the decisions behind them. §6.3 is the mechanism that actually refuses
+a stale write, and `expects_sha` — the binding the writer believed it was replacing — is the field
+it turns on.
 
 ### 4.3 The token seam is already open — but the writer is not
 
@@ -188,16 +209,42 @@ marker is protected only by the fact that hand-editing it is unnatural. Moving i
 data-plane path is a **trust** improvement independent of the TOCTOU, and that, not the lost
 prose edit, is what justifies the work.
 
-## 6. What the migration costs — the two things that must not be waved through
+## 6. What the migration costs — the three things that must not be waved through
 
-### 6.1 Two stores exist during the window
+### 6.1 Two stores exist during the window — with ONE authority at every instant
 
 The seed at `worker-live.sh:2647`, R1–R10, and the workflow-inline reader at `review-fix.yml:316`
 cannot flip in one commit. During the window the body marker and the ledger record can disagree,
-and a disagreement is read by a *security* surface. The record's position: **the ledger record is
-authoritative from the first commit that writes it, and the body marker becomes decoration** —
-never a merge, never a "prefer whichever is newer". A resolver that reconciles two stores is a
-third store with no owner. §7 orders the steps so a disagreement is never consulted.
+and a disagreement is read by a *security* surface. The record's position is **not** "the ledger is
+authoritative from the first commit that writes it" — that would contradict step 2, which leaves
+every reader body-backed, and two stores cannot both be authoritative. It is:
+
+> **The body marker is authoritative for the whole of steps 1–2. The ledger becomes authoritative
+> at exactly ONE boundary — the step-3 resolver repoint, which is one function because step 0 made
+> it one function. No reader consults both stores at any instant**, so there is nothing to
+> reconcile at read time: never a merge, never a "prefer whichever is newer". A resolver that
+> continuously reconciles two stores is a third store with no owner.
+
+**Write order and the partial-failure states**, because W1–W5 cannot write two stores atomically
+and a crash between the two writes is not hypothetical:
+
+* **Ledger first, body second, always.** The shadow store moves before the authoritative one, so
+  the only residual divergence is *ledger ahead of body* — and through steps 1–2 the ledger gates
+  nothing, because no reader consults it.
+* A ledger write that exhausts the §4.3 retry loop is a **hard failure of its caller**; the writer
+  does not fall through to the body write. For W1 that leaves the review outcome unmarked, so the
+  round re-runs — fail-closed as a re-review. For W2–W5 the carry-forward or retraction simply did
+  not happen, which is the pre-existing stuck-and-loud state those sites already handle (#69/#81,
+  #560, #708), not a new grant. A §6.3 **stale abort** suppresses the body write the same way, but
+  it is a justified refusal rather than an error: the operation was superseded, and the site that
+  raised it re-derives on the next tick.
+* The converse — the body write fails after the ledger write succeeded — leaves the authoritative
+  store unmoved and the shadow ahead. Same disposition: it gates nothing before step 3.
+* **Nothing reconciles the two continuously.** Divergence is allowed to accumulate through step 2
+  precisely because it is never consulted, and it is settled **once**, at the step-2½ census (§7),
+  which takes the **body** as ground truth — it is the authoritative store right up to the
+  boundary — and writes the ledger from it. That is what makes an ahead-ledger *safe* rather than
+  merely unread, and it is why the census is a cutover precondition rather than a cleanup.
 
 ### 6.2 The unknown-disposition is NOT uniform — and #389 gets it backwards
 
@@ -224,6 +271,44 @@ That last sentence is a live finding about the shipped tree, not a migration art
 benign today only because the body always arrives with the PR. It stops being benign the moment
 the binding lives anywhere the PR listing does not carry.
 
+### 6.3 Blob-SHA CAS is necessary and NOT sufficient — a stale operation must be refused, not retried
+
+The §4.3 writer re-reads the blob SHA and retries on conflict. That serializes *writes*; it does
+not order the *decisions* behind them, and the gap is live in both directions:
+
+* A W3–W5 retraction computed against binding `X` loses the CAS to a W1 review-bind of a newer
+  head `Y`, re-reads, and — if it replays its payload — writes `none` over a review that actually
+  completed. R1/R2 then disarm a valid latch and the review lane re-admits `Y`.
+* Symmetrically, a W1 bind of `Y` that loses to a W3 retraction and replays re-asserts a binding
+  the fix-lane hand-over just invalidated. That is the fail-**open** direction: an arm left latched
+  on a head whose verdict record was withdrawn.
+
+`epoch` catches neither. It increments on whoever writes last, so the stale overwrite lands with a
+perfectly monotone epoch and no reader is given any basis to reject it. "A stale-read overwrite is
+detectable" is true only of a *lost* write; neither case above loses a write, so the property was
+overclaimed and is withdrawn here.
+
+**Every operation therefore carries a semantic precondition, and a CAS conflict re-derives that
+precondition instead of replaying the payload** — which is what `ledger_retry.py`'s own header
+already demands of every writer in the fleet: each writer's loop re-reads the ledger and
+re-derives **both** the expected SHA **and the payload** before the next PUT.
+
+| op | precondition checked against the RE-READ record | on conflict |
+|---|---|---|
+| W1 bind `head` | the PR's live head is still `head`, and the verdict record this outcome job just wrote (whose envelope already carries `reviewed_sha`, §4.3) still names it | re-derive the head; **abort** if it moved — the next round binds it |
+| W2 carry-forward | the re-read `reviewed_sha` is still the binding `merge_only_advance` (`worker-pr.py:1442`) walked back to | re-walk from the fresh binding; abort if the walk no longer proves merge-only |
+| W3–W5 retract | `expects_sha` equals the re-read `reviewed_sha` — a retraction must name the **exact** binding it invalidates | **abort, never overwrite**: the justification (fix-lane hand-over / drafted+unarmed / arm-readmit) was derived against a binding that no longer exists, and must be re-derived |
+
+Abort is safe in every row because each of these sites is re-derived by the next tick; none is a
+last-chance write, so refusing is a deferral, not a loss. A conflict is classified as **stale**
+(precondition now false ⇒ abort, censused) or **contended** (precondition still true ⇒ retry with
+the re-derived expected SHA, per `ledger_retry.py`'s CAS schedule); nothing else retries.
+
+Step 1's self-tests must therefore include a **bind/retract race in BOTH orders** —
+stale-retract-vs-fresh-bind and stale-bind-vs-fresh-retract — each asserting that the older
+operation is refused and the newer justified state survives byte-for-byte. A test asserting only
+"the write eventually succeeded" passes for the losing implementation and is vacuous.
+
 ## 7. The sequence — step 0 is a precondition, not a phase
 
 **Step 0 (store-neutral, no migration).** One shared `reviewed_sha` module: the grammar defined
@@ -237,14 +322,38 @@ seam is pinned by **exact-match on the tokenised call**, never containment.
 Step 0 is independently worth doing even if steps 1–3 are never done: it kills the #958
 four-copies defect and makes the currently-unrepresentable UNKNOWN representable.
 
-**Step 1.** The mutable ledger writer (§4.3), with self-tests that inject a concurrent write and
-assert the CAS either preserves it or fails closed — **never** that a lost write counts as a pass.
+**Step 1.** The mutable ledger writer (§4.3) with the §6.3 semantic preconditions, with self-tests
+that inject a concurrent write and assert the CAS either preserves it or fails closed — **never**
+that a lost write counts as a pass — plus the §6.3 bind/retract race in both orders.
 
-**Step 2.** Dual write (W1–W5 write both stores; readers still read the body). Body marker becomes
-decoration.
+**Step 2.** Dual write, **ledger first, body second** (§6.1): W1–W5 write both stores, and the
+seed at `worker-live.sh:2647` writes an explicit `none` **record** beside the body comment, so
+every PR opened from step 2 onward is covered by construction. Readers still read the body, and
+the body is still **authoritative** for the whole step; the ledger is written and consulted by
+nobody.
+
+**Step 2½ — the bootstrap, and it is a GATE, not a nicety.** Step 2 covers future events and new
+PRs. It covers nothing about a PR that is open and bound *today* and takes no write during the
+window, and §4.2 is why that population must not be defaulted away. A one-shot, idempotent,
+`--apply`-gated backfill — modelled on `backfill-provenance.py`, which exists for exactly this
+shape of migration — enumerates every in-scope open PR from the same listing PLAN walks, parses
+its body with the step-0 grammar, and writes the ledger record from it, explicit `none` included.
+Two rules make it a gate rather than a sweep:
+
+* **A body marker that resolves to `UNKNOWN` — absent, malformed, duplicated — is never guessed.**
+  It is refused, named, and left for a human, exactly as `backfill-provenance.py` leaves an
+  unresolvable run fail-closed invisible rather than reconstructing it from forgeable evidence.
+* **It seals a census** — PRs enumerated, records written, refusals by reason — arithmetically
+  sealed in the `auto-mint-provenance.py:1134` `census_row` shape, because a census that does not
+  add up is a sweep that cannot say what it did. The seal lands on the `ledger` branch carrying
+  the enumeration boundary it covers.
 
 **Step 3.** Repoint the step-0 resolver's backing store — **one function**, because step 0 made it
-one function. Then stop writing the body marker and drop the seed.
+one function — **and fail closed unless coverage is proven**: the repointed resolver treats the
+ledger as authoritative only if the step-2½ seal exists, reports zero refusals, and covers the PR
+being asked about (below its enumeration boundary, or above it and therefore seeded by step 2).
+A PR outside that coverage is `UNKNOWN`, which §6.2 already routes correctly in both directions.
+Only once that holds do we stop writing the body marker and drop the body seed.
 
 **Nothing after step 0 should be written until this record is accepted and step 0 has landed with
 its dispositions pinned red-if-flipped.** Doing step 1 first would put a second store behind a
@@ -263,6 +372,12 @@ grammar with four owners, which is how a partial migration becomes permanent.
    getting it wrong in either direction is an arm-authority defect.
 4. **Step 0 as a precondition.** If you want the migration faster, the thing to cut is steps 2–3,
    not step 0.
+5. **Step 2½ (the bootstrap census) as a second precondition, on the same footing as step 0.**
+   A cutover that treats an unmigrated PR's missing record as a retraction discards live bindings
+   on a security surface; the only alternative to proving coverage is a bounded body-backed
+   compatibility read with a stated retirement date, which re-opens the two-authority problem §6.1
+   just closed. If you want to overrule this, overrule it explicitly — it is not a detail of
+   step 3.
 
 ## 9. Provenance
 
