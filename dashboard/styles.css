@@ -235,6 +235,9 @@ td.obs-unmeasured { color: var(--muted); }
 .obs-reason-row:last-child { border-bottom: 0; }
 .obs-reason-count { font-variant-numeric: tabular-nums; font-weight: 700; font-size: .8rem; }
 .obs-reason-count.bad { color: var(--bad); }
+/* Issue #1868: the display-cap affordance — `showing 12 of 50`, muted, sitting with the rows it
+   accounts for. Before it, an array four times its cap rendered exactly like one at it. */
+.obs-truncated { margin: 4px 0 12px; color: var(--muted); font-size: .68rem; font-variant-numeric: tabular-nums; }
 .obs-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .obs-chip { padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .68rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
 

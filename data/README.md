@@ -85,6 +85,17 @@ group is TWO fields, not five (issue #1839): `prompt_cache_read_fraction_1h` and
 `warm_drain_rate_1h`, `drained_1h` and `chain_length_histogram` are RETIRED — send one and it is
 ignored (never republished, and never measurement enough to publish the group) and named on stdout,
 so a collector on the old contract hears about it rather than watching its data vanish.
+**Every row array on this panel is a top-N DISPLAY slice** — 12 lanes, 12 `flow.queue` classes, 12
+`flow.target_ci_queue` repositories, 16 defer reasons, 16 model exit classes, 20 trigger fires — and
+the rows past a cap are dropped SILENTLY, because a truncation of rows the seam successfully read is
+a display contract rather than the producer/consumer mismatch #982/#1570/#1571 announce. Since issue
+#1868 the published document carries the pre-cap total of the WELL-FORMED rows beside each slice
+(`lanes_total`, `defer_reasons_1h_total`, `model_exit_classes_1h_total`, `trigger_fires_total`,
+`flow.queue_total`, `flow.target_ci_queue_total`) and `dashboard/app.js` renders `showing 12 of 50`,
+so a fleet with 50 congested target repositories no longer renders identically to one with 12. These
+are OUTPUT-side keys: a collector neither sends them nor is read for them, and each is published on
+every build, including the ones where the cap hid nothing.
+
 Validation is otherwise FAIL-CLOSED as before: an absent file hides the panel; a present document
 with the wrong `schema` fails the dashboard build LOUD; malformed rows inside a well-formed
 document are dropped (the model-health tolerance) — EXCEPT privacy violations, which are
