@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1929,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "81caf4c97c20b8a5ed22480041e7eecf040f78b4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added phases non-vacuously exercise both previously uncovered outcomes of _close_superseded_alert through the production _deliver_alerts path and directly verify the helper contract. The unreadable-tracker case independently pins delivery success, absence of blind close/comment mutations, preservation of the duplicate, the False return, and a warning carrying the condition. The vanished-marker case pins the silent no-op behavior, exact fallback read without mutation, preserved primary delivery, and the True return. Test setup and cleanup remain isolated within the existing try/finally, and no trust check or security posture is weakened.",
+  "verdict": "approve"
+ }
+}
