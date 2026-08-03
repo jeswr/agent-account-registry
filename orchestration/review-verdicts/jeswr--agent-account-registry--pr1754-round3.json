@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1754,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "eb1851289ed81ec1666790c076cf8722fe356111",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`guard_prefix` lowers `current` for every lower-indented non-opener. For a valid multiline suite such as `if (` / `    condition` / `):` / `    GATE`, the backward walk sees `):` at indentation 0, lowers `current` to 0, and then skips the real `if (` opener because its indentation is equal rather than lower. Thus the body copy derives `()` even though `_PY_OPENER` recognizes `if (`. The self-test independently asserts that `for _why, _wl_broken in (` is an opener and `):` is not, but it never passes a complete multiline header plus body through `guard_prefix`. If every copy in a cell is narrowed with the same multiline guard, all signatures can remain exactly as before, yielding a false green from this hard trust-plane gate.",
+    "file": "scripts/predicate-census.py",
+    "fix_hint": "Parse multiline Python headers as one structural header (preferably with Python token/AST positions), or make the walk preserve the opener across its closing header line without re-admitting closed sibling blocks. Add a red derivation test for `if (\\n    condition\\n):\\n    GATE` that requires the real enclosing guard, plus a census mutant showing a complete-cell multiline narrowing changes the cell signature and an incomplete one reds. Include a closed multiline sibling before an unguarded copy to prove the repair does not create a false enclosure.",
+    "severity": "major",
+    "title": "Multiline Python block headers make their governed body appear unguarded"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 fixes the prior arbitrary-lower-indented-statement finding, but the new syntax-filtered walk remains unsound for multiline Python block headers. The classifier recognizes the opening `if (` / `for ... in (` line, yet `guard_prefix` encounters the later dedented `):` first, lowers `current` to that header indentation, and therefore cannot admit the actual opener at the same indentation. A governed copy in that suite derives an empty guard. Applying the same multiline narrowing to all copies in a cell can consequently leave their signatures unchanged, so the hard census can green while observing none of the narrowing it claims to compare. The self-test checks classification of the two physical lines separately but never checks their combined enclosure. Because this is a new major soundness defect after the prior issue was corrected, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
