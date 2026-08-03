@@ -22,16 +22,6 @@
   },
   {
    "account": "58b7c92faa5b5ca5",
-   "claim_id": "091192edf0634e4f824fc7c41457f0c3",
-   "holder": "sparq-org/sparq#5823@30806608533.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785753761,
-   "expires_at": 1785760061
-  },
-  {
-   "account": "58b7c92faa5b5ca5",
    "claim_id": "9c2076b9d729473f97b869d84e91c334",
    "holder": "fix:sparq-org/sparq#5856@30806713521.1",
    "package": "ci",
