@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5875,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "47019fad0f9016dbc94dbd82d2f210fc660772a2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The release gui-bundle matrix now uses a SHA-pinned, exact-version taiki-e installer suitable for its x86_64/aarch64 runner mix. The replacement posture test preserves the prior js-lane assertions, adds release-lane checks for source-install removal, installer allowlisting, SHA/version pinning, and architecture suitability, and runs successfully. No correctness, security, or test-validity defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
