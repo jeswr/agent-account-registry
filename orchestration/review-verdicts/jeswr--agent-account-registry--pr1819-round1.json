@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1819,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "133fcc226079ab1f2a70f036e837cbdf7a70fbe9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces `hour12: false` with the explicit h23 cycle in the single shared absolute-time formatter. The self-test executes the real `utc()` helper on fixed midnight, noon, afternoon, and invalid inputs, examines rendered clock tokens rather than source text, and has distinct expectations that reject the prior h24 behavior as well as h11/h12/default regressions. Missing stamp output and page-script failures become named red assertions rather than aborting the remaining suite. No trust-plane control is weakened, no untrusted input is expanded into executable workflow context, and no injection-directed text appears in the diff.",
+  "verdict": "approve"
+ }
+}
