@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5629,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "922fdf5588ff6f1218583178dd36edb44603e111",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_upload_could_include` compares the unresolved YAML `path:` text directly with the relative target. An upload such as `path: ${{ github.workspace }}` or `path: ${{ github.workspace }}/coverage-cone-divergence-shard-1.json` retains the runner-root log after Actions expression expansion but returns false here. Absolute workspace paths are also reduced only by stripping `/`, leaving a workspace prefix that cannot match the relative target. Thus a common broad upload can still be introduced while the promised regression test stays green.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Conservatively reject upload path entries containing unresolved GitHub expressions or absolute paths unless they can be normalized relative to the known workspace, and add negative fixtures for `${{ github.workspace }}`, `${{ github.workspace }}/coverage-cone-divergence-shard-1.json`, and an absolute workspace directory. Alternatively, write the log into a dedicated directory and reject any upload specification that is broad, dynamic, or can include that directory.",
+    "severity": "major",
+    "title": "Artifact matcher misses expression-based and absolute workspace paths"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 corrects the evidence-base description and substantially improves wildcard/directory coverage, resolving the first prior finding and narrowing the second. However, the retention invariant is still bypassable through GitHub-expression or absolute upload paths, even though those resolve to the same workspace file at runtime. The targeted test could not be executed in this checkout because PyYAML is unavailable; the defect follows directly from the matcher implementation.",
+  "verdict": "request_changes"
+ }
+}
