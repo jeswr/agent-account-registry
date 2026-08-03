@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1744,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c7283eeebbb28fa3edf54b14bf73750d9df29e1b",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The #1121 regression test exercises the production run_sweep terminal-reap path at the load-bearing fresh-read boundary. All three cases hold the expired lease and empty snapshot constant while independently varying the direct issue read: an open, non-terminal issue retains its claim, whereas a true 404/absence and a closed issue release it. The expected tuple checks both the reclaimed count and the exact release set, preventing a universal no-reap implementation from satisfying the safety leg, and the exception wrapper turns crashes into mismatching values without aborting later checks. The fixture also uses literal stable-order listing paths rather than production-derived expectations. The added rationale accurately limits the ascending-pagination residual and identifies why direct revalidation makes a skipped open row safe. No production behavior or trust check is changed, no injected reviewer instruction appears in the diff, and no correctness, soundness, security, or test-validity defect is evident. With no findings in either round 6 or round 7, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
