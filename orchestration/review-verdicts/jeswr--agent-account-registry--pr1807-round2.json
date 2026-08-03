@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1807,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "eb61663c1a5f8f2b402e7bf178676b8ec4984394",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-one blocker is resolved. The implementation now documents the relevant `git read-tree` mode distinction and, more importantly, exercises `_worktree_seal_digest` through direct and end-to-end self-test rows: it must produce a 64-hex digest from an ordinary repository, preserve HEAD/index/worktree state, remain stable for identical content, change for tracked edits and deletions, ignore gitignored build output, and fail closed for an unreadable tree. The pre-gate digest is emitted by both sealing paths, wired by exact step-output names into each live gate, validated before target-controlled code runs, and rechecked after every gate profile. The worker bundle additionally proves that the recomputed snapshot digest equals the exact patch bytes later applied by the publisher. I found no remaining correctness, soundness, test-vacuity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
