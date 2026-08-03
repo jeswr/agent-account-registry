@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5888,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bd947cad8dd3a0fba981adc869dd94a3c676c9c5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is coherent and complete as scoped. The merge-group-specific timeout and poll-budget clamp preserve the pull-request path, the zero-pending hold logic retains fail-closed verdict rendering while avoiding an unusable extension, and the watchdog addition is observational only. Tests cover the budget ordering and wiring, both structural-hold variants, saturation and late-success countercases, the existing pending-work hang behavior, stall threshold/head selection, missing timestamps, and sweep integration. The ci-summary suite passed locally (197 passed, 3 skipped); the watchdog suite could not run in this environment because PyYAML is unavailable, but its focused tests exercise the real sweep path rather than a mock-only helper. No hostile review instructions were present in the diff.",
+  "verdict": "approve"
+ }
+}
