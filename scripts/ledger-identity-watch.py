@@ -8,6 +8,13 @@
 # writer that skips `account_fingerprint`, a hand-edited snapshot, or a restored old branch would
 # sit PUBLISHED until somebody thought to look. This is the standing form of that measurement.
 #
+# ⚠️ DEPLOYMENT ORDER. The scanner is not on the default branch yet, so the workflow ships with
+# `workflow_dispatch` and NO `schedule:`, and `_test_workflow_seam` reds if a cron appears while
+# the scanner is absent. `unverified` is the correct answer for a tick that cannot measure; it is
+# not a correct thing to schedule daily forever, because an alert nothing can clear is a false
+# alarm on the channel real exposures arrive on. Runtime polarity and deployment readiness are
+# separate questions and this module answers both.
+#
 # ⚠️ THIS SCRIPT OWNS NO DETECTION RULE. The definition of "raw account identity" lives in exactly
 # one place — `ledger-history-purge.py` — and is invoked as a SUBPROCESS, never re-derived here.
 # A second copy of that rule is the #958 shape (four independent definitions of one literal, two
@@ -288,9 +295,15 @@ def main(argv=None):
         if not isinstance(found, list):
             raise ValueError("expected a JSON array")
     except ValueError:
-        print("::warning::ledger-identity-watch: gh issue list succeeded but returned unparseable "
-              "JSON — skipping this tick (no dedupe/recovery data; next tick retries)")
-        return 0
+        # FAIL CLOSED. `gh` exited 0 but the alert board is unreadable, so this tick has no dedupe
+        # or recovery state. Returning 0 here would record the detector as HEALTHY on a tick that
+        # delivered no alert at all — and on a first `exposed`/`unverified` tick there is no
+        # pre-existing issue left visible to carry the signal, so the whole measurement would
+        # evaporate behind a green run. A failed run is retried and is visible; a green silent one
+        # is neither. The payload itself is never echoed: it is `gh` output bound for a public log.
+        print("::error::ledger-identity-watch: gh issue list succeeded but returned unparseable "
+              "JSON — refusing to decide on an alert board we could not read (no mutation)")
+        return 1
     num = next((row["number"] for row in found
                 if isinstance(row, dict) and ALERT_MARKER in (row.get("body") or "")), None)
     if num is None:
@@ -638,15 +651,27 @@ def _test_main_flows(chk):
         chk("an unreadable issue list -> rc=1 and NO mutation (never decide on a board we could "
             "not read)",
             (rc, [sub for sub in gh_subs() if sub != ("issue", "list")]), (1, []))
+        # An unreadable board is a FAILED tick, not a quiet one: a `return 0` here would report the
+        # detector healthy on a tick that filed no alert and, with no pre-existing issue to stay
+        # visible, produced no evidence anywhere. rc=1 AND no mutation are both required — passing
+        # either alone (fail loudly but create a duplicate; or stay silent) is the defect.
         rc, out = run_main(scan_rc=1, list_json="SENTINEL-MALFORMED {not json")
-        chk("a malformed issue list -> soft skip, payload never echoed",
-            (rc, "SENTINEL-MALFORMED" in out,
-             [sub for sub in gh_subs() if sub != ("issue", "list")]), (0, False, []))
-        rc, out = run_main(scan_rc=1, list_json='{"message": "sentinel-error-object"}')
-        chk("a NON-ARRAY issue list (gh renders an API error as an object) -> soft skip, payload "
+        chk("[RED] a malformed issue list -> rc=1 (a failed, retryable tick), no mutation, payload "
             "never echoed",
+            (rc, "SENTINEL-MALFORMED" in out,
+             [sub for sub in gh_subs() if sub != ("issue", "list")]), (1, False, []))
+        rc, out = run_main(scan_rc=1, list_json='{"message": "sentinel-error-object"}')
+        chk("[RED] a NON-ARRAY issue list (gh renders an API error as an object) -> rc=1, no "
+            "mutation, payload never echoed",
             (rc, "sentinel-error-object" in out,
-             [sub for sub in gh_subs() if sub != ("issue", "list")]), (0, False, []))
+             [sub for sub in gh_subs() if sub != ("issue", "list")]), (1, False, []))
+        # Both rows above are ALERTING ticks, so a fail-closed narrowed to `if verdict != CLEAN`
+        # would pass them both. The CLEAN tick is the other half: an unreadable board means the
+        # RECOVERY path (close the stale alert) could not run either, and that is a failed tick too.
+        rc, _ = run_main(list_json="SENTINEL-MALFORMED {not json")
+        chk("[RED] ...and a CLEAN tick over an unreadable board fails the same way — the recovery "
+            "path could not run, so the tick did not succeed, it went unmeasured",
+            (rc, [sub for sub in gh_subs() if sub != ("issue", "list")]), (1, []))
         rc, _ = run_main(scan_rc=1, fail=(("issue", "create"),))
         chk("a failed create -> rc=1 (delivery failure is loud, not swallowed)", rc, 1)
         rc, _ = run_main(list_json=open_alert, fail=(("issue", "close"),))
@@ -749,17 +774,45 @@ def _test_workflow_seam(chk):
     EXACT match, never containment."""
     import yaml  # lazy: available on ubuntu-latest and in pr-gate
 
+    def crons(document):
+        """How many `schedule:` entries a workflow document declares.
+
+        ONE definition, used by the deployment-gate row below AND by its control. Written twice it
+        would be #945's shape exactly: a misspelled trigger key in the guard's copy would make the
+        guard permanently permissive while the control's copy still passed, so each copy would be
+        individually unkillable.
+        """
+        # `on:` is parsed by PyYAML as the boolean True (the Norway problem), not the string "on".
+        return len(((document.get("on", document.get(True)) or {}).get("schedule")) or [])
+
     document = yaml.safe_load(_require(WORKFLOW_PATH))
-    # `on:` is parsed by PyYAML as the boolean True (the Norway problem), not the string "on".
     triggers = document.get("on", document.get(True)) or {}
     jobs = document.get("jobs") or {}
     chk("the workflow declares exactly one job", sorted(jobs), ["watch"])
     job = jobs["watch"]
     steps = job.get("steps") or []
 
-    chk("it is SCHEDULED — a standing detector that only runs on demand is the gap #1092 names",
-        len(triggers.get("schedule") or []), 1)
-    chk("...and is manually kickable for a maintainer verifying a purge",
+    # ⚠️ THE DEPLOYMENT GATE. The detection rule lives in `ledger-history-purge.py` (#536), which is
+    # not on the default branch yet. `unverified` is the right RUNTIME answer when it is missing —
+    # but a cron enabled before it lands can only ever produce that answer, i.e. one permanently
+    # open alert no maintainer action can clear, on the channel real exposures arrive on. So the
+    # schedule is COUPLED to the scanner's presence rather than left to a comment nobody re-reads.
+    # DIRECTIONALITY IS DELIBERATE: declaring a cron while the scanner is absent REDS here, but the
+    # row goes permissive the moment the scanner lands, so merging #536 can never red this required
+    # gate for every unrelated pull in the repository. Enabling the cron then is the follow-up.
+    chk("[RED] no `schedule:` while the scanner that drives it is absent from this checkout — a "
+        "cron that can only ever report `unverified` is a permanently alarming detector, not the "
+        "standing measurement #1092 asks for",
+        crons(document) > 0 and not Path(scanner_path()).is_file(), False)
+    # CONTROL for the row above: it reads a key that is ABSENT from the file today, so on its own
+    # it would be satisfied just as well by a `crons` that can never see a cron at all —
+    # permanently permissive, and permanently silent about it. Drive the SAME function over a
+    # document that does declare one.
+    chk("[CONTROL] the same `crons` read finds a cron when one IS declared, so the row above is a "
+        "live guard rather than a lookup that can never match",
+        crons(yaml.safe_load('on:\n  schedule:\n    - cron: "23 5 * * *"\n')), 1)
+    chk("...and the lane stays manually kickable, so a maintainer can take the measurement — or "
+        "read the honest `unverified` — on demand while the cron is withheld",
         "workflow_dispatch" in triggers)
     chk("the job carries no `if:` and no `needs:` — there is no upstream whose failure may "
         "suppress the detector",
