@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5573,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "78cc92b28b17f8095a61652fbff1525a7deff2b6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`LABEL_WRITE_PATTERNS` still requires an explicit `-X/--method POST|PUT|PATCH|DELETE` for `/labels` API calls. GitHub CLI automatically changes the method to POST when fields are supplied, so `gh api repos/$R/issues/$N/labels -f 'labels[]=needs:user'` mutates labels but is not classified as a label-writing step. A foreign PAT in that step consequently escapes R1. The self-test remains at four positives and six negatives and does not exercise this path, so the central invariant is still bypassable.",
+    "file": "scripts/check-label-write-token.py",
+    "fix_hint": "Classify `gh api` `/labels` calls as mutating when `-f`, `-F`, `--raw-field`, `--field`, or applicable `--input` usage causes the CLI's implicit POST, while excluding explicit or genuine GET requests. Add positive fixtures for explicit-method and implicit-default-POST label writes and a negative genuine-GET fixture.",
+    "severity": "major",
+    "title": "Default-POST `gh api` label writes still bypass the identity guard"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: the round-1 security finding remains materially unchanged. The classifier still recognizes a mutating `gh api .../labels` call only when `-X/--method POST|PUT|PATCH|DELETE` is explicit, while GitHub CLI implicitly uses POST when request fields or input are supplied. The self-test still has only four positive and six negative fixtures and adds no explicit-method, implicit-default-POST, or genuine-GET coverage. Therefore a standard label write using a foreign PAT can still bypass R1.",
+  "verdict": "request_changes"
+ }
+}
