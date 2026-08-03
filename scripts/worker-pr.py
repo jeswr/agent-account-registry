@@ -5231,8 +5231,86 @@ def arm_freshness_decision(freshness):
     return "" if state == _GATE_FRESH else ARM_DECLINE_GATE_STALE
 
 
+# ---- registry #1688: A PARKED APPROVAL DOES NOT SAY WHEN IT STOPPED COVERING THE HEAD --------
+#
+# #940 (above) asks "is this GREEN about the right TREE?". This asks the question one step to its
+# left, and it is the one nothing on the by-hand arm surface asked: **is this REVIEW about the
+# head being armed at all?**
+#
+# THE MEASURED HAZARD (#1688, observed on registry #1661). A PR that the review APPROVED and then
+# parked `human-arm` (the self-attested orchestrator class cannot authorise its own merge, so a
+# human arms it) keeps that presentation after its head advances past the reviewed sha: the label
+# and the approval comment read identically whether or not the approval still covers the code.
+# On #1661 the reviewed head was `2fd120cd`, the live head `e393ca29` — a push fixing a defect
+# round 1 itself raised, i.e. the MOST LIKELY reason a head moves after an approval — and nothing
+# on the PR said the approval had been invalidated. A human arming it merges what no reviewer has
+# seen. It is the same family as #1602, and worse in consequence: #1602 fails CLOSED (a parked PR
+# cannot earn a re-review), this fails OPEN.
+#
+# WHY THIS IS THE ARM SURFACE'S JOB AND NOT A NEW ONE. The MACHINE arm already refuses a moved
+# head twice over — `_arm_auto_merge` verifies the live head against the reviewed sha before it
+# latches, and the mutation's `expectedHeadOid` is GitHub's own CAS at latch time — and
+# `decide_disarm` retracts a latch the head then outruns. The by-hand arm this report exists for
+# (`arm_freshness_report`, #940: "the mitigation in force for it was a human remembering") had
+# neither. So this classifier is that CAS, asked from where the human stands.
+#
+# THE EVIDENCE IS THE PR BODY's `sparq-reviewed-sha` marker — the SAME assertion `disarm` reads
+# for the #42 invariant, not a second spelling of it. It is bound as the LAST mutation of a
+# completed review round (review-fix.yml's bind step), including on the `needs-user` park that
+# #1688 is about, so the human-arm park carries it; and the paths that cannot honestly assert it
+# retract it to `UNBOUND_REVIEWED_SHA` rather than leave a stale claim.
+#
+# WHO CAN WRITE THAT MARKER, ASKED EXPLICITLY (AGENTS.md pre-flight item 5), because a PR BODY is
+# author-visible text and three arm-capable holes in this estate came from exactly that. The
+# answer here is that this guard is MONOTONE and therefore unforgeable in the direction that
+# matters: it can only ADD a refusal to a surface that today has none, so the best a forged marker
+# can do is return the report to its pre-#1688 silence — it can never manufacture an authority,
+# raise a round budget, or clear another guard's refusal (`refused=` stays #940's alone). And
+# `covers-head` is stated as the ABSENCE OF THIS OBJECTION, never as an attestation that the
+# review was sound: nothing here prints "safe to arm". The strictly better evidence is the
+# BOT-AUTHORED `sparq-park-reason:v1` receipt's `head=` — author-filtered, quoted-contexts
+# stripped, line-anchored by `park_policy.parse_park_reason` — but it exists only on a PARKED PR,
+# and requiring it would refuse every unparked PR in this report's #940 population, i.e. convert
+# the guard into the blanket hold `arm_freshness_summary` exists to detect. Corroborating the two
+# where both exist is follow-up work, not a hole this leaves open.
+#
+# NOT A RE-ADMISSION. `human-arm` is one of park_policy.PARK_HUMAN_ONLY_CAUSES — no machine path
+# may convert that park out of the human terminal — so this SAYS the approval is stale where the
+# arm decision is made; it does not unpark, relabel, comment, or re-review. That is #1688's
+# minimum disposition, and its disposition 2 is deliberately left to a human.
+APPROVAL_COVERS_HEAD = "covers-head"   # a review is bound to exactly the head being armed
+APPROVAL_HEAD_MOVED = "head-moved"     # a review is bound to a DIFFERENT commit — it is stale
+APPROVAL_UNBOUND = "unbound"           # no reviewed head is asserted at all (or it is unreadable)
+APPROVAL_UNREAD = "unread"             # this caller did not ask (never rendered as an answer)
+
+
+def approval_coverage(reviewed_sha, head_sha):
+    """PURE (registry #1688): does the loop's recorded review cover `head_sha`?
+
+    APPROVAL_COVERS_HEAD only when BOTH are well-formed 40-hex shas AND equal. Anything else is
+    APPROVAL_HEAD_MOVED (both readable, different commits) or APPROVAL_UNBOUND — which is where
+    every unprovable input lands: `UNBOUND_REVIEWED_SHA` (`none`, the honest "no review is
+    asserted"), an unreadable/absent live head, a non-string, and any malformed value. The fail
+    direction is `arm_freshness_decision`'s and for the same reason: "we cannot tell which commit
+    this approval is about" is not evidence that it is about this one."""
+    if not isinstance(reviewed_sha, str) or not isinstance(head_sha, str):
+        return APPROVAL_UNBOUND
+    if (not re.fullmatch(r"[0-9a-f]{40}", reviewed_sha)
+            or not re.fullmatch(r"[0-9a-f]{40}", head_sha)):
+        return APPROVAL_UNBOUND
+    return APPROVAL_COVERS_HEAD if reviewed_sha == head_sha else APPROVAL_HEAD_MOVED
+
+
+def approval_coverage_refused(coverage):
+    """PURE: does `coverage` withhold a by-hand arm? Everything except APPROVAL_COVERS_HEAD does,
+    APPROVAL_UNREAD included — a caller that never asked has proved nothing, so it must not be
+    able to buy an arm by omitting the question. Spelled as its own predicate because the census
+    row and the exit code must partition the population identically."""
+    return coverage != APPROVAL_COVERS_HEAD
+
+
 def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, readmitted=False,
-                             gate=""):
+                             gate="", approval=APPROVAL_UNREAD):
     """PURE: the ONE census line emitted for EVERY arm attempt that reaches the freshness read —
     admitted, refused, or re-admitted. A per-stage success rate cannot express a missing edge, so
     this is a POPULATION row: every arm attempt produces exactly one, and `refused=` partitions
@@ -5255,7 +5333,16 @@ def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, 
     (`gate=missing ci=absent`) countable — and distinguishable from one at a head whose gate
     passed (`ci=green`) — on the ADMITTED path too, where nothing previously recorded the grade
     at all. A caller that has no grade in scope passes none and gets `gate=unread ci=unproven`:
-    the absence of a reading is never rendered as a green."""
+    the absence of a reading is never rendered as a green.
+
+    [registry #1688] `approval=` is `approval_coverage`'s verdict — whether a review is bound to
+    the head being armed — on the SAME row, for the reason `gate=` is: one line per arm attempt.
+    It is a SEPARATE field from `refused=` on purpose: `refused=` is #940's staleness count and
+    folding a second guard's refusals into it would make that population silently stop meaning
+    what it is read as meaning. A caller with no head to compare passes none and gets
+    `approval=unread` — "this row's caller did not ask", never rendered as coverage. The MACHINE
+    arm path is exactly that caller, and correctly so: it proves coverage with GitHub's own CAS
+    (`expectedHeadOid`) rather than with this classifier."""
     state = freshness.get("state") if isinstance(freshness, dict) else None
     gap = freshness.get("gap_seconds") if isinstance(freshness, dict) else None
     run_base = (freshness.get("run_base_sha") or "") if isinstance(freshness, dict) else ""
@@ -5267,7 +5354,8 @@ def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, 
             f"gate_base={run_base[:12] or 'none'} base_tip={tip[:12] or 'none'} "
             f"siblings={(freshness.get('sibling_state') if isinstance(freshness, dict) else None) or 'unread'} "
             f"refused={'true' if refused else 'false'} "
-            f"readmitted={'true' if readmitted else 'false'}")
+            f"readmitted={'true' if readmitted else 'false'} "
+            f"approval={approval or APPROVAL_UNREAD}")
 
 
 def arm_freshness_summary(rows):
@@ -5275,13 +5363,23 @@ def arm_freshness_summary(rows):
     `attempted` / `refused` / the `gap_seconds` of each refusal. Emitted alongside the rows, not
     instead of them — the rows say WHICH PR, the summary says whether the guard is refusing
     nothing (a guard that has gone quiet) or refusing everything (a guard that has become a
-    blanket hold). Both are failure modes and neither is visible from a single row."""
+    blanket hold). Both are failure modes and neither is visible from a single row.
+
+    [registry #1688] `refused_approval` / `approval_stale_prs` are counted and listed SEPARATELY
+    from `refused_stale`, because they answer a different question about a different population —
+    "which arms would have merged a commit no review covers" vs "which greens graded a superseded
+    base". Summing them would produce a number that means neither. Both are zero-sealed, so "no
+    approval outran its head this tick" and "this stopped being counted" cannot look the same."""
     refused = [row for row in rows if row.get("refused")]
     gaps = [str(row.get("gap_seconds")) if row.get("gap_seconds") is not None else "none"
             for row in refused]
+    stale_approval = [row for row in rows
+                      if approval_coverage_refused(row.get("approval") or APPROVAL_UNREAD)]
     return (f"{ARM_FRESHNESS_CENSUS_PREFIX} attempted={len(rows)} refused_stale={len(refused)} "
             f"refused_prs={[row.get('pr') for row in refused] or 'none'} "
-            f"age_gaps_seconds={gaps or 'none'}")
+            f"age_gaps_seconds={gaps or 'none'} "
+            f"refused_approval={len(stale_approval)} "
+            f"approval_stale_prs={[row.get('pr') for row in stale_approval] or 'none'}")
 
 
 def arm_freshness_report(repo, pr_numbers, log=print):
@@ -5305,18 +5403,30 @@ def arm_freshness_report(repo, pr_numbers, log=print):
     answer that question with silence on exactly the population that has no CI. The grade is
     read tier-appropriately for the PR's LIVE draft state through dispatch-claim's own walk (the
     same containment `_live_arm_gate` cites), and it decides nothing here — the refusal is still
-    `arm_freshness_decision`'s alone."""
+    `arm_freshness_decision`'s alone.
+
+    [registry #1688] And it answers the question one step to the left of #940's: does a review
+    cover this head AT ALL? A `human-arm` park (approved, awaiting a human to arm) presents
+    identically before and after its head advances past the reviewed sha, so the human standing
+    here is exactly the person with no signal. The reviewed sha is read from the SAME live PR
+    payload the head comes from — one read, no second API call — and `approval_coverage` decides
+    it. A refusal on EITHER guard exits non-zero; they are reported and counted apart."""
     rows = []
     for pr_number in pr_numbers:
         live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
         head = str((live.get("head") or {}).get("sha", "")) if isinstance(live, dict) else ""
         base_ref = str((live.get("base") or {}).get("ref", "")) if isinstance(live, dict) else ""
         draft = bool(live.get("draft")) if isinstance(live, dict) else True
+        # [#1688] The loop's own assertion about which commit a review completed on, read off the
+        # PR BODY — `disarm`'s evidence for the #42 invariant, not a second spelling of it. An
+        # unreadable payload yields None, which `approval_coverage` treats as UNBOUND (refuse).
+        reviewed = reviewed_sha_of(live.get("body") if isinstance(live, dict) else "")
+        coverage = approval_coverage(reviewed, head)
         gate = _dispatch_claim()._live_repair_gate(repo, head, draft)
         freshness = _dispatch_claim().live_gate_freshness(repo, head, base_ref, draft, pr_number)
         refused = bool(arm_freshness_decision(freshness))
         log(arm_freshness_census_row(repo, pr_number, head, freshness, refused=refused,
-                                     gate=gate))
+                                     gate=gate, approval=coverage))
         alarm = arm_ci_absent_alarm(repo, pr_number, head, gate)
         if alarm:
             log(alarm)
@@ -5324,10 +5434,18 @@ def arm_freshness_report(repo, pr_numbers, log=print):
             log(f"  REFUSE arming {repo}#{pr_number}: {freshness.get('reason', '')}. "
                 "`gh run rerun` cannot clear this — it re-tests the same tree; move the head "
                 "(update-branch / rebase) so a new pull_request event gates the real merge base.")
-        rows.append({"pr": pr_number, "refused": refused,
+        if approval_coverage_refused(coverage):
+            log(f"  REFUSE arming {repo}#{pr_number}: the recorded review is `{coverage}` — it "
+                f"is bound to {reviewed[:12] if reviewed else '(nothing)'} and the live head is "
+                f"{head[:12] or '(unreadable)'}. Arming merges a commit no reviewer has seen; a "
+                "park that reads `approved, awaiting a human to arm` says nothing about a push "
+                "that landed after it (registry #1688). The approval is void — a new review "
+                "round is owed. Do not arm this by hand.")
+        rows.append({"pr": pr_number, "refused": refused, "approval": coverage,
                      "gap_seconds": freshness.get("gap_seconds")})
     log(arm_freshness_summary(rows))
-    return 1 if any(row["refused"] for row in rows) else 0
+    return 1 if any(row["refused"] or approval_coverage_refused(row["approval"])
+                    for row in rows) else 0
 
 
 def _record_arm_stale_decline(repo, pr_number, reviewed_sha, freshness, bot_login=""):
@@ -12042,7 +12160,7 @@ def _self_test():
               f"{ARM_FRESHNESS_CENSUS_PREFIX} repo=o/r pr=41 head=bbbbbbbbbbbb gate=unread "
               "ci=unproven verdict=fresh "
               "gap_seconds=none gate_base=none base_tip=none siblings=unread refused=false "
-              "readmitted=false")
+              "readmitted=false approval=unread")
         # NO DEADLOCK. Both operands of the freshness test are FROZEN, so a refusal stands until
         # a NEW gate run exists — and this lane's only producer of one is the `gh pr ready` a
         # refusal placed above it suppresses. The bound is the exit: the SECOND arm at the SAME
@@ -12264,22 +12382,52 @@ def _self_test():
               in arm_decline_workflow_seam_report()["condition"], True)
         # ---- the ORCHESTRATOR-side surface (arm_freshness_report / _summary) -----------------
         check("arm_freshness_summary counts the population and lists each refusal's age gap",
-              arm_freshness_summary([{"pr": 752, "refused": True, "gap_seconds": -77087},
-                                     {"pr": 900, "refused": False, "gap_seconds": 3600},
-                                     {"pr": 784, "refused": True, "gap_seconds": None}]),
+              arm_freshness_summary([{"pr": 752, "refused": True, "gap_seconds": -77087,
+                                      "approval": "covers-head"},
+                                     {"pr": 900, "refused": False, "gap_seconds": 3600,
+                                      "approval": "covers-head"},
+                                     {"pr": 784, "refused": True, "gap_seconds": None,
+                                      "approval": "covers-head"}]),
               f"{ARM_FRESHNESS_CENSUS_PREFIX} attempted=3 refused_stale=2 "
-              "refused_prs=[752, 784] age_gaps_seconds=['-77087', 'none']")
+              "refused_prs=[752, 784] age_gaps_seconds=['-77087', 'none'] "
+              "refused_approval=0 approval_stale_prs=none")
         check("arm_freshness_summary says so plainly when nothing was refused",
-              arm_freshness_summary([{"pr": 900, "refused": False, "gap_seconds": 3600}]),
+              arm_freshness_summary([{"pr": 900, "refused": False, "gap_seconds": 3600,
+                                      "approval": "covers-head"}]),
               f"{ARM_FRESHNESS_CENSUS_PREFIX} attempted=1 refused_stale=0 "
-              "refused_prs=none age_gaps_seconds=none")
+              "refused_prs=none age_gaps_seconds=none "
+              "refused_approval=0 approval_stale_prs=none")
+        # [#1688] THE SECOND GUARD IS COUNTED APART. Same three rows, but 900's review is bound to
+        # a commit its head has outrun: the #940 staleness population must NOT move (folding the
+        # two together is the silent-shrink the row docstring forbids) and the approval population
+        # must name exactly 900. A row whose caller never asked (`unread`) counts as refused, so
+        # dropping the field cannot quietly empty this census.
+        check("[#1688] approval staleness is censused apart from gate staleness, both directions",
+              (arm_freshness_summary([{"pr": 752, "refused": True, "gap_seconds": -77087,
+                                       "approval": "covers-head"},
+                                      {"pr": 900, "refused": False, "gap_seconds": 3600,
+                                       "approval": "head-moved"}]),
+               arm_freshness_summary([{"pr": 41, "refused": False, "gap_seconds": 1}])),
+              (f"{ARM_FRESHNESS_CENSUS_PREFIX} attempted=2 refused_stale=1 "
+               "refused_prs=[752] age_gaps_seconds=['-77087'] "
+               "refused_approval=1 approval_stale_prs=[900]",
+               f"{ARM_FRESHNESS_CENSUS_PREFIX} attempted=1 refused_stale=0 "
+               "refused_prs=none age_gaps_seconds=none "
+               "refused_approval=1 approval_stale_prs=[41]"))
         report_lines, report_gh, report_dc, report_grades = [], [], [], []
         real_dc = globals()["_dispatch_claim"]
         real_gh = globals()["_gh_json"]
         try:
+            # [#1688] The two dimensions are ORTHOGONAL in this fixture, which is what makes the
+            # assertions below able to tell them apart: 752's review is bound to the live head
+            # (approval covers it) and its GATE is stale; 900's gate is fresh and its review is
+            # bound to a commit the head has since outrun — the #1661 shape.
             globals()["_gh_json"] = lambda a, **k: (
                 report_gh.append(a[1]) or {"head": {"sha": "f" * 40}, "base": {"ref": "master"},
-                                           "draft": False})
+                                           "draft": False,
+                                           "body": "<!-- sparq-reviewed-sha:"
+                                                   + ("f" if a[1].endswith("752") else "a") * 40
+                                                   + " -->"})
             globals()["_dispatch_claim"] = lambda: types.SimpleNamespace(
                 live_gate_freshness=lambda repo, head, base, draft, pr: (
                     report_dc.append((repo, head, base, draft, pr))
@@ -12320,6 +12468,65 @@ def _self_test():
                sum(1 for line in report_lines if ARM_CI_ABSENT_PREFIX in line),
                report_grades),
               (1, 1, 1, [("o/r", "f" * 40, False), ("o/r", "f" * 40, False)]))
+        # [#1688] THE QUESTION ONE STEP LEFT OF #940's: does a review cover this head at all? The
+        # truth table is asserted over LITERAL shas and LITERAL verdict strings — the rendered
+        # field is what an operator greps for, so reading the expected values out of the module's
+        # own constants would assert nothing about what is printed.
+        _live_head, _outrun_head = "f" * 40, "a" * 40
+        check("[#1688] approval_coverage admits ONLY a review bound to the EXACT live head; "
+              "every unprovable input is `unbound`, never coverage",
+              [approval_coverage(reviewed, head) for reviewed, head in (
+                  (_live_head, _live_head),            # the review is about this commit
+                  (_outrun_head, _live_head),          # #1661: the head advanced past it
+                  (UNBOUND_REVIEWED_SHA, _live_head),  # the loop asserts no reviewed head
+                  (None, _live_head),                  # unreadable PR payload
+                  (_live_head, ""),                    # unreadable live head
+                  (_live_head, "F" * 40),              # malformed (not 40 lower-hex)
+                  ("f" * 39, _live_head))],            # truncated marker value
+              ["covers-head", "head-moved", "unbound", "unbound", "unbound", "unbound",
+               "unbound"])
+        check("...and only `covers-head` admits an arm — an UNASKED question least of all, or a "
+              "caller could buy one by omitting it",
+              [approval_coverage_refused(verdict) for verdict in
+               ("covers-head", "head-moved", "unbound", "unread", "", None)],
+              [False, True, True, True, True, True])
+        # THE FIXTURE'S TWO PRs SEPARATE THE TWO GUARDS: 752 is gate-stale with a review bound to
+        # its live head, 900 is gate-FRESH with a review bound to a commit the head outran. So a
+        # census that folded the approval refusal into `refused=`/`refused_stale=` reds the #940
+        # assertions above, and one that dropped the approval verdict reds these.
+        check("[#1688] the by-hand arm report NAMES the stale approval on its row, REFUSES it in "
+              "prose a human can act on, and counts it apart from the gate-staleness refusal",
+              (sum(1 for line in report_lines if "approval=head-moved" in line),
+               sum(1 for line in report_lines if "approval=covers-head" in line),
+               any("REFUSE arming o/r#900" in line and "no reviewer has seen" in line
+                   and "aaaaaaaaaaaa" in line and "ffffffffffff" in line
+                   for line in report_lines),
+               any("refused_approval=1 approval_stale_prs=[900]" in line
+                   for line in report_lines)),
+              (1, 1, True, True))
+        # THE EXIT CODE IS THE ACT. Everything else about this PR is provably fresh — green
+        # merge-required gate, fresh freshness verdict — so the moved head is the ONLY term that
+        # can decide the code, and the `covers` half proves the guard is not a blanket hold.
+        approval_rc, approval_lines = {}, []
+        try:
+            globals()["_dispatch_claim"] = lambda: types.SimpleNamespace(
+                live_gate_freshness=lambda repo, head, base, draft, pr: {
+                    "state": "fresh", "gap_seconds": 3600, "run_base_sha": "e" * 40,
+                    "base_tip_sha": "e" * 40},
+                _live_repair_gate=lambda repo, head, draft: "green:merge-required")
+            for case, reviewed in (("moved", _outrun_head), ("covers", _live_head)):
+                globals()["_gh_json"] = lambda a, _r=reviewed, **k: {
+                    "head": {"sha": _live_head}, "base": {"ref": "master"}, "draft": True,
+                    "body": f"prose\n\n<!-- sparq-reviewed-sha:{_r} -->"}
+                approval_rc[case] = arm_freshness_report("o/r", [1661],
+                                                         log=approval_lines.append)
+        finally:
+            globals()["_dispatch_claim"] = real_dc
+            globals()["_gh_json"] = real_gh
+        check("[#1688] a head that outran its approval alone REFUSES the by-hand arm (exit 1), "
+              "and an approval that still covers the head is NOT held",
+              (approval_rc, sum(1 for line in approval_lines if "REFUSE arming o/r#1661" in line)),
+              ({"moved": 1, "covers": 0}, 1))
         check("...and it is READ-ONLY: an all-fresh tick exits 0 and mutates nothing",
               (arm_freshness_report("o/r", [], log=lambda _line: None), raa_latches()),
               (0, []))
