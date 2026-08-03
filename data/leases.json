@@ -43,12 +43,12 @@
   {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "b475d65cdac442ab822abea4d31233c7",
-   "holder": "jeswr/agent-account-registry#1462@dispatch-30779903359.1",
+   "holder": "jeswr/agent-account-registry#1462@30780169386.1",
    "package": "workflows",
    "role": "ci",
    "model": "opus5",
-   "issued_at": 1785725277,
-   "expires_at": 1785727977
+   "issued_at": 1785725308,
+   "expires_at": 1785728008
   },
   {
    "account": "dc2d751954080e13",
