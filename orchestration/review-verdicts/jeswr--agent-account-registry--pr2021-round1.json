@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2021,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d27e6d59ec07426dbfd4b2cc68307c5f93c70c07",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only correction accurately reconciles the design record with the census implementation that actually merged. The stated payload shape, total fold into the bounded `unspecified` row, producer-side omission of wire index 0, decoder behavior, routing treatment of `UNSPECIFIED`, and cited self-test coverage all match the checked-in code. It also preserves the important caveat that a dropped declaration is observationally indistinguishable from no signal, without claiming a behavior change. No correctness, soundness, test-validity, or security issue is introduced.",
+  "verdict": "approve"
+ }
+}
