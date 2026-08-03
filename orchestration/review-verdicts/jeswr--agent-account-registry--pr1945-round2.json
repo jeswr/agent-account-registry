@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1945,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3180919759c21b131abd5fe4545cfd645f66f12b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`read_ticks` treats a complete per-run artifact response with no parseable groom mint marker as harmless: `tick_records` adds nothing and the loop continues into older runs. That run is an evidence hole just as surely as a refused or partial response\u2014the watchdog cannot establish any owner's mint outcome for it. With `THRESHOLD+1` selected runs, four older `skip-jeswr` markers separated by one markerless run can still produce a four-tick streak and open an alert even though the evidence does not show four scheduled ticks in a row. Conversely, a markerless newest run can be stepped over to an older `ok` marker and support closing an existing alert while the newest run's outcome is unknown. The new test explicitly requires this unsafe behavior (`a validated run that uploaded no marker ... does not stop the crawl`), so it cannot catch either fabrication. A complete page proves the artifact listing is complete; it does not prove that a mint outcome exists.",
+    "file": "scripts/groom-mint-alert.py",
+    "fix_hint": "Require exactly one usable tick outcome for each run traversed before continuing to older runs. If a complete page contains no parseable mint marker, treat it as a hole: return no evidence when it is newest, or stop with `truncated=true` after a validated prefix. Add newest- and mid-crawl markerless fixtures asserting that older outcomes cannot be used across the hole. If in-progress runs must be ignored for upload latency, first prove run completion/status from independently validated run fields and define/test that boundary explicitly rather than treating every absent marker as safe to skip.",
+    "severity": "major",
+    "title": "A markerless validated run is skipped and older ticks are treated as adjacent"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior round's partial-page finding is addressed soundly: `total_count` is validated fail-closed, a partial newest run yields no evidence, and a partial mid-crawl run stops the history before older ticks can be spliced across it. However, the same adjacency guarantee is not applied when a validated run has a complete artifact page but no parseable mint marker. The crawl knowingly steps across that evidence-free run and can still combine older markers into a threshold streak. Because this is a new major finding despite the prior one being fixed, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
