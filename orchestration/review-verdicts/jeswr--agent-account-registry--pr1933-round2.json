@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1933,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "962ec21274d4c5df8c244a7824e67d148e5295e4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 7 and 8 require an always-emitted unattributed count/coverage signal in the per-target snapshot ring so bead 2 can refuse alert evaluation when attribution is incomplete. But a row whose run-id prefix did not join has no target identity, so its unattributed count cannot truthfully be assigned to any target. A fleet-wide count could be emitted, but then the design must explicitly defer every target (or define another sound mapping) whenever it is nonzero. Separately, the \u00a75.2 recorder-failure path creates no ledger row, so `(attributed rows)/(attributed + unattributed rows)` remains 100% and cannot detect that source of downward bias. The text currently groups join misses and dropped records under one coverage control and recommends an alert whose fail-closed completeness predicate cannot be computed as specified.",
+    "file": "research/987-no-change-telemetry.md",
+    "fix_hint": "Define the exact storage location, formula, and target-level defer predicate. One sound conservative option is a fleet-level unattributed count that causes all per-target no-change classifications to defer for that tick, while clearly limiting the coverage ratio to join completeness. Address recorder completeness with an independent observable acknowledgement/count reconciled against worker attempts, or explicitly scope it out and do not claim the proposed coverage bar closes that path. Map these fields and boundary cases into the bead acceptance criteria.",
+    "severity": "major",
+    "title": "Unattributed rows cannot provide the proposed per-target completeness gate"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior round's denominator and ceiling-direction defect is corrected: the design now gates on worker attempts and specifies a strict high-side ceiling. However, the replacement fail-closed attribution design is not implementable as described. A no-change row that fails the run-id join has, by definition, no target, so it cannot produce a truthful per-target unattributed count or per-target coverage ratio in the existing target ring. Moreover, a recorder failure produces no health row at all and therefore remains invisible to a joined-versus-unattributed ratio. Bead 2 consequently has no specified sound completeness predicate on which to defer a target alert. Because this is a new material finding after the prior one was resolved, progress is regressing under the required rubric.",
+  "verdict": "request_changes"
+ }
+}
