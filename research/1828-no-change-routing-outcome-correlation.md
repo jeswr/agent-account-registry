@@ -26,13 +26,36 @@ M4(b) is one sentence:
 That decomposes into two joins, and they have **different keys, different stores, and different
 lifetimes**:
 
-| join | left | right | key | right-hand lifetime |
-|---|---|---|---|---|
-| **J1 — reason → decision** | the `why_no_diff` on a health row | the arm `retry_decision` took for that row | `(issue, ts)` | the dispatch tick (a workflow log line) |
-| **J2 — decision → outcome** | that arm | what became of the issue | `(repo, issue)` | permanent issue state |
+| join | left | right | key | cardinality | right-hand lifetime |
+|---|---|---|---|---|---|
+| **J1 — reason → decision** | the `why_no_diff` on each health row | the arm `retry_decision` took on a tick that row was evidence in | `(issue, evidence-set digest)`; a row joins by **membership** in that tick's evidence set | many rows → one arm; one row → many arms | the dispatch tick (a workflow log line) |
+| **J2 — decision → outcome** | that arm | what became of the issue | `(repo, issue)` | one arm → one issue timeline | permanent issue state |
 
 The census answers neither. It is a *marginal* distribution over the left column of J1. Every
 finding below is about why J1 and J2 are harder than a `GROUP BY` over the same blob.
+
+**J1 is not a per-row join, and M4(b)'s wording hides that.** `retry_decision`
+(`scripts/no_change_routing.py:170-199`) is called **once per dispatch tick** with *every* validated
+in-window `no_change` row for the issue (`dispatch-claim.py:8559-8560` → `_issue_no_change_outcomes`,
+`:6388-6399`, over the pruned window) and returns **one** arm. Inside it the rows are reduced to
+**sets** before the arm is chosen — `declared_reasons` (`:159-167`) returns a set of reason names,
+`excluded_tiers` (`:137-156`) a set of aliases — so by the point the arm exists the individual rows
+are already anonymous *to the code*. And a row is not consumed once: the health window is 48 h
+(`model-health.py:81-82`) while the tier exclusion is 6 h (`no_change_routing.py:82`), so the same
+row is re-read on every later dispatch of that issue until it is pruned.
+
+So the honest cardinality is **many rows → one decision**, and **one row → many decisions**. M4(b)'s
+"for each `no_change` row" is a *row-level* sentence over a *decision-level* event, and reconciling
+the two is not cosmetic — it is what fixes the denominator:
+
+- **decision-level** (primary here, because that is the granularity at which an arm exists): the
+  denominator is *decisions*. A reason carried by three of five rows in one tick contributes once.
+- **row-level** (derived): the denominator is *(row, decision) participations*, and a row that is
+  evidence in K ticks is counted K times.
+
+The derived view is only sound if each decision names the rows it consumed — otherwise the reader
+cannot recover membership, cannot compute either denominator, and cannot tell two decisions over
+different windows apart. §8's option C is what has to carry that binding, and §8.1 specifies it.
 
 ## 2. What the repo records today — the three seams, grounded
 
@@ -194,7 +217,7 @@ performed at write time, while both sides are in hand.
 |---|---|---|---|---|
 | A | extend `data/model-health.json` (add `issue` to more classes + a `decision` field) | yes | partial | public-ledger schema change with live pre-merge readers (#739/#733); grows a *health* store with *routing* facts; still capped at 48 h / 200 records; still not repo-qualified |
 | B | new append-only `data/no-change-outcomes.json` on the `ledger` branch, CAS-written at the decision site | yes | no (outcome still elsewhere) | a **new ledger write on the dispatch hot path**. It must be best-effort or a ledger blip blocks dispatch — and a best-effort store is lossy, so its denominator is unaudited, which is the failure mode this whole line of work exists to remove |
-| C | the **target issue's own timeline**, via a new distinct bot-comment marker at the decision site | yes | yes | one extra comment per decision; must not touch `ATTEMPT_MARKER`'s grammar (§5); still needs a reader to aggregate |
+| C | the **target issue's own timeline**, via a new distinct bot-comment marker at the decision site | yes, at **decision** granularity, and row-level only if the marker binds its evidence (§8.1) | yes | one extra comment per decision; must not touch `ATTEMPT_MARKER`'s grammar (§5); still needs a reader to aggregate |
 | D | derive nothing durably; answer M4(b) as a **bounded one-off study** against the API, published as a record | yes (log-limited) | yes | not standing; costs a maintainer-run query; the J1 half degrades as Actions logs expire |
 
 **Recommendation: C for J1's missing half, and D for the first answer.**
@@ -206,16 +229,101 @@ artifact. Writing the long-lived fact into the short-lived store (A/B) does not 
 Finding A one layer over.
 
 Concretely, C is: at `dispatch-claim.py:8586-8613`, post one bot comment carrying a **new** marker
-— `arm` (`proceed` / `retry-other-tier` / `decompose`), the declared reason set that drove it, and
-whether the decompose was **reason-driven or exhaustion-driven** (§5's population split, which is
-the fact nothing records today). It is bot-authored, so it inherits the existing "only the
-orchestration bot's own comments are receipts" filter (pre-flight item 5) and cannot be forged from
-a target repo. It is *adjacent to*, and must not modify, the existing decline-escalation receipt,
-whose `key=` is an idempotence hash over evidence (`_decline_escalation_evidence`, `:6402-6406`) —
-changing that marker re-fires escalations that already reconciled.
+naming the `arm` (`proceed` / `retry-other-tier` / `decompose`), whether a decompose was
+**reason-driven or exhaustion-driven** (§5's population split, which is the fact nothing records
+today), and — §8.1 — a binding to the exact rows the decision consumed. It is bot-authored, so it
+inherits the existing "only the orchestration bot's own comments are receipts" filter (pre-flight
+item 5) and cannot be forged from a target repo. It is *adjacent to*, and must not modify, the
+existing decline-escalation receipt, whose `key=` is an idempotence hash over evidence
+(`_decline_escalation_evidence`, `:6402-6406`) — changing that marker re-fires escalations that
+already reconciled.
 
 **Do A only if a maintainer independently wants `issue` on success rows** for another reason. It
 should not be bought by this measurement.
+
+### 8.1 Option C's evidence binding — a reason *set* is not enough
+
+The obvious payload is "the arm plus the declared reason set". That does **not** support §1's join,
+and the gap is worth stating precisely because the set is what the code itself computes
+(`declared_reasons`, `no_change_routing.py:159-167`) and is therefore the thing an implementer will
+reach for. A set discards **multiplicity** (two rows carrying `too_large` collapse to one word),
+**provenance** (when several reasons are present, nothing says which row carried which), and
+**window identity** (a later decision over a *changed* window that happens to yield the same reason
+set is indistinguishable from a repeat). With all three gone the receipt supports neither
+denominator in §1: it cannot be counted per row, and per decision it cannot be deduplicated.
+
+So the marker must bind its evidence, using the shape this repo already uses one screen away:
+
+- **`key=<sha256 hex[:16]>` over the exact validated rows consumed**, computed the way
+  `_decline_escalation_evidence` (`:6402-6406`) already computes its idempotence key — canonical
+  `json.dumps(..., sort_keys=True, separators=(",", ":"))` over the row list, then a truncated
+  digest. Bounded, non-sensitive, and already a proven pattern on this exact timeline.
+- **An ordered entry per consumed row**, in `_issue_no_change_outcomes`'s own sort order
+  (`:6393-6399`), each carrying only `ts`, the row's `run_id` (or `ledger-ts-<ts>` when it is empty)
+  and its `why_no_diff` (absent → `unspecified`, matching `declared_reasons`). `run_id`-or-`ts` is
+  the identifier `_decline_outcome_name` (`:6430-6432`) **already** publishes on this timeline, so
+  this widens no disclosure. `account` and `provider` must **not** be republished from the health
+  ledger onto a target repo's issue; they are not needed to reconstruct the arm.
+
+**What that list does and does not reconstruct — state it, do not over-claim.** It carries the
+`declared_reasons` input in full, so the **reason** half of the arm is re-derivable offline and
+membership is verifiable against the digest. It does **not** carry `model_alias`, so the
+**exhaustion** half — which tiers `excluded_tiers` retired — is *not* re-derivable from the entries.
+That is what makes §5's `reason-driven` / `exhaustion-driven` flag load-bearing rather than a
+convenience: it is the only thing that closes the gap. Adding `model_alias` to the entries would
+close it directly but publishes fleet composition onto a public target-repo timeline, which the
+existing decline receipt (`_decline_outcome_name`) pointedly does not do — a separate disclosure
+decision for the maintainer, not one this record takes.
+
+Every field above is closed or shape-validated before it reaches the body — `why_no_diff` is a
+closed vocabulary (`NO_CHANGE_REASONS`), `run_id` is `_is_safe_field`-checked to the
+`<run>.<attempt>` token shape (`model-health.py:877-879`), and `ts` is a bounded int. That is not
+incidental: the marker writes ledger-derived data onto a **public** target-repo timeline, so it must
+inherit the `no-change-v1` envelope's own posture — no free text, no model-authored string — rather
+than reintroduce the one field able to carry attacker-chosen text (`no_change_routing.py:57-62`).
+
+The four cases the binding has to define, each answered from the code:
+
+- **Duplicate timestamps.** `ts` is not unique — `_issue_no_change_outcomes` breaks ties on
+  `run_id`, then `account`, then the whole canonical row, which is only necessary because collisions
+  are reachable. Identity is therefore **positional within the digest**, never `ts`: two rows with
+  the same `ts` and the same reason are two entries, and the entry count *is* the multiplicity.
+  `ledger-ts-<ts>` is a display label, not a key.
+- **Multiple reasons.** Record the per-row reasons (above) **and**, separately, the deciding subset
+  `declared_reasons(rows) & DECOMPOSE_REASONS` — the intersection at `no_change_routing.py:188`.
+  Together they let the reader name *which* row(s) drove the arm, which the set alone cannot.
+- **Aged-out rows.** `declared_reasons` applies **no** age bound, unlike `excluded_tiers`
+  (`:137-156`, `TIER_EXCLUSION_SECONDS`). A `too_large` row therefore still forces `decompose` for
+  the full health window — up to 48 h, and up to 8× longer than the same row keeps excluding its own
+  tier. The receipt must list **every** row it was handed, aged ones included, or the arm is not
+  reproducible; each entry's `ts` is what lets the reader see which rows were still inside the 6 h
+  exclusion horizon. Note also that once a row is past the 7 h retention floor
+  (`RETENTION_FLOOR_SECONDS`, `model-health.py:112`) it can leave the window to the **global
+  `MAX_RECORDS` count cap** and not only to age (`prune`, `:602-617`) — so "the window shrank" is
+  not a pure function of elapsed time, and unrelated fleet traffic can change an issue's evidence
+  set.
+- **Repeated decisions over the same evidence.** Same rows → same `key=`, so the receipt is
+  idempotent on it, exactly as `_decline_marker_action` (`:6409-6427`) is: if the bot has already
+  posted this marker with this key, post nothing. A row added or pruned changes the digest and
+  yields a **new** receipt — which is the "later decision over a changed window" case the bare reason
+  set could not distinguish. ⚠️ The digest binds **evidence, not time**: two ticks over an identical
+  window are deliberately indistinguishable, because they are the same decision over the same
+  evidence. If the study wants a *tick* count it needs a separate counter, and this record does not
+  propose one — the denominator below is decisions-over-distinct-evidence, and it must be labelled
+  as such rather than presented as "dispatch attempts".
+
+**The denominators this yields.** Decision-level: the count of distinct `key=` receipts. Row-level:
+the sum of entry counts across receipts, where a row appearing in K receipts contributes K times —
+double-counted, but *visibly* so, because the receipts name it. Both are auditable offline from the
+issue timeline.
+
+⚠️ **One denominator hazard, named because §10 invites it.** If the maintainer takes §10's
+suggestion and suppresses the `proceed`-arm receipt as noise, the denominator is no longer *all*
+decisions — it is all **non-`proceed`** decisions, and every rate computed against it is inflated by
+exactly the suppressed population. That is pre-flight item 8's rule applied to this store. Either
+emit the `proceed` receipt (including on the quiet tick), or publish the ratio against a denominator
+the record explicitly names as partial. Silently dividing by "decisions" is the same fabricated
+measurement as Finding A's 0 %, one layer over.
 
 ## 9. What a mismatch should DO
 
@@ -261,9 +369,12 @@ Stated plainly, because an over-claimed design record gets cited as a decision:
 - **#1595 is not on `master` at the time of writing** (its change is on the `#1595` PR branch;
   `no_change_reason_census` does not exist in this checkout). §6's finding is stated against that
   change as proposed and should be re-checked against whatever merges.
-- **§8's option C is a sketch, not a spec.** It has an unresolved cost — one comment per decision
-  on the issue timeline, on a plane four consumers already parse — and the maintainer should steer
-  that before anyone writes it. A `proceed`-arm comment in particular may be pure noise and is
-  probably better left unrecorded.
+- **§8's option C is a sketch, not a spec.** §8.1 pins the one part that cannot be left open —
+  what the marker must carry for §1's join to close — but the *cost* is unresolved: one comment per
+  decision on the issue timeline, on a plane four consumers already parse. A `proceed`-arm comment
+  in particular may be pure noise and is probably better left unrecorded; §8.1 states what that
+  choice costs the denominator, and the maintainer should steer it before anyone writes the marker.
+  The marker's grammar, and whether a decision over unchanged evidence should be visible at all,
+  are also still open.
 - **Findings B and D are defects, not design options.** Both are filed separately; neither is
   repaired here, and (b) cannot be answered honestly while D stands.
