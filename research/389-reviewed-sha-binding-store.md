@@ -147,6 +147,7 @@ Keyed by PR (not by sha), because W3–W5 must retract and R7/`dispatch.yml:1415
   "reviewed_sha": "<40-hex>|none",
   "bound_by": "seed|census|review-outcome|carry-forward|retract-fix-lane|retract-stranded|retract-arm-readmit",
   "expects_sha": "<40-hex>|none",
+  "expects_epoch": 6,
   "epoch": 7 }
 ```
 
@@ -169,10 +170,12 @@ begins and says nothing about the ones already bound. `backfill-provenance.py` i
 for both halves: a one-shot, idempotent, dry-run-unless-`--apply` backfill, and a population that
 stays fail-closed invisible and human-listed when it cannot be resolved.
 
-`epoch` is a monotone write counter for **audit**, and that is the whole of its value: it orders
-the writes that landed, not the decisions behind them. §6.3 is the mechanism that actually refuses
-a stale write, and `expects_sha` — the binding the writer believed it was replacing — is the field
-it turns on.
+`epoch` is a monotone per-record write counter, advanced by **every** write — bind and retraction
+alike. As an *audit* field it would order the writes that landed, not the decisions behind them,
+which is worth nothing on its own; §6.3 therefore lifts it into the **precondition**, and that is
+where its value is. Every operation carries the pair `(expects_sha, expects_epoch)` — the binding
+it believed it was replacing, **and the revision it read that binding at** — because the value
+alone cannot see a binding that was retracted and re-established (§6.3's ABA case).
 
 ### 4.3 The token seam is already open — but the writer is not
 
@@ -283,10 +286,13 @@ not order the *decisions* behind them, and the gap is live in both directions:
   the fix-lane hand-over just invalidated. That is the fail-**open** direction: an arm left latched
   on a head whose verdict record was withdrawn.
 
-`epoch` catches neither. It increments on whoever writes last, so the stale overwrite lands with a
-perfectly monotone epoch and no reader is given any basis to reject it. "A stale-read overwrite is
-detectable" is true only of a *lost* write; neither case above loses a write, so the property was
-overclaimed and is withdrawn here.
+`epoch` **as an audit field** catches neither. It increments on whoever writes last, so the stale
+overwrite lands with a perfectly monotone epoch and no reader is given any basis to reject it. "A
+stale-read overwrite is detectable" is true only of a *lost* write; neither case above loses a
+write, so that property was overclaimed and is withdrawn here. What does catch them is the same
+counter **turned into a precondition** — an operation that names the epoch it derived against
+cannot land on a record that has moved since, and a retraction moves it. That is the mechanism
+below; the audit reading is a by-product of it, not its purpose.
 
 **Every operation therefore carries a semantic precondition, and a CAS conflict re-derives that
 precondition instead of replaying the payload** — which is what `ledger_retry.py`'s own header
@@ -295,19 +301,63 @@ re-derives **both** the expected SHA **and the payload** before the next PUT.
 
 | op | precondition checked against the RE-READ record | on conflict |
 |---|---|---|
-| W1 bind `head` | the PR's live head is still `head`, and the verdict record this outcome job just wrote (whose envelope already carries `reviewed_sha`, §4.3) still names it | re-derive the head; **abort** if it moved — the next round binds it |
-| W2 carry-forward | the re-read `reviewed_sha` is still the binding `merge_only_advance` (`worker-pr.py:1442`) walked back to | re-walk from the fresh binding; abort if the walk no longer proves merge-only |
-| W3–W5 retract | `expects_sha` equals the re-read `reviewed_sha` — a retraction must name the **exact** binding it invalidates | **abort, never overwrite**: the justification (fix-lane hand-over / drafted+unarmed / arm-readmit) was derived against a binding that no longer exists, and must be re-derived |
+| W1 bind `head` | **`expects_epoch` equals the re-read `epoch`** — nothing at all has been written to this record since the round's justification was formed, and in particular no retraction has — **and** the PR's live head is still `head`, and the verdict record this outcome job just wrote (whose envelope already carries `reviewed_sha`, §4.3) still names it | **abort** on either: the head moved (the next round binds it), or the record moved (the bind was superseded — see below) |
+| W2 carry-forward | the re-read `(reviewed_sha, epoch)` is still the `(binding, revision)` `merge_only_advance` (`worker-pr.py:1442`) walked back from | re-walk from the fresh binding; abort if the walk no longer proves merge-only |
+| W3–W5 retract | `(expects_sha, expects_epoch)` equals the re-read `(reviewed_sha, epoch)` — a retraction must name the **exact** binding it invalidates, at the exact revision it read it at | **abort, never overwrite**: the justification (fix-lane hand-over / drafted+unarmed / arm-readmit) was derived against a binding that no longer exists, and must be re-derived |
+
+**Why W1 needs the epoch and not just its own facts.** Both of W1's original predicates are
+*invariant under a retraction*: the live head is unchanged by definition in this race, and the
+verdict record is create-or-keep immutable (§4.3), so it goes on naming `head` forever. A W3–W5
+retraction of that very binding leaves both true, and a stale W1 replaying against them writes the
+binding back over a justified withdrawal — the fail-**open** case the second bullet above says must
+be refused. The epoch is the one field on the record that a retraction is *guaranteed* to move, so
+it is the only sound precondition, and carrying `expects_epoch` is what makes W1 **prove it derived
+after** the latest write rather than merely re-observe facts that predate it.
+
+`expects_epoch` for W1 is the epoch read by the `already_done` gate that **admitted** the round
+(§2.2, `review-fix.yml:316`), carried into the outcome job as a job output — not a value re-read at
+write time, which would swallow every retraction that landed during the round.
+
+**The same-head race, walked through.** PR #42; the head is `H` throughout and never moves; every
+verdict record ever written is immutable and goes on naming `H`.
+
+| t | actor | state read | state written |
+|---|---|---|---|
+| t0 | gate (`review-fix.yml:316`) | `{reviewed_sha: none, epoch: 4}`; `none ≠ H` ⇒ admits round **R**, which carries `expects_epoch = 4` | — |
+| t1 | W1(**R′**) — a duplicate outcome for the same head, the race the gate's own comment names | `(none, 4)` | CAS wins → `{reviewed_sha: H, epoch: 5}` |
+| t2 | W3 fix-lane hand-over | `(H, 5)`; `expects_sha = H`, `expects_epoch = 5` | CAS wins → `{reviewed_sha: none, epoch: 6, expects_sha: H, expects_epoch: 5}` |
+| t3 | W1(**R**) | PUT rejected (blob SHA moved); re-reads `(none, 6)` | — |
+| t4 | W1(**R**) | `6 ≠ expects_epoch 4` ⇒ **STALE** | **nothing.** The record is byte-identical to what W3 wrote at t2 |
+
+At t4 the old table's predicates are *all still true* — the live head is `H`, and the verdict record
+this job wrote names `H` — which is exactly why they cannot be the precondition. And the value
+alone would not have caught it either: the record travelled `none → H → none`, so a W1 checking
+only `expects_sha = none` against the re-read `none` matches and overwrites. That is the **ABA**
+shape, and it is why the pair is `(expects_sha, expects_epoch)` and never `expects_sha` alone.
 
 Abort is safe in every row because each of these sites is re-derived by the next tick; none is a
-last-chance write, so refusing is a deferral, not a loss. A conflict is classified as **stale**
-(precondition now false ⇒ abort, censused) or **contended** (precondition still true ⇒ retry with
-the re-derived expected SHA, per `ledger_retry.py`'s CAS schedule); nothing else retries.
+last-chance write, so refusing is a deferral, not a loss. For W1 specifically, aborting leaves the
+binding at the retracted `none`, and `already_done` keys on the **binding**, not on the verdict
+record (§2.2) — so the round is re-admitted and re-derived rather than lost. Aborting on *any*
+intervening write, not only on a retraction, is deliberately over-strict: the cost of a false abort
+is one re-review, which is the fail-closed direction, while distinguishing "benign intervening
+write" from "invalidation" at conflict time is a second reconciliation with no owner (§6.1).
+
+A 409 that `ledger_retry.is_cas_conflict` accepts is then split by what the **re-read shows**,
+never by any further reading of the error text: **stale** iff
+`(reviewed_sha, epoch)` moved off `(expects_sha, expects_epoch)` ⇒ abort and census; **contended**
+iff both are unchanged — the branch tip moved under an unrelated ledger write, so the conflict is
+real but this record did not move ⇒ retry with the re-derived expected blob SHA on
+`ledger_retry.py`'s CAS schedule. Nothing else retries.
 
 Step 1's self-tests must therefore include a **bind/retract race in BOTH orders** —
 stale-retract-vs-fresh-bind and stale-bind-vs-fresh-retract — each asserting that the older
-operation is refused and the newer justified state survives byte-for-byte. A test asserting only
-"the write eventually succeeded" passes for the losing implementation and is vacuous.
+operation is refused and the newer justified state survives **byte-for-byte**. Both orders must be
+exercised in the **same-head** form above, where every predicate other than the epoch still holds,
+and the stale-bind case must also be exercised in its **ABA** form (`none → head → none`), which is
+the one an `expects_sha`-only implementation passes. A test asserting only "the write eventually
+succeeded" passes for the losing implementation and is vacuous; so does one whose stale operation
+would have been refused by the head check anyway.
 
 ## 7. The sequence — step 0 is a precondition, not a phase
 
@@ -324,7 +374,8 @@ four-copies defect and makes the currently-unrepresentable UNKNOWN representable
 
 **Step 1.** The mutable ledger writer (§4.3) with the §6.3 semantic preconditions, with self-tests
 that inject a concurrent write and assert the CAS either preserves it or fails closed — **never**
-that a lost write counts as a pass — plus the §6.3 bind/retract race in both orders.
+that a lost write counts as a pass — plus the §6.3 bind/retract race in both orders, in its
+same-head and ABA forms.
 
 **Step 2.** Dual write, **ledger first, body second** (§6.1): W1–W5 write both stores, and the
 seed at `worker-live.sh:2647` writes an explicit `none` **record** beside the body comment, so
