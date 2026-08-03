@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5722,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2f1505380a0d7a287560c15fcbb0d57466068b91",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. The carve-out is now restricted to the explicitly audited `.github/feature-matrix.d/` tree rather than attempting an incomplete repository-wide inventory of raw-text YAML consumers. Workflow YAML remains categorically ineligible, including the concrete Miri and fast-fix-ring counterexamples. The implementation fails closed when revisions, blobs, PyYAML, parsing, or document equality are unavailable, and the tests exercise real PyYAML comment behavior, block-scalar changes, selection consequences, and the allowlist boundary. The current consumers named by the audit all parse fragments as YAML (or merely use the directory as a path filter), so parsed-document equality preserves their observed behavior.",
+  "verdict": "approve"
+ }
+}
