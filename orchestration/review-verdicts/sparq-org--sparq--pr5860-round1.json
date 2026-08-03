@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5860,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f8a8669e8405cbc05828218c07c553624f48a204",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "find_open_issue() calls `gh issue list --label ... --limit 100` and then treats absence from that truncated page as proof that no matching issue exists. The justification that there is at most one open issue per key does not bound the total number of distinct keys under the label. With more than 100 open flake suites or regression clusters, an older matching issue can fall outside the returned page and the script will file a duplicate. The same truncation pattern is copied into the three CI failure filers and the coverage alarm probe.",
+    "file": "scripts/bench-triage.py",
+    "fix_hint": "Enumerate all label-matching open issues (for example, use paginated `gh api` requests until no page remains) before concluding there is no match. Factor the pagination/listing behavior into a shared helper if practical, and add a test with more than 100 candidates where the match occurs after the first page. Apply the same exhaustive behavior to every changed filer and to coverage-gate.py.",
+    "severity": "major",
+    "title": "Fixed 100-item listing can still miss an existing issue"
+   }
+  ],
+  "progress": null,
+  "summary": "The move away from GitHub search-index deduplication is directionally sound, and the new pure predicate tests cover punctuation-heavy keys. However, the replacement is not exhaustive as claimed: every label-scoped query is capped at 100 results, while the number of open issues carrying each label is not bounded to 100. Once a lane has more than 100 open keyed issues, an older matching issue can be omitted and a duplicate will be filed. This directly violates the non-spam invariant the change is intended to guarantee.",
+  "verdict": "request_changes"
+ }
+}
