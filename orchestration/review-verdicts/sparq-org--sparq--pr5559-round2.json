@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5559,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9b9d7c87f897706dfd2216ff155d8b0104cc9fac",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The implementation now tracks unmatched step duration separately as `unmatched_secs`, computes `unclassified_pct` only from that subset, retains `other_pct` as the complete recognized-plus-unmatched OTHER workload category, and thresholds only `unclassified_pct`. The distinction is consistently reflected in the CLI help, rendered report, and design record. The tests are non-vacuous and exercise both sides of the corrected seam: a long recognized ratchet step increases OTHER while leaving the unclassified share at zero, whereas an unmatched step increases the unclassified share and can fail the CLI threshold. No new correctness, soundness, test-validity, or security issues are evident in the diff.",
+  "verdict": "approve"
+ }
+}
