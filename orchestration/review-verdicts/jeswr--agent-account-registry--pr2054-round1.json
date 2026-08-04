@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2054,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7b7cbc8a33add4410acd214a4497c0296581ef4c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added end-to-end self-test is sound and materially closes the call-site coverage gap. It drives main() through create, edit, and recovery paths with subprocess.run stubbed, verifies both routed repository and GH_TOKEN on every alert-side gh operation, separately pins the census read to the policy target without the alert credential, and exercises both half-configured fallback cases against the observed ambient token. Missing commands fail explicitly as (null, null), fixture sentinels are distinct, mutable process state is restored in finally, and the production change is limited to the model-agnostic provenance-header migration plus invoking the new test. No correctness, security, fail-closed, or test-vacuity issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
