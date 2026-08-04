@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2052,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "94fce045afab69d469e190e2e4866f5b01571d5b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains sound. The shared expander rejects each atom or range endpoint outside the field-specific bounds before unioning values, so mixed-validity cron fields cannot be rounded down into plausible schedules. The dispatch-floor consumer imports that single owner without a private fallback, reports derivation failures as red assertion data, pins the independently derived six-fire count, and tests stepped ranges, malformed and partly invalid fields, single-cron cardinality, missing ownership, and healthy/error wrapper paths in both directions. The workflow sparse checkout exactly includes the new self-test dependency through REQUIRED_FILES. No new correctness, soundness, test-validity, or security finding is supported by the diff.",
+  "verdict": "approve"
+ }
+}
