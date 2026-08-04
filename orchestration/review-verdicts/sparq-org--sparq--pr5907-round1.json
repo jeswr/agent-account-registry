@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5907,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ad017fe7b5cf4a60c461782ef250b19207b0fc93",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The test only rejects a parsed value exactly equal to Python True. A workflow edit such as `continue-on-error: ${{ true }}` is parsed by PyYAML as a string and therefore passes this assertion while enabling failure swallowing in GitHub Actions. This leaves a bypass in the structural regression guard's load-bearing invariant, although the workflow in this PR does not use such a form.",
+    "file": "scripts/tests/test_fmt_gate_posture.py",
+    "fix_hint": "Require both the job and fmt-step values to be absent or exactly false, as the repository's arm-capability wiring test already does (for example, assert the value is in `(None, False)`).",
+    "severity": "minor",
+    "title": "continue-on-error guard accepts non-boolean enabling forms"
+   }
+  ],
+  "progress": null,
+  "summary": "The change correctly converts the existing rustfmt step into a hard gate, updates the associated documentation, and applies a workspace-wide mechanical rustfmt normalization. The new posture test exercises the intended current configuration and is wired into the existing quick-gates job after its shared PyYAML setup. One minor robustness gap remains in the regression test: expression/string forms of continue-on-error could evade its boolean-only assertion, though the checked-in workflow itself is correctly gating.",
+  "verdict": "approve"
+ }
+}
