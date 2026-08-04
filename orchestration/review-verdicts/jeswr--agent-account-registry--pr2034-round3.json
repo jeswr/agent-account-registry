@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2034,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "00048954417fd946777f7c37bab636273e9ed1ab",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_invokes_command` remains `token in line.split()`. Shell quotes are syntax and are removed before argv reaches Python, but `str.split()` preserves them as characters. Thus `run: python3 scripts/account-usage.py \"--persist-limits\" usage.json` invokes the persistence entrypoint while the reader sees the distinct token `\"--persist-limits\"` and returns false. If a second workflow uses that ordinary spelling, `_workflows_invoking` omits it and `serialization_premise_errors` can still return empty in both workflows. The new reader tests contain no single- or double-quoted exact flag, so they do not detect this bypass.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Parse executable shell text with a shell-aware lexer so quotes are decoded before exact argv-token comparison, with explicit handling for the supported command separators and continuations. Add synthetic second-workflow tests using both double-quoted and single-quoted `--persist-limits`; assert that each workflow is enumerated and that `persist_limits` refuses before any `gh` call.",
+    "severity": "major",
+    "title": "Quoted persist flags still bypass workflow invocation discovery"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 major remains unchanged. The invocation reader still models shell argv with plain whitespace splitting, so quoted spellings of the persistence flag are invisible even though the shell passes the exact unquoted argv token to Python. The added tests still cover comments, prose, suffixes, and unquoted tokens only; they do not exercise the quoted spelling identified previously. A second workflow can therefore invoke persistence with an ordinary quoted flag while both its own production-path premise check and the repository scan omit it, leaving the serialization premise falsely satisfied.",
+  "verdict": "request_changes"
+ }
+}
