@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5798,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8080bf07c7a2c13d95f93c52ec4f695013e9cfb1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. S1 no longer treats arbitrary retained command arguments as execution: invocations are classified by command position or a narrow interpreter allowlist, quoted spans are masked, inline `-c` bodies are rejected, and the mutation table now includes the previously requested successful `test -n '<required text>'` bypass plus unquoted non-interpreter data and quoted interpreter-argument cases. The remaining interpreter-argv ambiguity is explicitly and consistently disclosed as a limitation rather than overclaimed as proof of execution. The lane-level S3 coverage and S2 waiver checks remain coherent, and the added tests exercise the real checker path through `check_tree`. No correctness, soundness, vacuity, or security defect requiring changes was found in the supplied diff.",
+  "verdict": "approve"
+ }
+}
