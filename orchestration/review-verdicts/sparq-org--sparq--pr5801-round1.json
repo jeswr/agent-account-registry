@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5801,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a73c2273fe0ce742ecc7bcd3ecf85f143b944d38",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces the fixed-size, newest-first quarantine read with exhaustive REST pagination, normalizes the REST field names consumed by the approval check, excludes pull requests, and fails closed on API failure, malformed timestamps, or a runaway result set. The focused self-test is behavioral rather than vacuous: it exercises a 250-item multi-page queue, proves the oldest item is retained, checks stale versus post-edit reactions through the normalized timestamp, and covers both ceiling and fetch failures. The workflow runs these tests before label mutations, and the added docs-quality gate makes regressions visible on pull requests. The focused promote.py self-test passes.",
+  "verdict": "approve"
+ }
+}
