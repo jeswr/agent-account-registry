@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2046,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2b9a8f3ff6ca4b0cc5850c3cd58778381944b12c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new `_runs_before` proof correlates the target binding with the loop, but the subsequent scan accepts any individually live `park_starved_partition_holder` call under that loop. For example, `targets = starvation_park_targets(...); for target in targets: if repo: continue; if repo: park_starved_partition_holder(repo, target)` is certified as `tick`, although when `repo` is true the `continue` skips the call and when it is false the second guard skips the call. Thus no pass through an iteration reaches the park call. `_dead_child_ids` deliberately cannot decide runtime tests, but treating all undecidable nodes as mutually compatible turns that limitation into a fail-open structural certification. The existing runtime-conditional accept row does not catch this because it has no earlier correlated guard.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make the loop-to-call portion of certification path-sensitive enough to prove a compatible pass, or fail closed when compatibility cannot be established. Add a refusal row with a guarded `continue` followed by a park call under the same guard, plus an accepting control where the later guard is the opposite condition (or otherwise demonstrably compatible), so blanket refusal of guarded calls cannot satisfy the suite. Ensure the seam's documentation states only the property actually proved.",
+    "severity": "major",
+    "title": "The park call is still correlated only by per-node liveness"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-2 binding-to-loop ordering and opposite-leg cases are now directly handled and tested, but the same single-pass correlation gap remains between the loop entry and the park call. `_live_nodes(loop)` establishes only that the call is individually live; it does not establish that any execution reaching the call is compatible with the earlier control flow in the loop body. Correlated runtime guards can therefore make the call unreachable while the seam still certifies `tick`. Because this is a new major instance of the same trust-seam unsoundness after the prior finding was repaired, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
