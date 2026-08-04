@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2037,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cf965583fcdd0b2a2bcd7222b57ec81ee79a70c3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved. Present, non-null utilization values that `_obs_fraction` cannot parse are now announced through the bounded lease-specific drop log while absent and explicit-null values retain the documented unmeasured-row behavior. The new tests use literal malformed inputs and literal expected diagnostics, cover multiple malformed types, verify survivor aggregates, silence on accepted and unmeasured rows, decision-22 privacy/fatality, bounded emission, and independence from the queue warning budget. I found no new correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
