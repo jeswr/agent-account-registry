@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1945,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "86ad31d0517ebac2081e994738da51c5c30f7324",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`artifacts_complete` still returns true for every integer `total_count <= len(artifacts)`. Responses such as `{\"total_count\": 0, \"artifacts\": [<valid marker>]}` and negative counts contradict the endpoint's count semantics, yet their markers are accepted and may be scored. That fails open at the evidence boundary. The new rejection cases cover counts larger than the page, missing/non-integer/boolean counts, and malformed artifact lists, but still do not cover either `0 <= total_count < len(artifacts)` or a negative count, exactly the cases identified in round 4.",
+    "file": "scripts/groom-mint-alert.py",
+    "fix_hint": "Require a non-negative `total_count` and exact equality with `len(artifacts)` for this one-page completeness proof. Add non-vacuous newest-run and mid-crawl cases containing a valid-looking marker where `total_count` is smaller than the returned list, plus a negative-count case, and assert they are handled as evidence holes rather than scored.",
+    "severity": "major",
+    "title": "Inconsistent artifact counts are still accepted as proof of completeness"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 major remains unresolved. `artifacts_complete` still accepts internally contradictory responses whenever `total_count` is smaller than the returned artifact list, including negative counts. Such a page is treated as complete, so a valid-looking stale marker can be scored at the evidence boundary instead of producing a hole. The expanded tests still omit both contradiction shapes named in the prior finding. Progress is `stagnant` because the same trust-plane validation defect remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
