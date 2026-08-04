@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2031,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d74d35abffc5b6c882af474a948db5e039bdaf9c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change remains correct and complete. Groom now composes the shared case-insensitive `gh_403.header` reader with the existing strict, capped `gh_retry.retry_after_header_seconds` parser, preserving fallback behavior for absent or unreadable headers and failing loudly if the checkout dependency is missing. The added checks are non-vacuous: they distinguish lowercase and `.items()`-only inputs from the former private `.get`, explicitly exercise exception rendering, pin both delegation identity and the exact field name, and run the dependency's own self-test. I found no correctness, soundness, test-validity, or security issue. Round 2 is stagnant only in the prescribed progress sense: the prior round also had zero findings, so there are no fewer or lower-severity findings to report.",
+  "verdict": "approve"
+ }
+}
