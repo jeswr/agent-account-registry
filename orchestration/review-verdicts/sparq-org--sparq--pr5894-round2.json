@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5894,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "eeb30734abf3d1b0ea1e8728e54d4496a2ddf4e0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`argparse` accepts any integer, while `budget_split()` treats only zero/None as unlimited and then evaluates `list(to_add)[:limit]`. For `--limit -1`, that slice schedules every addition except the last (and potentially a repository-scale batch), despite the option being documented as a safety cap on total writes. The direction proof does not mitigate this mutation-volume failure, and the self-test covers only positive and absent limits.",
+    "file": "scripts/audit-issue-deps.py",
+    "fix_hint": "Reject negative limits during argument parsing (for example with a non-negative integer type or an explicit `ap.error` check), define whether zero means zero writes or unlimited, and add self-tests for zero and negative inputs. Prefer making `None` the sole unlimited sentinel so `--limit 0` naturally performs zero mutations if the CLI accepts it.",
+    "severity": "major",
+    "title": "Negative --limit values bypass the intended write cap"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes both previously reported defects: removal is now limited to native edges whose endpoints are authenticated bd mappings, unmapped edges are report-only, and additions/removals share one write budget with focused self-tests. However, the new budget helper accepts negative limits. Because Python negative slicing selects nearly the entire additions list, `--limit -1` can still issue many POST requests instead of rejecting the invalid safety bound. This is a new major safety defect in the apply path, so the round is regressing under the required comparison scale.",
+  "verdict": "request_changes"
+ }
+}
