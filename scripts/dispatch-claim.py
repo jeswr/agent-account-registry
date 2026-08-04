@@ -22762,6 +22762,12 @@ def _escalation_call_site(source):
 #   - a JUMPED-PAST TAIL: the statements a `return`/`raise`/`break`/`continue` EARLIER IN THE SAME
 #     BLOCK skips over. `targets = ...; return; for target in targets: park(...)` is the shape.
 #
+# Liveness is a property of ONE node, and the seam needs a property of a PASS: review round 2 found
+# that two separately-live nodes can be uncombinable by any execution — a binding written AFTER
+# the loop that reads it, or a binding and the loop in opposite legs of one `if`. `_live_positions`
+# therefore carries each node's position and `_runs_before` decides the ORDER, on the same
+# decidable-cases-only floor: paths that diverge at a list boundary are refused rather than guessed.
+#
 # A class body is deliberately NOT a boundary: it EXECUTES IN PLACE at definition time, so a
 # statement written directly in one really does run. Its `def`s do not, and they are already
 # boundaries in their own right — which is what keeps "class-body method" refused while
@@ -22829,8 +22835,8 @@ def _jumped_past(body):
     return []
 
 
-def _live_children(node):
-    """The direct children of `node` that a single pass through `node` can actually reach."""
+def _dead_child_ids(node):
+    """The ids of `node`'s direct children a single pass through `node` cannot reach."""
     dead = []
     if isinstance(node, (ast.If, ast.IfExp, ast.While)):
         truth = _literal_truth(node.test)
@@ -22844,8 +22850,33 @@ def _live_children(node):
     for _field, value in ast.iter_fields(node):
         if isinstance(value, list):             # `body`, `orelse`, `finalbody`, each on its own —
             dead.extend(_jumped_past(value))    # an EXPRESSION list holds no jump, so it is a no-op
-    dead = {id(leg) for leg in dead}
-    return [child for child in ast.iter_child_nodes(node) if id(child) not in dead]
+    return {id(leg) for leg in dead}
+
+
+def _live_positions(root):
+    """Every live node under `root`, paired with its POSITION PATH — one `(list, index)` pair per
+    enclosing list field, outermost first.
+
+    Liveness alone is a per-node property, and two nodes can each be live while NO single pass
+    reaches both (registry #1028 review 2): a binding written AFTER the loop that reads it, or a
+    binding in `if repo:` and the loop in its `else:`. The path is what lets `_runs_before` decide
+    that, and it is carried here rather than recomputed so the pruning has ONE definition only."""
+    out, queue = [(root, ())], [(root, ())]
+    while queue:
+        node, path = queue.pop()
+        dead = _dead_child_ids(node)
+        for _field, value in ast.iter_fields(node):
+            # A list field is a POSITION-BEARING block; a bare child node shares its parent's
+            # position, so an expression nested in a statement compares as that statement.
+            entries = list(enumerate(value)) if isinstance(value, list) else [(None, value)]
+            for index, child in entries:
+                if not isinstance(child, ast.AST) or id(child) in dead:
+                    continue
+                child_path = path if index is None else path + ((value, index),)
+                out.append((child, child_path))
+                if not isinstance(child, _SCOPE_BOUNDARIES):
+                    queue.append((child, child_path))
+    return out
 
 
 def _live_nodes(root):
@@ -22854,13 +22885,29 @@ def _live_nodes(root):
 
     A scope boundary is YIELDED but not descended into, so a caller scanning a module still finds
     every function it defines while a call buried in an uncalled nested `def` stays invisible."""
-    out, queue = [root], [root]
-    while queue:
-        for child in _live_children(queue.pop()):
-            out.append(child)
-            if not isinstance(child, _SCOPE_BOUNDARIES):
-                queue.append(child)
-    return out
+    return [node for node, _path in _live_positions(root)]
+
+
+def _runs_before(earlier, later):
+    """True when every pass that reaches position `later` has PROVABLY already run `earlier`.
+
+    Two paths are comparable only through the lists they SHARE. Diverging at a list boundary means
+    the two sit in mutually exclusive legs — `if:` against its `else:`, two `except` handlers —
+    and no pass reaches both, so this refuses. Within one shared list the lower index runs first.
+
+    `earlier` must BE the statement at that index, not something nested deeper inside it: a binding
+    under `if repo:` is skipped by the pass that takes the empty `else:` and falls through to the
+    loop below, so `depth + 1 == len(earlier)` is what keeps that fail-closed rather than merely
+    "the enclosing statement came first"."""
+    for depth, ((list_a, index_a), (list_b, index_b)) in enumerate(zip(earlier, later)):
+        if list_a is not list_b:
+            return False
+        if index_a != index_b:
+            return index_a < index_b and depth + 1 == len(earlier)
+    # One path is a prefix of the other, i.e. `earlier` is nested INSIDE `later`'s own statement —
+    # a binding written in the body of the very loop that reads it. The first iteration reads it
+    # unbound, so this is a refusal too, not a fall-through.
+    return False
 
 
 def _park_call_site(source):
@@ -22885,7 +22932,12 @@ def _park_call_site(source):
                                                 `return`/`raise`/`break`/`continue` in its own
                                                 block parks nothing while `ast.walk` still sees
                                                 it. Every ACCEPTING scan below therefore runs on
-                                                `_live_nodes`, never `ast.walk`.
+                                                `_live_nodes`, never `ast.walk`;
+      - a binding NO PASS carries to the loop  -> liveness is per-node, so a `targets = ...` written
+        (registry #1028, review 2)                AFTER the loop, INSIDE it, or in the `if repo:`
+                                                whose `else:` holds the loop is live and still
+                                                reaches nothing. The binding must `_runs_before`
+                                                the loop on every pass that enters it.
 
     The asymmetry between the two scan kinds is deliberate: a scan that ACCEPTS reads only live
     nodes, while a scan that REFUSES (the slice probe) keeps raw `ast.walk` and so refuses on a
@@ -22895,24 +22947,29 @@ def _park_call_site(source):
     for func in _live_nodes(tree):
         if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
             continue
-        bound = set()
-        for node in _live_nodes(func):
+        positions = _live_positions(func)
+        bound = {}
+        for node, path in positions:
             if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
                 continue
             if getattr(node.value.func, "id", None) != "starvation_park_targets":
                 continue
             if any(keyword.arg == "cap" for keyword in node.value.keywords):
                 continue                  # a call-site cap can silently restore the 1/tick defect
-            bound.update(target.id for target in node.targets
-                         if isinstance(target, ast.Name))
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bound.setdefault(target.id, []).append(path)
         if not bound:
             continue
-        for loop in _live_nodes(func):
+        for loop, loop_path in positions:
             if not isinstance(loop, ast.For):
                 continue
             iter_names = {node.id for node in _live_nodes(loop.iter)
                           if isinstance(node, ast.Name)}
-            if not (iter_names & bound):
+            # The name must be bound by an assignment THIS pass already ran — being live somewhere
+            # else in the same function is not enough (registry #1028 review 2).
+            if not any(_runs_before(path, loop_path)
+                       for name in iter_names & set(bound) for path in bound[name]):
                 continue                  # `for t in (targets if False else [])` iterates nothing
             if any(isinstance(node, ast.Slice) for node in ast.walk(loop.iter)):
                 continue                  # `targets[:1]` is the per-tick cap of 1, re-typed
@@ -22957,6 +23014,16 @@ _PARK_SEAM_ROWS = (
     ("constant-true guard BODY", "tick", """
         targets = starvation_park_targets(items, starved, occupancy)
         if True:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # ORDERED and SAME-BRANCH: the binding and the loop share one runtime leg, so the pass that
+    # enters the leg runs both. The mirror of the two "no pass combines them" refusals below —
+    # without this row, refusing every binding that is not a direct child of the function body
+    # would satisfy them, and so would refusing all correlation outright.
+    ("binding and loop in the SAME runtime branch", "tick", """
+        if repo:
+            targets = starvation_park_targets(items, starved, occupancy)
             for target in targets:
                 park_starved_partition_holder(repo, target)
     """),
@@ -23043,6 +23110,40 @@ _PARK_SEAM_ROWS = (
             return
         else:
             raise RuntimeError("no starvation")
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    # ---- REFUSED: binding and loop both LIVE, but no single pass carries one to the other ----
+    # Liveness is per-node; certification is a claim about a PASS. Each row below leaves every
+    # node reachable in isolation, which is exactly why scanning for them independently — the
+    # shape review round 2 found — certifies a `tick` that parks nothing.
+    ("binding AFTER the park loop", None, """
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+        targets = starvation_park_targets(items, starved, occupancy)
+    """),
+    # The binding is inside the very loop that reads it, so iteration 1 reads it unbound. This is
+    # the row that kills `_runs_before`'s final refusal: one path is a prefix of the other, and
+    # returning True there would certify it.
+    ("binding INSIDE the loop that reads it", None, """
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+            targets = starvation_park_targets(items, starved, occupancy)
+    """),
+    ("binding and loop in OPPOSITE runtime legs", None, """
+        if repo:
+            targets = starvation_park_targets(items, starved, occupancy)
+        else:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # Ordered, same block at the top level, and still not proven: the pass that takes the empty
+    # `else:` falls through to the loop having never bound `targets`. This is the row that kills
+    # `_runs_before`'s `depth + 1 == len(earlier)` clause — drop it and "the enclosing `if` came
+    # first" is mistaken for "the binding ran".
+    ("binding nested in a runtime `if` BEFORE the loop", None, """
+        if repo:
+            targets = starvation_park_targets(items, starved, occupancy)
         for target in targets:
             park_starved_partition_holder(repo, target)
     """),
@@ -24457,6 +24558,14 @@ def _starvation_sweep_self_test():
     # and the boundary note above claimed that direction fell CLOSED when it fell open. Order is
     # now decided per statement list, which is why `return` AFTER the loop is an ACCEPT row.
     #
+    # Review round 2 found the residue of that same fix: pruning made every node's LIVENESS right
+    # while the scan still collected bindings and loops INDEPENDENTLY, so two nodes that are each
+    # live but that no single pass combines still certified. MEASURED on the round-1 tree, all
+    # three returned "tick": the binding written after the loop, the binding written inside the
+    # loop that reads it, and the binding in `if repo:` with the loop in its `else:`. Certification
+    # is now a claim about a PASS — `_runs_before` on the two positions — and its accept side is
+    # held open by the ordered and same-runtime-branch rows, so blanket refusal reds too.
+    #
     # CORRECTED, because the follow-up that asked for this check overclaimed here and the
     # correction is what makes the rest of it trustworthy: the checker really was fooled — on the
     # pre-#1028 tree `_park_call_site` returned "dispatch" for BOTH real production mutants (the
@@ -24499,13 +24608,14 @@ def _starvation_sweep_self_test():
             "reports the batch park as structurally proven while the partition is never released.")
         _park_accepted += _expect is not None
         _park_refused += _expect is None
-    assert (_park_accepted, _park_refused) == (8, 19), (
-        f"#1028 expected 8 accepted and 19 refused park-seam shapes, got "
+    assert (_park_accepted, _park_refused) == (9, 23), (
+        f"#1028 expected 9 accepted and 23 refused park-seam shapes, got "
         f"({_park_accepted}, {_park_refused}) — a row was dropped from _PARK_SEAM_ROWS, which is "
         "how a refusal quietly stops being tested")
-    print(f"  ok   #1028 park call-site seam decides REACHABILITY, not existence: "
+    print(f"  ok   #1028 park call-site seam decides what ONE PASS reaches, not what exists: "
           f"{_park_accepted} live shapes certify and {_park_refused} — dead branches, uncalled "
-          "nested scopes, jumped-past tails, and the three #822 re-scalarisations — are refused")
+          "nested scopes, jumped-past tails, bindings no pass carries to the loop, and the three "
+          "#822 re-scalarisations — are refused")
 
     # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
     _starvation_park_batch_seam_self_test()
