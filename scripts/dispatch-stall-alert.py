@@ -61,9 +61,15 @@
 # (enforced by _test_no_hold_labels below, not by convention). Every alert auto-closes on an
 # explicit recovery. Its job carries `actions: read` + `contents: read` + `issues: write`.
 #
-# DEBT (issue #591, PR #590): `_alert_route` is another private copy of locked decision 22c.
-# scripts/alert_route.py is not on master, so this file carries a byte-compatible copy with the
-# IDENTICAL signature; migration is a one-line import swap.
+# DEBT (issue #591): `_alert_route` is another private copy of locked decision 22c. THERE IS NO
+# SHARED HOME — PR #590 proposed `scripts/alert_route.py` and never landed, so that module does not
+# exist on master and has to be AUTHORED, not imported. This body is byte-compatible with the other
+# five presence-only copies and with nothing beyond them: scripts/worker-pr.py returns a non-`None`
+# fallback token and scripts/pat-validity.py / scripts/usage-alert.py return a 3-tuple with a
+# `redact` flag. Nor is migration a one-line import swap — two host jobs sparse-check-out a SINGLE
+# file and the route is the first call in `main()`, so every affected checkout list must grow and
+# each growth must be asserted at the YAML seam (the REQUIRED_FILES idiom below) or the live job
+# reds on a file pr-gate always has. Full cost: research/1021-alert-route-consolidation.md §3.
 import ast
 import importlib.util
 import json
