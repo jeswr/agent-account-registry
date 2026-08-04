@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2062,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d7c92aed32b2f542da183e9a5745c8bff86c206e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new note says this function is byte-compatible with the other five presence-only copies, making six total. At this PR head, the same three-argument, two-tuple, presence-only body also exists in `scripts/ledger-identity-watch.py` and `scripts/ratelimit-alert.py`, in addition to the six T1 sites listed by `research/1021-alert-route-consolidation.md`. Thus there are at least eight such copies, and the same false `other five` claim was added to the other two changed headers. This is material to the note's purpose: an implementer using it as the consolidation inventory can omit live trust-plane callers while believing the tier is complete.",
+    "file": "scripts/metrics-alert.py",
+    "fix_hint": "Derive and state the current exhaustive inventory/count from the PR-head tree (including ledger-identity-watch.py and ratelimit-alert.py), or avoid a fixed count and link to a checked/generated inventory. Apply the same correction to all three changed DEBT notes.",
+    "severity": "major",
+    "title": "The claimed six-copy presence-only inventory omits current implementations"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe revised notes correctly remove the nonexistent shared-module claim and describe the return-shape and sparse-checkout hazards, but they introduce an exhaustive count that is already false at this PR head. The tree has additional presence-only `_alert_route` implementations beyond the six claimed, so the documentation still gives a future consolidation author an incomplete inventory. Because round 1 had no findings and this round has a new major finding, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
