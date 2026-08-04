@@ -1115,6 +1115,80 @@ def pinned_fix_chain(provider, floor):
     return ladder[ladder.index(floor):]
 
 
+def escalated_fix_tier(provider, per_round_models):
+    """The ladder tier ABOVE the highest tier that has ALREADY run a fix round for this PR, or
+    None when there is nothing to escalate FROM (no attributable fix round) or nothing to escalate
+    TO (the ladder's terminal tier has already run).
+
+    ONE DEFINITION, two consumers (registry #703). `decide_budget`'s model-pin extension and
+    `decide_fix`'s repeated-decline escalation ask the SAME question — "is there a stronger fixer
+    that has not been tried yet?" — and a second copy of the answer is the #958/#945 shape: two
+    writings of one rule, each individually unkillable. So the rule lives here and both call it.
+
+    TOTAL and fail-closed. A non-string entry, a docs-only alias, a retired tier this register
+    cannot migrate, and an alias belonging to another provider's ladder all contribute NOTHING:
+    an outcome that cannot prove which tier ran must never retire a tier or authorise a stronger
+    one (`no_change_routing.excluded_tiers`, registry #701, has the same fail direction). Callers
+    that must REFUSE a non-ladder alias instead of ignoring it validate before calling —
+    `decide_budget` does exactly that, and its raise is unchanged."""
+    ladder = ESCALATION_LADDERS.get(provider)
+    if not ladder:
+        return None
+    ran = [alias for alias in migrate_tiers(
+        [alias for alias in (per_round_models or []) if isinstance(alias, str) and alias])
+        if alias in ladder]
+    if not ran or ladder[-1] in ran:
+        return None
+    return ladder[ladder.index(max(ran, key=ladder.index)) + 1]
+
+
+# [registry #703] The stand-in `fix_escalation` maps an unclassifiable fix-model record onto. It is
+# a private sentinel rather than a string precisely so it can never collide with a ladder member,
+# an alias a future catalog adds, or a value an attacker could write into a marker.
+_UNATTRIBUTABLE_TIER = object()
+
+
+def fix_escalation(per_round_models):
+    """[registry #703] ``(provider, tier)`` for a repeated-decline fix escalation, else
+    ``(None, None)``.
+
+    THE PROVIDER IS DERIVED FROM THE RECORDED FIX HISTORY, not passed in. The fix lane is
+    same-provider by construction (review-fix.yml's claim step refuses a `fix` run whose account
+    provider differs from the record's `impl_provider`), and the escalation ladders partition the
+    alias space, so the aliases that actually executed a fix round name their own ladder. That
+    keeps this decision inside the review loop's own durable evidence — no new workflow input, no
+    second view of `impl_provider` that could drift from the one the claim asserted against.
+
+    FAIL-CLOSED in every ambiguity, and each one yields the pre-#703 behaviour (park):
+      * no recorded fix round -> no provider (nothing proves which tier ran);
+      * an alias outside EVERY ladder (a docs-only model, a forged marker) -> no provider, because
+        the recorded set is then not a subset of any ladder;
+      * a NON-ALIAS entry (None, a number, an empty string) -> the same, and deliberately not
+        filtered away first: an entry that cannot be classified is exactly as unattributable as
+        one that classifies to nothing, and dropping it would let junk sit beside a real alias and
+        still buy an escalation (found by mutating this function's own guard);
+      * a recorded set spanning TWO ladders -> no provider (a cross-provider fix history is a
+        contradiction of the lane's own assertion; guessing one of them could pin a floor the
+        route never authorised);
+      * the terminal tier has already run -> no tier (see escalated_fix_tier).
+
+    Note the DELIBERATE asymmetry with `escalated_fix_tier`, which ignores non-members instead of
+    refusing on them: that function answers "which ladder member ran highest" for a caller that has
+    already validated its input (`decide_budget` raises on a non-member first), while this one has
+    to establish WHICH ladder from unvalidated history and so treats any unclassifiable member as
+    proof that it cannot."""
+    aliases = {migrate_tier(alias) if isinstance(alias, str) and alias else _UNATTRIBUTABLE_TIER
+               for alias in (per_round_models or [])}
+    if not aliases:
+        return None, None
+    providers = [provider for provider, ladder in ESCALATION_LADDERS.items()
+                 if aliases <= set(ladder)]
+    if len(providers) != 1:
+        return None, None
+    tier = escalated_fix_tier(providers[0], sorted(aliases))
+    return (providers[0], tier) if tier else (None, None)
+
+
 def decide_budget(rounds_used, per_round_models, latest_progress, provider,
                   base_rounds=3, hard_cap=HARD_CAP_ROUNDS,
                   pending_fix_models=(), pin_floor=None):
@@ -1218,10 +1292,13 @@ def decide_budget(rounds_used, per_round_models, latest_progress, provider,
         return {"action": "extend-pending-review", "pin": None}
     # Mechanism 1 — model escalation: the top tier has not yet run a fix round, so this is not
     # yet a top-model failure. (No recorded fix rounds at all = nothing to escalate FROM; the
-    # progress mechanism below still applies.)
-    if models and ladder[-1] not in models:
-        highest = max(models, key=ladder.index)
-        return {"action": "extend-model-pin", "pin": ladder[ladder.index(highest) + 1]}
+    # progress mechanism below still applies.) The "is there a stronger untried tier" rule is
+    # escalated_fix_tier's, shared with decide_fix's repeated-decline escalation (#703) — every
+    # `models` entry is already validated as a ladder member above, so the shared helper's
+    # fail-closed filtering cannot change this answer.
+    pin = escalated_fix_tier(provider, models)
+    if pin:
+        return {"action": "extend-model-pin", "pin": pin}
     # Mechanism 2 — progress extension: only an explicitly IMPROVING latest verdict extends.
     if latest_progress == "improving":
         return {"action": "extend-progress", "pin": None}
@@ -1532,13 +1609,45 @@ def decide_review(verdict, has_blockers, injection, round_n, max_rounds, securit
     return "changes"
 
 
-def decide_fix(injection, made_changes, gate_ok, pushed, nochange_runs, gatefail_runs):
+def decide_fix(injection, made_changes, gate_ok, pushed, nochange_runs, gatefail_runs, *,
+               escalation):
     """The fix-outcome state machine. no-change twice for the SAME round (round only advances on a
-    review) or gate-fail twice for the same round => a disagreement a human must break."""
+    review) or gate-fail twice for the same round => a disagreement the loop cannot settle at the
+    tier it has been running.
+
+    [registry #703] `escalation` — `fix_escalation`'s tier, or None — is what that sentence now
+    turns on for the NO-CHANGE arm. Measured 2026-07-26: `review:parked` is dominated by
+    unarbitrated reviewer<->fixer deadlocks, and the repeated-decline park is one of the two shapes
+    that produce them ("two consecutive fix attempts made no change (fixer judges the findings
+    spurious)"). It fires INSIDE a single review round, so the round budget — and with it
+    `decide_budget`'s model-pin escalation, the loop's only "try a stronger fixer" mechanism — has
+    typically not been touched at all: the loop terminated on the weakest configuration it ever
+    tried. Re-admitting that park later re-runs the same tier against the same findings and
+    reproduces the same nothing, which is #701's lesson (retrying an unchanged configuration
+    reproduces the unchanged result) inside the review loop.
+
+    So a repeated decline ESCALATES THE FIXER while a strictly stronger untried tier exists, and
+    parks only once the ladder is spent. Three properties make that bounded rather than a loop:
+    the pinned floor only ever moves UP the ladder (record_model_pin), a tier that has run is
+    recorded durably (record_fix_model) so it cannot be escalated to twice, and the ladder is
+    finite — so the worst case is one escalation per remaining rung and then the same park.
+
+    It settles nothing about WHO WAS RIGHT: the reviewer's findings stand unchanged, no verdict is
+    cleared, and nothing here can arm (research/967 — a rationale-reader must never overrule a
+    recorded blocking verdict; the correctness question goes back through the gate). `escalation`
+    is keyword-only and REQUIRED so no call site can reach this decision without deciding it —
+    a defaulted None would be silently inert wiring, which is the failure mode this whole
+    mechanism exists inside.
+
+    The GATE-FAIL arm deliberately does NOT escalate: a local gate that fails twice is a fact
+    about the tree the fixer produced, not a reviewer<->fixer disagreement, and #703 scopes the
+    escalation to the deadlock class."""
     if injection:
         return "needs-user"
     if not made_changes:
-        return "needs-user" if nochange_runs >= 2 else "stay-changes"
+        if nochange_runs < 2:
+            return "stay-changes"
+        return "escalate-fix" if escalation else "needs-user"
     if not gate_ok:
         return "needs-user" if gatefail_runs >= 2 else "stay-changes"
     return "re-review" if pushed else "stay-changes"
@@ -2418,9 +2527,31 @@ def record_fix_model(repo, pr_number, round_n, model, run_key, bot_login):
     print(f"fix model recorded for round {round_n}: {model}")
 
 
-def record_model_pin(repo, pr_number, round_n, tier, provider, run_key, bot_login):
-    """Durably pin the fix-model floor after a budget extension (idempotent: an existing
-    equal-or-higher recorded floor wins — the floor only ever moves UP the ladder)."""
+MODEL_PIN_REASON_BUDGET = ("review round budget extended; the fix-model floor is pinned to "
+                           "`{tier}` (a weaker tier burned the base budget, so a stronger model "
+                           "gets the extension before a human is involved)")
+# [registry #703] The repeated-decline escalation's prose. A DISTINCT reason because it is a
+# distinct event: no round budget was spent here — the fixer declined twice INSIDE one round —
+# and a comment claiming a budget extension would misreport it to the one reader (a human, or the
+# adjudicator this park population is waiting on) who needs to know which of the two happened.
+# The MARKER both sites write is byte-identical: the floor is the floor, whoever raised it.
+MODEL_PIN_REASON_DECLINE = (
+    "the fixer made no change twice for this review round — it judges the reviewer's findings "
+    "spurious, and nothing here adjudicates that disagreement. Rather than park the pull request "
+    "on the weakest configuration it has tried, the fix-model floor is pinned to `{tier}`, the "
+    "next untried tier, and the reviewer's findings stand unchanged. The park still follows once "
+    "the ladder is spent")
+
+
+def record_model_pin(repo, pr_number, round_n, tier, provider, run_key, bot_login,
+                     reason=MODEL_PIN_REASON_BUDGET):
+    """Durably pin the fix-model floor (idempotent: an existing equal-or-higher recorded floor
+    wins — the floor only ever moves UP the ladder).
+
+    `reason` is the human-facing prose, `{tier}`-formatted; it defaults to the round-budget
+    extension this was written for. The MARKER is independent of it — every reader parses the
+    marker, never the prose — so a new pin site states what actually happened without any consumer
+    having to learn a second grammar (registry #703)."""
     ladder = ESCALATION_LADDERS.get(provider)
     tier = migrate_tier(tier)   # [OPUS-5] a caller carrying a pre-deprecation tier converges up
     if not ladder or tier not in ladder:
@@ -2431,9 +2562,7 @@ def record_model_pin(repo, pr_number, round_n, tier, provider, run_key, bot_logi
         print(f"model pin already at or above {tier} ({existing})")
         return
     _comment(repo, pr_number,
-             f"> 🤖 SPARQ agent — review round budget extended; the fix-model floor is pinned "
-             f"to `{tier}` (a weaker tier burned the base budget, so a stronger model gets the "
-             f"extension before a human is involved).\n\n"
+             f"> 🤖 SPARQ agent — {reason.format(tier=tier)}.\n\n"
              f"{MODEL_PIN_MARKER} round={round_n} tier={tier} run={run_key} -->")
     print(f"model pin recorded: {tier} (round {round_n})")
 
@@ -6323,14 +6452,22 @@ def fix_outcome(args):
         record_fix_model(args.repo, args.pr, args.round, args.model, args.run_key,
                          args.bot_login)
     nochange_runs = gatefail_runs = 0
+    # [registry #703] The repeated-decline escalation's inputs, derived from the SAME post-write
+    # view of the durable fix-model markers that counts the no-change runs — including the marker
+    # this run just recorded above, so the tier that produced THIS decline can never be escalated
+    # to. `(None, None)` everywhere else, which is the pre-#703 behaviour exactly.
+    escalation_provider = escalation_tier = None
     if not injection:
         if not made_changes:
             comments = _paginated_comments(args.repo, args.pr)
             if args.run_key not in marker_runs(comments, args.bot_login, "nochange", args.round):
                 record_marker(args.repo, args.pr, "nochange", args.round, args.run_key,
                               args.bot_login)
-            nochange_runs = len(marker_runs(_paginated_comments(args.repo, args.pr),
-                                            args.bot_login, "nochange", args.round))
+            comments = _paginated_comments(args.repo, args.pr)
+            nochange_runs = len(marker_runs(comments, args.bot_login, "nochange", args.round))
+            escalation_provider, escalation_tier = fix_escalation(
+                [alias for aliases in fix_round_models(comments, args.bot_login).values()
+                 for alias in aliases])
         elif not gate_ok:
             record_marker(args.repo, args.pr, "gatefail", args.round, args.run_key,
                           args.bot_login)
@@ -6364,14 +6501,61 @@ def fix_outcome(args):
               "returning the PR to the review lane so the next round re-arms this same commit "
               "(bounded re-admission; without it this head parks after a second no-change fix)")
         return
-    decision = decide_fix(injection, made_changes, gate_ok, pushed, nochange_runs, gatefail_runs)
-    _write_outputs({"decision": decision})
+    decision = decide_fix(injection, made_changes, gate_ok, pushed, nochange_runs, gatefail_runs,
+                          escalation=escalation_tier)
+    # `escalation_tier` is the tier that WOULD be pinned, not one that was: it is emitted on
+    # every fix outcome so a run log says whether a stronger fixer was available, which is the
+    # one fact a reader of a `nochange` park cannot otherwise recover. The applied pin is the
+    # durable marker, never this output.
+    _write_outputs({"decision": decision, "escalation_tier": escalation_tier or ""})
     if decision == "re-review":
         set_review_state(args.repo, args.pr, "needs")
+    elif decision == "escalate-fix":
+        # [registry #703] THE DEADLOCK ESCALATION. The pin marker is the ONLY mutation: the PR is
+        # already in `review:changes` (a no-change fix never moved it), so the next dispatch tick
+        # re-enumerates it into the fix lane exactly as it would have anyway — but now
+        # dispatch-claim reads this floor through `pinned_fix_floor`/`pinned_fix_chain` and the
+        # tiers below it are never offered again (defer-not-fallback). That is what makes the
+        # retry a DIFFERENT configuration instead of the identical one #701 measured.
+        #
+        # Nothing else is touched, and that is deliberate: no label, no verdict, no review state,
+        # no reviewed-sha. The reviewer's findings are neither cleared nor weakened — the loop is
+        # only refusing to give up at a tier it has not tried.
+        #
+        # record_model_pin is idempotent on an equal-or-higher floor, so a re-run of this outcome
+        # (or a crash between the pin and the next tick) converges silently rather than
+        # re-commenting; the pin can only ever move UP, which with the durable per-round fix-model
+        # record is what bounds this to one escalation per remaining rung.
+        #
+        # RESIDUAL, stated rather than hidden: this pin does not consult the SOURCE ISSUE's route,
+        # because the fix outcome cannot see it. dispatch-claim intersects the pinned chain with
+        # the live route (`_route_constrained_fix_chain`) on the next tick, so a floor the route
+        # excludes yields an empty chain there — a defer on an ordinary route, and a
+        # `routing-unresolvable` human park on an `escalate = true` one. That exposure is
+        # PRE-EXISTING and identical for decide_budget's `extend-model-pin`, which pins from the
+        # same ladder with the same blindness; this site reaches it more often rather than
+        # introducing it. On the registry's own trust-surface routes it is unreachable by
+        # construction (they resolve to the single-rung anthropic ladder, so nothing escalates).
+        record_model_pin(args.repo, args.pr, args.round, escalation_tier, escalation_provider,
+                         args.run_key, args.bot_login, reason=MODEL_PIN_REASON_DECLINE)
+        print(f"fix outcome: {nochange_runs} no-change attempt(s) for round {args.round} — the "
+              f"fixer judges the findings spurious and nothing adjudicates that. Escalating the "
+              f"fix-model floor to `{escalation_tier}` (the next untried "
+              f"{escalation_provider} tier) instead of parking on the weakest configuration "
+              "tried; the reviewer's findings stand and the park follows once the ladder is spent")
     elif decision == "needs-user":
         reason = (INJECTION_PROSE_FIX
                   if injection else
-                  "two consecutive fix attempts made no change (fixer judges the findings spurious)"
+                  # [registry #703] The park now states WHY escalating instead was not an option —
+                  # the deadlock is unarbitrated either way, but "the ladder is spent" and "no fix
+                  # round names a tier" are different facts about it, and a park that says neither
+                  # reads as a capacity stop. The leading clause is UNCHANGED on purpose:
+                  # park_policy.LEGACY_PARK_PROSE classifies historical prose-only parks on
+                  # `consecutive fix attempts made no change`, so rewording it would strand the
+                  # very population #703 measured.
+                  "two consecutive fix attempts made no change (fixer judges the findings "
+                  "spurious), and no stronger untried fix tier remains to escalate to — this is "
+                  "an unarbitrated reviewer/fixer disagreement, not a capacity stop"
                   if not made_changes else
                   "the local gate failed twice for the same review round")
         # Injection is a genuine human (security) question; repeated no-change declines and the
@@ -10651,12 +10835,176 @@ def _self_test():
     finally:
         wiring_globals.update(real_disarm_io)
 
-    check("fix pushed re-reviews", decide_fix(False, True, True, True, 0, 0), "re-review")
-    check("first nochange stays", decide_fix(False, False, True, False, 1, 0), "stay-changes")
-    check("second nochange stops", decide_fix(False, False, True, False, 2, 0), "needs-user")
-    check("first gatefail stays", decide_fix(False, True, False, False, 0, 1), "stay-changes")
-    check("second gatefail stops", decide_fix(False, True, False, False, 0, 2), "needs-user")
-    check("fix injection stops", decide_fix(True, True, True, True, 0, 0), "needs-user")
+    check("fix pushed re-reviews", decide_fix(False, True, True, True, 0, 0, escalation=None),
+          "re-review")
+    check("first nochange stays", decide_fix(False, False, True, False, 1, 0, escalation=None),
+          "stay-changes")
+    check("second nochange stops", decide_fix(False, False, True, False, 2, 0, escalation=None),
+          "needs-user")
+    check("first gatefail stays", decide_fix(False, True, False, False, 0, 1, escalation=None),
+          "stay-changes")
+    check("second gatefail stops", decide_fix(False, True, False, False, 0, 2, escalation=None),
+          "needs-user")
+    check("fix injection stops", decide_fix(True, True, True, True, 0, 0, escalation=None),
+          "needs-user")
+
+    # ---- [registry #703] THE REPEATED-DECLINE ESCALATION --------------------------------------
+    # The deadlock half of `review:parked`: the fixer declines twice INSIDE one review round, so
+    # the round budget (and with it decide_budget's model-pin escalation) has not been touched and
+    # the loop would park on the weakest tier it ever tried. Both directions are pinned, because
+    # only the pair distinguishes "escalate while a stronger untried tier exists" from "escalate
+    # whenever the counter trips".
+    check("[#703] a second nochange ESCALATES when a stronger untried tier exists",
+          decide_fix(False, False, True, False, 2, 0, escalation="sol"), "escalate-fix")
+    check("[#703] ...and still PARKS when the ladder offers nothing untried",
+          decide_fix(False, False, True, False, 2, 0, escalation=None), "needs-user")
+    # The escalation is gated on the COUNT too: a first decline must not spend a ladder rung.
+    check("[#703] a FIRST nochange never escalates, even with a tier available",
+          decide_fix(False, False, True, False, 1, 0, escalation="sol"), "stay-changes")
+    # ...and it is scoped to the NO-CHANGE arm. A gate that fails twice is a fact about the tree
+    # the fixer produced, not a reviewer/fixer disagreement; deleting the `not made_changes` guard
+    # on the escalation would turn this row red.
+    check("[#703] a repeated GATE-FAIL parks even with a tier available (scoped to no-change)",
+          decide_fix(False, True, False, False, 0, 2, escalation="sol"), "needs-user")
+    # Injection outranks everything: a security question is never escalated around.
+    check("[#703] an injection flag parks even with a tier available",
+          decide_fix(True, False, True, False, 2, 0, escalation="sol"), "needs-user")
+    # `escalation` is REQUIRED and keyword-only — a defaulted parameter is how this wiring would
+    # go silently inert (AGENTS.md pre-flight 2d: does the control ever EXECUTE?).
+    try:
+        decide_fix(False, False, True, False, 2, 0)          # type: ignore[call-arg]
+    except TypeError:
+        check("[#703] decide_fix REFUSES a call that does not decide the escalation", True, True)
+    else:
+        check("[#703] decide_fix REFUSES a call that does not decide the escalation",
+              "accepted", "refused")
+
+    # ---- [registry #703] escalated_fix_tier / fix_escalation, the shared "stronger untried tier"
+    # rule. `escalated_fix_tier` is the SAME rule decide_budget's model-pin extension uses (the
+    # rows in the decide_budget block above execute it through that path), so these pin its own
+    # exported contract and the provider derivation fix_escalation adds on top.
+    check("[#703] the tier above the highest that ran", escalated_fix_tier("openai", ["luna"]),
+          "sol")
+    check("[#703] ...and nothing once the terminal tier has run",
+          escalated_fix_tier("openai", ["luna", "sol"]), None)
+    check("[#703] a single-rung ladder never escalates",
+          escalated_fix_tier("anthropic", ["opus5"]), None)
+    check("[#703] no recorded fix round escalates nothing (nothing to escalate FROM)",
+          escalated_fix_tier("openai", []), None)
+    check("[#703] an unknown provider escalates nothing",
+          escalated_fix_tier("acme", ["luna"]), None)
+    # escalated_fix_tier's OWN exported contract, pinned separately because fix_escalation's
+    # subset-of-one-ladder test would otherwise mask it: with two guards over one property, each
+    # copy is individually unkillable unless something calls this one directly (AGENTS.md
+    # pre-flight 4, mutually-masking duplicates — the shape #945 measured). decide_budget is the
+    # other caller and it validates first, so nothing else would ever hand this a non-member.
+    # The raise is CAUGHT rather than allowed to propagate: dropping that filter makes
+    # `max(ran, key=ladder.index)` throw, and an uncaught throw would abort the suite here and
+    # record a kill while every row below never ran (pre-flight 4, crash-after-partial-run).
+    try:
+        _nonmember = escalated_fix_tier("openai", ["luna", "sonnet"])
+    except Exception as _exc:                    # noqa: BLE001 — a raise here IS the finding
+        _nonmember = f"raised {_exc.__class__.__name__}"
+    check("[#703] a non-ladder alias contributes nothing rather than raising", _nonmember, "sol")
+    # WHAT MAKES fix_escalation's "exactly one provider" test DECIDABLE, and an honest declaration
+    # of a survivor: relaxing `len(providers) != 1` to `not providers` survives every row above,
+    # because two ladders sharing an alias is unreachable in the shipped catalog — an EQUIVALENT
+    # survivor. This row is what keeps it equivalent. If a future catalog ever puts one alias on
+    # two ladders, this goes red first and that guard becomes load-bearing again.
+    check("[#703] the escalation ladders partition the alias space",
+          sorted({alias for a, first in ESCALATION_LADDERS.items()
+                  for b, second in ESCALATION_LADDERS.items()
+                  if a != b for alias in set(first) & set(second)}), [])
+    # A pre-deprecation history migrates UP rather than escalating off a retired rung.
+    check("[#703] a legacy `fable` fix round reads as the opus5 terminal, not a rung below it",
+          escalated_fix_tier("anthropic", ["fable"]), None)
+    # fix_escalation derives the provider from the recorded aliases. Every ambiguity is (None,
+    # None) — the pre-#703 park — and each of these is a DISTINCT hole:
+    check("[#703] fix_escalation names the provider the recorded aliases belong to",
+          fix_escalation(["luna"]), ("openai", "sol"))
+    check("[#703] ...and yields nothing once the terminal tier has run",
+          fix_escalation(["luna", "sol"]), (None, None))
+    check("[#703] an EMPTY fix history proves no ladder (unattributable -> park)",
+          fix_escalation([]), (None, None))
+    check("[#703] a docs-only alias belongs to no ladder (-> park, never a guessed provider)",
+          fix_escalation(["sonnet"]), (None, None))
+    check("[#703] a FORGED alias belongs to no ladder (-> park)",
+          fix_escalation(["luna", "gpt-9-omni"]), (None, None))
+    check("[#703] a CROSS-PROVIDER fix history is a contradiction, not a coin flip (-> park)",
+          fix_escalation(["luna", "opus5"]), (None, None))
+    for junk in (None, 7, True, "", b"luna"):
+        check(f"[#703] a non-alias fix-model record {junk!r} escalates nothing",
+              fix_escalation([junk]), (None, None))
+    # THE MUTANT THAT FOUND THIS ROW: filtering the non-alias entries away BEFORE the
+    # subset-of-one-ladder test leaves every row above green while junk sitting beside a real
+    # alias still buys an escalation. An unclassifiable record is unattributable evidence.
+    check("[#703] ...and junk beside a real alias cannot promote it either",
+          fix_escalation(["luna", None, 7]), (None, None))
+    check("[#703] ...nor can an EMPTY alias beside a real one",
+          fix_escalation(["luna", ""]), (None, None))
+    # THE TERMINATION PROPERTY, simulated rather than asserted in prose: each escalation is
+    # recorded as a fix round that ran, so the floor strictly rises and the ladder is spent in at
+    # most len(ladder) - 1 escalations. A rule that could ever return a tier at or below the
+    # highest recorded one would spin here forever.
+    # It REPORTS rather than raises: an `assert` here would abort the suite on the very mutant it
+    # is meant to catch, recording a kill while every row below it never ran (AGENTS.md pre-flight
+    # 4, crash-after-partial-run). The bound is generous so a non-terminating rule ends the loop
+    # and reds this row instead of hanging.
+    _ran, _steps, _repeat = ["luna"], 0, None
+    while _steps <= len(ESCALATION_LADDERS["openai"]) + 2:
+        _provider, _next = fix_escalation(_ran)
+        if not _next:
+            break
+        _steps += 1
+        if _next in _ran and _repeat is None:
+            _repeat = _next
+        _ran.append(_next)
+    check("[#703] the decline escalation spends the ladder and stops, re-offering nothing",
+          (_steps, _ran, _repeat), (len(ESCALATION_LADDERS["openai"]) - 1, ["luna", "sol"], None))
+
+    # ---- [registry #703] record_model_pin's `reason` parameter, driven through the REAL writer.
+    # The parameter is prose ONLY: the two sites must emit the SAME marker, because every consumer
+    # (pinned_fix_floor here, dispatch-claim's fix-chain narrowing) parses the marker and none of
+    # them parses the prose. A `{`-bearing template would also raise at the write, which is a
+    # comment this function cannot post and therefore a floor it cannot pin — so both templates
+    # are rendered here rather than asserted about in a docstring.
+    _pin_bodies = []
+    _real_pin_io = {name: globals()[name] for name in ("_paginated_comments", "_comment")}
+    try:
+        globals()["_paginated_comments"] = lambda repo, pr: []
+        globals()["_comment"] = lambda repo, pr, body: _pin_bodies.append(body)
+        record_model_pin("o/r", 41, 2, "sol", "openai", "9.1", "sparq[bot]")
+        record_model_pin("o/r", 41, 2, "sol", "openai", "9.1", "sparq[bot]",
+                         reason=MODEL_PIN_REASON_DECLINE)
+    finally:
+        globals().update(_real_pin_io)
+    _pin_marker = f"{MODEL_PIN_MARKER} round=2 tier=sol run=9.1 -->"
+    check("[#703] both pin sites emit the IDENTICAL marker (only the prose differs)",
+          [body.split("\n\n")[-1] for body in _pin_bodies], [_pin_marker, _pin_marker])
+    check("[#703] the default reason still states the BUDGET extension",
+          ("round budget extended" in _pin_bodies[0], "`sol`" in _pin_bodies[0]), (True, True))
+    check("[#703] the decline reason states the DECLINE, not a budget extension",
+          ("made no change twice" in _pin_bodies[1],
+           "round budget extended" in _pin_bodies[1],
+           "`sol`" in _pin_bodies[1]), (True, False, True))
+    # WHAT THE ESCALATION DELIVERS INTO (AGENTS.md pre-flight 11). A pin nobody can read is a
+    # transition that produced nothing: the escalation's entire effect is that the NEXT dispatch
+    # tick resolves a narrower fix chain, which it does by parsing this comment back through
+    # pinned_fix_floor and expanding it with pinned_fix_chain (dispatch-claim reads exactly those
+    # two). So the emitted body is fed straight back to both, rather than asserted about.
+    _pin_readback = [{"user": {"login": "sparq[bot]"}, "body": _pin_bodies[1]}]
+    check("[#703] the decline pin is READ BACK as the floor by the consumer that acts on it",
+          pinned_fix_floor(_pin_readback, "sparq[bot]", "openai"), "sol")
+    # Caught for the same reason as the non-member row above: an unreadable floor makes
+    # pinned_fix_chain raise, and an uncaught raise here would abort the suite on the very mutant
+    # the row exists to catch (pre-flight 4, crash-after-partial-run).
+    try:
+        _pin_chain = pinned_fix_chain(
+            "openai", pinned_fix_floor(_pin_readback, "sparq[bot]", "openai"))
+    except Exception as _exc:                    # noqa: BLE001 — a raise here IS the finding
+        _pin_chain = f"raised {_exc.__class__.__name__}"
+    check("[#703] ...and the chain it expands to excludes the tier that just declined",
+          _pin_chain, ["sol"])
 
     check("provenance path", provenance_path("sparq-org/sparq", 12),
           "orchestration/provenance/sparq-org--sparq--pr12.json")
@@ -12763,7 +13111,11 @@ def _self_test():
                                                         or oc_bodies.append(body))
         globals()["needs_user"] = oc_needs_user
         globals()["post_findings"] = lambda *a, **kw: oc_calls.append("post-findings")
-        globals()["record_model_pin"] = lambda *a, **kw: oc_calls.append("model-pin")
+        # [registry #703] The stub records the TIER and PROVIDER it was handed, not just that it
+        # was called: the escalation's whole content is WHICH floor it pins, and a bare
+        # "model-pin" marker would pass for a site that pinned the tier that just failed.
+        globals()["record_model_pin"] = (
+            lambda *a, **kw: oc_calls.append(f"model-pin:{a[4]}:{a[3]}"))
         globals()["record_round_void"] = lambda *a, **kw: oc_calls.append("round-void")
         globals()["_alert_route"] = lambda: (None, None)
         globals()["_write_outputs"] = oc_outputs.update
@@ -13038,6 +13390,64 @@ def _self_test():
         check("[#869] SITE fix_outcome/no-change: stays CAPACITY with cause=nochange",
               (oc_kwargs[-1].get("park_class"), oc_kwargs[-1].get("park_cause"))
               if oc_kwargs else None, ("capacity", "nochange"))
+
+        # ---- [registry #703] THE REPEATED-DECLINE ESCALATION, THROUGH THE REAL fix_outcome ----
+        # The rows above run with an EMPTY comment history, so no fix round is attributable to a
+        # tier and the park is correct. These drive the same function with the durable fix-model
+        # marker the fix lane really writes, and pin the two OPPOSITE outcomes it selects — the
+        # only pair that distinguishes the escalation from a counter that always parks (or one
+        # that always escalates).
+        def fix_model_comment(round_n, alias):
+            return {"user": {"login": "sparq[bot]"},
+                    "body": f"fix round {round_n} executed by `{alias}`.\n\n"
+                            f"{FIX_MODEL_MARKER} round={round_n} model={alias} run=8.1 -->"}
+
+        run_fix_outcome(made_changes="false", comments=[fix_model_comment(1, "luna")])
+        check("[#703] SITE fix_outcome/no-change: a stronger untried tier ESCALATES the floor "
+              "instead of parking",
+              (oc_calls, oc_kwargs, oc_outputs.get("decision"),
+               oc_outputs.get("escalation_tier")),
+              (["model-pin:openai:sol"], [], "escalate-fix", "sol"))
+        # THE OTHER DIRECTION, on the SAME history shape: the terminal tier has now run, so the
+        # loop parks — and the park's cause is still the machine-owned capacity `nochange`, never
+        # a human question. Deleting the `ladder[-1] in ran` guard turns this row red.
+        run_fix_outcome(made_changes="false",
+                        comments=[fix_model_comment(1, "luna"), fix_model_comment(1, "sol")])
+        check("[#703] ...and a SPENT ladder parks, pinning nothing",
+              (oc_calls, oc_outputs.get("decision"),
+               (oc_kwargs[-1].get("park_class"), oc_kwargs[-1].get("park_cause"))
+               if oc_kwargs else None),
+              (["needs-user"], "needs-user", ("capacity", "nochange")))
+        # ...and the park SAYS which of the two facts it is, so a reader (or the adjudicator this
+        # population is waiting on) can tell a spent ladder from a capacity stop. The historical
+        # classifier's anchor is asserted separately, because rewording it would strand every
+        # prose-only park park_policy.LEGACY_PARK_PROSE still has to classify.
+        check("[#703] ...and the park reason names the exhausted escalation",
+              ("no stronger untried fix tier remains" in (oc_reasons[-1] if oc_reasons else ""),
+               "unarbitrated reviewer/fixer disagreement" in (oc_reasons[-1] if oc_reasons else "")),
+              (True, True))
+        check("[#703] ...while keeping LEGACY_PARK_PROSE's anchor intact",
+              _park_policy().reclassify_legacy_park(
+                  [{"user": {"login": "sparq[bot]"},
+                    "body": f"> 🤖 SPARQ agent — the autonomous review loop stopped: "
+                            f"{oc_reasons[-1] if oc_reasons else ''}"}], "sparq[bot]")[:2],
+              ("nochange", "capacity"))
+        # A FORGED fix-model marker (not the bot's) proves nothing and must not buy an escalation:
+        # the history reads as unattributable and the PR parks exactly as it did before #703.
+        run_fix_outcome(made_changes="false",
+                        comments=[{"user": {"login": "mallory"},
+                                   "body": f"{FIX_MODEL_MARKER} round=1 model=luna run=8.1 -->"}])
+        check("[#703] a NON-BOT fix-model marker buys no escalation",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("escalation_tier")),
+              (["needs-user"], "needs-user", ""))
+        # ...and the COUNT still gates it: with only ONE recorded no-change run the same history
+        # stays in review:changes and pins nothing, so the escalation cannot spend a ladder rung
+        # on a first decline.
+        globals()["marker_runs"] = lambda *_a, **_kw: ["8.1"]
+        run_fix_outcome(made_changes="false", comments=[fix_model_comment(1, "luna")])
+        check("[#703] a FIRST decline stays in review:changes and pins nothing",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("escalation_tier")),
+              ([], "stay-changes", "sol"))
         globals()["marker_runs"] = real_oc["marker_runs"]
         globals()["record_marker"] = real_oc["record_marker"]
         # The findings site writes a COMMENT rather than a park reason, and post_findings is
