@@ -22753,12 +22753,14 @@ def _escalation_call_site(source):
 
 # ---- [registry #1028] "THIS NODE RUNS", not "this node EXISTS" ---------------------------------
 # `ast.walk` enumerates every node in a subtree, so an ancestry check built on it proves a call
-# EXISTS somewhere under the loop — never that a pass through the loop REACHES it. Two shapes of
+# EXISTS somewhere under the loop — never that a pass through the loop REACHES it. Three shapes of
 # dead code satisfy `ast.walk` while doing nothing at run time, and MEASURED on the pre-#1028 tree
-# both made `_park_call_site` certify a production tick that parks nothing at all:
+# each made `_park_call_site` certify a production tick that parks nothing at all:
 #
 #   - a CONSTANT-FALSE branch: `if False:` / `while False:` / the `else:` of `if True:`;
-#   - a DEFERRED CALLABLE SCOPE: a nested `def` / `async def` / `lambda` that nothing calls.
+#   - a DEFERRED CALLABLE SCOPE: a nested `def` / `async def` / `lambda` that nothing calls;
+#   - a JUMPED-PAST TAIL: the statements a `return`/`raise`/`break`/`continue` EARLIER IN THE SAME
+#     BLOCK skips over. `targets = ...; return; for target in targets: park(...)` is the shape.
 #
 # A class body is deliberately NOT a boundary: it EXECUTES IN PLACE at definition time, so a
 # statement written directly in one really does run. Its `def`s do not, and they are already
@@ -22766,18 +22768,65 @@ def _escalation_call_site(source):
 # "statement in a class body" stays accepted, rather than collapsing both into "anything nested".
 #
 # HONEST BOUNDARY, stated because the overclaim is the failure mode this repo keeps measuring:
-# this proves a node is NOT reachable in the two decidable cases above. It is a FLOOR, not a
-# decision procedure. A test that is always false but not a literal (`if 1 == 2:`, `if not True:`,
-# `if DEBUG:` with `DEBUG = False`) is NOT proven dead and stays live here — deliberately, because
-# the alternative is constant-folding arbitrary expressions. It also cannot see a node made
-# unreachable by an earlier `return`/`raise`, and it does not descend into a nested `def`'s
-# decorators or defaults, which do run in place; both of those directions REFUSE, i.e. fail closed.
+# this proves a node is NOT reachable in the three decidable cases above. It is a FLOOR, not a
+# decision procedure, and the two directions it gets wrong do NOT fail the same way — the first cut
+# of this note claimed they both refused, which was itself the overclaim, so each is now named with
+# the direction it actually takes:
+#
+#   - REFUSES (fail-closed, safe): it does not descend into a nested `def`'s decorators or
+#     defaults, which do run in place, so a park call written there is never certified.
+#   - ACCEPTS (fail-open, the residue): anything it cannot DECIDE stays live. A test that is always
+#     false but not a literal (`if 1 == 2:`, `if not True:`, `if DEBUG:` with `DEBUG = False`) is
+#     not proven dead — deliberately, because the alternative is constant-folding arbitrary
+#     expressions. Likewise fall-through is decided recursively only through `if`, so a block whose
+#     terminator hides in a `with`/`try`/`match`, or a `while True:` with no `break`, leaves the
+#     statements after it live. Widening either of those is a strictly larger seam, not this one.
 _SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 
 def _literal_truth(test):
     """The truth of `test` when it is a LITERAL constant, else None ("not decidable here")."""
     return bool(test.value) if isinstance(test, ast.Constant) else None
+
+
+_TERMINATORS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
+
+
+def _terminates(stmt):
+    """True when a pass that ENTERS `stmt` provably cannot fall through to the NEXT statement.
+
+    Decidable cases only, the same floor as `_literal_truth`: the four jump statements, and an
+    `if` whose reachable legs all terminate. Everything else — a jump buried in a `with`/`try`,
+    a `while True:` with no `break` — is reported as falling through, which keeps the statements
+    after it LIVE. That is the fail-open residue named in the boundary note above."""
+    if isinstance(stmt, _TERMINATORS):
+        return True
+    if not isinstance(stmt, ast.If):
+        return False
+    truth = _literal_truth(stmt.test)
+    if truth is True:                 # `if True: return` — only the body can run, and it jumps
+        return _block_terminates(stmt.body)
+    if truth is False:                # `if False: return` — the jump is DEAD; only `else:` runs
+        return _block_terminates(stmt.orelse)
+    # A runtime test terminates only when BOTH legs do. A bare `if repo: return` has an EMPTY
+    # `orelse`, and an empty block never terminates, so it falls through without a special case.
+    return _block_terminates(stmt.body) and _block_terminates(stmt.orelse)
+
+
+def _block_terminates(body):
+    """True when one statement list jumps out before its end — anything after it is unreachable."""
+    return any(_terminates(stmt) for stmt in body)
+
+
+def _jumped_past(body):
+    """The tail of ONE block that a terminator earlier in THAT SAME block skips over.
+
+    Per-list and ORDER-SENSITIVE on purpose: a `return` after the park loop kills nothing, and a
+    `finally:` still runs after a `return` in the `try:` body because they are separate lists."""
+    for index, stmt in enumerate(body):
+        if _terminates(stmt):
+            return body[index + 1:]
+    return []
 
 
 def _live_children(node):
@@ -22791,13 +22840,17 @@ def _live_children(node):
             dead = node.body      # `if False:`/`while False:` — the body can never run
         if not isinstance(dead, list):
             dead = [dead]         # an IfExp's legs are single expressions, not statement bodies
+    dead = list(dead)
+    for _field, value in ast.iter_fields(node):
+        if isinstance(value, list):             # `body`, `orelse`, `finalbody`, each on its own —
+            dead.extend(_jumped_past(value))    # an EXPRESSION list holds no jump, so it is a no-op
     dead = {id(leg) for leg in dead}
     return [child for child in ast.iter_child_nodes(node) if id(child) not in dead]
 
 
 def _live_nodes(root):
     """`root` plus every descendant a SINGLE pass through `root` reaches — `ast.walk` minus the
-    two prunings described above.
+    three prunings described above.
 
     A scope boundary is YIELDED but not descended into, so a caller scanning a module still finds
     every function it defines while a call buried in an uncalled nested `def` stays invisible."""
@@ -22826,12 +22879,13 @@ def _park_call_site(source):
       - any SLICE in the loop's iterable            -> `[:1]` is the defect wearing a loop;
       - a `cap=` keyword at the call site           -> the bound must be the DERIVED constant,
                                                        not a number retyped at the call site;
-      - a DEAD or DEFERRED ancestor (registry #1028) -> a `for`/park call under `if False:`, under
-                                                       the `else:` of a constant-true guard, or
-                                                       inside an uncalled nested `def`/method
-                                                       parks nothing while `ast.walk` still sees
-                                                       it. Every ACCEPTING scan below therefore
-                                                       runs on `_live_nodes`, never `ast.walk`.
+      - a DEAD, DEFERRED or JUMPED-PAST      -> a `for`/park call under `if False:`, under the
+        ancestor (registry #1028)               `else:` of a constant-true guard, inside an
+                                                uncalled nested `def`/method, or after a
+                                                `return`/`raise`/`break`/`continue` in its own
+                                                block parks nothing while `ast.walk` still sees
+                                                it. Every ACCEPTING scan below therefore runs on
+                                                `_live_nodes`, never `ast.walk`.
 
     The asymmetry between the two scan kinds is deliberate: a scan that ACCEPTS reads only live
     nodes, while a scan that REFUSES (the slice probe) keeps raw `ast.walk` and so refuses on a
@@ -22914,6 +22968,83 @@ _PARK_SEAM_ROWS = (
         for target in targets:
             class Receipt:
                 parked = park_starved_partition_holder(repo, target)
+    """),
+    # A `return` AFTER the batch is the production shape, and the pruning is order-sensitive: a
+    # terminator only kills what FOLLOWS it in its own block. Reds if `_jumped_past` ever degrades
+    # into "this block contains a jump somewhere".
+    ("`return` after the park loop", "tick", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+        return
+    """),
+    # A CONDITIONAL early return before the batch: one leg falls through, so the loop still runs.
+    # This is the row that stops "refuse any function containing a `return`".
+    ("loop after a conditional `return`", "tick", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if not starved:
+            return
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    # `continue` inside a runtime guard skips ITS OWN iteration, not the park call after the guard
+    # — the real filter-then-park shape. Stops "refuse any loop body containing a `continue`".
+    ("park call after a guarded `continue`", "tick", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            if not repo:
+                continue
+            park_starved_partition_holder(repo, target)
+    """),
+    # The jump is itself dead, so it terminates nothing and the loop below it still runs. Reds if
+    # `_terminates` stops consulting `_literal_truth` before believing a nested jump.
+    ("`return` inside `if False:`", "tick", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if False:
+            return
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    # ---- REFUSED: jumped-past tails — the block already left before the code below it -------
+    ("loop after an unconditional `return`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        return
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    ("loop after an unconditional `raise`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        raise RuntimeError("unreachable")
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    ("park call after `break`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            break
+            park_starved_partition_holder(repo, target)
+    """),
+    ("park call after `continue`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            continue
+            park_starved_partition_holder(repo, target)
+    """),
+    ("loop after `if True:` that returns", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if True:
+            return
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    ("loop after an if/else whose BOTH legs jump", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if starved:
+            return
+        else:
+            raise RuntimeError("no starvation")
+        for target in targets:
+            park_starved_partition_holder(repo, target)
     """),
     # ---- REFUSED: dead branches — the loop or the call exists but never runs ----------------
     ("loop under `if False:`", None, """
@@ -24316,8 +24447,15 @@ def _starvation_sweep_self_test():
     # decides ancestry from one that certifies any call that merely EXISTS. `ast.walk` is the
     # latter: it enumerates dead code, so the same seam certified a park site whose loop — or whose
     # `park_starved_partition_holder` call — sat under `if False:`, in the `else:` of a
-    # constant-true guard, or inside a nested `def`/method nothing ever calls. Each of those
+    # constant-true guard, inside a nested `def`/method nothing ever calls, or after a
+    # `return`/`raise`/`break`/`continue` its own block had already jumped out on. Each of those
     # restores the exact 1-holder-per-tick defect #822 removed, or removes parking altogether.
+    #
+    # The jumped-past family arrived in review round 1: the first cut pruned dead BRANCHES and
+    # deferred SCOPES but enumerated a block's children with no statement ORDER, so
+    # `targets = ...; return; for target in targets: park(...)` still certified as the call site,
+    # and the boundary note above claimed that direction fell CLOSED when it fell open. Order is
+    # now decided per statement list, which is why `return` AFTER the loop is an ACCEPT row.
     #
     # CORRECTED, because the follow-up that asked for this check overclaimed here and the
     # correction is what makes the rest of it trustworthy: the checker really was fooled — on the
@@ -24335,6 +24473,23 @@ def _starvation_sweep_self_test():
     # advertises had no red-on-regression test at all. Every refusal now has one, and the ACCEPT
     # rows are what stop the cheap fix: a checker that refused all nesting, or returned None
     # unconditionally, passes every REFUSE row and reds on those.
+    #
+    # `_live_nodes` is pinned DIRECTLY first, because the table cannot see one thing: a terminator
+    # is the LAST live statement of its block, not the first dead one. `park_starved_partition_
+    # holder` never hides inside a `return`, so `body[index:]` for `body[index + 1:]` changes no
+    # verdict above — it is invisible to every row while still being wrong about what runs. Here
+    # `a` occurs ONLY as the `return`'s operand and `b` only in the jumped-past tail, so the one
+    # set reds in BOTH directions: the off-by-one loses `a`, no pruning at all gains `b`. (Giving
+    # `a` an assignment first would hide the off-by-one, since the target is a `Name` too.)
+    # Rooted at the `def` itself, not the module: a scope boundary is yielded without being
+    # descended into, so `_live_nodes(module)` would stop at `f` and report no names at all.
+    _live_names = {_node.id for _node in _live_nodes(
+        ast.parse("def f():\n    return a\n    b = 2\n").body[0])
+        if isinstance(_node, ast.Name)}
+    assert _live_names == {"a"}, (
+        f"#1028 `_live_nodes` statement order: expected the `return`'s own operand live and the "
+        f"statement after it pruned, got {sorted(_live_names)}")
+
     _park_accepted = _park_refused = 0
     for _what, _expect, _block in _PARK_SEAM_ROWS:
         _verdict = _park_seam_verdict(_block)
@@ -24344,13 +24499,13 @@ def _starvation_sweep_self_test():
             "reports the batch park as structurally proven while the partition is never released.")
         _park_accepted += _expect is not None
         _park_refused += _expect is None
-    assert (_park_accepted, _park_refused) == (4, 13), (
-        f"#1028 expected 4 accepted and 13 refused park-seam shapes, got "
+    assert (_park_accepted, _park_refused) == (8, 19), (
+        f"#1028 expected 8 accepted and 19 refused park-seam shapes, got "
         f"({_park_accepted}, {_park_refused}) — a row was dropped from _PARK_SEAM_ROWS, which is "
         "how a refusal quietly stops being tested")
     print(f"  ok   #1028 park call-site seam decides REACHABILITY, not existence: "
           f"{_park_accepted} live shapes certify and {_park_refused} — dead branches, uncalled "
-          "nested scopes, and the three #822 re-scalarisations — are refused")
+          "nested scopes, jumped-past tails, and the three #822 re-scalarisations — are refused")
 
     # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
     _starvation_park_batch_seam_self_test()
