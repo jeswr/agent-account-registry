@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5915,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5d71c78e2bfc35f13fc90ce8fe92554f417e636f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The advisory-disposition tripwire is correctly scoped as a staleness check rather than a vulnerability scanner. It enforces exact lock-instance path sets, recorded versions, dependency-field/range pins, and root overrides; parse failures fail closed. The focused hermetic suite exercises each claimed drift class plus the committed live inputs, and all 25 tests pass. The workflow runs the self-test before the live gate, while the documentation consistently preserves Dependabot as the advisory source and avoids suppressing alerts. No correctness, soundness, security, or vacuous-test issue was found.",
+  "verdict": "approve"
+ }
+}
