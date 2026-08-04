@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "efb4eb2781de6958",
-   "claim_id": "83a10fa39324492fb4347aaf5f142426",
-   "holder": "jeswr/agent-account-registry#1279@30875744242.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785815256,
-   "expires_at": 1785817956
-  },
-  {
-   "account": "efb4eb2781de6958",
    "claim_id": "0f8efa61cb6c4b3784966e818d7c530c",
    "holder": "jeswr/agent-account-registry#1773@30875750878.1",
    "package": "workflows",
