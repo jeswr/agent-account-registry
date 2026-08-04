@@ -525,6 +525,119 @@ def schedule_minute_map(root) -> dict[str, set[int]]:
 MIN_SCHEDULED_LANES = 10
 
 
+# =================================================================================
+# SAME-MINUTE DISJOINTNESS — THE DECISION #1278 ASKED FOR: it is OPT-IN, PER LANE,
+# and the lane that wants it DECLARES IT IN ITS OWN FILE.
+# =================================================================================
+# #1046 derived the map and wired ONE consumer (regate-sweep's own seam). #1278 asked whether
+# same-minute disjointness is an ESTATE invariant or a per-lane one. Measured on this tree
+# rather than assumed (master, 2026-08-04): 16 scheduled lanes make 48 minute-claims over 33
+# distinct minutes and collide in 13 PAIRS, not the 3 the issue counted — the estate grew past
+# the map faster than anyone repointed it. Estate-wide disjointness is therefore not a
+# description of this repo, it is a repointing project across most of the directory — and it
+# does not survive growth: 48 claims fit in 60 minutes with little room, so the next few lanes
+# make the invariant unsatisfiable, at which point whoever hits it deletes the assertion rather
+# than the collision. An invariant that must be switched off to add a lane is a countdown, not
+# a fail-closed check.
+#
+# It is also not what the estate actually needs. Same-minute is only a hazard where two lanes
+# contend for one thing, and the lanes here mostly do not: separate workflows, separate
+# concurrency groups. What DOES contend is a shared write to the `ledger` ref, and that cuts
+# across the minute map rather than following it — which is why it is filed as its own issue
+# and NOT smuggled into this marker (a binary "nobody may share my minute" cannot express it:
+# `dispatch` holds six minutes and calls its own cron a BACKSTOP behind the doorbell, so it
+# will never be exclusive, yet it is one of the ledger writers).
+#
+# So: a lane that genuinely needs a private minute SAYS SO, on a comment line of its own
+# workflow, and gets a derived assertion over the whole tree for free. A lane that says
+# nothing is unconstrained, and a reported overlap against it is not a defect to "fix".
+# Today `regate-sweep` and `latch-watchdog` declare — the two whose own prose already made
+# the claim, and the two the claim is load-bearing for (a drain-rate sweeper and a 10-minute
+# watchdog both lose ticks to a same-minute pile-up).
+#
+# THE MARKER IS ANCHORED TO THE START OF A COMMENT LINE ON PURPOSE. Prose that mentions
+# `cron-exclusive:` mid-sentence — including the notes in the lanes that deliberately do NOT
+# claim — must not be read as a declaration, and the self-test carries that control.
+#
+# WHO CAN WRITE WHAT THIS READS: only a commit to `.github/workflows` in this repository, which
+# is the same review path as the crons themselves. The direction of the grant matters more than
+# the source: a marker only ever ADDS a constraint, so the worst an unwanted one can do is red
+# this gate, never widen anything — and DELETING one is caught by name at the seam below for the
+# two lanes whose own headers make the claim.
+CRON_EXCLUSIVE_RE = re.compile(r"^[ \t]*#[ \t]*cron-exclusive:[ \t]*(.*)$", re.M)
+
+# A FLOOR ON THE EVIDENCE, the same shape as MIN_SCHEDULED_LANES and for the same reason:
+# `exclusive_minute_violations` returns [] for an empty claim set, so a marker convention that
+# silently stopped being read — renamed, reformatted, or lost to a thin checkout — would make
+# the estate assertion vacuously green. Two lanes declare today.
+MIN_EXCLUSIVE_MINUTE_LANES = 2
+
+
+def exclusive_minute_lanes(root) -> dict[str, str]:
+    """Which lanes CLAIM a private minute, and why — DERIVED from each lane's own file (#1278).
+
+    -> {".github/workflows/<name>.yml": "<the reason the lane gave>"} for every workflow
+    carrying a `# cron-exclusive: <reason>` comment line.
+
+    Read as RAW TEXT, not through YAML: a comment does not survive `safe_load`, and putting
+    the claim in a workflow key would make it an input GitHub has to tolerate. FAIL CLOSED in
+    the two directions that would quietly shrink the claim set: a missing workflows directory
+    raises, and a marker with no reason, or a second marker in one file, raises rather than
+    being dropped — a claim this function does not return is a lane the estate check does not
+    watch, which is indistinguishable from a lane that never claimed.
+    """
+    wf_dir = Path(root) / WORKFLOWS_DIR
+    if not wf_dir.is_dir():
+        raise AlarmError(f"no workflows directory at {wf_dir}")
+    out: dict[str, str] = {}
+    for path in sorted(wf_dir.glob("*.yml")) + sorted(wf_dir.glob("*.yaml")):
+        found = CRON_EXCLUSIVE_RE.findall(path.read_text(encoding="utf-8"))
+        if not found:
+            continue
+        if len(found) > 1:
+            raise AlarmError(
+                f"{WORKFLOWS_DIR}/{path.name} carries {len(found)} cron-exclusive markers; "
+                "one lane makes the claim once, so which reason is authoritative is not a "
+                "question this check gets to guess at")
+        reason = found[0].strip()
+        if not reason:
+            raise AlarmError(
+                f"{WORKFLOWS_DIR}/{path.name} claims a private cron minute with no reason — "
+                "the reason is what stops the next author repointing it back")
+        out[f"{WORKFLOWS_DIR}/{path.name}"] = reason
+    return out
+
+
+def exclusive_minute_violations(minute_map, exclusive) -> list[dict]:
+    """-> every claim in `exclusive` that the derived `minute_map` does NOT bear out. [] = clean.
+
+    Pure, so the seam can feed it the real derived map and the fixture rows can feed it maps
+    written by hand. Records are `{lane, kind, other, minutes}`; `kind` is `shared-minute` (the
+    claim is contradicted by a named lane, per minute) or `unscheduled-claim`.
+
+    UNLIKE `regate-sweep.py`'s `cron_collisions`, an EMPTY map is not a clean bill here: every
+    claim becomes an `unscheduled-claim`, because a lane that claims a minute and cannot be
+    found holding one is either a marker on an unscheduled workflow or a map that never read
+    the tree, and both must red. The remaining vacuity — no claims at all — cannot be seen from
+    inside this function, which is what MIN_EXCLUSIVE_MINUTE_LANES is for at the call site.
+    """
+    out: list[dict] = []
+    for lane in sorted(exclusive):
+        mine = set(minute_map.get(lane) or ())
+        if not mine:
+            out.append({"lane": lane, "kind": "unscheduled-claim", "other": None,
+                        "minutes": []})
+            continue
+        for other, taken in sorted(minute_map.items()):
+            if other == lane:
+                continue
+            shared = sorted(mine & set(taken))
+            if shared:
+                out.append({"lane": lane, "kind": "shared-minute", "other": other,
+                            "minutes": shared})
+    return out
+
+
 # ---------------------------------------------------------------------------------
 # detectors — pure functions over already-fetched state
 # ---------------------------------------------------------------------------------
@@ -1363,6 +1476,112 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         pass
     except Exception:
         chk("schedule map: a missing workflows directory raised the wrong error", False)
+
+    # --- exclusive_minute_lanes on a HERMETIC tree (#1278). The live-tree rows in the seam
+    # section can only say "the claims held today"; every way the claim set can silently
+    # SHRINK — which is how this check goes quiet without going red — lives here. ---
+    with tempfile.TemporaryDirectory() as _xtmp:
+        _xwf = Path(_xtmp) / WORKFLOWS_DIR
+        _xwf.mkdir(parents=True)
+        (_xwf / "claimer.yml").write_text(
+            "on:\n  schedule:\n"
+            "    # cron-exclusive: the drain arithmetic assumes three whole ticks\n"
+            "    - cron: '4,24,44 * * * *'\njobs: {}\n")
+        (_xwf / "tabbed.yaml").write_text(
+            "on:\n  schedule:\n"
+            "\t#\tcron-exclusive:\ta tab-indented claim is still a claim\n"
+            "    - cron: '9 * * * *'\njobs: {}\n")
+        (_xwf / "quiet.yml").write_text(
+            "on:\n  schedule:\n"
+            "    # This lane makes no `cron-exclusive:` claim and tolerates an overlap.\n"
+            "    - cron: '13,43 * * * *'\njobs: {}\n")
+        chk("exclusive lanes: a lane that claims is returned WITH its reason, and .yaml is read "
+            "on the same terms as .yml",
+            exclusive_minute_lanes(_xtmp)
+            == {f"{WORKFLOWS_DIR}/claimer.yml":
+                "the drain arithmetic assumes three whole ticks",
+                f"{WORKFLOWS_DIR}/tabbed.yaml":
+                "a tab-indented claim is still a claim"})
+        # THE ANTI-VACUITY CONTROL FOR THE MARKER ITSELF, and the reason it is anchored to the
+        # start of a comment line: `quiet.yml` above says the token mid-sentence, exactly as the
+        # non-claiming lanes in this repo do. A containment match would read those notes as
+        # declarations, put lanes that chose to overlap under the estate assertion, and red the
+        # gate on a deliberate overlap — the failure mode #1278 explicitly warned about.
+        chk("exclusive lanes: a lane that only MENTIONS the marker mid-comment has NOT claimed",
+            f"{WORKFLOWS_DIR}/quiet.yml" not in exclusive_minute_lanes(_xtmp))
+        (_xwf / "reasonless.yml").write_text(
+            "on:\n  schedule:\n    # cron-exclusive:   \n    - cron: '5 * * * *'\njobs: {}\n")
+        try:
+            exclusive_minute_lanes(_xtmp)
+            chk("exclusive lanes: a claim with NO REASON raises — a reason-less claim is the "
+                "one the next author repoints away", False)
+        except AlarmError:
+            pass
+        except Exception:
+            chk("exclusive lanes: a reason-less claim raised the wrong error", False)
+        (_xwf / "reasonless.yml").unlink()
+        (_xwf / "twice.yml").write_text(
+            "on:\n  schedule:\n    # cron-exclusive: one reason\n"
+            "    # cron-exclusive: a contradicting second reason\n"
+            "    - cron: '6 * * * *'\njobs: {}\n")
+        try:
+            exclusive_minute_lanes(_xtmp)
+            chk("exclusive lanes: TWO markers in one file raise rather than one silently "
+                "winning", False)
+        except AlarmError:
+            pass
+        except Exception:
+            chk("exclusive lanes: a doubly-marked lane raised the wrong error", False)
+    try:
+        exclusive_minute_lanes(_xtmp)
+        chk("exclusive lanes: a MISSING workflows directory raises rather than returning {} — "
+            "a thin checkout must not read as `nobody claimed anything`", False)
+    except AlarmError:
+        pass
+    except Exception:
+        chk("exclusive lanes: a missing workflows directory raised the wrong error", False)
+
+    # --- exclusive_minute_violations: PURE, both directions, on maps written here. The minute
+    # sets below are chosen so a partial overlap cannot be confused with a full one and so no
+    # two lanes share a value by accident. ---
+    _held = {".github/workflows/sweeper.yml": {4, 24, 44},
+             ".github/workflows/other.yml": {8, 38},
+             ".github/workflows/third.yml": {50, 55}}
+    _claim = {".github/workflows/sweeper.yml": "three whole ticks"}
+    chk("exclusive minutes: a claim the map bears out reports NOTHING",
+        exclusive_minute_violations(_held, _claim) == [])
+    chk("exclusive minutes: ONE shared minute out of three is a violation — a partial overlap "
+        "must not average away, and the record names the other lane and the minute",
+        exclusive_minute_violations(
+            {".github/workflows/sweeper.yml": {4, 24, 44},
+             ".github/workflows/other.yml": {8, 24}}, _claim)
+        == [{"lane": ".github/workflows/sweeper.yml", "kind": "shared-minute",
+             "other": ".github/workflows/other.yml", "minutes": [24]}])
+    chk("exclusive minutes: EVERY contradicting lane is reported, not just the first",
+        [(v["other"], v["minutes"]) for v in exclusive_minute_violations(
+            {".github/workflows/sweeper.yml": {4, 24, 44},
+             ".github/workflows/other.yml": {4, 44},
+             ".github/workflows/third.yml": {24}}, _claim)]
+        == [(".github/workflows/other.yml", [4, 44]),
+            (".github/workflows/third.yml", [24])])
+    chk("exclusive minutes: a lane that did NOT claim keeps its overlaps — this is opt-in, and "
+        "reporting an unclaimed overlap is what would make the estate check unsatisfiable",
+        exclusive_minute_violations(
+            {".github/workflows/sweeper.yml": {4, 24, 44},
+             ".github/workflows/other.yml": {8, 38},
+             ".github/workflows/third.yml": {8, 38}}, _claim) == [])
+    chk("exclusive minutes: a claimant the map does not hold is an UNSCHEDULED-CLAIM, never a "
+        "clean bill — a marker on an unscheduled lane and a map that read nothing look alike",
+        exclusive_minute_violations(
+            _held, {".github/workflows/absent.yml": "claims from nowhere"})
+        == [{"lane": ".github/workflows/absent.yml", "kind": "unscheduled-claim",
+             "other": None, "minutes": []}])
+    chk("exclusive minutes: an EMPTY map turns every claim into a violation, so a thin checkout "
+        "reds here instead of clearing every claim at once",
+        [v["kind"] for v in exclusive_minute_violations({}, _claim)] == ["unscheduled-claim"])
+    chk("exclusive minutes: NO claims reports nothing — the one vacuity this function cannot "
+        "see, which is why the seam floors the claim COUNT before reading its verdict",
+        exclusive_minute_violations(_held, {}) == [])
 
     # --- M1 scope: EVERY scheduled lane here (no cron_lane_liveness counterpart) ---
     sched_only = {"schedule": [{"cron": "*/15 * * * *"}], "workflow_dispatch": None}
@@ -2235,6 +2454,28 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             len(_map) >= MIN_SCHEDULED_LANES)
         chk("seam: every lane in the schedule map holds at least one minute",
             all(minutes for minutes in _map.values()))
+        # --- THE OPT-IN DISJOINTNESS CLAIMS (#1278), against the LIVE tree ------------
+        # Estate-wide disjointness is NOT this repo's invariant (see CRON_EXCLUSIVE_RE for the
+        # measurement that decided it); a lane that needs a private minute declares one, and
+        # this is where the declaration is checked against the derived map. The floor comes
+        # FIRST because a verdict of [] means "no claim was contradicted", which is also what
+        # a claim set that stopped being read returns.
+        _exclusive = exclusive_minute_lanes(root)
+        chk(f"seam: at least {MIN_EXCLUSIVE_MINUTE_LANES} lanes declare a private cron minute "
+            f"(saw {sorted(_exclusive)}) — with none, the estate check below is vacuous",
+            len(_exclusive) >= MIN_EXCLUSIVE_MINUTE_LANES)
+        # The two lanes whose OWN prose makes the claim, pinned by name so deleting a marker
+        # reds here rather than quietly narrowing what the estate check watches. A subset
+        # check, not equality: a new lane may declare without touching this file.
+        chk("seam: regate-sweep and latch-watchdog still declare — both state in their own "
+            "headers that their minutes are free of every other lane, and the marker is what "
+            "makes that statement enforced rather than aspirational",
+            {f"{WORKFLOWS_DIR}/regate-sweep.yml",
+             f"{WORKFLOWS_DIR}/latch-watchdog.yml"} <= set(_exclusive))
+        _violations = exclusive_minute_violations(_map, _exclusive)
+        chk("seam: every lane that claims a private cron minute HAS one — repointing any lane "
+            f"in this directory onto a claimed minute reds here ({_violations})",
+            _violations == [])
         wf = yaml.safe_load((root / GROOM_WORKFLOW).read_text())
         jobs = wf.get("jobs", {})
         chk("seam: groom.yml hosts a `ci-latency` job", "ci-latency" in jobs)

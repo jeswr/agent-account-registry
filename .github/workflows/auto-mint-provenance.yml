@@ -51,7 +51,16 @@ on:
         type: boolean
   schedule:
     # Explicit minutes mirror dispatch/retriage/curate and avoid GitHub's degraded */N scheduling.
-    # Offset from curate (17,47) and the other half-hourly sweeps so the ticks do not pile up.
+    #
+    # The line that used to sit here said the offset was chosen "so the ticks do not pile up". The
+    # derived map (#1046) says otherwise, on BOTH of these ticks, so the claim is withdrawn rather
+    # than restated (#1278): disjointness is opt-in per lane on this repo — a lane that needs a
+    # minute to itself carries a `cron-exclusive:` marker line, which ci-latency-alert.py checks
+    # against the derived map — and this lane declares nothing. The pile-up is bounded (its own
+    # concurrency group, a per-tick cap of DEFAULT_MAX_MINTS records) but it is NOT nothing: the
+    # lane it lands on also commits to the `ledger` ref, so the two can lose a PUT to each other.
+    # That is a whole class — several lanes write that one ref on minutes nobody coordinates — and
+    # it is filed as its own issue rather than half-fixed here by moving one cron.
     - cron: '13,43 * * * *'
 
 permissions: {}
