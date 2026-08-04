@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5904,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0e30f2b946389999048e9b0c63ed385c1dafefec",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "beads_export_records selects newest using raw string ordering and only scan_beads_export_stale later parses that single value. For example, an old valid record plus any record whose timestamp is `zzzz` yields newest=`zzzz`; export_age_days returns None, stale becomes false, and an old export is not flagged unless the independent missing-reference count also happens to exceed 25. Thus a malformed field poisons all valid timestamp evidence instead of being skipped, despite the parser's documented tolerance and the report's `unparsable` wording.",
+    "file": "scripts/drift-scan.py",
+    "fix_hint": "Parse each candidate timestamp while iterating, ignore invalid candidates, and compare normalized timezone-aware datetimes (retaining a canonical string for reporting). Add a test with an old valid timestamp and a lexicographically larger malformed timestamp, with no missing references, asserting that the stale finding still fires. This also avoids incorrect ordering if valid ISO-8601 timestamps use different UTC offsets.",
+    "severity": "major",
+    "title": "One malformed timestamp can suppress stale-export detection"
+   }
+  ],
+  "progress": null,
+  "summary": "The new scanner is well scoped and its tests cover the normal age and missing-reference paths, but malformed timestamp handling can silently disable the age signal. The implementation chooses the lexicographically greatest raw timestamp before validating it; one malformed but lexicographically high field can therefore eclipse every valid timestamp, make export_age_days return null, and prevent a genuinely stale export from being reported when the missing-reference threshold is not exceeded. This contradicts the stated malformed-data tolerance and needs a focused regression test.",
+  "verdict": "request_changes"
+ }
+}
