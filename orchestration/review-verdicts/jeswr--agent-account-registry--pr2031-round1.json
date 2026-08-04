@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2031,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d74d35abffc5b6c882af474a948db5e039bdaf9c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly replaces groom's private case-sensitive `Retry-After` lookup with the existing shared case-insensitive header reader while retaining the shared strict numeric parser. The new tests cover lowercase mappings, `.items()`-only objects, unreadable objects, exception rendering, delegation identity, the exact requested field name, and the dependency's own self-test. The production call remains bounded to idempotent transient retries, missing or unreadable headers still fall back to the existing backoff, and the checkout dependency fails loudly if absent. I found no correctness, soundness, test-vacuity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
