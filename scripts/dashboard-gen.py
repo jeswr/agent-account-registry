@@ -2081,12 +2081,21 @@ def _obs_flow(flow):
     # published a load-balance figure derived from the other half, and a wrong number reads as a
     # measurement where an empty panel at least reads as nothing.
     #
+    # A row is subtracted from that sample TWO ways, and both are announced: the row is not an
+    # object at all, or it is a well-formed row whose `utilization_1h` this build cannot read. The
+    # second is the likelier producer/consumer mismatch — a collector reporting a percentage, a
+    # string, or a null-shaped sentinel keeps a row that PARSES and passes the decision-22 label
+    # check, and pre-#1869 it lowered the sample with no diagnostic anywhere. The absent/null case
+    # is NOT a mismatch and stays silent: a row that reports no utilization is an unmeasured row,
+    # which is #1557's reading of an explicit null, held here for the reason `_obs_stat` holds it.
+    #
     # Decision 22 bounds what may be said, which is why this seam took its own review rather than
     # riding along with #1571's six: the message names the row's SHAPE — a type name this build
     # computed — and NOTHING out of the row. A lease row's `label` is a salted account fingerprint
     # and #374/#841 removed exactly those from the published page; echoing one into the build log
     # would republish it one artifact over. A non-object row can itself BE a raw handle string, so
-    # there is no safe `_obs_text` form of it and none is taken.
+    # there is no safe `_obs_text` form of it and none is taken; an unreadable `utilization_1h` is
+    # named by TYPE for the same reason, since a collector controls that value too.
     lease_drops = _ObsDropLog("observability lease rows")
     lease_utilizations = []
     for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
@@ -2098,9 +2107,14 @@ def _obs_flow(flow):
         if not isinstance(label, str) or OBS_SALTED_LABEL_RE.fullmatch(label) is None:
             raise DashboardError(
                 "observability lease row does not carry a salted account label (decision 22)")
-        utilization = _obs_fraction(item.get("utilization_1h"))
+        raw_utilization = item.get("utilization_1h")
+        utilization = _obs_fraction(raw_utilization)
         if utilization is not None:
             lease_utilizations.append(utilization)
+        elif raw_utilization is not None:
+            lease_drops.drop("observability lease input (row `utilization_1h` "
+                             f"(type {type(raw_utilization).__name__}) is not a fraction "
+                             "between 0 and 1)")
     # Load-bearing, unlike the stat seam's `close()` below: `flow.leases` is unbounded on the way
     # IN and #374 publishes none of it on the way out, so nothing else limits how many rows can
     # announce themselves. A snapshot of 100k unreadable rows must write 12 lines and one total.
@@ -7542,6 +7556,42 @@ esac
         check(f"[#1869] {case} is dropped LOUDLY, and with no row left the stat HIDES rather than "
               "publishing an aggregate over an empty sample",
               obs_lease_drops([row]), (None, [_LEASE_DROP.format(detail)]))
+    # THE SECOND WAY A ROW LEAVES THE SAMPLE, and the likelier producer/consumer mismatch: the row
+    # is a well-formed object carrying a salted label — so the guard above waves it through and the
+    # decision-22 check passes — but `_obs_fraction` cannot read its `utilization_1h`. Pre-#1869
+    # that row was subtracted from the sample with NO diagnostic at all, which is the same
+    # confident-mean-over-the-survivors failure as a dropped non-object row and is invisible to
+    # every row above (they all send readable values). Announcing only inside the `isinstance`
+    # guard reds all three of these. The reject side is walked by TYPE because a guard narrowed to
+    # one of them (`isinstance(raw, str)`) survives a suite that only ever sends a string.
+    _LEASE_UTIL = ("dashboard-gen: dropped observability lease input (row `utilization_1h` "
+                   "(type {}) is not a fraction between 0 and 1)")
+    for case, value, type_name in (
+        ("an unparseable string", "busy", "str"),
+        ("a percentage out of the 0..1 range", 80, "int"),
+        ("a boolean", True, "bool"),
+        ("a nested object", {"mean": 0.4}, "dict"),
+    ):
+        check(f"[#1869] a lease row reporting {case} still publishes the SURVIVORS' aggregate, "
+              "and the row it quietly subtracted from that sample now names itself",
+              obs_lease_drops([copy.deepcopy(_KEPT_LEASE),
+                               {"label": "ef56ab78b3c2d104", "provider": "anthropic",
+                                "utilization_1h": value}]),
+              ({"mean": 0.8, "max": 0.8}, [_LEASE_UTIL.format(type_name)]))
+    # ...and the accept side of that same guard: a row that reports NO utilization is an unmeasured
+    # row, not a shape mismatch, so it stays silent (#1557's reading of an explicit null, which
+    # `_obs_stat` already holds one seam over). Announce every unreadable fraction unconditionally
+    # — the tempting one-line form — and a collector that has simply not shipped the field yet
+    # writes one warning per account per build; these two rows are what stops that.
+    for case, row in (
+        ("absent", {"label": "ef56ab78b3c2d104", "provider": "anthropic"}),
+        ("an explicit null", {"label": "ef56ab78b3c2d104", "provider": "anthropic",
+                              "utilization_1h": None}),
+    ):
+        check(f"[#1869] a lease row whose utilization is {case} is UNMEASURED, not malformed: it "
+              "is absent from the sample and announces nothing",
+              obs_lease_drops([copy.deepcopy(_KEPT_LEASE), row]),
+              ({"mean": 0.8, "max": 0.8}, []))
     # DECISION 22 is why this seam is announced separately from #1571's six. A non-object row can
     # itself BE an account identity — a raw handle, or the salted fingerprint #374/#841 removed
     # from the published page — so the message may name the row's TYPE and nothing else. Echo the
