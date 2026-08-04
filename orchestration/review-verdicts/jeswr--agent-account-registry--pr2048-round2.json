@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2048,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9874c744f6b5424bbd23a00680746dd802d385df",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 change remains correct and complete. The repeated no-change path escalates only after the second decline, only from bot-authored durable fix-model evidence that uniquely identifies one provider ladder, and it fails closed for absent, malformed, forged, cross-provider, or exhausted histories. Injection and gate-failure paths retain precedence and still park. The escalation is bounded by the finite ladder and monotonic durable pin, preserves the blocking review state and findings, and feeds the existing route-constrained dispatch path. The shared tier helper preserves decide_budget's validated behavior. Tests exercise both state-machine directions, count and security precedence, attribution ambiguity, termination, marker identity/readback, legacy park classification, and the real fix_outcome tier/provider wiring. No reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
