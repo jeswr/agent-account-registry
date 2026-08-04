@@ -662,6 +662,101 @@ def _issue_view(number, registry_repo, run):
     return issue.get("body") or "", count, True
 
 
+# ---- [#317] SERIALIZATION PREMISE: this lane vs the other account-catalog writers ---------------
+# #317 asked for a shared serialization mechanism between `persist_limits` and set-up-account.yml —
+# a claim-ref / advisory lock in the `acct-claims` namespace, held across the limits write,
+# mirroring the broker's first-writer-wins ref. That lock is REFUSED. What ships instead is the
+# ENFORCEMENT of the two wiring facts that keep the automated write window EMPTY, via the three
+# readers below and the `[#317]` rows in `_self_test`. Reasons, in the order they were decided:
+#
+#   1. MEASUREMENT FIRST — #317's premise is half true, and the false half is the load-bearing one.
+#      The two lanes' RUNS can indeed overlap (`registry-dispatcher` vs `set-up-account-login` are
+#      different concurrency groups). But the broker has no body-replacing write to lose: it writes
+#      an account-record body EXACTLY ONCE, with `gh issue create` (set-up-account.yml:824), and
+#      both of its `gh issue edit` calls are label-only (:1216, :1490 — `--remove-label` /
+#      `--add-label`, no `--body`). A create cannot be clobbered by our edit of a different issue,
+#      and our edit re-reads the fresh body first (#198). So the residual window is against
+#      OUT-OF-BAND MANUAL edits, exactly as `_persist_one` says.
+#   2. A MUTEX CANNOT BIND THE WRITER THAT ACTUALLY REACHES THE WINDOW. A human editing an issue
+#      body in the web UI observes no ref protocol, so serializing the two automated writers against
+#      each other narrows nothing that is reachable today — while the count-shape guard already
+#      DETECTS the manual case and refuses loudly.
+#   3. THE NAMESPACE HAS NO RELEASE, BY DESIGN, AND THAT IS WHAT MAKES IT SOUND. `acct-claims` refs
+#      are never deleted — "a run that fails after claiming burns its slot rather than releasing it,
+#      so a different credential can never overwrite an in-flight one" (set-up-account.yml:653). A
+#      lock is the same primitive with the opposite requirement: it MUST be released, and a holder
+#      that dies mid-hold (a cancelled run, a 15-minute job timeout) leaves a ref no automation may
+#      remove. That fail-closes ACCOUNT ENROLLMENT — the highest-consequence path in this repo — to
+#      protect a `limits:` line whose sole consumer is one dashboard capacity FALLBACK
+#      (research/1051-catalog-clobber-auto-restore.md §5). Backwards trade, and §7 of that record
+#      says to settle where the line is STORED before investing further in this guard.
+#
+# So the honest cure is to stop the premise from rotting silently. Both halves are falsifiable
+# offline, from the checked-out workflow files, and both go RED on the repoint that would make the
+# window reachable by automation: (a) the persist entrypoint leaving the one workflow whose runs are
+# serialized, and (b) the broker acquiring a body-replacing write.
+def _workflow_concurrency(text):
+    """PURE: the DOCUMENT-level `concurrency:` mapping of a workflow file, as {key: raw value text}.
+
+    Anchored at column 0, which in a workflow document can only be the document's own key — a
+    job-level `concurrency:` is indented under `jobs:` and must never be able to satisfy an
+    assertion about the WORKFLOW's serialization. Anything but exactly one such block reads as `{}`
+    (fail closed: an absent or ambiguous declaration must never report as 'serialized')."""
+    blocks = re.findall(r"(?m)^concurrency:[ \t]*\n((?:[ \t]+[^\n]*\n)+)", text)
+    if len(blocks) != 1:
+        return {}
+    mapping = {}
+    for line in blocks[0].split("\n"):
+        entry = line.strip()
+        if entry.startswith("#"):
+            continue
+        key, sep, value = entry.partition(":")
+        if sep:
+            mapping[key.strip()] = value.strip()
+    return mapping
+
+
+def _gh_issue_edit_invocations(text):
+    """PURE: every `gh issue edit ...` command in a shell/workflow document, one reassembled
+    LOGICAL line each (backslash continuations joined, whitespace collapsed).
+
+    Continuations are joined BEFORE the command is judged, because that is where this reader would
+    otherwise be vacuous: set-up-account.yml's own label edit spans two physical lines, so a reader
+    working line-by-line would report every continued `--body` write as body-free — the exact
+    acquisition the caller's assertion exists to catch. Whole-line comments are dropped so prose
+    can neither satisfy nor defeat an assertion about code."""
+    logical, buffer = [], ""
+    for line in text.split("\n"):
+        entry = line.strip()
+        if entry.startswith("#"):
+            continue
+        if entry.endswith("\\"):
+            buffer += entry[:-1].strip() + " "
+            continue
+        logical.append(buffer + entry)
+        buffer = ""
+    if buffer:
+        logical.append(buffer)
+    return [" ".join(command.split()) for command in logical
+            if re.search(r"\bgh issue edit\b", command)]
+
+
+def _workflows_containing(token, workflows_dir):
+    """The sorted names of the workflow files under `workflows_dir` whose text carries `token`.
+
+    Used to pin WHERE an entrypoint is invoked from. An unreadable directory raises rather than
+    returning an empty list: 'no workflow runs this' and 'I could not look' must never be the same
+    answer to a serialization question."""
+    names = []
+    for name in sorted(os.listdir(workflows_dir)):
+        if not name.endswith((".yml", ".yaml")):
+            continue
+        with open(os.path.join(workflows_dir, name), encoding="utf-8") as handle:
+            if token in handle.read():
+                names.append(name)
+    return names
+
+
 def _persist_one(number, handle, line, registry_repo, run, schema_errors):
     """Merge the single `limits:` line into ONE account issue via a GUARDED read-merge-write (issue
     #198). `gh issue edit --body` REPLACES the whole body and GitHub's issue API has no conditional
@@ -678,8 +773,10 @@ def _persist_one(number, handle, line, registry_repo, run, schema_errors):
     bounded by PERSIST_ATTEMPTS. Automated writers cannot even reach the window — dispatch.yml
     self-serializes (`registry-dispatcher`, cancel-in-progress: false) and set-up-account only
     CREATES catalog issues (fail-closed on re-registration) — so this guard covers out-of-band
-    manual edits, and its soundness does not depend on that workflow config. Returns True on
-    success (incl. an idempotent no-op), False otherwise — the caller PROPAGATES it."""
+    manual edits, and its soundness does not depend on that workflow config. [#317] BOTH halves of
+    that premise are now ENFORCED rather than asserted in this prose (see SERIALIZATION PREMISE
+    above), because prose is what a repoint walks straight past. Returns True on success (incl. an
+    idempotent no-op), False otherwise — the caller PROPAGATES it."""
     for _ in range(PERSIST_ATTEMPTS):
         body0, count0, ok = _issue_view(number, registry_repo, run)
         if not ok:
@@ -1744,6 +1841,79 @@ def _self_test(escaped=None):
         os.environ.pop("REGISTRY_REPO", None)
     else:
         os.environ["REGISTRY_REPO"] = saved_repo
+
+    # ---- [#317] the SERIALIZATION PREMISE, made falsifiable (see the block above _persist_one) -
+    # The rows above prove the guard DETECTS a lost foreign edit. It cannot PREVENT one — the issue
+    # API has no conditional write — so what keeps the AUTOMATED window empty is wiring, and until
+    # now that wiring lived only in `_persist_one`'s docstring. These rows read it out of the
+    # checked-out workflow files, where a repoint is visible offline. They run in the live claim job
+    # too: dispatch.yml preflights `--self-test` in the same job that later persists.
+    dg = _load_sibling(script_dir, "dashboard-gen.py", "registry_dashboard_gen")
+    workflows_dir = os.path.join(os.path.dirname(script_dir), ".github", "workflows")
+    #   (a) persist vs persist: the entrypoint is invoked from exactly ONE workflow, and that
+    #   workflow serializes its own runs. Moving the step into a second lane — the repoint that
+    #   makes two persist writers concurrent — reds this row instead of shipping silently.
+    chk("[#317] exactly one workflow invokes the tier-limit persist entrypoint",
+        _workflows_containing("--persist-limits", workflows_dir), ["dispatch.yml"])
+    #   CONTROL for the row above: the same scan over a token many workflows DO carry. Without it,
+    #   a scan that read nothing (wrong directory, wrong suffix filter) would satisfy `[]` for the
+    #   wrong reason and the single-name assertion would be measuring an empty sweep.
+    chk("[#317] ...and that scan really does see the workflow directory (control)",
+        len(_workflows_containing("actions/checkout@", workflows_dir)) > 1, True)
+    #   the scan's own selection, over a directory whose noise this repo's real one happens not to
+    #   have: both workflow suffixes are read, and a same-named non-workflow file is not.
+    with tempfile.TemporaryDirectory() as scan_dir:
+        for name in ("a.yml", "b.yaml", "c.txt", "d.yml.bak", "notes.md"):
+            with open(os.path.join(scan_dir, name), "w", encoding="utf-8") as handle:
+                handle.write("--persist-limits\n")
+        chk("[#317] the workflow scan reads .yml and .yaml only, never a neighbouring file",
+            _workflows_containing("--persist-limits", scan_dir), ["a.yml", "b.yaml"])
+    concurrency = _workflow_concurrency(dg._repo_file(".github", "workflows", "dispatch.yml"))
+    #   `cancel-in-progress: false` is the half that keeps a queued tick WAITING instead of killing
+    #   a run mid write->confirm, so it is pinned by VALUE — a truthiness read would accept `true`.
+    chk("[#317] the persisting workflow serializes its runs and never cancels one mid-write",
+        (concurrency.get("group"), concurrency.get("cancel-in-progress")),
+        ("registry-dispatcher", "false"))
+    #   the reader's own two directions: a JOB-level group must not satisfy a DOCUMENT-level
+    #   question (set-up-account.yml declares only job-level ones), and an ambiguous document is {}.
+    chk("[#317] the concurrency reader is document-level: a job-level group cannot satisfy it",
+        _workflow_concurrency("jobs:\n  claim:\n    concurrency:\n      group: job-level\n"
+                              "      cancel-in-progress: false\n"), {})
+    #   ...and it reads a document-level block it IS given — through a COMMENT that would otherwise
+    #   forge a key into the mapping. The expected value is the WHOLE mapping, so dropping the
+    #   comment skip adds `# group` and reds this row (a prose claim must never enter the answer).
+    chk("[#317] ...and it does read a document-level block when there is one, comments excluded",
+        _workflow_concurrency("on: push\nconcurrency:\n  # group: forged-by-prose\n  group: g\n"
+                              "  cancel-in-progress: true\n"),
+        {"group": "g", "cancel-in-progress": "true"})
+    chk("[#317] ...and two document-level blocks are ambiguous -> {} (fail closed)",
+        _workflow_concurrency("concurrency:\n  group: a\nconcurrency:\n  group: b\n"), {})
+    #   (b) persist vs the enrollment broker: the broker CREATES account records and never replaces
+    #   a body. If it ever acquires a `--body` edit, the window stops being empty and the mechanism
+    #   #317 asks for has to be built for real — so that acquisition must red a row, not land
+    #   quietly.
+    broker_edits = _gh_issue_edit_invocations(
+        dg._repo_file(".github", "workflows", "set-up-account.yml"))
+    chk("[#317] the enrollment broker issues no body-replacing `gh issue edit` (label edits only)",
+        [command for command in broker_edits if "--body" in command], [])
+    #   CONTROL: the row above is `[]` because every edit it found is label-only, not because the
+    #   extractor found nothing. Bounded below rather than pinned at today's count — an added
+    #   LABEL edit is not the acquisition this guard is watching for, and a control that reds on
+    #   one is a control somebody deletes. `all()` over an empty list is True, so the count half
+    #   is what carries the emptiness.
+    chk("[#317] ...and the extractor DID find that workflow's label edits (control)",
+        (len(broker_edits) >= 2, all("--add-label" in command for command in broker_edits)),
+        (True, True))
+    chk("[#317] ...and it sees a `--body` edit split across a continuation, which is the shape the "
+        "broker's own edits have (positive control)",
+        _gh_issue_edit_invocations('  gh issue edit "$num" -R "$REPO" \\\n'
+                                   '    --body "$new"\n  gh issue comment "$n" --body x\n'),
+        ['gh issue edit "$num" -R "$REPO" --body "$new"'])
+    #   ...including one left OPEN at the end of the document. A reader that drops the unterminated
+    #   continuation loses the last command entirely, which is a body write hiding in plain sight.
+    chk("[#317] ...and a continuation still open at end-of-document is not dropped",
+        _gh_issue_edit_invocations('gh issue edit "$n" \\\n  --body x \\'),
+        ['gh issue edit "$n" --body x'])
 
     ok = _self_test_ledgergate(chk) and ok
 
