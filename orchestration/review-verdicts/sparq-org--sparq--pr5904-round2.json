@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5904,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1747c9090f2b734cc029d8dee61adaee4076f7c7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. beads_export_records now parses every candidate timestamp before comparison, skips unusable values, and compares timezone-aware instants rather than raw strings, so a lexicographically large malformed stamp cannot suppress valid stale-export evidence. The focused tests cover both direct winner selection and the end-to-end stale trigger with no missing-reference fallback, and also verify ordering across UTC offsets. The change is coherent and complete within the diff-scoped scanner behavior.",
+  "verdict": "approve"
+ }
+}
