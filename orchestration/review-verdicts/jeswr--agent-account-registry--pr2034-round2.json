@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2034,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d99a82cd9308ae94f6e2e0adf04cf88bb99f6101",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_invokes_command` checks `token in line.split()`, but shell quoting is removed before argv reaches Python. For example, `run: python3 scripts/account-usage.py \"--persist-limits\" usage.json` really invokes the persistence entrypoint, while `line.split()` produces the distinct token `\"--persist-limits\"`. A second workflow using that entirely ordinary spelling is therefore omitted from `_workflows_invoking`; `serialization_premise_errors` can still report that only dispatch.yml invokes persistence, and the new workflow proceeds because its own production-path premise check sees the same false result. The tests cover comments, prose, and a suffixed token, but no shell-equivalent quoted spelling.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Tokenize executable shell text with a shell-aware lexer (and handle command separators/continuations consistently), then compare the decoded argv token. Add a synthetic second workflow that passes `\"--persist-limits\"` and assert both that it is enumerated and that `persist_limits` refuses before any `gh` call. Include single-quoted and separator-adjacent controls if those forms are supported by the reader.",
+    "severity": "major",
+    "title": "Quoted persist flags bypass workflow invocation discovery"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The production-path enforcement and body-write flag coverage address the prior blocker and one prior major, and prose/comments no longer satisfy the workflow scan. One soundness gap remains in the invocation reader: it models shell argv with whitespace splitting, so ordinary shell quoting can hide a real persistence invocation. Because that lets a second workflow enter the guarded read/edit path without being counted, the serialization premise can still return empty in the condition it is meant to refuse.",
+  "verdict": "request_changes"
+ }
+}
