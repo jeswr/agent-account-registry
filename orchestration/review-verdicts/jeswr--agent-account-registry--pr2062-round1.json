@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2062,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d7c92aed32b2f542da183e9a5745c8bff86c206e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe diff is documentation-only and accurately corrects the three stale consolidation notes: no shared alert_route.py exists, the private route helpers have materially different signatures/return semantics, and the plan/groom alert jobs use single-file sparse checkouts that a future shared-module migration must update and test at the workflow seam. The executable _alert_route body in metrics-alert.py is unchanged. I found no correctness, soundness, test-validity, security, or fail-closed regression in the changed lines.",
+  "verdict": "approve"
+ }
+}
