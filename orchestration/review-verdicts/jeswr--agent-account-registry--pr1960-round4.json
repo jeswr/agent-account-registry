@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1960,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8d57cce64f44dc9c6e2ed2cefb93123a1a1a927c",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The selector remains `started && /^[[:space:]]*path:[[:space:]]*target[[:space:]]*$/`, which does not match `path: \"target\"` or `path: 'target'` even though GitHub Actions/YAML resolves both to the same destination. A pinned, unquoted decoy can therefore be counted as the sole target checkout while the real model checkout uses a quoted target path and a moving/default ref. The extractor returns the decoy's expected ref instead of `<ambiguous>`, so the marquee checks remain green on an unbound model tree. This is materially the same trust-binding bypass reported in round 3, and none of the added mutants exercises quoted scalar equivalence.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Parse YAML values or normalize supported quoted and unquoted scalar spellings before comparing the destination, then fail closed unless exactly one checkout step semantically resolves to `target`. Add non-vacuity mutants containing a correctly pinned unquoted decoy plus a real checkout with each of `path: \"target\"` and `path: 'target'` and a moving or absent ref; both must return `<ambiguous>` or otherwise refuse.",
+    "severity": "major",
+    "title": "Quoted target paths still bypass checkout uniqueness"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major finding remains unresolved. `_model_target_checkout_ref` still recognizes only the literal unquoted scalar `path: target`; semantically equivalent quoted YAML paths remain invisible, allowing a pinned unquoted decoy to mask the real checkout after its path is quoted and its ref is made moving or omitted. The new tests cover only unquoted paths, so they do not close this bypass. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
