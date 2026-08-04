@@ -879,9 +879,11 @@ def _self_test():
     # EXECUTION in the "[#487] the sweep board is EXACTLY the two lane queries" row below), and
     # nothing puts a `github-actions[bot]` issue on either lane: `triage-issue.yml` is the only
     # thing that applies a lane label and it fires on `issues: [opened, edited, reopened, labeled,
-    # unlabeled]` (#607), while events written with the repository's own `GITHUB_TOKEN` do not start
-    # workflow runs — so the alert issues `metrics.py` opens on `github.token`, and every label our
-    # own workflows then write on them, are never triaged at all. `plan()` is
+    # unlabeled]` (#607 — that restatement is READ, not decoration: `triage.py --self-test` scans
+    # for it and reds it against the workflow's own `types:` (#1741), so widen the workflow and
+    # this line in the same change), while events written with the repository's own `GITHUB_TOKEN`
+    # do not start workflow runs — so the alert issues `metrics.py` opens on `github.token`, and
+    # every label our own workflows then write on them, are never triaged at all. `plan()` is
     # therefore never called on them and this gate is never reached. Making the alert-responder
     # class actually triageable needs the UPSTREAM unit (open those issues as the App bot, for
     # which `triage-issue.yml` does fire, or have `metrics.py` apply the triage labels itself);

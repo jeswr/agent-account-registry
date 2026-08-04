@@ -2474,6 +2474,80 @@ def _self_test():
         "run on labeled/unlabeled",
         step_if(wf_step("Static triage (trusted author)")), "steps.trust.outputs.trusted == '1'")
     # -----------------------------------------------------------------------------------------------
+    # [#1741] THE PROSE COPIES OF THAT SAME SET ARE PINNED HERE TOO — the #958 shape applied to
+    # prose. Two sibling modules RESTATE this trigger set in their own comments/docstrings
+    # (`retriage.py`'s [#487] sweep-board argument, `curate-frontier.py`'s `is_staged` docstring)
+    # because it is load-bearing to their argument. No consumer read those copies, so nothing goes
+    # red when they drift — and they are exactly what the next author reasons from. #1741 reports
+    # that shape from the #1094 widening: one copy updated, the other left stale. Both copies were
+    # in fact CORRECT on master when these rows landed (the widening is not on this branch), so
+    # this is the PREVENTIVE half of #1741 — the rows below are what makes the next widening
+    # unable to land half-applied.
+    #
+    # A restatement is a bracketed BARE-WORD list naming both `opened` and `unlabeled`. Bare-word
+    # excludes every quoted Python list — including this section's own expected value on the #607
+    # row above — so no assertion here compares the code against itself, and a PARTIAL reference to
+    # the label events alone (`[labeled, unlabeled]`, this module's header comment) is deliberately
+    # not a restatement. Adding a third prose copy reds the file-set row on purpose: cite this
+    # assertion instead of restating the list, or enrol the new file here deliberately.
+    def prose_restatements(text):
+        """Every restatement of the trigger set in `text`, as sorted token lists.
+
+        Comment/docstring wrapping is FLATTENED first because `retriage.py`'s copy is split across
+        two comment lines: a per-line regex misses it and reports a vacuous zero.
+        """
+        flat = re.sub(r"\n\s*#?\s*", " ", text)
+        found = []
+        for restated in re.finditer(r"\[([a-z][a-z, ]*)\]", flat):
+            toks = sorted(t.strip() for t in restated.group(1).split(",") if t.strip())
+            if {"opened", "unlabeled"} <= set(toks):
+                found.append(toks)
+        return found
+
+    # FIXTURES, built by joining token literals rather than written out as a bracketed list, so that
+    # this module's own source stays free of restatements the live scan below would then attribute
+    # to triage.py. `wrapped_copy` reproduces retriage.py's two-line comment shape.
+    fixture_tokens = ["opened", "edited", "reopened", "labeled", "unlabeled"]
+    flat_copy = "[" + ", ".join(fixture_tokens) + "]"
+    wrapped_copy = "[" + ", ".join(fixture_tokens[:-1]) + ",\n    # " + fixture_tokens[-1] + "]"
+    chk("[#1741] a one-line prose copy is read back as its exact token set",
+        prose_restatements("    # ...the curator's docstring says " + flat_copy + " since #607"),
+        [sorted(fixture_tokens)])
+    chk("[#1741] POSITIVE CONTROL: a copy WRAPPED across comment lines (retriage.py's real shape) "
+        "is read too — without the flatten this row is the vacuous zero the live scan would report",
+        prose_restatements("    # ...it fires on `issues: " + wrapped_copy + "` (#607), while"),
+        [sorted(fixture_tokens)])
+    # The extra token is deliberately NOT a GitHub issue event type: a legitimate future widening
+    # of the workflow (#1094 proposed `typed`/`untyped`) must red the LIVE rows below and nothing
+    # else, so this fixture must never be able to come out equal to `trigger_types`.
+    drifted = prose_restatements(
+        "    # ...it fires on [" + ", ".join(fixture_tokens + ["neverevent"]) + "] (#1094)")
+    chk("[#1741] NEGATIVE CONTROL: a DRIFTED copy (the #1094 widening applied to the prose only) "
+        "is found AND compares unequal to the workflow — this is the failure the live rows detect",
+        (len(drifted), drifted == [trigger_types]), (1, False))
+    chk("[#1741] NEGATIVE CONTROL: a quoted Python list is not a prose copy, so the #607 row's own "
+        "expected value is never scanned as evidence about itself",
+        prose_restatements('    chk("x", trigger_types, ["edited", "labeled", "opened", '
+                           '"reopened", "unlabeled"])'), [])
+    chk("[#1741] NEGATIVE CONTROL: a PARTIAL reference to the label events alone is not a "
+        "restatement of the full set",
+        prose_restatements("# The trigger is `triage-issue.yml`'s `[labeled, unlabeled]` types."),
+        [])
+    live_copies = {}
+    for module in sorted(os.listdir(os.path.join(root, "scripts"))):
+        if not module.endswith(".py"):
+            continue
+        with open(os.path.join(root, "scripts", module), encoding="utf-8") as handle:
+            restated = prose_restatements(handle.read())
+        if restated:
+            live_copies[module] = restated
+    chk("[#1741] the live scan FINDS both known prose copies — EXACT file set, so a regex that "
+        "stopped matching reds here instead of passing on a scan that found nothing",
+        sorted(live_copies), ["curate-frontier.py", "retriage.py"])
+    chk("[#1741] every prose copy restates the workflow's OWN trigger set exactly",
+        sorted({tuple(toks) for restated in live_copies.values() for toks in restated}),
+        [tuple(trigger_types)])
+    # -----------------------------------------------------------------------------------------------
     # [PR #998 round 1, findings 1+2] QUARANTINE REMOVAL IS AUTHORIZED BY THE **ACTOR**, NEVER BY THE
     # EVENT TYPE. #607's first cut exempted `labeled`/`unlabeled` from the quarantine write because
     # "only a triage/write actor can label an issue". That premise contradicts the trust rule three
