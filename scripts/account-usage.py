@@ -38,6 +38,7 @@
 # downstream reads any of it, and Stage A is exactly the change that emits nothing readable: see the
 # OBSERVATION blocks at `_raw_header_fields` and `_assemble_opus5` for why gating a SOLE-tier
 # premium bucket before it has ever been observed is a fleet outage rather than a safeguard.
+import ast
 import contextlib
 import importlib.util
 import io
@@ -702,7 +703,10 @@ def _issue_view(number, registry_repo, run):
 # repoint this guards against is a SECOND workflow entering the read/edit window, and a red row in
 # dispatch.yml's probe step does not stop that workflow's write. Now the refusal travels with the
 # writer: any invocation, from any workflow, reads the same checked-out tree and refuses itself.
-PERSIST_FLAG = "--persist-limits"          # the argv token main() dispatches on (read there too)
+# The entrypoint spells this token as a LITERAL rather than referencing the constant — see the
+# comment at `__main__` — so the two are pinned equal by `_entrypoint_argv_flags`'s `[#317]` rows
+# instead of by sharing a name. Renaming either one alone reds the self-test.
+PERSIST_FLAG = "--persist-limits"          # the argv token the entrypoint dispatches on
 PERSIST_WORKFLOW = "dispatch.yml"          # the ONE workflow allowed to invoke it
 PERSIST_CONCURRENCY = ("registry-dispatcher", "false")   # ...whose runs must serialize, uncancelled
 BROKER_WORKFLOW = "set-up-account.yml"     # the enrollment broker, which must stay create-only
@@ -771,6 +775,33 @@ def _invokes_command(text, token):
     is in a sentence. Substring containment over the whole file — the previous reader — counted
     both (AGENTS.md pre-flight item 6: pin exact-match at the YAML seam, never containment)."""
     return any(token in line.split() for line in _run_script_lines(text))
+
+
+def _entrypoint_argv_flags(source):
+    """PURE: the string LITERALS a module's `if __name__ == "__main__":` block tests `sys.argv` for.
+
+    The counterpart of `_invokes_command`, on the other side of the same seam: that one reads which
+    token a workflow PASSES, this one reads which tokens the entrypoint DECLARES. Both must name
+    the same flag, and pr-gate's required CLI-signature step is what compares them — it parses the
+    script's AST and counts only a LITERAL operand, so a dispatch spelled through a named constant
+    declares nothing at all and every workflow-passed flag reads as drift. Deliberately scoped to
+    the `__main__` block: a literal somewhere else in the module cannot dispatch anything, so it
+    must not be able to answer "does the entrypoint still select this flag?". Fail-closed by
+    construction — an unparseable module raises rather than reporting an empty declaration set."""
+    flags = set()
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name) and node.test.left.id == "__name__"):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Compare):
+                continue
+            operands = [inner.left, *inner.comparators]
+            if any(isinstance(operand, ast.Attribute) and operand.attr == "argv"
+                   for operand in operands):
+                flags |= {operand.value for operand in operands
+                          if isinstance(operand, ast.Constant) and isinstance(operand.value, str)}
+    return flags
 
 
 def _workflow_concurrency(text):
@@ -2134,6 +2165,32 @@ def _self_test(escaped=None):
                              f"      - run: python3 x.py {PERSIST_FLAG} usage.json\n")
         chk("[#317] the workflow scan reads .yml and .yaml only, never a neighbouring file",
             _workflows_invoking(PERSIST_FLAG, scan_dir), ["a.yml", "b.yaml"])
+    #   ...and the OTHER side of that same seam, which the round-1 constant broke: the workflow
+    #   passes `--persist-limits`, and pr-gate's REQUIRED CLI-signature step asks whether this
+    #   script DECLARES it — from the AST, counting only a literal operand. Routing the entrypoint
+    #   through `PERSIST_FLAG` declared nothing, so the shipped, correct wiring reported as
+    #   "scripts/account-usage.py is passed --persist-limits, which the script never declares" and
+    #   the required gate went red. The expected set is built from PERSIST_FLAG, so this row is
+    #   ALSO the pin that keeps the entrypoint's literal and the wiring guard's constant equal:
+    #   renaming either one alone reds it.
+    with open(os.path.abspath(__file__), encoding="utf-8") as handle:
+        own_source = handle.read()
+    chk("[#317] the entrypoint DECLARES its flags as literals (pr-gate reads the AST, not names)",
+        _entrypoint_argv_flags(own_source), {"--self-test", PERSIST_FLAG})
+    #   the reader's own directions, on sources whose token appears nowhere else in this harness: a
+    #   constant-routed dispatch declares NOTHING (the regression), a literal one declares its flag,
+    #   a literal outside the entrypoint block dispatches nothing so it declares nothing, and a
+    #   literal inside the block that is never tested against `sys.argv` is not a declaration either
+    #   (without that last one, a reader that simply collected every string in `__main__` would
+    #   agree with the shipped module and answer the wrong question everywhere else).
+    chk("[#317] ...and the reader's four directions: constant / literal / outside / non-argv",
+        [_entrypoint_argv_flags(source) for source in (
+            'FLAG = "--zzq-token"\nif __name__ == "__main__":\n'
+            "    if FLAG in sys.argv:\n        pass\n",
+            'if __name__ == "__main__":\n    if "--zzq-token" in sys.argv:\n        pass\n',
+            'if "--zzq-token" in sys.argv:\n    pass\n',
+            'if __name__ == "__main__":\n    print("--zzq-token")\n')],
+        [set(), {"--zzq-token"}, set(), set()])
     concurrency = _workflow_concurrency(dg._repo_file(".github", "workflows", "dispatch.yml"))
     #   `cancel-in-progress: false` is the half that keeps a queued tick WAITING instead of killing
     #   a run mid write->confirm, so it is pinned by VALUE — a truthiness read would accept `true`.
@@ -2721,7 +2778,14 @@ def _self_test_ledgergate(chk):
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         sys.exit(_run_self_test_contained())
-    if PERSIST_FLAG in sys.argv:               # the SAME token the wiring guard looks for
-        index = sys.argv.index(PERSIST_FLAG)
+    # The dispatch token is spelled as a LITERAL, never as `PERSIST_FLAG`. pr-gate's required
+    # CLI-signature step reads the flags a script DECLARES from its AST — an `add_argument` literal
+    # or an argv membership/index test whose operand is a literal — so a dispatch written through a
+    # named constant declares nothing there and dispatch.yml's shipped `--persist-limits` reads as
+    # signature drift, redding the required `gate` on a correct tree. `_entrypoint_argv_flags` +
+    # its `[#317]` rows pin this literal EQUAL to PERSIST_FLAG, so the guard and the entrypoint
+    # still cannot drift apart (which is the reason the constant exists).
+    if "--persist-limits" in sys.argv:         # == PERSIST_FLAG, the token the wiring guard reads
+        index = sys.argv.index("--persist-limits")
         sys.exit(persist_limits(sys.argv[index + 1]))
     sys.exit(main())
