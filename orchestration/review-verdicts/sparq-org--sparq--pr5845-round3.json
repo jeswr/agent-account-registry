@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5845,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4e39e8dd68debfbfd8a5fe4bae2b546f200f448c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. Version extraction is now scoped by indentation to direct children of the action step's `with:` mapping, preserves duplicate entries for rejection, and returns a non-version sentinel when the input is absent, empty, duplicated, or misplaced. The focused mutation coverage includes both the previously identified sibling `env.version` bypass and duplicate direct `with.version` keys; the complete focused suite passes. The workflow change consistently pins ci.yml to the same exact wasm-pack version as js.yml, with no new correctness, soundness, test-validity, or security issue found.",
+  "verdict": "approve"
+ }
+}
