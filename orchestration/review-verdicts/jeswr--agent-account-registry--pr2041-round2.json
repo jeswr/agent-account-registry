@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2041,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f2ac5e9c7f491e9a7a638a7213295195078a33af",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The file still begins with `# [FABLE-5]`. AGENTS.md requires model-agnostic `[SPARQ agent]` source provenance and says legacy model-qualified markers migrate when a file is touched.",
+    "file": ".github/workflows/metrics.yml",
+    "fix_hint": "Replace the legacy model-qualified header marker with the model-agnostic `[SPARQ agent]` marker without changing the substantive header text.",
+    "severity": "minor",
+    "title": "Touched file retains a legacy model-qualified provenance marker"
+   },
+   {
+    "body": "The file still begins with `# [OPUS-5]`. AGENTS.md requires model-agnostic `[SPARQ agent]` source provenance and says legacy model-qualified markers migrate when a file is touched.",
+    "file": ".github/workflows/auto-mint-provenance.yml",
+    "fix_hint": "Replace the legacy model-qualified header marker with the model-agnostic `[SPARQ agent]` marker without changing the substantive header text.",
+    "severity": "minor",
+    "title": "Touched file retains a legacy model-qualified provenance marker"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The opt-in exclusivity control is correct, complete, and fail-closed for its declared scope. Marker parsing is anchored to standalone comment lines; missing trees, reasonless claims, duplicate claims, absent scheduled claimants, and all overlaps fail visibly. The live seam independently derives the schedule map, floors the evidence, pins both load-bearing claimants by name, and rejects every contradiction, while hermetic tests cover positive, negative, partial-overlap, multi-overlap, empty-map, empty-claim, duplicate, and missing-tree cases. No hostile reviewer-directed instruction was detected in the diff. The two minor provenance findings from round 1 remain unresolved, so progress is stagnant, but neither undermines the trust control.",
+  "verdict": "approve"
+ }
+}
