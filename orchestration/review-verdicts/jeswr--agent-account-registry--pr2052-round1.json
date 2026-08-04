@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2052,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "017625701371892c65d43c0902af20dd7ba22898",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_cron_minutes` now claims that anything it cannot expand raises, but the delegated `ci-latency-alert.py` expander filters values outside 0..59 after unioning the field. Thus a minute field such as `3,13,23,33,43,53,60` expands to the same six-minute set as the valid dispatch schedule. `_test_budget_arithmetic` then sees `(None, 6, True)` and passes, while the workflow cron is malformed and the claimed six scheduled firings do not exist. The added rejection rows cover wholly invalid inputs but not a mixed valid/invalid list, so they do not detect this fail-open edge.",
+    "file": "scripts/dispatch-tick-floor.py",
+    "fix_hint": "Make the shared expansion contract reject any out-of-range atom/range endpoint instead of silently filtering it, then add a consumer-side self-test using a literal containing the six expected valid minutes plus a unique out-of-range minute and assert that it raises. If the owner cannot be changed in this PR, validate the minute field before accepting its delegated result without reintroducing a second expansion implementation.",
+    "severity": "major",
+    "title": "Schedule assertion accepts partially invalid minute fields"
+   }
+  ],
+  "progress": null,
+  "summary": "The shared-expander wiring and sparse-checkout seam are coherent, and the tests do exercise the stepped-range regression and ownership failure. However, the new fail-closed claim is not true for mixed valid/out-of-range minute lists: the consumed expander silently filters out-of-range values. A malformed workflow can therefore retain the expected six valid minutes, add an invalid minute, and still make the new budget row pass even though GitHub will not provide the asserted schedule. The consumer needs a non-vacuous rejection check for this case before approval.",
+  "verdict": "request_changes"
+ }
+}
