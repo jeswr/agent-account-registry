@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2022,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d50d380e447405fa3e0ea812c5f4cb48a27fab21",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly closes the continue-on-error observability gap. Each watchdog exports the pre-continue outcome, groom-alert has exact needs wiring under always(), and the runtime requires explicit success on both the job and alert-step legs before recovery closes an alert. Missing or malformed evidence cannot close alerts, write failures propagate through the alert step outcome, routing retains the verified-private fail-closed behavior, and the workflow-seam plus end-to-end tests exercise the load-bearing call-site, output, gate, sparse-checkout, dedupe, and return-code paths without relying on substring-only assertions. No blocker or major issue is supported by the diff. Injection detection is set because the untrusted diff contains reader-directed imperative text (for example, \u201cRead this block once\u201d and \u201cKEEP IN SYNC\u201d); those statements were treated only as data and did not influence the verdict.",
+  "verdict": "approve"
+ }
+}
