@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-5] ALERT ON THE STOCK, NOT THE RUN — applied to the HUMAN-TERMINAL park population.
+# [SPARQ agent] ALERT ON THE STOCK, NOT THE RUN — applied to the HUMAN-TERMINAL park population.
 #
 # The principle is `triage-stock-alert.py`'s and it is quoted here because this file exists only
 # because it was not applied widely enough:
@@ -415,6 +415,8 @@ def _self_test():
 
     # ---- the alert-route contract (#1667, extending #1021) --------------------------------------
     _test_alert_route_contract(chk)
+    # ---- and the route's END-TO-END wiring into the gh calls (#1773) ----------------------------
+    _test_route_wiring(chk)
 
     print(("park-stock-alert self-test: FAIL " + ", ".join(failures)) if failures
           else "park-stock-alert self-test: PASS")
@@ -608,6 +610,141 @@ def _test_alert_route_contract(chk):
         _alert_route("org/priv-1667", "", "org/reg-1667"), ("org/reg-1667", None))
     chk("#1667: ... and neither does an absent ALERT_REPO with a token beside it",
         _alert_route("", "not-a-credential-1667", "org/reg-1667"), ("org/reg-1667", None))
+
+
+def _test_route_wiring(chk):
+    """#1773: the (repo, token) the router returns must REACH the `gh` calls — asserted END TO END.
+
+    The matrix rows above exercise the FUNCTION; they structurally cannot see the CALL SITE.
+    `main()` resolves the route ONCE and then threads `repo` through `-R` and `token` through
+    `_gh`'s env on SIX separate commands (issue list, label create, issue create, issue edit, issue
+    comment, issue close). Dropping `token=token` from any one of them, or pointing one `-R` at a
+    census target instead of the routed repo, leaves every matrix row green while the alert lands
+    somewhere the maintainer is not looking — the call-site vacuity AGENTS.md pre-flight #2a and #6
+    name, and the reason this file's router had NO coverage at all while five sibling alert scripts
+    pinned theirs.
+
+    `subprocess.run` is stubbed, so this is hermetic: no network, no `gh`, no real token. Every
+    command `main()` issues is recorded with its FULL argv and env, and the rows below read the
+    routed repo and `GH_TOKEN` back off those recordings. The fallback rows compare against the
+    ambient token OBSERVED on the one command the route never tokenises (the PR census read) rather
+    than against a constant restated here, so the expected value comes from the same place the code
+    reads it (pre-flight #2b).
+
+    Independently killable, one mutant each: return the registry on the private branch; return the
+    alert token on either fallback branch; drop `token=token` from any single `_gh` call; drop
+    `-R repo` from one; point one command at the census target; or drop a command entirely."""
+    import contextlib  # noqa: PLC0415 — self-test only
+    import io  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    # Literals that appear NOWHERE else in this harness, so a substituted value cannot collide with
+    # a fixture's and read as a pass (pre-flight #4, value-identical survivor).
+    PRIVATE, REGISTRY, TARGET = "org/priv-1773", "org/reg-1773", "org/target-1773"
+    ALERT_TOK = "sentinel-park-tok-1773"
+
+    pp = _load_park_policy()
+    # One HUMAN-TERMINAL PR, so the default run reaches `upsert` and actually ISSUES the commands
+    # whose wiring is under test. A healthy board (`[]`) plus an open alert reaches `close`.
+    terminal_board = json.dumps([{"number": 1773,
+                                  "labels": [{"name": pp.MACHINE_PARK_PR_LABEL},
+                                             {"name": pp.HUMAN_PR_PARK_LABEL}]}])
+    open_alert = json.dumps([{"number": 42, "title": ALERT_TITLE, "body": ALERT_MARKER}])
+
+    class _Result:
+        def __init__(self, rc=0, stdout=""):
+            self.returncode, self.stdout = rc, stdout
+            self.stderr = "SENTINEL-STDERR-1773"
+
+    calls = []                                       # [(argv, env)] for the LAST run only
+    state = {"board": terminal_board, "listing": "[]"}
+
+    def fake_run(cmd, capture_output=False, text=False, env=None):
+        calls.append((list(cmd), dict(env or {})))
+        if cmd[1] == "api":
+            return _Result(0, state["board"])
+        if cmd[1:3] == ["issue", "list"]:
+            return _Result(0, state["listing"])
+        return _Result(0, "")
+
+    def routed(*sub):
+        """(the `-R` argument, the GH_TOKEN) of the recorded `gh <sub…>` command.
+
+        (None, None) when that command was never issued — so a row whose command vanishes REDS
+        instead of quietly comparing two absences."""
+        for cmd, env in calls:
+            if cmd[1:1 + len(sub)] == list(sub):
+                return (cmd[cmd.index("-R") + 1] if "-R" in cmd else None), env.get("GH_TOKEN")
+        return None, None
+
+    def ambient():
+        """The GH_TOKEN seen on the PR census read — the ONE call `main()` makes with `token=None`,
+        whatever the harness ambient happens to be (unset locally, set in CI)."""
+        return routed("api")[1]
+
+    def run_once(alert_repo, alert_token, board=terminal_board, listing="[]"):
+        calls.clear()
+        state["board"], state["listing"] = board, listing
+        os.environ["ALERT_REPO"], os.environ["ALERT_TOKEN"] = alert_repo, alert_token
+        with contextlib.redirect_stdout(io.StringIO()):
+            return main([f"--policy-file={policy_path}"])
+
+    saved_run = subprocess.run
+    saved_env = {k: os.environ.get(k) for k in ("REGISTRY_REPO", "ALERT_REPO", "ALERT_TOKEN")}
+    with tempfile.TemporaryDirectory() as tmp:
+        policy_path = str(Path(tmp) / "repos.toml")
+        Path(policy_path).write_text(f'[repos."{TARGET}"]\nenabled = true\n', encoding="utf-8")
+        try:
+            subprocess.run = fake_run
+            os.environ["REGISTRY_REPO"] = REGISTRY
+
+            rc = run_once(PRIVATE, ALERT_TOK)
+            chk("#1773 wiring: the PRIVATE route reaches EVERY command of the alert upsert — the "
+                "dedupe listing, the label ensure and the issue create all carry -R ALERT_REPO and "
+                "run under ALERT_TOKEN",
+                (rc, routed("issue", "list"), routed("label", "create"),
+                 routed("issue", "create")),
+                (0, (PRIVATE, ALERT_TOK), (PRIVATE, ALERT_TOK), (PRIVATE, ALERT_TOK)))
+            # The route governs where the alert LANDS; it must not follow the census read, which is
+            # a different repo under a different credential. Pinning both halves is what stops a
+            # "just use `repo` everywhere" simplification from silently re-pointing the census.
+            api_cmd, api_env = next(((c, e) for c, e in calls if c[1] == "api"), (None, {}))
+            chk("#1773 wiring: ...while the PR census still reads the POLICY target, and never "
+                "borrows the routed credential to do it",
+                (api_cmd is not None and TARGET in api_cmd[2],
+                 api_env.get("GH_TOKEN") == ALERT_TOK), (True, False))
+
+            rc_edit = run_once(PRIVATE, ALERT_TOK, listing=open_alert)
+            chk("#1773 wiring: ...and the EDIT-in-place branch is routed identically (a repoint "
+                "that lands only on `issue create` refreshes nothing)",
+                (rc_edit, routed("issue", "edit"), routed("issue", "create")),
+                (0, (PRIVATE, ALERT_TOK), (None, None)))
+
+            rc_close = run_once(PRIVATE, ALERT_TOK, board="[]", listing=open_alert)
+            chk("#1773 wiring: ...and so is the RECOVERY branch — comment and close both target "
+                "ALERT_REPO under ALERT_TOKEN, or the alert is closed in the wrong repository",
+                (rc_close, routed("issue", "comment"), routed("issue", "close")),
+                (0, (PRIVATE, ALERT_TOK), (PRIVATE, ALERT_TOK)))
+
+            rc_half = run_once(PRIVATE, "")
+            chk("#1773 wiring: a HALF-CONFIGURED route falls back to the REGISTRY under the "
+                "UNCHANGED ambient token — the alert still lands, and never under ALERT_TOKEN",
+                (rc_half, routed("issue", "create") == (REGISTRY, ambient()),
+                 routed("issue", "create")[1] == ALERT_TOK),
+                (0, True, False))
+
+            rc_norepo = run_once("", ALERT_TOK)
+            chk("#1773 wiring: ...and so does a token with NO ALERT_REPO beside it",
+                (rc_norepo, routed("issue", "create") == (REGISTRY, ambient()),
+                 routed("issue", "create")[1] == ALERT_TOK),
+                (0, True, False))
+        finally:
+            subprocess.run = saved_run
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":
