@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1927,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6968cbe282ca6e662a4efea3dc7400c3a9a4febe",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_model_container_binds` recognizes mount options only when the flag and specification occur as literal source tokens. `_run_headless_harness` can instead assign, for example, `local registry_flag=--volume registry_spec=\"$SCRIPT_DIR/..:/registry\"` and place `\"$registry_flag\" \"$registry_spec\"` in the initial `container=(...)` array. This is valid shell and gives Docker a writable bind of the registry checkout, but the awk scanner ignores both the assignments and expansions, still emits exactly the four expected records, and the `container+=(` assertion still sees one append. The synthetic fixture covers literal mount syntaxes only, so it does not close the composition seam recorded in round 4.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Validate the effective argv passed to Docker, or tightly constrain and structurally validate every construct that can produce launcher-array elements, including scalar/array/function/command-substitution expansion. Add a valid, non-crashing mutant that builds `--volume` and its specification in variables and expands them into the initial `container` array, and require the containment assertion to fail. A lexical inventory of literal Docker spellings cannot establish an exact runtime argv contract.",
+    "severity": "blocker",
+    "title": "Exact mount assertion still misses shell-composed Docker arguments"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 blocker remains. `_model_container_binds` still scans literal whitespace-delimited source tokens inside `_run_headless_harness`; it does not validate the effective Docker argv after shell expansion. The launcher can assign a mount flag and writable registry bind specification to shell variables and expand them into the initial `container=(...)` array. Docker then receives the registry mount, while this awk scan emits only the four expected literal records and the separate `container+=(` count remains one. The added mutants and syntax fixture exercise literal Docker spellings but not shell-composed arguments. This is materially the same blocker at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
