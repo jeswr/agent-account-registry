@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2007,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7448c91a67efc9157cf49f16f305061129b652a7",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 approval remains supported. All six display slices publish unconditional totals computed only after row validation and before capping, and the browser renders a note only for non-negative integer totals greater than the actual displayed length. The executed DOM fixture covers over-cap, under-cap, legacy, malformed, fractional, and empty-lane states, while separately confirming that widening the health-card gate preserves defer and exit content. Expected values and fixture sizes are literal rather than derived from production caps, so the assertions are non-vacuous. I found no correctness, soundness, security, or test-validity issue in the diff.",
+  "verdict": "approve"
+ }
+}
