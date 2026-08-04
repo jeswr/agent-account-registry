@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2041,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f2ac5e9c7f491e9a7a638a7213295195078a33af",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The file still begins with `# [FABLE-5]`. AGENTS.md requires model-agnostic `[SPARQ agent]` source provenance and says legacy model-qualified markers migrate when a file is touched.",
+    "file": ".github/workflows/metrics.yml",
+    "fix_hint": "Replace the legacy model-qualified header marker with the model-agnostic `[SPARQ agent]` marker without changing the substantive header text.",
+    "severity": "minor",
+    "title": "Touched file retains a legacy model-qualified provenance marker"
+   },
+   {
+    "body": "The file still begins with `# [OPUS-5]`. AGENTS.md requires model-agnostic `[SPARQ agent]` source provenance and says legacy model-qualified markers migrate when a file is touched.",
+    "file": ".github/workflows/auto-mint-provenance.yml",
+    "fix_hint": "Replace the legacy model-qualified header marker with the model-agnostic `[SPARQ agent]` marker without changing the substantive header text.",
+    "severity": "minor",
+    "title": "Touched file retains a legacy model-qualified provenance marker"
+   }
+  ],
+  "progress": null,
+  "summary": "The opt-in exclusivity control is sound and fail-closed: declarations are anchored to standalone comment lines, malformed or duplicate declarations raise, claimants absent from the independently derived schedule map fail, every overlap with every other scheduled lane is enumerated, and the live seam prevents the current two load-bearing declarations from disappearing or becoming vacuous. The changed schedules currently satisfy both declarations, and the tests exercise the important positive, negative, partial-overlap, empty-map, empty-claim, duplicate, and missing-tree cases. Two touched workflow files retain legacy model-qualified provenance headers; these are minor repository-hygiene issues and do not undermine the control.",
+  "verdict": "approve"
+ }
+}
