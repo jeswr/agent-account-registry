@@ -1602,6 +1602,17 @@ _gh_retry = _load_module(Path(__file__).resolve().with_name("gh_retry.py"), "reg
 _http_transient = _load_module(
     Path(__file__).resolve().with_name("http_transient.py"), "registry_http_transient"
 )
+# THE 403 TAXONOMY (registry #1208), loaded for ONE thing: `header`, the shared case-insensitive
+# response-header LOOKUP that plan-snapshot, metrics and dashboard-gen already read their headers
+# through. groom's Retry-After adapter used to do its own `headers.get("Retry-After")` — the last
+# hand-written fragment of Retry-After handling left in this file after #928 moved the numeric
+# policy to gh_retry, and the residual half of registry #1410's "three divergent parsers".
+# CHECKOUT DEPENDENCY, same class as the two loads above and no wider: all six steps that invoke
+# this script take a FULL checkout today (groom.yml x2, dispatch.yml CLAIM, curate.yml,
+# conflict-resolver.yml, latch-watchdog.yml, reconcile-conflict-park.yml), and nothing yet PINS
+# that. Make one of them sparse without listing these siblings and `_load_module` raises GroomError
+# at import — the step dies LOUDLY, never silently degrading to a private lookup.
+_gh_403 = _load_module(Path(__file__).resolve().with_name("gh_403.py"), "registry_gh_403")
 _IDEMPOTENT_METHODS = {"GET", "HEAD"}
 _TRANSIENT_RETRIES = _gh_retry.MAX_ATTEMPTS  # total attempts before a transient failure fails loud
 # The cap groom INHERITS (it is applied inside gh_retry, not here) — never let a hostile or
@@ -1622,11 +1633,22 @@ def _retry_after_seconds(headers: Any) -> float | None:
     """The server's requested wait (seconds, capped) from a response's headers, or None when it
     sent none — the caller then falls back to the exponential schedule.
 
-    groom owns only the header LOOKUP, because its witness is an ``HTTPError.headers`` mapping
-    rather than the `gh` stderr text every other consumer parses. The numeric POLICY — reject
-    absent / unparseable / NON-POSITIVE, treat an HTTP-date form as absent rather than mis-parse
-    it, cap at ``RETRY_AFTER_CAP`` — is `gh_retry`'s and is deliberately NOT restated here (issue
-    #928), the same way ``ledger_retry.retry_after_seconds`` delegates.
+    groom owns NEITHER half of this — it owns only the COMPOSITION, because its witness is an
+    ``HTTPError.headers`` mapping rather than the `gh` stderr text every other consumer parses.
+    The numeric POLICY — reject absent / unparseable / NON-POSITIVE, treat an HTTP-date form as
+    absent rather than mis-parse it, cap at ``RETRY_AFTER_CAP`` — is `gh_retry`'s and is
+    deliberately NOT restated here (issue #928), the same way ``ledger_retry.retry_after_seconds``
+    delegates. The header LOOKUP is `gh_403.header`'s (registry #1410), the same reviewed
+    case-insensitive reader plan-snapshot, metrics and dashboard-gen use.
+
+    WHY THE LOOKUP MOVED TOO. The `headers.get("Retry-After")` this replaced was groom's last
+    private fragment of Retry-After handling, and it disagreed with the shared reader in two ways
+    that only ever fail in the SAFE-LOOKING direction, which is why nothing caught them: a plain
+    mapping keyed `retry-after` (HTTP/2 lowercases field names; only `HTTPMessage` folds case for
+    you) read as ABSENT, and a headers object exposing ``.items()`` but no ``.get`` raised
+    ``AttributeError`` out of the retry loop and killed the whole hygiene sweep on a blip it was
+    built to survive. `gh_403.header` answers both — and answers "no headers" for an object with
+    neither, never a match.
 
     It delegates to ``retry_after_header_seconds``, the FULL-MATCH entry point, not to the text
     extractor ``retry_after_seconds``: a lookup yields one complete header field value, so a
@@ -1642,8 +1664,7 @@ def _retry_after_seconds(headers: Any) -> float | None:
     `sleep_backoff`'s own non-positive guard, but a bound written out in three files is the drift
     #958 is about: the fix lands in one and the other two keep the hole.
     """
-    raw = headers.get("Retry-After") if headers is not None else None
-    return _gh_retry.retry_after_header_seconds(raw)
+    return _gh_retry.retry_after_header_seconds(_gh_403.header(headers, "Retry-After"))
 
 
 def _sleep_transient(attempt: int, retry_after: float | None = None) -> None:
@@ -7458,6 +7479,80 @@ def _self_test() -> int:
         _gh_retry.retry_after_header_seconds = _real_retry_after
     check("#928 the Retry-After bound IS gh_retry's shared header parser, not a local copy",
           (delegated, parser_texts), (41.5, ["7"]))
+
+    # [registry #1410] ...and so is the header LOOKUP, which was the OTHER half of this adapter and
+    # the last Retry-After code groom still owned. The three shapes below are exactly what the
+    # private `headers.get("Retry-After")` got wrong, all in the direction that never looks like a
+    # bug: a lowercase-keyed mapping (HTTP/2 field names are lowercase; only `HTTPMessage` folds
+    # case for you) silently read ABSENT and lost a real server-requested wait. Restore that `.get`
+    # and rows 1-2 red (None instead of 7.0) while every `{"Retry-After": ...}` row above stays
+    # green — which is precisely why nothing above could see it.
+    class _ItemsOnlyHeaders:
+        """A headers reader exposing `.items()` and NO `.get` — the shape `gh_403.header`'s
+        `.items()` fallback exists for, and the shape the private `.get` died on."""
+
+        def __init__(self, pairs: list[tuple[str, str]]):
+            self._pairs = pairs
+
+        def items(self) -> list[tuple[str, str]]:
+            return list(self._pairs)
+
+    def _lookup(headers: Any) -> Any:
+        """`_retry_after_seconds` with an exception rendered as a VALUE, never propagated.
+
+        Two of the shapes below make a re-inlined private `.get` raise AttributeError, and an
+        exception raised by the mutated line itself is MALFORMEDNESS, not detection: uncaught it
+        aborts this suite where it stands and suppresses every check after it, so the mutant run
+        would record a kill while ~240 rows never ran. Comparing a marker instead makes each kill
+        a real comparison and keeps the mutant run's check count equal to the pristine run's.
+        The same total-capture shape `_snapshot_refusal` and `_race_snapshot` use above."""
+        try:
+            return _retry_after_seconds(headers)
+        except Exception as exc:  # noqa: BLE001 — naming the class IS the assertion here
+            return f"raised {type(exc).__name__}"
+
+    check("#1410 the header lookup folds case and reads a `.items()`-only headers object",
+          (_lookup({"retry-after": "7"}),
+           _lookup({"RETRY-AFTER": "7"}),
+           _lookup(_ItemsOnlyHeaders([("Retry-After", "7")])),
+           _lookup(_ItemsOnlyHeaders([("x-ratelimit-remaining", "0")]))),
+          (7.0, 7.0, 7.0, None))
+    # The FAIL-CLOSED direction, and the one that cost a whole sweep: an unrecognised headers
+    # object must read as "the server sent no wait" and fall back to the exponential schedule, NOT
+    # raise out of the retry loop and kill the hygiene pass on the very blip the loop exists to
+    # survive. Under the private `.get` this row reads 'raised AttributeError'.
+    check("#1410 an unreadable headers object is ABSENT, never an exception out of the retry loop",
+          _lookup(object()), None)
+    # ...and `_lookup`'s rendering is PROVEN, not assumed. It is the only reason the two rows above
+    # can red by COMPARISON, and on the pristine tree nothing makes it raise — so an unexercised
+    # `except` that had drifted into re-raising would silently restore the abort-mid-suite shape and
+    # every future mutant here would record a kill with ~240 rows unrun. Force the raise.
+    _header_before_raise = _gh_403.header
+    _gh_403.header = lambda headers, name: (_ for _ in ()).throw(AttributeError("no headers"))
+    try:
+        rendered = _lookup({"Retry-After": "7"})
+    finally:
+        _gh_403.header = _header_before_raise
+    check("#1410 the harness RENDERS a raise as a value rather than aborting the suite (without it "
+          "a re-inline records as a kill while every row below never runs)",
+          rendered, "raised AttributeError")
+    # ...and the lookup IS gh_403's shared reader, not a local copy that happens to agree today
+    # (#552's identity rule again). The stub pins the FIELD NAME asked for as well: a lookup of the
+    # wrong header would answer None on every real response and silently disable the whole
+    # Retry-After path while every behavioural row above still passed against its own fixture.
+    _real_header = _gh_403.header
+    lookup_calls: list[Any] = []
+    _gh_403.header = lambda headers, name: (lookup_calls.append((headers, name)), "13")[1]
+    try:
+        looked_up = _retry_after_seconds({"Retry-After": "7"})
+    finally:
+        _gh_403.header = _real_header
+    check("#1410 the header LOOKUP is gh_403's shared reader, not a private `.get`",
+          (looked_up, lookup_calls), (13.0, [({"Retry-After": "7"}, "Retry-After")]))
+    # ...and the shared taxonomy's OWN suite must pass, since groom's Retry-After handling now rests
+    # on it — the same rule #552 applied to http_transient above. A reader that ships broken must
+    # not be adopted silently by its consumer.
+    check("#1410 the shared gh_403 taxonomy's own self-test passes", _gh_403._self_test(), True)
 
     class _FakeResp:
         def __init__(self, raw: bytes):
