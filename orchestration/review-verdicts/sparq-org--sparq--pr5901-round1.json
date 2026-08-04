@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5901,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4dec4ee503e16f7095db8cdd86cdc72f24acd3a7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The comment-only change accurately documents the existing CI topology: docs-quality has unfiltered pull_request, merge_group, and main-push triggers; its quick-gates job runs the named constraint-pack --check step without continue-on-error; and zk-toolchain's path filters exclude bench/zk-compose. No correctness, soundness, test-validity, or security issue is introduced.",
+  "verdict": "approve"
+ }
+}
