@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5883,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0ac00017be32b73c34a94ed0bedbd4b050c84fa6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. Both bead and GitHub issue replay text now use the shared select_replay path: parsed mismatches narrow to the first seed with count 1, while seedless failures use the configured seed_start/count window. The added UPDATE-lane test exercises build_issue_body and build_bead_record with an empty parsed result and rejects the former '?' replay. The workflow supplies the correct flag-shaped UPDATE replay template, legacy callers retain the positional default, and the hermetic self-test passes.",
+  "verdict": "approve"
+ }
+}
