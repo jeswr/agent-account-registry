@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2052,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "94fce045afab69d469e190e2e4866f5b01571d5b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's fail-open mixed-validity edge is closed. The shared expander now rejects each atom or range endpoint outside the field-specific bounds before unioning values, so an impossible minute can no longer be filtered into a plausible six-fire schedule. The owner self-test and dispatch-floor consumer test both pin the exact valid-six-plus-60 mutant, while boundary-valid and non-raising probe rows keep the refusal assertions non-vacuous. The consumer reports derivation failures as a red assertion rather than an empty schedule or an early suite abort, pins the derived count independently, and the workflow sparse-checkout is asserted exactly against the complete self-test input set. No new correctness, soundness, test-validity, or security finding is supported by the diff.",
+  "verdict": "approve"
+ }
+}
