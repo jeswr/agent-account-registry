@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2048,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9874c744f6b5424bbd23a00680746dd802d385df",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is correct and complete for the repeated no-change escalation. Provider derivation is based only on bot-authored durable fix-model records, ambiguous or unclassifiable histories fail closed to the existing park behavior, and the escalation is bounded by a monotonic durable floor plus the finite provider ladder. Injection and gate-failure outcomes retain precedence and are not escalated. The real fix-outcome wiring records the current model before deriving the next tier, persists only the model-floor marker, and leaves the blocking verdict and review state intact. The shared tier helper preserves decide_budget's prior validated behavior. Tests cover both decision directions, count and injection precedence, provider/history ambiguity, termination, marker identity/readback, and the real write-site tier/provider wiring without relying only on source constants.",
+  "verdict": "approve"
+ }
+}
