@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2056,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "03c37ce066fbe8a2a8685fc2ccdbe291af0a6588",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe explicit CRLF/LF tokenizer preserves all pre-existing body bytes while replacing or appending only the limits line, retains the replaced line's terminator, and uses the record's observed terminator for an append without a trailing newline. The added literal-expectation tests cover exotic splitlines-only characters, decoy limits text, replacement, no-op, CRLF append, empty input, and the actual gh edit body delivery path. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
