@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-5] RE-QUALIFY THE PRs A MASTER-SIDE GATE FIX ALREADY UNBLOCKED (issue #927).
+# [SPARQ agent] RE-QUALIFY THE PRs A MASTER-SIDE GATE FIX ALREADY UNBLOCKED (issue #927).
 #
 # WHAT BROKE, MEASURED. #910 (#888's SIGPIPE scanner matching its own definition line in
 # worker-live.sh) made `pr-gate` fail for reasons unrelated to any PR under test. At its worst the
