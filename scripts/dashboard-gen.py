@@ -134,7 +134,7 @@ OBS_CACHE_DROP = ("dashboard-gen: dropped the observability cache group (type {}
 # [#1570] How many per-row drop warnings ONE seam may print before it stops naming rows and prints
 # a single counting tail instead. The drop diagnostics (#982 on `flow.queue`, and the evidence-link
 # warning that set the precedent) emit ONE LINE PER DROPPED ROW, and NEITHER input list is bounded
-# on the way IN — `queue[:12]` / `rows[:20]` truncate on the way OUT, after the loop. So a collector
+# on the way IN — `_obs_capped` truncates both on the way OUT, after the loop. So a collector
 # snapshot on the public `ledger` branch carrying 100k malformed rows writes 100k lines into
 # dashboard.yml's step log, which is the failure the diagnostic exists to FIX: a log nobody can read
 # is a log nobody reads. The cap is on the DIAGNOSTIC only — the drop-the-row tolerance, the
@@ -1801,17 +1801,46 @@ def _obs_text(value, cap):
     return text[:cap] if text and text.isprintable() else ""
 
 
+def _obs_capped(rows, cap):
+    """[#1868] A DISPLAY cap, with what it hid: `(rows[:cap], the PRE-cap total)`.
+
+    Every observability array on this panel is a top-N slice — the queue's 12, the fires' 20, the
+    defer/exit `[:16]`s, the 12 lanes — and each of them drops WELL-FORMED rows. #982/#1570/#1571
+    deliberately left that silent in the BUILD LOG and said why: a truncation of rows the seam
+    successfully READ is a display contract, not a producer/consumer mismatch, and a warning would
+    fire on every healthy 13-lane fleet. But the operator-facing half was still missing — a fleet
+    with 50 congested target repositories and one with 12 rendered IDENTICALLY, which is #1571's
+    'indistinguishable from nothing happened' one layer up. So the total travels WITH the slice and
+    `dashboard/app.js` renders `showing 12 of 50`.
+
+    The total counts the rows that SURVIVED validation, never the raw input: a malformed row is a
+    different fact, it is already announced on stdout by its own seam, and folding it in here would
+    put a count on the public page that no rendered row can account for. It is also COUNTED here
+    rather than read from a collector-supplied field, which matters because that snapshot lives on
+    a branch this build does not own (AGENTS.md pre-flight item 5, *who can write what this
+    reads*): a collector cannot assert `of 50000` on the public page, only send rows to be counted.
+
+    Published UNCONDITIONALLY, including when the cap hid nothing (AGENTS.md pre-flight item 8: a
+    census that emits only when it has something to say is one a mutant can silence on exactly the
+    quiet tick an operator interrogates). The page owns the `total > shown` decision.
+    """
+    return rows[:cap], len(rows)
+
+
 def _obs_lane_rows(lanes):
     """Per-workflow (worker/review-fix/drain/groom/...) run outcomes over the 1h/24h windows.
     Lane names are declared by the collector, validated as safe tokens here — a new lane appears
-    on the dashboard without a UI change. Malformed rows are dropped, not fatal."""
+    on the dashboard without a UI change. Malformed rows are dropped, not fatal.
+
+    [#1868] The 12-lane cap is applied on the way OUT, like every sibling seam's. It used to sit
+    INSIDE the loop (`len(rows) == 12 or ...`), which stopped validating at the cap and so could
+    not have counted the lanes past it."""
     rows = []
     if not isinstance(lanes, dict):
-        return rows
+        return _obs_capped(rows, 12)
     for name in sorted(str(key) for key in lanes):
         row = lanes.get(name)
-        if (len(rows) == 12 or OBS_TOKEN_RE.fullmatch(name) is None
-                or not isinstance(row, dict)):
+        if OBS_TOKEN_RE.fullmatch(name) is None or not isinstance(row, dict):
             continue
         out = {"lane": name}
         for window in ("1h", "24h"):
@@ -1822,7 +1851,7 @@ def _obs_lane_rows(lanes):
             out[window] = {key: _obs_count(source.get(key)) or 0
                            for key in ("success", "failure", "defer")}
         rows.append(out)
-    return rows
+    return _obs_capped(rows, 12)
 
 
 def _obs_counted_rows(items, key_field, cap):
@@ -1837,7 +1866,7 @@ def _obs_counted_rows(items, key_field, cap):
             continue
         rows.append({key_field: key, "count": count})
     rows.sort(key=lambda row: (-row["count"], row[key_field]))
-    return rows[:cap]
+    return _obs_capped(rows, cap)
 
 
 def _obs_exit_rows(items):
@@ -1853,7 +1882,7 @@ def _obs_exit_rows(items):
             continue
         rows.append({"model": model, "exit_class": exit_class, "count": count})
     rows.sort(key=lambda row: (-row["count"], row["model"], row["exit_class"]))
-    return rows[:16]
+    return _obs_capped(rows, 16)
 
 
 def _obs_lease_aggregate(value):
@@ -1990,7 +2019,7 @@ def _obs_flow(flow):
     # but every drop is now ANNOUNCED, one reason at a time, so a shape mismatch is legible
     # instead of arriving as an empty panel. The container check is part of it: `queue_stats()`
     # keyed by the integer classes is a dict, which loses every row before the loop even starts.
-    # [#1570] `raw_queue` is UNBOUNDED (`queue[:12]` truncates on the way out, below), so the
+    # [#1570] `raw_queue` is UNBOUNDED (`_obs_capped` truncates it on the way out, below), so the
     # announcement is capped: the first OBS_DROP_WARN_MAX rows are named and the rest are counted.
     drops = _ObsDropLog("observability queue rows")
     raw_queue = flow.get("queue")
@@ -2100,10 +2129,15 @@ def _obs_flow(flow):
             continue
         ci_queue.append({"repository": repository, "depth": depth})
 
-    return {"queue": queue[:12], "lease_utilization_1h": lease_utilization,
+    # [#1868] Both row arrays publish the pre-cap total of well-formed rows beside themselves, so a
+    # 26-class backlog and a 12-class one stop rendering identically. See `_obs_capped`.
+    queue, queue_total = _obs_capped(queue, 12)
+    ci_queue, ci_queue_total = _obs_capped(ci_queue, 12)
+    return {"queue": queue, "queue_total": queue_total,
+            "lease_utilization_1h": lease_utilization,
             "review_rounds": review_rounds,
             "parks_1h": parks_1h, "arm_to_merge_minutes_24h": arm_to_merge,
-            "target_ci_queue": ci_queue[:12]}
+            "target_ci_queue": ci_queue, "target_ci_queue_total": ci_queue_total}
 
 
 def _obs_trigger_rows(items):
@@ -2111,10 +2145,10 @@ def _obs_trigger_rows(items):
     dashboard only displays). Evidence links are pinned to github.com — anything else is dropped
     loudly rather than published on the public page.
 
-    [#1570] `items` is UNBOUNDED here — `rows[:20]` truncates on the way OUT, after every row has
-    been walked — and each row contributes up to 8 evidence drops, so the announcement is capped
-    per BUILD rather than per row: a hoisted-into-the-loop counter would still let N rows write 8N
-    lines.
+    [#1570] `items` is UNBOUNDED here — `_obs_capped` truncates at 20 on the way OUT, after
+    every row has been walked — and each row contributes up to 8 evidence drops, so the
+    announcement is capped per BUILD rather than per row: a hoisted-into-the-loop counter would
+    still let N rows write 8N lines.
 
     [#1867] The ROW drops are announced too, which REVERSES the decision #1570 asserted (that a
     non-object fire row stays silent). The evidence drops were loud while the row CARRYING them was
@@ -2166,7 +2200,7 @@ def _obs_trigger_rows(items):
     row_drops.close()
     drops.close()
     rows.sort(key=lambda row: row["fired_at"] or "", reverse=True)
-    return rows[:20]
+    return _obs_capped(rows, 20)
 
 
 def _normalize_observability(document):
@@ -2222,14 +2256,30 @@ def _normalize_observability(document):
                     and math.isfinite(value) and value >= 0):
                 thresholds[key] = value
 
+    # [#1868] Each capped array travels with the pre-cap total of the well-formed rows it came
+    # from, published unconditionally; `dashboard/app.js` turns `total > len(rows)` into
+    # `showing 12 of 50`. See `_obs_capped` for why the count is not a build-log warning.
+    # The call ORDER is the one the dict literal below used to impose (lanes, defers, exits, flow,
+    # fires): each of these seams announces its dropped rows on stdout as it runs, and the #1570
+    # rows assert those lines as an ordered list.
+    lanes, lanes_total = _obs_lane_rows(document.get("lanes"))
+    defer_reasons, defer_reasons_total = _obs_counted_rows(
+        document.get("defer_reasons_1h"), "reason", 16)
+    exit_classes, exit_classes_total = _obs_exit_rows(document.get("model_exit_classes_1h"))
+    flow = _obs_flow(document.get("flow"))
+    trigger_fires, trigger_fires_total = _obs_trigger_rows(document.get("trigger_fires"))
     return {
         "generated_at": _utc_iso(document.get("generated_at")),
         "cache": cache,
-        "lanes": _obs_lane_rows(document.get("lanes")),
-        "defer_reasons_1h": _obs_counted_rows(document.get("defer_reasons_1h"), "reason", 16),
-        "model_exit_classes_1h": _obs_exit_rows(document.get("model_exit_classes_1h")),
-        "flow": _obs_flow(document.get("flow")),
-        "trigger_fires": _obs_trigger_rows(document.get("trigger_fires")),
+        "lanes": lanes,
+        "lanes_total": lanes_total,
+        "defer_reasons_1h": defer_reasons,
+        "defer_reasons_1h_total": defer_reasons_total,
+        "model_exit_classes_1h": exit_classes,
+        "model_exit_classes_1h_total": exit_classes_total,
+        "flow": flow,
+        "trigger_fires": trigger_fires,
+        "trigger_fires_total": trigger_fires_total,
         "thresholds": thresholds,
     }
 
@@ -6069,12 +6119,22 @@ esac
             {"lane": "review-fix", "1h": {"success": 1, "failure": 0, "defer": 0}, "24h": None},
             {"lane": "worker", "1h": {"success": 3, "failure": 1, "defer": 2},
              "24h": {"success": 30, "failure": 4, "defer": 9}}],
+        # [#1868] Every `_total` below is the count of the rows that SURVIVED validation, never of
+        # the rows the collector sent: each of these six seams is handed one malformed row in the
+        # fixture above, so a total taken over the raw input reads one higher on every one of them.
+        # Nothing here is truncated (each array is far under its cap), which is the other half —
+        # the total is published on the quiet tick too, so the page can tell "12 of 12" from "12 of
+        # 50" and a mutant cannot silence it by only emitting when it has something to say.
+        "lanes_total": 2,
         "defer_reasons_1h": [{"reason": "trust-gate-missing", "count": 9},
                              {"reason": "partial-disarm", "count": 7}],
+        "defer_reasons_1h_total": 2,
         "model_exit_classes_1h": [{"model": "terra", "exit_class": "no-changes", "count": 8},
                                   {"model": "fable", "exit_class": "success", "count": 3}],
+        "model_exit_classes_1h_total": 2,
         "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.3},
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3.0}],
+                 "queue_total": 2,
                  # [#374] three validated lease rows in, ZERO published: only the mean/max of the
                  # utilizations that parsed (0.8, 0.4 -> 0.6/0.8). The unparseable third row proves
                  # the aggregate is taken over reporting rows, and the count itself never appears.
@@ -6082,12 +6142,14 @@ esac
                  "review_rounds": {"mean": 1.44, "max": 3, "budget_exhausted_1h": 0},
                  "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
                  "arm_to_merge_minutes_24h": {"p50": 18.0, "p90": 55.5, "samples": 9},
-                 "target_ci_queue": [{"repository": "sparq-org/sparq", "depth": 5}]},
+                 "target_ci_queue": [{"repository": "sparq-org/sparq", "depth": 5}],
+                 "target_ci_queue_total": 1},
         "trigger_fires": [
             {"rule": "worker-failure-rate", "fired_at": "2025-06-15T15:01:40Z",
              "summary": "worker failure rate 67% over 3 consecutive runs",
              "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/1"],
              "enqueued_task": "heal-2a-0001"}],
+        "trigger_fires_total": 1,
         "thresholds": {"workflow_failure_rate": 0.5, "defer_reason_hourly": 4,
                        "queue_age_clamp_minutes": 10, "merge_stall_minutes": 90},
     }
@@ -6524,6 +6586,222 @@ esac
            for name, rendered in (obs_window_page.items()
                                   if isinstance(obs_window_page, dict) else ())},
           {"measured": None, "quiet": None, "unread": None, "hostile": None})
+    # ---- [#1868] A DISPLAY CAP MUST SAY WHAT IT HID. Every array this panel publishes is a top-N
+    # slice, and the rows past the cap are WELL-FORMED ones — nothing announces them, by design
+    # (#982/#1570/#1571 all decided a truncation of rows the seam READ is not a producer/consumer
+    # mismatch and must not warn on every healthy 13-lane fleet). So a fleet with 50 congested
+    # target repositories and one with 12 rendered IDENTICALLY: #1571's "indistinguishable from
+    # nothing happened", one layer up. The fix is a PAGE affordance fed by a published count, and
+    # the rows below pin it at both layers and in both directions.
+    #
+    # Every size here is a LITERAL — 20 lanes, 19 reasons, 18 exit classes, 26 queue classes, 15
+    # target repositories, 23 fires — and so is every expected pair. Deriving an over-cap input, or
+    # an expectation, from the cap the code reads is the #941 tautology (pre-flight 2(b)/2(c)):
+    # re-tuning any cap would then move the input and the expectation together and stay green.
+    # Each seam is also handed exactly ONE malformed row, so a total taken over the RAW input reads
+    # one higher on all six.
+    over_cap_fixture = copy.deepcopy(obs_fixture)
+    over_cap_fixture["lanes"] = {
+        **{f"lane-{index:02d}": {"1h": {"success": 1, "failure": 0, "defer": 0}}
+           for index in range(20)},
+        "bad lane!": {"1h": {"success": 1}}}
+    over_cap_fixture["defer_reasons_1h"] = (
+        [{"reason": f"reason-{index:02d}", "count": 40 - index} for index in range(19)]
+        + [{"reason": "bad reason!", "count": 3}])
+    over_cap_fixture["model_exit_classes_1h"] = (
+        [{"model": f"model-{index:02d}", "exit_class": "success", "count": 30 - index}
+         for index in range(18)]
+        + [{"model": "bad model!", "exit_class": "x", "count": 1}])
+    over_cap_fixture["flow"]["queue"] = (
+        [{"class": f"2{chr(ord('a') + index)}", "depth": index + 1} for index in range(26)]
+        + [{"class": "9z", "depth": 1}])
+    over_cap_fixture["flow"]["target_ci_queue"] = (
+        [{"repository": f"owner/repo-{index:02d}", "depth": index} for index in range(15)]
+        + [{"repository": "not-a-repo", "depth": 2}])
+    over_cap_fixture["trigger_fires"] = (
+        [{"rule": f"rule-{index:02d}", "fired_at": now - index, "summary": "over the cap"}
+         for index in range(23)]
+        + [{"rule": "bad rule!", "fired_at": now, "summary": "must be skipped"}])
+    with contextlib.redirect_stdout(io.StringIO()):
+        over_cap = obs_normalized(copy.deepcopy(over_cap_fixture))
+
+    def obs_capped_pairs(document):
+        """{seam: (rows PUBLISHED, the total published beside them)} for all six capped seams."""
+        flow = document["flow"]
+        return {"lanes": (len(document["lanes"]), document["lanes_total"]),
+                "defer reasons": (len(document["defer_reasons_1h"]),
+                                  document["defer_reasons_1h_total"]),
+                "model exit classes": (len(document["model_exit_classes_1h"]),
+                                       document["model_exit_classes_1h_total"]),
+                "queue classes": (len(flow["queue"]), flow["queue_total"]),
+                "target repositories": (len(flow["target_ci_queue"]),
+                                        flow["target_ci_queue_total"]),
+                "trigger fires": (len(document["trigger_fires"]), document["trigger_fires_total"])}
+
+    check("[#1868] every capped seam publishes the PRE-CAP total of its WELL-FORMED rows beside "
+          "the slice it published. Dropping a cap reds the left number; deriving a total from the "
+          "published slice reds the right one; counting the raw input instead of the rows that "
+          "survived validation reds it by exactly the one malformed row each seam was handed",
+          obs_capped_pairs(over_cap),
+          {"lanes": (12, 20), "defer reasons": (16, 19), "model exit classes": (16, 18),
+           "queue classes": (12, 26), "target repositories": (12, 15), "trigger fires": (20, 23)})
+    # The other direction, and the one a conditional emission would pass: an UNTRUNCATED fleet
+    # publishes its totals too, equal to what it published. Emitting a total only when the cap bit
+    # is the "census that never zero-seals" shape (pre-flight item 8) — the page could then no
+    # longer tell "12 of 12" from a producer that stopped sending the count at all.
+    with contextlib.redirect_stdout(io.StringIO()):
+        under_cap = obs_normalized(copy.deepcopy(obs_fixture))
+    check("[#1868] ...and a fleet comfortably UNDER every cap publishes each total anyway, equal "
+          "to the rows it published — the golden fixture's one malformed row per seam is already "
+          "excluded from all six",
+          obs_capped_pairs(under_cap),
+          {"lanes": (2, 2), "defer reasons": (2, 2), "model exit classes": (2, 2),
+           "queue classes": (2, 2), "target repositories": (1, 1), "trigger fires": (1, 1)})
+    # ...and THE PAGE IS WHAT THIS HAS TO DELIVER INTO (pre-flight item 11): a count published into
+    # site/data.json that no panel renders leaves the operator exactly where #1868 found them. So
+    # the affordance is EXECUTED against dashboard/app.js under the shared DOM shim — a lexical
+    # assertion here is satisfiable by a comment (the #612 round-4 lesson) — and the notes are
+    # collected by EXACT className, never by searching the card's text for "showing".
+    _OBS_TRUNCATION_PAGE_BODY = r"""
+  const byClass = (root, wanted) => {
+    const found = [];
+    const walk = (el) => {
+      if (!el) return;
+      if (el.className === wanted) found.push(flat(el).join(" ").trim());
+      for (const kid of el.children || []) walk(kid);
+    };
+    walk(root);
+    return found;
+  };
+  const truncations = (root) => byClass(root, "obs-truncated");
+  const out = {};
+  for (const [name, document] of Object.entries(input.documents)) {
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      scope.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    const card = (title) => ids["obs-grid"].children.find((kid) =>
+      kid.tagName === "article" && kid.children[0]
+      && kid.children[0].textContent === title);
+    out[name] = {
+      error,
+      health: truncations(card("Agent-run health")),
+      flow: truncations(card("Queue & flow")),
+      triggers: truncations(ids["obs-triggers"]),
+      // The health card's OWN rows, so a card that renders a note while dropping the content it
+      // sits beside cannot read as a pass — the notes above are identical either way.
+      reasons: byClass(card("Agent-run health"), "obs-reason-row"),
+      chips: byClass(card("Agent-run health"), "obs-chip"),
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+    # `legacy` is the pre-#1868 published shape of the SAME truncated fleet — a data.json a browser
+    # still holds, or one hand-edited — and `hostile` carries every unusable total a future or
+    # tampered producer can put in a JSON document: a string, a negative, a null, a boolean, one
+    # EQUAL to the slice beside it and one SMALLER than it. None of them may draw a note: an
+    # unknown total is not a truncation, and `showing 12 of undefined` would be a worse lie than
+    # the silence #1868 replaces. (NaN/Infinity are absent on purpose — `_write_site` dumps with
+    # `allow_nan=False`, so neither can reach a browser through this page's own data.json.)
+    legacy_page_doc = {key: value for key, value in copy.deepcopy(over_cap).items()
+                       if not key.endswith("_total")}
+    legacy_page_doc["flow"] = {key: value for key, value in legacy_page_doc["flow"].items()
+                               if not key.endswith("_total")}
+    hostile_page_doc = copy.deepcopy(over_cap)
+    hostile_page_doc["lanes_total"] = "20"
+    hostile_page_doc["defer_reasons_1h_total"] = -19
+    hostile_page_doc["model_exit_classes_1h_total"] = None
+    hostile_page_doc["trigger_fires_total"] = True
+    hostile_page_doc["flow"]["queue_total"] = 12
+    hostile_page_doc["flow"]["target_ci_queue_total"] = 11
+    # `fractional` is the hostile case the six seams above have no room left to carry, and it is a
+    # DIFFERENT shape from all of them: a finite number, larger than the slice, that is not a count.
+    # Every one of these fields counts ROWS, so `12.5` is malformed whichever way it arrived —
+    # rendering `showing 12 of 12.5 lanes` with a `0.5 more` title would be the fabricated total
+    # the row above exists to forbid, dressed as a readable one. All six seams carry it, so the
+    # check reds for a call site that reaches the note through anything looser than an integer test.
+    fractional_page_doc = copy.deepcopy(over_cap)
+    fractional_page_doc["lanes_total"] = 12.5
+    fractional_page_doc["defer_reasons_1h_total"] = 19.5
+    fractional_page_doc["model_exit_classes_1h_total"] = 18.5
+    fractional_page_doc["trigger_fires_total"] = 23.5
+    fractional_page_doc["flow"]["queue_total"] = 26.5
+    fractional_page_doc["flow"]["target_ci_queue_total"] = 15.5
+    # ...and the zero-row case obsHealthCard documents: `shown === 0 && total > 0` cannot come out
+    # of this generator, but it is exactly what a hand-edited data.json looks like, and gating the
+    # whole card on `lanes.length` made the promised `showing 0 of 50 lanes` unreachable — the same
+    # slice-is-empty silence #1868 was filed about. The defer/exit rows stay populated so the row
+    # below can also witness that widening the gate did not cost the card its sibling content.
+    zero_lane_page_doc = copy.deepcopy(over_cap)
+    zero_lane_page_doc["lanes"] = []
+    zero_lane_page_doc["lanes_total"] = 50
+    truncation_page = _executed_page(
+        _page_harness("renderObservability", _OBS_TRUNCATION_PAGE_BODY),
+        {"documents": {"truncated": copy.deepcopy(over_cap),
+                       "healthy": copy.deepcopy(under_cap),
+                       "legacy": legacy_page_doc,
+                       "hostile": hostile_page_doc,
+                       "fractional": fractional_page_doc,
+                       "zero-lane": zero_lane_page_doc}})
+
+    def obs_truncation_notes(name):
+        rendered = truncation_page.get(name)
+        return ((rendered.get("health"), rendered.get("flow"), rendered.get("triggers"),
+                 rendered.get("error")) if isinstance(rendered, dict) else truncation_page)
+
+    check("[#1868] EXECUTED page script: the truncated fleet states every cap it hit, beside the "
+          "rows it accounts for — six notes, each naming the REAL total. Expected strings are "
+          "literals written here rather than read back off the page (pre-flight 2(b))",
+          obs_truncation_notes("truncated"),
+          (["showing 12 of 20 lanes", "showing 16 of 19 defer reasons",
+            "showing 16 of 18 model exit classes"],
+           ["showing 12 of 26 queue classes", "showing 12 of 15 target repositories"],
+           ["showing 20 of 23 trigger fires"], None))
+    check("[#1868] EXECUTED page script: ...and a fleet under every cap draws NO note anywhere — "
+          "the affordance is `total > shown`, not a badge on every panel. This is the control the "
+          "row above rests on: a page that always renders the note would pass it and fail here",
+          obs_truncation_notes("healthy"), ([], [], [], None))
+    check("[#1868] EXECUTED page script: a LEGACY data.json — the same truncated fleet published "
+          "before the totals existed — renders no note rather than `showing 12 of undefined`, and "
+          "the page does not throw reaching for a key that is not there",
+          obs_truncation_notes("legacy"), ([], [], [], None))
+    check("[#1868] EXECUTED page script: an unusable total draws nothing either — a string, a "
+          "negative, a null, a boolean, a total EQUAL to the slice and one SMALLER than it are "
+          "each 'no truncation known', never a fabricated one",
+          obs_truncation_notes("hostile"), ([], [], [], None))
+    check("[#1868] EXECUTED page script: ...and a FRACTIONAL total is unusable too — `12.5` beside "
+          "12 rows is not a row count, and the page states nothing rather than `showing 12 of "
+          "12.5 lanes`. All six seams carry one, so no call site can reach the note through a "
+          "finite-number test",
+          obs_truncation_notes("fractional"), ([], [], [], None))
+    check("[#1868] EXECUTED page script: a hand-edited document whose lane slice is EMPTY beside a "
+          "positive total still states it — `showing 0 of 50 lanes` is the honest render of it, "
+          "and gating the health card on `lanes.length` made that documented case unreachable. "
+          "Its flow and trigger notes are unchanged, so the widened gate is the only thing moving",
+          obs_truncation_notes("zero-lane"),
+          (["showing 0 of 50 lanes", "showing 16 of 19 defer reasons",
+            "showing 16 of 18 model exit classes"],
+           ["showing 12 of 26 queue classes", "showing 12 of 15 target repositories"],
+           ["showing 20 of 23 trigger fires"], None))
+
+    def obs_health_rows(name):
+        rendered = truncation_page.get(name)
+        if not isinstance(rendered, dict):
+            return truncation_page
+        reasons, chips = rendered.get("reasons") or [], rendered.get("chips") or []
+        return (reasons[:1], reasons[-1:], len(reasons), chips[:1], chips[-1:], len(chips))
+
+    check("[#1868] ...and that card still carries the ROWS the notes account for: a gate widened "
+          "far enough to render a lone note over an empty card would pass the row above and fail "
+          "this one. Sixteen defer rows and sixteen exit chips, first and last named literally",
+          obs_health_rows("zero-lane"),
+          (["reason-00 ×40"], ["reason-15 ×25"], 16,
+           ["model-00 · success ×30"], ["model-15 · success ×15"], 16))
     # ---- [#982] A DROPPED QUEUE ROW MUST BE ANNOUNCED. `flow.queue: []` renders identically to
     # an idle queue, so the pre-#982 silent `continue` turned a producer/consumer shape mismatch
     # into a green build, a green self-test and a panel reading `no backlog` — the loss visible
@@ -6610,7 +6888,7 @@ esac
               ([], [_QUEUE_DROP.format(
                   f"row `class` {quoted} is not one of the queue classes")]))
     # ---- [#1570] THE DIAGNOSTIC ITSELF MUST BE BOUNDED. Both drop warnings above emit ONE LINE
-    # PER DROPPED ROW over a list nothing bounds on the way IN (`queue[:12]` and `rows[:20]` cut on
+    # PER DROPPED ROW over a list nothing bounds on the way IN (`_obs_capped` cuts both of them on
     # the way OUT, after the loop), so a snapshot on the public `ledger` branch carrying 100k
     # malformed rows writes 100k lines into dashboard.yml's step log — the very failure the drop
     # diagnostic exists to fix. The rows below pin BOTH directions: the cap FIRES, and the tail
@@ -6767,9 +7045,9 @@ esac
         check(f"[#1867] a {case} rule is not echoed into the build log that diagnoses it",
               obs_drops([], [{"rule": rule, "summary": "s"}]),
               ([], [], [_FIRE_DROP.format(f"row `rule` {quoted} is not a safe token")]))
-    # `items` is unbounded on the way IN (`rows[:20]` cuts on the way OUT), so this seam needs the
-    # #1570 cap as much as the queue seam does: 20 unreadable rows print 12 warnings and ONE tail
-    # naming the REAL total. Sizes and expected strings are literals — deriving either from
+    # `items` is unbounded on the way IN (`_obs_capped` cuts at 20 on the way OUT), so this seam
+    # needs the #1570 cap as much as the queue seam does: 20 unreadable rows print 12 warnings
+    # and ONE tail naming the REAL total. Sizes and expected strings are literals — deriving either from
     # OBS_DROP_WARN_MAX is the #941 tautology. The 21st row still publishes: capping a WARNING must
     # never cap the DATA.
     check("[#1867] 20 unreadable fire rows print 12 warnings and ONE tail naming the real total — "

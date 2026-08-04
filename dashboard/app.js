@@ -863,6 +863,38 @@ function obsLaneDefers(lanes) {
   return total;
 }
 
+// Issue #1868. EVERY array in this panel is a top-N DISPLAY slice the generator cut — 12 lanes, 12
+// queue classes, 12 target repositories, 16 defer reasons, 16 exit classes, 20 trigger fires — and
+// the rows past the cap were WELL-FORMED. Without this note a fleet with 50 congested target
+// repositories and one with 12 render identically, which is the "indistinguishable from nothing
+// happened" complaint #1571 was filed about, one layer up. `<field>_total` is the pre-cap count of
+// well-formed rows, published beside every capped array (see dashboard-gen `_obs_capped`).
+//
+// The comparison is `total > shown` HERE rather than a flag from the generator, so nothing renders
+// on a healthy fleet whose array fit under its cap. An absent/unreadable total — a data.json
+// published before #1868, or hand-edited — draws NOTHING: an unknown total is not a truncation, and
+// `showing 12 of undefined` would be a worse lie than the silence this replaces.
+//
+// `Number.isInteger`, not `obsNum`: every one of these fields is a COUNT OF ROWS. `obsNum` accepts
+// any finite number, so a tampered or future `lanes_total: 12.5` beside 12 rows would render
+// `showing 12 of 12.5 lanes` with a `0.5 more` title — a malformed value read as authoritative is
+// the same operator-facing lie the unreadable-total silence exists to prevent. Non-integral,
+// non-finite, non-numeric and negative totals are all "no truncation known".
+function obsTruncated(rows, total) {
+  const collected = obsNum(total);
+  return Number.isInteger(collected) && collected > (Array.isArray(rows) ? rows.length : 0);
+}
+
+function obsTruncationNote(rows, total, noun) {
+  const shown = Array.isArray(rows) ? rows.length : 0;
+  const collected = obsNum(total);
+  if (!obsTruncated(rows, total)) return null;
+  const note = node("p", "obs-truncated", `showing ${shown} of ${collected} ${noun}`);
+  note.setAttribute("title",
+    `${collected - shown} more ${noun} are in the collector snapshot than this panel displays`);
+  return note;
+}
+
 function obsThresholds(o) {
   const supplied = o && typeof o.thresholds === "object" && o.thresholds ? o.thresholds : {};
   const out = { ...OBS_DEFAULT_THRESHOLDS };
@@ -940,7 +972,7 @@ function obsCard(title) {
   return card;
 }
 
-function obsRenderTriggers(fires) {
+function obsRenderTriggers(fires, total) {
   const host = byId("obs-triggers");
   host.replaceChildren();
   for (const fire of fires) {
@@ -965,6 +997,8 @@ function obsRenderTriggers(fires) {
     row.append(meta);
     host.append(row);
   }
+  const note = obsTruncationNote(fires, total, "trigger fires");
+  if (note) host.append(note);
 }
 
 // Issue #1839. USAGE-DERIVED ONLY: `warm_drain_rate_1h`, `drained_1h` and `chain_length_histogram`
@@ -988,7 +1022,10 @@ function obsCacheCard(cache) {
   return card;
 }
 
-function obsHealthCard(lanes, deferReasons, exitClasses, thresholds) {
+// `totals` defaults to `{}` for the same reason every other read on this page is guarded: a throw
+// out of a renderer takes the WHOLE observability panel down, and a missing display-cap count is
+// the least important thing on it — an absent total simply draws no note (see obsTruncationNote).
+function obsHealthCard(lanes, deferReasons, exitClasses, thresholds, totals = {}) {
   const card = obsCard("Agent-run health");
   const table = node("table", "obs-table");
   const head = node("tr");
@@ -1022,7 +1059,13 @@ function obsHealthCard(lanes, deferReasons, exitClasses, thresholds) {
     table.append(row);
   }
   card.append(table);
-  if (deferReasons.length) {
+  // Each note sits with the rows it accounts for, and each is rendered even when its own array is
+  // EMPTY: `shown === 0 && total > 0` cannot come out of this generator, but it is exactly what a
+  // hand-edited data.json looks like and "showing 0 of 50" is the honest render of it.
+  const laneNote = obsTruncationNote(lanes, totals.lanes, "lanes");
+  if (laneNote) card.append(laneNote);
+  const deferNote = obsTruncationNote(deferReasons, totals.deferReasons, "defer reasons");
+  if (deferReasons.length || deferNote) {
     const list = node("div", "obs-reasons");
     list.append(node("p", "obs-spark-caption", "top defer reasons / 1h"));
     for (const item of deferReasons) {
@@ -1032,14 +1075,17 @@ function obsHealthCard(lanes, deferReasons, exitClasses, thresholds) {
       rowEl.append(node("span", `obs-reason-count${hot ? " bad" : ""}`, `×${obsNum(item.count, 0)}`));
       list.append(rowEl);
     }
+    if (deferNote) list.append(deferNote);
     card.append(list);
   }
-  if (exitClasses.length) {
+  const exitNote = obsTruncationNote(exitClasses, totals.exitClasses, "model exit classes");
+  if (exitClasses.length || exitNote) {
     const chips = node("div", "obs-chips");
     for (const row of exitClasses) {
       chips.append(node("span", "obs-chip", `${row.model} · ${row.exit_class} ×${obsNum(row.count, 0)}`));
     }
     card.append(chips);
+    if (exitNote) card.append(exitNote);
   }
   card.append(obsSparkline("defers / 1h trend", obsTrend.points.map((p) => p.defers), "var(--warn)"));
   return card;
@@ -1048,7 +1094,8 @@ function obsHealthCard(lanes, deferReasons, exitClasses, thresholds) {
 function obsFlowCard(flow, thresholds) {
   const card = obsCard("Queue & flow");
   const queue = Array.isArray(flow.queue) ? flow.queue : [];
-  if (queue.length) {
+  const queueNote = obsTruncationNote(queue, flow.queue_total, "queue classes");
+  if (queue.length || queueNote) {
     const list = node("div", "obs-reasons");
     list.append(node("p", "obs-spark-caption", "task queue depth · oldest age"));
     for (const row of queue) {
@@ -1062,6 +1109,7 @@ function obsFlowCard(flow, thresholds) {
         `${obsNum(row.depth, 0)} deep${age === null ? "" : ` · ${age}m`}`));
       list.append(rowEl);
     }
+    if (queueNote) list.append(queueNote);
     card.append(list);
   }
   const grid = node("div", "obs-metric-grid");
@@ -1086,11 +1134,17 @@ function obsFlowCard(flow, thresholds) {
       { sub: `${obsNum(latency.p90) === null ? "—" : latency.p90 + "m"} p90 · ${obsNum(latency.samples, 0)} samples / 24h`,
         tone: p50 !== null && p50 >= thresholds.merge_stall_minutes ? "bad" : "" }));
   }
-  for (const target of Array.isArray(flow.target_ci_queue) ? flow.target_ci_queue : []) {
+  const targets = Array.isArray(flow.target_ci_queue) ? flow.target_ci_queue : [];
+  for (const target of targets) {
     grid.append(obsMetric(`CI queue · ${target.repository}`, String(obsNum(target.depth, 0)),
       { sub: "pending target CI runs" }));
   }
   if (grid.childElementCount) card.append(grid);
+  // The CI cells share the metric grid with the review/park/latency stats, so this note goes on the
+  // CARD rather than in the grid — a 50-repository backlog is the whole point of issue #1868 and it
+  // must still be stated when the grid carries nothing else.
+  const targetNote = obsTruncationNote(targets, flow.target_ci_queue_total, "target repositories");
+  if (targetNote) card.append(targetNote);
   // Issue #374: this used to be one bar PER SALTED ACCOUNT — a per-account row array by another
   // name, whose length was the fleet size and whose labels were stable across builds. The
   // generator now sends only the mean and max of the reported utilizations, which is what the
@@ -1128,18 +1182,24 @@ function renderObservability(o) {
   byId("obs-time").textContent = o.generated_at
     ? `Collected ${relative(o.generated_at)} · ${utc(o.generated_at)}` : "Collection time unknown";
   const thresholds = obsThresholds(o);
-  obsRenderTriggers(Array.isArray(o.trigger_fires) ? o.trigger_fires : []);
+  obsRenderTriggers(Array.isArray(o.trigger_fires) ? o.trigger_fires : [], o.trigger_fires_total);
   const grid = byId("obs-grid");
   grid.replaceChildren();
   if (o.cache && typeof o.cache === "object") grid.append(obsCacheCard(o.cache));
   const lanes = Array.isArray(o.lanes) ? o.lanes : [];
-  if (lanes.length) {
-    grid.append(obsHealthCard(
-      lanes,
-      Array.isArray(o.defer_reasons_1h) ? o.defer_reasons_1h : [],
-      Array.isArray(o.model_exit_classes_1h) ? o.model_exit_classes_1h : [],
-      thresholds,
-    ));
+  const deferReasons = Array.isArray(o.defer_reasons_1h) ? o.defer_reasons_1h : [];
+  const exitClasses = Array.isArray(o.model_exit_classes_1h) ? o.model_exit_classes_1h : [];
+  const healthTotals = { lanes: o.lanes_total, deferReasons: o.defer_reasons_1h_total,
+    exitClasses: o.model_exit_classes_1h_total };
+  // The gate is EVERY slice this card carries, not just lanes: gating on `lanes.length` alone made
+  // obsHealthCard's documented `shown === 0 && total > 0` note unreachable — a hand-edited document
+  // with `lanes: []` beside `lanes_total: 50` drew nothing at all — and it also dropped non-empty
+  // defer/exit rows on the floor whenever the lane slice happened to be empty.
+  if (lanes.length || deferReasons.length || exitClasses.length
+      || obsTruncated(lanes, healthTotals.lanes)
+      || obsTruncated(deferReasons, healthTotals.deferReasons)
+      || obsTruncated(exitClasses, healthTotals.exitClasses)) {
+    grid.append(obsHealthCard(lanes, deferReasons, exitClasses, thresholds, healthTotals));
   }
   if (o.flow && typeof o.flow === "object") grid.append(obsFlowCard(o.flow, thresholds));
   if (!grid.childElementCount) {
