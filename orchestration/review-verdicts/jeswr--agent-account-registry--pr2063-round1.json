@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2063,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "83df144a07f427e48c17b40dab78d97edb89e31f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly publishes a generator-owned, unconditional queue refusal count, keeps it distinct from the surviving-row total, and renders partial or total loss without treating legacy or malformed counts as evidence of loss. Queue-depth trend samples become unknown whenever any queue row was refused. The executed page tests cover empty, fully dropped, partly dropped, legacy, malformed, and forged-count cases, while the generator tests independently pin accepted, refused, capped-warning, and collector-supplied inputs. I found no correctness, soundness, test-vacuity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
