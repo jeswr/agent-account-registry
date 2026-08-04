@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2046,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bd38870fa5ed9fbde5b4e56c6ff34a246f3abf41",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_live_nodes` prunes literal-dead branches and deferred scopes, but otherwise enumerates children without statement-order control flow. Consequently a candidate such as `targets = starvation_park_targets(...); return; for target in targets: park_starved_partition_holder(...)` is certified as `tick`, even though no invocation can reach the loop. The same problem occurs when the park call follows an unconditional `return`, `raise`, `break`, or `continue` in its enclosing block. The added comment explicitly says earlier `return`/`raise` is not seen but then claims that direction REFUSES; the implementation actually accepts when the binding, loop, and call remain syntactically present. None of the 17 table rows exercises this case, so the new tests do not catch it.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make the accepting traversal conservatively account for sequential terminators (including terminators inside the relevant enclosing block/control-flow shape), or explicitly narrow the claimed guarantee and ensure the seam fails closed for unsupported control-flow shapes. Add red-on-regression rows with the loop after `return`/`raise` and the call after `break`/`continue`, plus live control cases so an unconditional refusal cannot satisfy the suite.",
+    "severity": "major",
+    "title": "The reachability seam accepts code after an unconditional return or raise"
+   }
+  ],
+  "progress": null,
+  "summary": "The new traversal rejects the two added syntactic cases, but it is not a sound reachability check: it still certifies calls that are unconditionally unreachable after an earlier control-flow terminator. This directly contradicts the new documentation's claim that the earlier-return/raise direction refuses and leaves the marquee structural proof vulnerable. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
