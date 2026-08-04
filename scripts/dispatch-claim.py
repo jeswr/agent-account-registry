@@ -22751,6 +22751,65 @@ def _escalation_call_site(source):
     return None
 
 
+# ---- [registry #1028] "THIS NODE RUNS", not "this node EXISTS" ---------------------------------
+# `ast.walk` enumerates every node in a subtree, so an ancestry check built on it proves a call
+# EXISTS somewhere under the loop — never that a pass through the loop REACHES it. Two shapes of
+# dead code satisfy `ast.walk` while doing nothing at run time, and MEASURED on the pre-#1028 tree
+# both made `_park_call_site` certify a production tick that parks nothing at all:
+#
+#   - a CONSTANT-FALSE branch: `if False:` / `while False:` / the `else:` of `if True:`;
+#   - a DEFERRED CALLABLE SCOPE: a nested `def` / `async def` / `lambda` that nothing calls.
+#
+# A class body is deliberately NOT a boundary: it EXECUTES IN PLACE at definition time, so a
+# statement written directly in one really does run. Its `def`s do not, and they are already
+# boundaries in their own right — which is what keeps "class-body method" refused while
+# "statement in a class body" stays accepted, rather than collapsing both into "anything nested".
+#
+# HONEST BOUNDARY, stated because the overclaim is the failure mode this repo keeps measuring:
+# this proves a node is NOT reachable in the two decidable cases above. It is a FLOOR, not a
+# decision procedure. A test that is always false but not a literal (`if 1 == 2:`, `if not True:`,
+# `if DEBUG:` with `DEBUG = False`) is NOT proven dead and stays live here — deliberately, because
+# the alternative is constant-folding arbitrary expressions. It also cannot see a node made
+# unreachable by an earlier `return`/`raise`, and it does not descend into a nested `def`'s
+# decorators or defaults, which do run in place; both of those directions REFUSE, i.e. fail closed.
+_SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _literal_truth(test):
+    """The truth of `test` when it is a LITERAL constant, else None ("not decidable here")."""
+    return bool(test.value) if isinstance(test, ast.Constant) else None
+
+
+def _live_children(node):
+    """The direct children of `node` that a single pass through `node` can actually reach."""
+    dead = []
+    if isinstance(node, (ast.If, ast.IfExp, ast.While)):
+        truth = _literal_truth(node.test)
+        if truth is True:
+            dead = node.orelse    # `if True:`/`while True:` — the `else:` leg can never run
+        elif truth is False:
+            dead = node.body      # `if False:`/`while False:` — the body can never run
+        if not isinstance(dead, list):
+            dead = [dead]         # an IfExp's legs are single expressions, not statement bodies
+    dead = {id(leg) for leg in dead}
+    return [child for child in ast.iter_child_nodes(node) if id(child) not in dead]
+
+
+def _live_nodes(root):
+    """`root` plus every descendant a SINGLE pass through `root` reaches — `ast.walk` minus the
+    two prunings described above.
+
+    A scope boundary is YIELDED but not descended into, so a caller scanning a module still finds
+    every function it defines while a call buried in an uncalled nested `def` stays invisible."""
+    out, queue = [root], [root]
+    while queue:
+        for child in _live_children(queue.pop()):
+            out.append(child)
+            if not isinstance(child, _SCOPE_BOUNDARIES):
+                queue.append(child)
+    return out
+
+
 def _park_call_site(source):
     """[registry #822] STRUCTURAL proof that some PRODUCTION function iterates EVERY target
     `starvation_park_targets(...)` returned and parks EACH one. Returns that function's name,
@@ -22766,15 +22825,24 @@ def _park_call_site(source):
       - `park_starved_partition_holder` outside it  -> at most one holder is ever written;
       - any SLICE in the loop's iterable            -> `[:1]` is the defect wearing a loop;
       - a `cap=` keyword at the call site           -> the bound must be the DERIVED constant,
-                                                       not a number retyped at the call site.
+                                                       not a number retyped at the call site;
+      - a DEAD or DEFERRED ancestor (registry #1028) -> a `for`/park call under `if False:`, under
+                                                       the `else:` of a constant-true guard, or
+                                                       inside an uncalled nested `def`/method
+                                                       parks nothing while `ast.walk` still sees
+                                                       it. Every ACCEPTING scan below therefore
+                                                       runs on `_live_nodes`, never `ast.walk`.
+
+    The asymmetry between the two scan kinds is deliberate: a scan that ACCEPTS reads only live
+    nodes, while a scan that REFUSES (the slice probe) keeps raw `ast.walk` and so refuses on a
+    slice hidden in a dead leg too. Both directions err toward refusing the seam.
     """
-    import ast
     tree = ast.parse(source)
-    for func in ast.walk(tree):
+    for func in _live_nodes(tree):
         if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
             continue
         bound = set()
-        for node in ast.walk(func):
+        for node in _live_nodes(func):
             if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
                 continue
             if getattr(node.value.func, "id", None) != "starvation_park_targets":
@@ -22785,21 +22853,154 @@ def _park_call_site(source):
                          if isinstance(target, ast.Name))
         if not bound:
             continue
-        for loop in ast.walk(func):
+        for loop in _live_nodes(func):
             if not isinstance(loop, ast.For):
                 continue
-            iter_names = {node.id for node in ast.walk(loop.iter)
+            iter_names = {node.id for node in _live_nodes(loop.iter)
                           if isinstance(node, ast.Name)}
             if not (iter_names & bound):
-                continue
+                continue                  # `for t in (targets if False else [])` iterates nothing
             if any(isinstance(node, ast.Slice) for node in ast.walk(loop.iter)):
                 continue                  # `targets[:1]` is the per-tick cap of 1, re-typed
-            for stmt in ast.walk(loop):
+            for stmt in _live_nodes(loop):
                 if (isinstance(stmt, ast.Call)
                         and getattr(stmt.func, "id", None)
                         == "park_starved_partition_holder"):
                     return func.name
     return None
+
+
+def _park_seam_verdict(block):
+    """`_park_call_site`'s verdict on a synthetic module whose only candidate function is `tick`.
+
+    Every refusal in that docstring is a trust check, and before #1028 not one of them had a
+    fixture: the seam's only assertion was that the REAL source returns `"dispatch"`, which cannot
+    tell a checker that decides ancestry from one that accepts anything. This builds the mutants
+    the production tree must never look like, so both directions are pinned."""
+    return _park_call_site("def tick(repo, items, starved, occupancy):\n"
+                           + textwrap.indent(textwrap.dedent(block).strip("\n"), "    ") + "\n")
+
+
+# Each row is (what, expected verdict, the BODY of `tick`). The park call site is certified only
+# when a pass through `tick` actually reaches both the `for` over the assigned targets and the
+# `park_starved_partition_holder` call inside it.
+_PARK_SEAM_ROWS = (
+    # ---- ACCEPTED: the shapes production legitimately writes -------------------------------
+    ("live loop", "tick", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    # The real call sits under `elif park_starved_partition_holder(...)` inside a `try`, so a
+    # RUNTIME condition must stay accepted: only a LITERAL-constant test is proven dead. Without
+    # this row, "refuse every conditional call" would pass every other row here.
+    ("runtime-conditional call", "tick", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            if repo:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("constant-true guard BODY", "tick", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if True:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # A class body EXECUTES IN PLACE, so this call really does run once per iteration. This is the
+    # row that keeps the scope-boundary set honest: adding ast.ClassDef to _SCOPE_BOUNDARIES would
+    # collapse the predicate into "refuse anything nested" and reds HERE.
+    ("statement in a class body", "tick", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            class Receipt:
+                parked = park_starved_partition_holder(repo, target)
+    """),
+    # ---- REFUSED: dead branches — the loop or the call exists but never runs ----------------
+    ("loop under `if False:`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if False:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call under `if False:`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            if False:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("loop in the `else:` of `if True:`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if True:
+            pass
+        else:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call under `while False:`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            while False:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("targets ASSIGNED in a dead branch", None, """
+        if False:
+            targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    ("iterable is a dead conditional leg", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in (targets if False else []):
+            park_starved_partition_holder(repo, target)
+    """),
+    # ---- REFUSED: deferred scopes — the call is defined under the loop but never invoked ----
+    ("park call in a nested `def`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            def _park_later():
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call in a nested `async def`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            async def _park_later():
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call in a class-body METHOD", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            class Receipt:
+                def park(self):
+                    park_starved_partition_holder(repo, target)
+    """),
+    # The WHOLE batch — binding, loop and call — inside one uncalled helper. MEASURED: with only
+    # the rows above, reverting the module-level scan to `ast.walk` SURVIVED, because a nested
+    # `def` that holds just the park call has no `targets =` binding of its own and is refused for
+    # that unrelated reason. This is the row that makes the module-level scan load-bearing: under
+    # `ast.walk` the helper is certified as the call site under its OWN name.
+    ("the ENTIRE batch in an uncalled nested `def`", None, """
+        for target in []:
+            def _park_all():
+                targets = starvation_park_targets(items, starved, occupancy)
+                for inner in targets:
+                    park_starved_partition_holder(repo, inner)
+    """),
+    # ---- REFUSED: the three #822 re-scalarisations, none of which had a fixture -------------
+    ("no loop at all — park(targets[0])", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        park_starved_partition_holder(repo, targets[0])
+    """),
+    ("sliced iterable — `targets[:1]`", None, """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets[:1]:
+            park_starved_partition_holder(repo, target)
+    """),
+    ("call-site `cap=`", None, """
+        targets = starvation_park_targets(items, starved, occupancy, cap=1)
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+)
 
 
 def _starvation_park_batch_source():
@@ -24109,6 +24310,47 @@ def _starvation_sweep_self_test():
         f"— otherwise the 1-holder-per-tick defect is back at 10 min/holder (found {park_seam!r})")
     print("  ok   #822 park call-site seam (AST): the production tick PARKS EVERY selected "
           "holder — a re-scalarised call site, a `[:1]`, or a call-site cap= reds here")
+
+    # ---- [registry #1028] ...AND THE SEAM ITSELF, DECIDED ON REACHABILITY ---------------------
+    # The assertion above is the seam's ONLY assertion, and it cannot distinguish a checker that
+    # decides ancestry from one that certifies any call that merely EXISTS. `ast.walk` is the
+    # latter: it enumerates dead code, so the same seam certified a park site whose loop — or whose
+    # `park_starved_partition_holder` call — sat under `if False:`, in the `else:` of a
+    # constant-true guard, or inside a nested `def`/method nothing ever calls. Each of those
+    # restores the exact 1-holder-per-tick defect #822 removed, or removes parking altogether.
+    #
+    # CORRECTED, because the follow-up that asked for this check overclaimed here and the
+    # correction is what makes the rest of it trustworthy: the checker really was fooled — on the
+    # pre-#1028 tree `_park_call_site` returned "dispatch" for BOTH real production mutants (the
+    # park call buried in `if False:`, and the whole batch moved into an uncalled nested `def`) —
+    # but the SUITE was NOT green for either. `_starvation_park_batch_seam_self_test` EXECUTES the
+    # sentinel-delimited production block against stubs and saw 0 of 4 label writes. That is a
+    # genuine second line of defence, and its reach is exactly what the sentinels bracket: it
+    # cannot see a park call site refactored out from between them, and it cannot see any of the
+    # other functions this MODULE-WIDE checker is asked about. A checker that certifies dead code
+    # is still the defect, and it is the one that generalises.
+    #
+    # MEASURED before this block existed (`trace --count --missing`): the `cap=` refusal, the slice
+    # refusal and `return None` were NEVER-EXECUTED lines — three of the four refusals the seam
+    # advertises had no red-on-regression test at all. Every refusal now has one, and the ACCEPT
+    # rows are what stop the cheap fix: a checker that refused all nesting, or returned None
+    # unconditionally, passes every REFUSE row and reds on those.
+    _park_accepted = _park_refused = 0
+    for _what, _expect, _block in _PARK_SEAM_ROWS:
+        _verdict = _park_seam_verdict(_block)
+        assert _verdict == _expect, (
+            f"#1028 park call-site reachability [{_what}]: expected {_expect!r}, got {_verdict!r}. "
+            "A seam that certifies a park call it cannot prove RUNS is worse than no seam: it "
+            "reports the batch park as structurally proven while the partition is never released.")
+        _park_accepted += _expect is not None
+        _park_refused += _expect is None
+    assert (_park_accepted, _park_refused) == (4, 13), (
+        f"#1028 expected 4 accepted and 13 refused park-seam shapes, got "
+        f"({_park_accepted}, {_park_refused}) — a row was dropped from _PARK_SEAM_ROWS, which is "
+        "how a refusal quietly stops being tested")
+    print(f"  ok   #1028 park call-site seam decides REACHABILITY, not existence: "
+          f"{_park_accepted} live shapes certify and {_park_refused} — dead branches, uncalled "
+          "nested scopes, and the three #822 re-scalarisations — are refused")
 
     # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
     _starvation_park_batch_seam_self_test()
