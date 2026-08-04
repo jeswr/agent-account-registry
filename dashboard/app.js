@@ -863,6 +863,47 @@ function obsLaneDefers(lanes) {
   return total;
 }
 
+// Issue #1896. The count of `flow.queue` inputs the GENERATOR REFUSED (`queue_dropped`), read as a
+// row count. A dropped queue row is not published as anything — unlike a lane window, which #1879
+// could key off the `null` on the wire — so `queue: []` is what an idle fleet AND a snapshot whose
+// rows were all unreadable both look like, and the panel read `no backlog` for each. That is #982's
+// finding one layer out, on the layer an operator reads (pre-flight item 11): the generator's
+// build-log announcement of the drop is not something anybody sees on a green build.
+//
+// Fail-closed to 0 — "no drop known" — for anything that is not a positive whole number of rows,
+// which is `obsTruncated`'s reading of `<field>_total` and for the same reason: a data.json
+// published before #1896, or hand-edited, carries no count at all, and rendering "unreadable" off
+// an absent or malformed field would mark every legacy snapshot as a loss that never happened.
+function obsDropped(count) {
+  const dropped = obsNum(count);
+  return Number.isInteger(dropped) && dropped > 0 ? dropped : 0;
+}
+
+// The fleet-wide queue depth for the trend, or null when the generator refused ANY row: a sum over
+// the survivors is not a smaller backlog, it is an unknown one. This is obsLaneDefers' reasoning on
+// the seam #1879 left alone — folding a fully-dropped queue in as a confident 0 draws a reassuring
+// dip in the depth sparkline out of a measurement that never arrived. obsSparkline drops a null
+// point from its series, which is what "unknown" has to look like there.
+function obsQueueDepth(flow) {
+  const source = flow || {};
+  if (obsDropped(source.queue_dropped)) return null;
+  const queue = Array.isArray(source.queue) ? source.queue : [];
+  return queue.reduce((sum, row) => sum + obsNum(row.depth, 0), 0);
+}
+
+// ...and the row an operator reads instead of `no backlog`. The two texts are two different facts:
+// with no readable row left, NOTHING under the caption is a measurement; beside rows that did
+// parse, the depths shown are real but add up to less than the fleet's.
+function obsQueueDropNote(dropped, shown) {
+  const rows = `${dropped} queue row${dropped === 1 ? "" : "s"}`;
+  const note = node("p", "obs-dropped", shown
+    ? `${rows} unreadable — the depths below are incomplete`
+    : `${rows} unreadable — no queue depth measured`);
+  note.setAttribute("title",
+    "the dashboard build refused these rows as malformed; see its log for the shape mismatch");
+  return note;
+}
+
 // Issue #1868. EVERY array in this panel is a top-N DISPLAY slice the generator cut — 12 lanes, 12
 // queue classes, 12 target repositories, 16 defer reasons, 16 exit classes, 20 trigger fires — and
 // the rows past the cap were WELL-FORMED. Without this note a fleet with 50 congested target
@@ -910,11 +951,10 @@ function obsRecordTrend(o) {
   obsTrend.stamp = o.generated_at;
   const cache = o.cache || {};
   const lanes = Array.isArray(o.lanes) ? o.lanes : [];
-  const queue = o.flow && Array.isArray(o.flow.queue) ? o.flow.queue : [];
   obsTrend.points.push({
     read: obsNum(cache.prompt_cache_read_fraction_1h),
     defers: obsLaneDefers(lanes),
-    queue: queue.reduce((sum, row) => sum + obsNum(row.depth, 0), 0),
+    queue: obsQueueDepth(o.flow),
   });
   if (obsTrend.points.length > OBS_SPARK_POINTS) {
     obsTrend.points.splice(0, obsTrend.points.length - OBS_SPARK_POINTS);
@@ -1095,7 +1135,11 @@ function obsFlowCard(flow, thresholds) {
   const card = obsCard("Queue & flow");
   const queue = Array.isArray(flow.queue) ? flow.queue : [];
   const queueNote = obsTruncationNote(queue, flow.queue_total, "queue classes");
-  if (queue.length || queueNote) {
+  // [#1896] A queue whose rows were ALL refused must not render as the absent list of an idle
+  // fleet: the drop count opens this block on its own, so the caption and the loss are stated even
+  // when nothing survived to sit under them.
+  const queueDropped = obsDropped(flow.queue_dropped);
+  if (queue.length || queueNote || queueDropped) {
     const list = node("div", "obs-reasons");
     list.append(node("p", "obs-spark-caption", "task queue depth · oldest age"));
     for (const row of queue) {
@@ -1110,6 +1154,7 @@ function obsFlowCard(flow, thresholds) {
       list.append(rowEl);
     }
     if (queueNote) list.append(queueNote);
+    if (queueDropped) list.append(obsQueueDropNote(queueDropped, queue.length));
     card.append(list);
   }
   const grid = node("div", "obs-metric-grid");
