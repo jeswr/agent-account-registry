@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2043,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c954c0bc9598a02a52318191b3a6f9c9e0db1368",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly ties both known load-bearing prose restatements to the workflow-derived trigger set. The live scan is non-vacuous because it separately pins the exact files found, and the focused positive and negative controls exercise wrapped comments, drift, quoted code, and partial references. Expected workflow values remain independently pinned by the existing #607 assertion, so the new comparison does not merely accept arbitrary coordinated drift. No trust check, permission, workflow behavior, or executable production path is weakened, and no reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
