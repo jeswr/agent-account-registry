@@ -601,25 +601,42 @@ def _limits_line(entry):
     return ("limits: " + " ".join(parts)) if parts else None
 
 
+# Account records are split with an EXPLICIT `\r?\n` grammar, never `str.splitlines()` (#2035).
+# splitlines() ALSO breaks on `\v`, `\f`, `\x1c`-`\x1e`, `\x85`, `\u2028` and `\u2029`, and drops
+# the terminator it matched — so splitting a live body with it and rejoining on "\n" REWRITES lines
+# this lane never meant to touch: one `notes: a\fb` line came back as TWO lines and every CRLF
+# terminator was normalised to LF. Silently, because `account_record_schema_errors` validates NAMED
+# fields and cannot see a stray line. The capturing group keeps each terminator so it is written
+# back verbatim: this lane exists to add ONE line, and every other byte of the account->credential
+# binding must round-trip unchanged.
+_LINE_SPLIT_RE = re.compile(r"(\r?\n)")
+
+
 def _upsert_limits_line(body, line):
     """(new_body, changed): replace or append the one `limits:` line, idempotently (an identical
-    line means changed=False, so re-probes do not churn issue bodies)."""
-    lines = (body or "").splitlines()
-    out, replaced, changed = [], False, False
-    for existing in lines:
+    line means changed=False, so re-probes do not churn issue bodies). Every OTHER byte of the
+    record — in-line control characters, and each line's own terminator — round-trips unchanged
+    (#2035); see `_LINE_SPLIT_RE`."""
+    parts = _LINE_SPLIT_RE.split(body or "")  # [text, sep, text, sep, ..., text]
+    out, replaced, changed, last_sep = [], False, False, "\n"
+    for index in range(0, len(parts), 2):
+        existing, sep = parts[index], (parts[index + 1] if index + 1 < len(parts) else "")
+        if sep:
+            last_sep = sep
         if existing.strip().startswith("limits:") and not replaced:
             replaced = True
             if existing.strip() != line:
-                out.append(line)
+                out.append(line + sep)  # the replacement inherits the line it replaces
                 changed = True
-            else:
-                out.append(existing)
-        else:
-            out.append(existing)
+                continue
+        out.append(existing + sep)
+    merged = "".join(out)
     if not replaced:
-        out.append(line)
+        # Append. Separate from the preceding line only when it does not already end in one, and
+        # with the record's OWN terminator so an all-CRLF body does not acquire a lone LF line.
+        merged += line if (not merged or merged.endswith("\n")) else last_sep + line
         changed = True
-    return "\n".join(out), changed
+    return merged, changed
 
 
 PERSIST_ATTEMPTS = 3  # bounded re-merge attempts when a writer lands AFTER our edit (issue #198)
@@ -1104,6 +1121,44 @@ def _self_test(escaped=None):
     body4, changed3 = _upsert_limits_line(body2, "limits: 5h_limit=20")
     chk("upsert replaces on change", (changed3, "5h_limit=20" in body4, "5h_limit=10" in body4),
         (True, True, False))
+    #   #2035: the upsert adds ONE line and must rewrite NOTHING else. `str.splitlines()` breaks
+    #   on \v \f \x1c-\x1e \x85 and the U+2028 / U+2029 separators too, and rejoining its output
+    #   normalises CRLF -> LF — so the pre-fix merge silently split single record lines in two and
+    #   re-terminated the whole body, invisible to `account_record_schema_errors`, which validates
+    #   NAMED fields and not stray lines. Every expected body below is a LITERAL, never recomputed
+    #   from the input through the code under test, and every boundary character used here appears
+    #   nowhere else in this harness — so a revert to splitlines, or a dropped terminator, reds
+    #   these rows rather than colliding with a value the fixture already holds.
+    line_sep = chr(0x2028)  # spelled by codepoint: an escape this exotic does not survive a paste
+    exotic = "provider: anthropic\r\nnotes: a\x0cb" + line_sep + "c\x85d\r\nmodels: [haiku]\r\n"
+    chk("upsert appends without rewriting exotic line boundaries or CRLF (#2035)",
+        _upsert_limits_line(exotic, "limits: 5h_limit=1"),
+        ("provider: anthropic\r\nnotes: a\x0cb" + line_sep + "c\x85d\r\n"
+         "models: [haiku]\r\nlimits: 5h_limit=1", True))
+    #   ...and the boundary grammar decides which line IS the limits line, so a `limits:` decoy
+    #   sitting mid-line after a splitlines-only boundary must NOT be adopted as one: adopting it
+    #   would rewrite a `notes:` value and leave the real limits line unwritten. (Mutation-measured:
+    #   preserving terminators alone still round-trips these bytes, so only this row reds a regex
+    #   that re-adopts the splitlines boundary set.)
+    decoy = ("provider: anthropic\r\nnotes: keep\x0climits: decoy-a" + line_sep +
+             "limits: decoy-b\r\nmodels: [haiku]\r\n")
+    chk("an in-line limits: decoy after a splitlines-only boundary is not a limits line (#2035)",
+        _upsert_limits_line(decoy, "limits: 5h_limit=1"),
+        ("provider: anthropic\r\nnotes: keep\x0climits: decoy-a" + line_sep +
+         "limits: decoy-b\r\nmodels: [haiku]\r\nlimits: 5h_limit=1", True))
+    exotic_repl = "provider: anthropic\r\nlimits: 5h_limit=9\r\nnotes: a\x1cb\x1eq\r\n"
+    chk("upsert replaces in place, keeping that line's own terminator and the lines after (#2035)",
+        _upsert_limits_line(exotic_repl, "limits: 5h_limit=1"),
+        ("provider: anthropic\r\nlimits: 5h_limit=1\r\nnotes: a\x1cb\x1eq\r\n", True))
+    chk("upsert no-op leaves an exotic record byte-identical (#2035)",
+        _upsert_limits_line(exotic_repl, "limits: 5h_limit=9"), (exotic_repl, False))
+    chk("upsert appends with the record's OWN terminator when the body has no trailing newline",
+        _upsert_limits_line("provider: anthropic\r\nmodels: [haiku]", "limits: 5h_limit=1"),
+        ("provider: anthropic\r\nmodels: [haiku]\r\nlimits: 5h_limit=1", True))
+    chk("upsert on an empty/absent body is just the line",
+        (_upsert_limits_line("", "limits: 5h_limit=1"),
+         _upsert_limits_line(None, "limits: 5h_limit=1")),
+        (("limits: 5h_limit=1", True), ("limits: 5h_limit=1", True)))
     # [FABLE-5] fable sub-quota classification (issue #30): shape-drift is caught here, and a present-
     # but-unparseable window fail-closes to UNAVAILABLE (None) rather than parsing to garbage.
     #   utilization validator: numeric [0,1] strings only
@@ -1643,6 +1698,23 @@ def _self_test(escaped=None):
     chk("persist: merges limits onto the FRESH body (no stale overwrite)",
         (len(edits), "provider: openai" in edits[0][1], limits_line in edits[0][1]),
         (1, True, True))
+
+    #   (i-bis) #2035 at the DELIVERY layer: the merge is only half the claim — what this lane hands
+    #   `gh issue edit --body` REPLACES the whole record, so the round-trip is asserted against the
+    #   WRITE ARGUMENT, not just the pure function. The live body is an ordinary GitHub-authored
+    #   record (CRLF-terminated) whose notes value carries a \f, and the expected write argument is
+    #   the live body plus the one line — anything else is a rewrite this lane never asked for. The
+    #   queued confirm is that same literal, so a merge that differs also fails the confirm (rc=1).
+    crlf_live = ("provider: openai\r\nharness: codex\r\nmodels: [sol]\r\n"
+                 "credential_format: codex-auth-json\r\nsecret_ref: ACCT01_TOKEN\r\n"
+                 "notes: keep\x0cthis\r\n")
+    crlf_written = crlf_live + limits_line
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(crlf_live, 0), (crlf_written, 1)]}})
+    chk("persist: the WRITTEN body adds one line and preserves CRLF + in-line \\f (#2035)",
+        (_persist_captured(upath, run=run)[0], len(edits),
+         edits[0][1] if edits else None),          # `if edits` so a suppressed write REDS this row
+        (0, 1, crlf_written))                      # rather than raising and aborting the suite
 
     #   (ii) idempotent no-op: the live body already carries the exact line -> zero edits, still 0
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
