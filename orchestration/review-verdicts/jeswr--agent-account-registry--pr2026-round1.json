@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2026,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "36eec1aa52ff693364de0ef321489f93990764ee",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly retracts both authoritative merge-latch forms before ambiguity convergence exposes the human-owned park, preserves the required dequeue-before-disable ordering, and fails closed when the proof re-read cannot establish that both latch forms are absent. The implementation leaves explicit needs-user escalations and ordinary state transitions outside this new GraphQL dependency as intended. The added self-tests exercise the real latch parser and mutation dispatcher through process seams, assert operation ordering and no-write refusal, cover idempotent mutation failure, and use literal external mutation names so the principal assertions are not tautological. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
