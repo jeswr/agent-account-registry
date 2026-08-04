@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2028,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0a74de728e2675f73b905ad91e7c258b5d9cd535",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly distinguishes an unavailable jq dependency from an assertion failure while remaining fail-closed: ENV-BLOCKED returns nonzero, genuine failures take precedence, and the executed workflow-step tests still run on the ubuntu-latest gate where jq is present. The dependency probe is injected for deterministic positive and negative tests, reporter outcomes are asserted, and source-level wiring checks pin a single returning guard ahead of every executed sweep row. The final reporter preserves the prior pass/fail behavior when dependencies are available. No correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
