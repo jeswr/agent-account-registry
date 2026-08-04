@@ -794,7 +794,10 @@ def _cron_minutes(workflow, expand=None):
     one-cron-per-workflow contract the caller depends on: the consumer counts minutes PER HOUR, so
     reading only the first of several schedules would under-count and make the budget invariant
     pass on a schedule it never saw. Anything it cannot expand RAISES rather than reducing to the
-    empty set, which would satisfy that invariant vacuously."""
+    empty set, which would satisfy that invariant vacuously — and since #1279 that includes a
+    field that is only PARTLY unreadable, which is the shape an empty-set refusal cannot catch:
+    the owner refuses an out-of-range atom instead of discarding it, so a minute list cannot come
+    back rounded down to a plausible schedule the workflow will never actually fire on."""
     triggers = workflow.get("on", workflow.get(True)) or {}
     crons = [entry["cron"] for entry in (triggers.get("schedule") or []) if "cron" in entry]
     if len(crons) != 1:
@@ -899,6 +902,18 @@ def _test_cron_minute_expansion(chk):
                         ("a cron with the wrong field count", "3,13 * * *")):
         chk(f"cron: {label} RAISES rather than expanding to nothing (an empty set satisfies the "
             "budget invariant vacuously)", _raised(lambda e=expr: minutes(e)), True)
+    # THE PARTIALLY-invalid field, which the rows above cannot reach: they are all WHOLLY
+    # unreadable, and an expander that merely DISCARDS what it cannot use refuses those anyway by
+    # running out of values. This one keeps six perfectly good minutes — dispatch's own schedule,
+    # exactly — beside a minute the hour does not have, so a discarding expander answers `{3, 13,
+    # 23, 33, 43, 53}` and hands the budget row below the same `(None, 6, True)` it gets from the
+    # real cron. The row would go green on a workflow whose six claimed firings do not exist. :60
+    # is used by no valid expansion anywhere in this suite, so this cannot pass by collision.
+    chk("cron: a minute list that is valid EXCEPT for one impossible atom RAISES — discarding "
+        "the :60 would answer with dispatch's own six minutes and confirm a schedule that never "
+        "fires", _raised(lambda: minutes("3,13,23,33,43,53,60 * * * *")), True)
+    chk("cron: a range whose END runs past :59 RAISES rather than being truncated to :59",
+        _raised(lambda: minutes("55-70 * * * *")), True)
     # The one-cron-per-workflow contract this file's own consumer depends on, in both directions.
     chk("cron: a workflow with no schedule at all RAISES",
         _raised(lambda: _cron_minutes({"on": {"push": {}}})), True)
