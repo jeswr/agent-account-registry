@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5860,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8d5bc16fa84046ce93c737262082b699e392fad8",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "select_open_issue() documents the match as the structured prefix and the round-2 fix guidance called for matching the complete prefix, but the implementation uses `if f\"{marker} {key}:\" in title`. Thus a noncanonical title such as `note: [marker] suite=x: ...` can still dedupe as though it were the filer's canonical rolling issue. The copied lane/shard selectors and coverage probe use the same containment pattern. Label scoping makes this a limited hardening concern rather than a blocker, and the key-prefix collision itself is resolved.",
+    "file": "scripts/bench-triage.py",
+    "fix_hint": "Use `title.startswith(f\"{marker} {key}:\")` here and the equivalent `startswith` checks in the changed lane, shard, and coverage selectors; add one negative test with text preceding the otherwise canonical marker/key fragment.",
+    "severity": "minor",
+    "title": "Structured title match is not anchored at the start"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2's major key-boundary defect is fixed consistently across all four filers and the coverage alarm probe: matches now require the canonical colon delimiter, and targeted negative tests cover suite, cluster, lane, and shard prefix collisions. The pagination and real-path self-tests pass. One minor hardening gap remains: the helpers describe and test a structured title prefix but use substring containment rather than startswith(), so a manually edited or mislabeled title containing the canonical fragment later in the text could still be selected. This does not block approval because canonical filer-created titles always begin with the fragment and label scoping substantially limits exposure.",
+  "verdict": "approve"
+ }
+}
