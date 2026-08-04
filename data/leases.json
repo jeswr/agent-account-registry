@@ -23,12 +23,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "d7ffdfb513a64ab5a255495b365d6cb9",
-   "holder": "review:jeswr/agent-account-registry#2026@dispatch-30867745203.1",
+   "holder": "review:jeswr/agent-account-registry#2026@30868057776.1",
    "package": "review-loop",
    "role": "review",
    "model": "sol",
-   "issued_at": 1785805971,
-   "expires_at": 1785810171
+   "issued_at": 1785806004,
+   "expires_at": 1785810204
   },
   {
    "account": "dc2d751954080e13",
