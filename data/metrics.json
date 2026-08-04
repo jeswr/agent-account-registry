@@ -1,11 +1,11 @@
 {
-  "generated_at": "2026-08-04T07:07:38Z",
+  "generated_at": "2026-08-04T07:35:14Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 2152,
       "issues_ready": 239,
-      "issues_closed_1h": 1,
+      "issues_closed_1h": 0,
       "issues_closed_24h": 9,
       "prs_open": 160,
       "prs_draft": 142,
@@ -26,14 +26,14 @@
     "jeswr/agent-account-registry": {
       "issues_open": 988,
       "issues_ready": 632,
-      "issues_closed_1h": 1,
-      "issues_closed_24h": 53,
+      "issues_closed_1h": 0,
+      "issues_closed_24h": 52,
       "prs_open": 48,
       "prs_draft": 32,
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
-      "prs_merged_24h": 47,
+      "prs_merged_24h": 46,
       "review_changes_backlog": 7,
       "needs_user_parked": 15,
       "review_lane_health": "idle",
