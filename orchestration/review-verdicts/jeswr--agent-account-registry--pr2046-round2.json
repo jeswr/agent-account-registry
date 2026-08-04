@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2046,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f346a2d3e2aa027b315e81aa94a365e1557783dc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_park_call_site` first collects every live `targets = starvation_park_targets(...)` assignment in a function, then separately scans every live loop. `_live_nodes` prunes some dead tails but does not preserve or compare execution order and does not correlate runtime branches. Thus `for target in targets: park_starved_partition_holder(repo, target); targets = starvation_park_targets(...)` is certified as `tick` even though the local is bound only after the loop (and execution raises before parking). Likewise, putting the assignment in `if repo:` and the loop in its `else:` certifies even though no pass through `tick` reaches both. This contradicts the new claim that certification means a pass actually reaches both the assignment and loop. None of the table rows reverses their order or places them in mutually exclusive live branches, so the suite remains green for these fail-open shapes.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make certification path- and order-sensitive across the binding, loop, and park call, or fail closed for control-flow shapes whose correlation is not proven. Add red-on-regression rows for a binding after the loop and for binding/loop in opposite runtime branches, alongside live ordered and same-branch controls so unconditional refusal cannot satisfy the tests.",
+    "severity": "major",
+    "title": "The seam independently finds live nodes that no execution can combine"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-1 jumped-past cases are now handled and directly tested, but the replacement still does not establish its stated single-pass reachability property. It gathers live bindings and live loops independently, without preserving statement order or path correlation, so it can certify a batch whose target binding cannot precede the loop on any execution. The specific prior examples improved, but a new major instance of the same trust-seam unsoundness remains.",
+  "verdict": "request_changes"
+ }
+}
