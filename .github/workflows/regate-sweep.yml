@@ -22,6 +22,13 @@ on:
     # These were :09/:29/:49 until the derivation was turned on and reported what the hand-copied
     # list had never included: latch-watchdog runs :09/:19/:29/:39/:49/:59, i.e. this sweeper had
     # been landing on top of it on ALL THREE ticks.
+    #
+    # The marker below is how the claim in the first paragraph is DECLARED rather than merely
+    # written down (#1278): same-minute disjointness is opt-in per lane on this repo, and
+    # ci-latency-alert.py's `exclusive_minute_lanes` reads this line straight out of this file,
+    # so the claim is checked for THIS lane by the map's own owner and not only by the seam of
+    # the script this workflow happens to run.
+    # cron-exclusive: a tick lost to a pile-up is drain rate this sweeper's arithmetic already spent
     - cron: '4,24,44 * * * *'
 
 permissions: {}

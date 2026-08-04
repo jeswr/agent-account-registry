@@ -16,6 +16,15 @@ name: metrics
 on:
   workflow_dispatch:
   schedule:
+    # This lane does NOT claim a private minute (#1278). Disjointness is opt-in per lane on this
+    # repo — a lane that needs a minute to itself carries a `cron-exclusive:` marker line, which
+    # ci-latency-alert.py checks against the derived map — and what this lane needs is narrower
+    # than a private minute: separation from the OTHER writers of the `ledger` ref, which is what
+    # the header above claims and what the derived map (#1046) still bears out for the dashboard
+    # and groom lanes it names. It is NOT clean against every ledger writer — one of the lanes it
+    # shares a tick with persists a counter to that same ref — and that gap is a class rather than
+    # a fact about this cron, so it is filed as its own issue rather than papered over by
+    # repointing this one lane onto a free minute.
     - cron: '11-59/15 * * * *'
 
 permissions: {}
