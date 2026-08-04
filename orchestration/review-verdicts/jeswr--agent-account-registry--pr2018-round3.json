@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2018,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f68c8b2bbbbfbac001bcded0a52576063efa6277",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The sole diff remains a correct model-agnostic provenance-header migration from `[OPUS-5]` to `[SPARQ agent]`. It preserves the script's substantive text and behavior, changes no trust-plane control, and contains no reviewer-directed injection. No correctness, soundness, test-validity, or security issues are present.",
+  "verdict": "approve"
+ }
+}
