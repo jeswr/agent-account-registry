@@ -2072,17 +2072,53 @@ def _obs_flow(flow):
     #   * the decision-22 label check is unconditional over the rows that ARE present. Supplying
     #     the aggregate is not a way to smuggle an unvalidated row past it, and a collector that
     #     regresses to writing rows is still caught the moment a raw handle appears in one.
+    #
+    # [#1869] Drop-the-row tolerance is unchanged — a malformed lease row never fails the build —
+    # but the drop is now ANNOUNCED, in the shape #982/#1867 set on the queue and trigger-fire
+    # seams. It reads WORSE here than at either of those: a dropped queue row empties a panel,
+    # whereas a dropped lease row leaves the SURVIVORS and `lease_utilization_1h` publishes a
+    # confident mean/max over them. A collector sending half its rows in the wrong shape therefore
+    # published a load-balance figure derived from the other half, and a wrong number reads as a
+    # measurement where an empty panel at least reads as nothing.
+    #
+    # A row is subtracted from that sample TWO ways, and both are announced: the row is not an
+    # object at all, or it is a well-formed row whose `utilization_1h` this build cannot read. The
+    # second is the likelier producer/consumer mismatch — a collector reporting a percentage, a
+    # string, or a null-shaped sentinel keeps a row that PARSES and passes the decision-22 label
+    # check, and pre-#1869 it lowered the sample with no diagnostic anywhere. The absent/null case
+    # is NOT a mismatch and stays silent: a row that reports no utilization is an unmeasured row,
+    # which is #1557's reading of an explicit null, held here for the reason `_obs_stat` holds it.
+    #
+    # Decision 22 bounds what may be said, which is why this seam took its own review rather than
+    # riding along with #1571's six: the message names the row's SHAPE — a type name this build
+    # computed — and NOTHING out of the row. A lease row's `label` is a salted account fingerprint
+    # and #374/#841 removed exactly those from the published page; echoing one into the build log
+    # would republish it one artifact over. A non-object row can itself BE a raw handle string, so
+    # there is no safe `_obs_text` form of it and none is taken; an unreadable `utilization_1h` is
+    # named by TYPE for the same reason, since a collector controls that value too.
+    lease_drops = _ObsDropLog("observability lease rows")
     lease_utilizations = []
     for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
         if not isinstance(item, dict):
+            lease_drops.drop("observability lease input "
+                             f"(the row (type {type(item).__name__}) is not an object)")
             continue
         label = item.get("label")
         if not isinstance(label, str) or OBS_SALTED_LABEL_RE.fullmatch(label) is None:
             raise DashboardError(
                 "observability lease row does not carry a salted account label (decision 22)")
-        utilization = _obs_fraction(item.get("utilization_1h"))
+        raw_utilization = item.get("utilization_1h")
+        utilization = _obs_fraction(raw_utilization)
         if utilization is not None:
             lease_utilizations.append(utilization)
+        elif raw_utilization is not None:
+            lease_drops.drop("observability lease input (row `utilization_1h` "
+                             f"(type {type(raw_utilization).__name__}) is not a fraction "
+                             "between 0 and 1)")
+    # Load-bearing, unlike the stat seam's `close()` below: `flow.leases` is unbounded on the way
+    # IN and #374 publishes none of it on the way out, so nothing else limits how many rows can
+    # announce themselves. A snapshot of 100k unreadable rows must write 12 lines and one total.
+    lease_drops.close()
     if "leases" in flow:
         lease_utilization = {
             "mean": round(sum(lease_utilizations) / len(lease_utilizations), 2),
@@ -7443,6 +7479,172 @@ esac
     ):
         check(f"[#841] {case} collector aggregate is dropped, never published",
               obs_flow_without_rows(aggregate), None)
+    # ---- [#1869] A DROPPED LEASE ROW MUST NAME ITSELF. The seams #982/#1570/#1571/#1867 made loud
+    # all EMPTY a panel when they drop. This one does not: it shrinks the sample
+    # `lease_utilization_1h` is computed over and publishes a confident mean/max across whatever
+    # survived, so a collector sending half its rows in the wrong shape reported a load-balance
+    # figure derived from the other half. A wrong number reads as a measurement; an empty panel at
+    # least reads as nothing. Every expected string below is a test-side literal (reading the
+    # message back off the module under test is pre-flight 2(b)'s tautology) and every input is a
+    # literal (2(c)); the capture keeps EVERY `dashboard-gen:` line, in order and unfiltered, so a
+    # line printed to the wrong seam, or with the wrong text, reds.
+    _LEASE_DROP = "dashboard-gen: dropped observability lease input ({})"
+    _LEASE_ROWS = "observability lease rows"
+    _KEPT_LEASE = {"label": "ab12cd340a5f9e71", "provider": "anthropic", "utilization_1h": 0.8}
+
+    def obs_lease_drops(rows, queue_rows=None):
+        """(published `flow.lease_utilization_1h`, EVERY `dashboard-gen:` line printed).
+
+        The FIXTURE is quietened rather than the capture (as `obs_drops` does above): the golden
+        snapshot's unknown queue class, retired cache keys and unsafe trigger rule each announce
+        themselves from a different seam, and filtering them out of the capture would also hide a
+        lease line mislabelled as one of them.
+        """
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["flow"]["leases"] = rows
+        fixture["flow"]["queue"] = ([{"class": "2a", "depth": 1}]
+                                    if queue_rows is None else queue_rows)
+        fixture["cache"] = {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7}
+        fixture["trigger_fires"] = []
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        except Exception as error:  # noqa: BLE001 — #1880's arm, for #1880's reason: this seam
+            # walks rows it has just declared unreadable, so a guard that ANNOUNCES the row without
+            # skipping it raises out of `item.get(...)` and would abort every check below rather
+            # than red the row that provoked it. Rendered, not swallowed: nothing here equals it.
+            document = ObsRefusal(raised=f"{type(error).__name__}: {error}"[:200])
+        return (document["flow"]["lease_utilization_1h"],
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen:")])
+
+    # THE REGRESSION, in the shape the issue names, and both directions in one row: the survivors
+    # still publish (this is a drop diagnostic, not a new fatality), and the two rows that were
+    # silently subtracted from the sample now name themselves. Pre-#1869 the value below was
+    # published with an empty line list — a confident 0.5 mean over half a fleet, announced nowhere.
+    check("[#1869] a lease list half of whose rows are unreadable publishes a mean/max over the "
+          "SURVIVORS — the aggregate is unchanged, and every subtracted row now names itself "
+          "instead of quietly lowering the sample the load-balance figure is computed from",
+          obs_lease_drops([copy.deepcopy(_KEPT_LEASE),
+                           ["ef56ab78b3c2d104", 0.4],
+                           None,
+                           {"label": "cd90ef1276a8b535", "provider": "openai",
+                            "utilization_1h": 0.2}]),
+          ({"mean": 0.5, "max": 0.8},
+           [_LEASE_DROP.format("the row (type list) is not an object"),
+            _LEASE_DROP.format("the row (type NoneType) is not an object")]))
+    # The accept path must stay SILENT, or the warning marks nothing: an unconditional drop, or one
+    # hoisted above the guard, publishes this same aggregate and turns this row red.
+    check("[#1869] a lease list whose rows all parse prints NOTHING — the warning marks a real "
+          "drop, so it can never fire on the accept path",
+          obs_lease_drops([copy.deepcopy(_KEPT_LEASE),
+                           {"label": "ef56ab78b3c2d104", "provider": "anthropic",
+                            "utilization_1h": 0.4}]),
+          ({"mean": 0.6, "max": 0.8}, []))
+    # One line per dropped row, naming the SHAPE that failed. The null and bare-scalar cases are
+    # here because the list case does not cover them: a guard made inert for exactly the null input
+    # (`item is None or not isinstance(...)`) survives a suite that only ever sends a list, which is
+    # pre-flight item 3's #938 shape, and null is the likeliest thing a JSON producer emits.
+    for case, row, detail in (
+        ("a non-object row", ["ab12cd340a5f9e71", 0.5], "the row (type list) is not an object"),
+        ("a null row", None, "the row (type NoneType) is not an object"),
+        ("a bare-scalar row", 0.5, "the row (type float) is not an object"),
+    ):
+        check(f"[#1869] {case} is dropped LOUDLY, and with no row left the stat HIDES rather than "
+              "publishing an aggregate over an empty sample",
+              obs_lease_drops([row]), (None, [_LEASE_DROP.format(detail)]))
+    # THE SECOND WAY A ROW LEAVES THE SAMPLE, and the likelier producer/consumer mismatch: the row
+    # is a well-formed object carrying a salted label — so the guard above waves it through and the
+    # decision-22 check passes — but `_obs_fraction` cannot read its `utilization_1h`. Pre-#1869
+    # that row was subtracted from the sample with NO diagnostic at all, which is the same
+    # confident-mean-over-the-survivors failure as a dropped non-object row and is invisible to
+    # every row above (they all send readable values). Announcing only inside the `isinstance`
+    # guard reds all three of these. The reject side is walked by TYPE because a guard narrowed to
+    # one of them (`isinstance(raw, str)`) survives a suite that only ever sends a string.
+    _LEASE_UTIL = ("dashboard-gen: dropped observability lease input (row `utilization_1h` "
+                   "(type {}) is not a fraction between 0 and 1)")
+    for case, value, type_name in (
+        ("an unparseable string", "busy", "str"),
+        ("a percentage out of the 0..1 range", 80, "int"),
+        ("a boolean", True, "bool"),
+        ("a nested object", {"mean": 0.4}, "dict"),
+    ):
+        check(f"[#1869] a lease row reporting {case} still publishes the SURVIVORS' aggregate, "
+              "and the row it quietly subtracted from that sample now names itself",
+              obs_lease_drops([copy.deepcopy(_KEPT_LEASE),
+                               {"label": "ef56ab78b3c2d104", "provider": "anthropic",
+                                "utilization_1h": value}]),
+              ({"mean": 0.8, "max": 0.8}, [_LEASE_UTIL.format(type_name)]))
+    # ...and the accept side of that same guard: a row that reports NO utilization is an unmeasured
+    # row, not a shape mismatch, so it stays silent (#1557's reading of an explicit null, which
+    # `_obs_stat` already holds one seam over). Announce every unreadable fraction unconditionally
+    # — the tempting one-line form — and a collector that has simply not shipped the field yet
+    # writes one warning per account per build; these two rows are what stops that.
+    for case, row in (
+        ("absent", {"label": "ef56ab78b3c2d104", "provider": "anthropic"}),
+        ("an explicit null", {"label": "ef56ab78b3c2d104", "provider": "anthropic",
+                              "utilization_1h": None}),
+    ):
+        check(f"[#1869] a lease row whose utilization is {case} is UNMEASURED, not malformed: it "
+              "is absent from the sample and announces nothing",
+              obs_lease_drops([copy.deepcopy(_KEPT_LEASE), row]),
+              ({"mean": 0.8, "max": 0.8}, []))
+    # DECISION 22 is why this seam is announced separately from #1571's six. A non-object row can
+    # itself BE an account identity — a raw handle, or the salted fingerprint #374/#841 removed
+    # from the published page — so the message may name the row's TYPE and nothing else. Echo the
+    # row (or any `_obs_text` prefix of it) and the build log republishes what the page stopped
+    # carrying; the last element names exactly what such a leak looks like.
+    _leaky_rows = obs_lease_drops([handle, "ab12cd340a5f9e71", copy.deepcopy(_KEPT_LEASE)])
+    check("[#1869] decision 22: a dropped lease row names its SHAPE and nothing out of the row — "
+          "neither a raw handle nor a salted fingerprint reaches the build log diagnosing it",
+          (_leaky_rows[0], _leaky_rows[1],
+           [text for text in (handle, "ab12cd340a5f9e71")
+            if text in "\n".join(_leaky_rows[1])]),
+          ({"mean": 0.8, "max": 0.8},
+           [_LEASE_DROP.format("the row (type str) is not an object")] * 2, []))
+    # ...and the fatality on the rows that DO parse is untouched: turning the decision-22 raise
+    # into one more drop line would read as a tolerated shape mismatch. The unreadable row comes
+    # FIRST, so the drop is announced before the fatal row is reached.
+    mixed_raw = copy.deepcopy(obs_fixture)
+    mixed_raw["flow"]["leases"] = [None, {"label": handle, "provider": "anthropic",
+                                          "utilization_1h": 0.5}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            _normalize_observability(mixed_raw)
+            raw_still_fatal = "published"
+        except DashboardError:
+            raw_still_fatal = "fatal"
+        except Exception as error:  # noqa: BLE001 — see `obs_lease_drops`: a guard that announces
+            # the row without skipping it reaches `item.get(...)` on a non-object and raises
+            # something that is NOT a DashboardError. Rendered as this row's value so it reds here
+            # rather than aborting every check below (`_raises_dashboard` would let it through).
+            raw_still_fatal = f"{type(error).__name__}: {error}"[:200]
+    check("[#1869] announcing a dropped row does not soften the decision-22 fatality beside it — "
+          "a raw handle in a row that parses is still fatal, drop diagnostic or not",
+          raw_still_fatal, "fatal")
+    # `flow.leases` is unbounded on the way IN and #374 publishes none of it on the way out, so
+    # nothing but this seam's own `_ObsDropLog` limits the emission — the #1570 flood, exactly. The
+    # 21st row still publishes: capping a WARNING must never cap the DATA. Every size and expected
+    # string here is a literal; deriving either from OBS_DROP_WARN_MAX is the #941 tautology.
+    check("[#1869] 20 unreadable lease rows print 12 warnings and ONE tail naming the real total, "
+          "and the readable row beside them still publishes its aggregate",
+          obs_lease_drops([None] * 20 + [copy.deepcopy(_KEPT_LEASE)]),
+          ({"mean": 0.8, "max": 0.8},
+           [_LEASE_DROP.format("the row (type NoneType) is not an object")] * 12
+           + [_SUPPRESSED.format(8, _LEASE_ROWS, 20)]))
+    # The lease seam and the queue seam count SEPARATELY, for the reason #1570 kept the queue and
+    # evidence seams apart: one shared budget would let a flood of unreadable lease rows silence
+    # the queue warning on the same document — trading one invisible loss for another — and would
+    # print one tail naming the wrong seam. Ordering is fixed: the queue loop closes first.
+    check("[#1869] a flooded lease seam does not consume the queue seam's budget: the lone bad "
+          "queue row still names itself, and the tail names the LEASE seam",
+          obs_lease_drops([None] * 20, queue_rows=[{"class": 1, "depth": 4}])[1],
+          [_INT_CLASS]
+          + [_LEASE_DROP.format("the row (type NoneType) is not an object")] * 12
+          + [_SUPPRESSED.format(8, _LEASE_ROWS, 20)])
     try:
         with_observability = build_dashboard(
             issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
