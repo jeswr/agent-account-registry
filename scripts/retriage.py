@@ -93,6 +93,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tomllib
 
@@ -729,6 +730,51 @@ def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_label
         print(f"::error title=retriage #{number}::{decision['action']} did not satisfy the "
               f"single-role post-condition (registry #582): {'; '.join(outcome['warnings'])}")
         return 1
+    return 0
+
+
+# [issue #1740] Dependencies the EXECUTED self-test rows shell out to but this repo does not ship.
+# The sweep-paging rows run the workflow's OWN step body, which filters every board page with `jq`.
+# jq is preinstalled on ubuntu-latest — where this gate actually runs — but ABSENT from the
+# unprivileged model container (no root, no sudo, no pip), where `jq -e 'type == "array"'` exits 127
+# and the step's page-shape guard reads that as a malformed page and fails closed on page 1.
+SELFTEST_EXECUTED_DEPS = ("jq",)
+
+
+def selftest_env_blocked(deps, present=None):
+    """PURE given its injected probe: one ENV-BLOCKED line per dependency the probe cannot find.
+
+    Returns [] — and ONLY then — when every dependency is present. The probe is a parameter so the
+    self-test can drive both directions offline, on whatever the runner happens to have installed.
+    """
+    probe = shutil.which if present is None else present
+    return [f"ENV-BLOCKED {dep} is unavailable — the EXECUTED sweep-paging rows run the "
+            f"workflow's own step body, which filters every board page with {dep}; those rows were "
+            f"NOT run. This is NOT a test failure and NOT a pass: install {dep} (it is preinstalled "
+            f"on ubuntu-latest, where this gate runs) or run the self-test where it exists."
+            for dep in deps if not probe(dep)]
+
+
+def _selftest_report(checks, env_blocked):
+    """Print every assertion row, then exactly one verdict line. Returns the process exit code.
+
+    Three verdicts, in precedence order. A genuine row failure OUTRANKS a blocked section — "we
+    could not run part of the suite" must never mask a regression the part that DID run observed.
+    ENV-BLOCKED is its own class and is still a REFUSAL: "we could not test this" is not evidence
+    that the change is safe (worker-live.sh's #824 preflight makes the same call for the suite).
+    """
+    ok = all(result for _, result in checks)
+    for name, result in checks:
+        print(f"  {'ok  ' if result else 'FAIL'} {name}")
+    for line in env_blocked:
+        print(line)
+    if not ok:
+        print("retriage self-test FAILED")
+        return 1
+    if env_blocked:
+        print("retriage self-test ENV-BLOCKED")
+        return 1
+    print("retriage self-test PASSED")
     return 0
 
 
@@ -2109,6 +2155,85 @@ def _self_test():
                    "UNCHANGED board" in warning and "not a per-issue deadline" in warning))
 
     # -------------------------------------------------------------------------------------------
+    # [issue #1740] UN-RUNNABLE IS NOT FAILING. Everything above this point is pure Python and runs
+    # anywhere; everything below shells out to the workflow's own sweep step, which needs `jq`.
+    # MEASURED on a clean master in the model container (no jq): 10 of those rows report FAIL and
+    # read exactly like a paging regression, and an ELEVENTH — "a non-array page payload fails the
+    # step CLOSED" — reports `ok` for the WRONG REASON: `jq -e` exits 127, the step refuses page 1
+    # as unreadable, and the row sees the very refusal it is asserting. That row is a FALSE GREEN,
+    # which is worse than the ten reds: it would pass with the page-shape guard DELETED.
+    #
+    # So the section is probed BEFORE it runs and refused under its own ENV-BLOCKED class — the
+    # shape worker-live.sh's #824 preflight already gives the whole suite ("an unrunnable row must
+    # never be confused with a failing one"), and the shape migrate-secrets.sh's own `command -v jq`
+    # refusal gives its harness. Naming the one absent dependency beats printing eleven rows a
+    # reader will act on. It stays a REFUSAL: a partial suite is not a result and is not a pass.
+    # -------------------------------------------------------------------------------------------
+    import contextlib
+    import io
+
+    chk("[#1740] an ABSENT executed-suite dependency yields exactly one ENV-BLOCKED line, naming it",
+        [line.split(" is unavailable")[0]
+         for line in selftest_env_blocked(("jq",), present=lambda name: None)],
+        ["ENV-BLOCKED jq"])
+    chk("[#1740] ...and a PRESENT one yields NOTHING — the PROBE decides, not the table",
+        selftest_env_blocked(("jq",), present=lambda name: "/usr/bin/jq"), [])
+    chk("[#1740] the real probe is a lookup of the dependency on PATH, not a hard-coded verdict",
+        selftest_env_blocked(SELFTEST_EXECUTED_DEPS) == [],
+        all(shutil.which(dep) for dep in SELFTEST_EXECUTED_DEPS))
+
+    def report(rows, blocked):
+        """(exit code, stdout) for one verdict rendering."""
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = _selftest_report(rows, blocked)
+        return code, buffer.getvalue()
+
+    green, red = [("row", True)], [("row", False)]
+    blocked_line = ["ENV-BLOCKED jq is unavailable — ..."]
+    code_blocked, out_blocked = report(green, blocked_line)
+    chk("[#1740] ENV-BLOCKED is a REFUSAL under its OWN verdict — never reported as a pass",
+        (code_blocked, "retriage self-test ENV-BLOCKED" in out_blocked,
+         "retriage self-test PASSED" in out_blocked, blocked_line[0] in out_blocked),
+        (1, True, False, True))
+    code_pass, out_pass = report(green, [])
+    chk("[#1740] POSITIVE CONTROL: green rows with every dependency present still PASS",
+        (code_pass, "retriage self-test PASSED" in out_pass), (0, True))
+    code_fail, out_fail = report(red, [])
+    chk("[#1740] a genuine row failure still FAILS",
+        (code_fail, "retriage self-test FAILED" in out_fail), (1, True))
+    code_both, out_both = report(red, blocked_line)
+    chk("[#1740] a genuine failure OUTRANKS the block — ENV-BLOCKED must not mask a regression the "
+        "rows that DID run observed",
+        (code_both, "retriage self-test FAILED" in out_both,
+         "retriage self-test ENV-BLOCKED" in out_both), (1, True, False))
+
+    # WIRING. The three reporter rows above would all stay green with the guard below deleted,
+    # `if False`-ed, or moved after the executed rows it is supposed to gate — the reporter is
+    # perfectly correct and simply never reached (AGENTS.md pre-flight item 4). So the guard is
+    # asserted STRUCTURALLY, as an exact ADJACENT-PAIR match ordered against the first executed row.
+    own_lines = [line.strip() for line in
+                 open(__file__, encoding="utf-8").read().splitlines()]
+    guard_at = [index for index in range(len(own_lines) - 1)
+                if own_lines[index] == "if env_blocked:"
+                and own_lines[index + 1] == "return _selftest_report(checks, env_blocked)"]
+    # Anchored on the executed rows' own `code, log, ... = run_sweep_step(...)` shape rather than on
+    # the bare call text: a substring needle matches THIS line too, which sits above the guard and
+    # made the ordering row read False on a correctly-wired tree (measured while writing it).
+    first_executed = next((index for index, line in enumerate(own_lines)
+                           if line.startswith("code, log, ") and "run_sweep_step(" in line), None)
+    chk("[#1740] WIRING: the executed section is guarded by exactly one probe that RETURNS",
+        (len(guard_at),
+         own_lines.count("env_blocked = selftest_env_blocked(SELFTEST_EXECUTED_DEPS)")), (1, 1))
+    chk("[#1740] WIRING: the guard precedes EVERY executed sweep row",
+        (first_executed is not None and len(guard_at) == 1
+         and guard_at[0] < first_executed), True)
+
+    env_blocked = selftest_env_blocked(SELFTEST_EXECUTED_DEPS)
+    if env_blocked:
+        return _selftest_report(checks, env_blocked)
+
+    # -------------------------------------------------------------------------------------------
     # [#605 review ROUND 2, finding 2] THE SHELL PAGINATION GUARDS ARE EXECUTED. The step body is
     # extracted from the workflow and run against a stubbed `gh_retry` (canned board pages) and a
     # stubbed applier, so the REQUEST ceiling, the page-shape guard and the short-page completeness
@@ -2381,11 +2506,7 @@ if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split
                    (code != 0, applies, log.count("fail-closed retriage FAILED"),
                     "one or more issues failed" in log) == (True, 80, 2, True)))
 
-    ok = all(result for _, result in checks)
-    for name, result in checks:
-        print(f"  {'ok  ' if result else 'FAIL'} {name}")
-    print("retriage self-test", "PASSED" if ok else "FAILED")
-    return 0 if ok else 1
+    return _selftest_report(checks, [])
 
 
 def build_parser():
