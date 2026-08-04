@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1911,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b3bdf56614549bdd3e36148dd8327bd367920719",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_park_call_site` still accepts both bypasses recorded in round four. For `targets if pending is not pending else []`, `_constant_truth` returns `None`, `_static_control` is false because the comparison contains `Name` nodes, and `_control_arms` marks both arms live; however a local name is identical to itself, so the condition is always false and the loop receives `[]`. For `filter(lambda _: False, targets)`, `_live_nodes` sees the `targets` argument to the call and the checker certifies it, although the filter yields no elements. The added refusal suite contains neither required case. Reachability during iterable construction is not evidence that the constructed iterable iterates every selected target.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Restrict accepted loop iterables to a structural grammar that guarantees iteration of the bound batch, preferably the bound name itself plus only explicitly justified transparent forms. Add a live control and named refusal tests for `targets if pending is not pending else []` and `filter(lambda _: False, targets)`, and verify that the production call site remains certified.",
+    "severity": "major",
+    "title": "Runtime-valued iterable wrappers still certify without iterating the batch"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-five change still does not close the prior round's soundness finding. `_live_nodes` proves only that `targets` may be evaluated while constructing the loop iterable; it does not prove that the resulting iterable contains the selected batch. Both concrete bypasses from round four therefore remain accepted while iterating no selected holder. This is materially the same major finding at the same severity.",
+  "verdict": "request_changes"
+ }
+}
