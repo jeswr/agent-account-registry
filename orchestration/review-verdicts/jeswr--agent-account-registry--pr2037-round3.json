@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2037,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cf965583fcdd0b2a2bcd7222b57ec81ee79a70c3",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The lease-row drop diagnostics remain correct, bounded, and privacy-preserving. Non-object rows and present non-null utilization values that cannot be parsed are announced without exposing collector-controlled contents; absent and explicit-null utilization remain silent unmeasured rows; valid survivors continue to determine the aggregate; and the decision-22 salted-label check remains fatal. The tests use independent literal inputs and expected messages, cover both drop paths and their accept paths, preserve the privacy/fatality boundary, exercise bounded emission and per-seam budget independence, and guard against crash-after-partial-run behavior. I found no new correctness, soundness, test-validity, or security issue. With no findings in either round 2 or round 3, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
