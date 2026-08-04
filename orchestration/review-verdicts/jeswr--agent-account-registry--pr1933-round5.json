@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1933,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "513808f6bdb959b0a944ea9e895951521fb0bf54",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Bead 2 still defines `worker_no_change_max_unattributed` as an integer with default `0` and says only that it needs no float-branch edit. In the current `_thresholds_of`, every non-curator threshold other than `worker_success_floor` must be a non-boolean integer strictly greater than zero. Thus an explicit policy override of the documented zero boundary raises `must be a positive integer`. The design still does not specify the dedicated validation rule or boundary tests needed to make its recommended fail-closed setting implementable.",
+    "file": "research/987-no-change-telemetry.md",
+    "fix_hint": "Require a dedicated `_thresholds_of` case for `worker_no_change_max_unattributed` that accepts non-boolean integers `>= 0` (and define an upper bound if one is intended). Add acceptance criteria proving that `0` is accepted while `-1`, booleans, and non-integers are rejected.",
+    "severity": "major",
+    "title": "The zero unattributed threshold remains incompatible with policy validation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 major finding remains materially unchanged. Bead 2 still specifies `worker_no_change_max_unattributed` with a default and meaningful boundary of `0`, but only says that it needs no float-branch edit. The current validator's generic integer branch rejects zero, and the acceptance criteria still omit tests for this policy boundary. Consequently the recommended fail-closed default cannot be explicitly configured. Progress is stagnant because the same major issue persists at the same severity.",
+  "verdict": "request_changes"
+ }
+}
