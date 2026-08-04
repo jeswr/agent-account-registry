@@ -2050,6 +2050,83 @@ def _live_review_labels(repo, pr_number):
     return {label["name"] for label in labels} & set(REVIEW_LABELS)
 
 
+# [registry #686] The ambiguity convergence is a PARK WRITE, so it must retract the auto-merge
+# latch first. The two GitHub-side latch forms are retracted in the ONLY safe order — dequeue
+# FIRST — because `disablePullRequestAutoMerge` on a QUEUED pull request does NOT remove it from
+# the queue (`gh pr merge --disable-auto` answers "is already queued to merge"); the reverse order
+# can leave a PR that merges anyway. disarm() has pinned this same order since issue #69, and the
+# mutation names are `_queue_disarm_mutation`'s, so there is ONE definition of each half.
+CONVERGENCE_DISARM_DEQUEUE = "dequeuePullRequest"
+CONVERGENCE_DISARM_DISABLE_AUTO = "disablePullRequestAutoMerge"
+
+
+def _disarm_before_convergence_park(repo, pr_number):
+    """[registry #686] Retract `repo#pr_number`'s auto-merge latch — and PROVE it gone — BEFORE
+    set_review_state's ambiguity convergence writes the human hold `review:needs-user`.
+
+    WHY ONLY THIS BRANCH, and not every review-state stamp. `review:needs-user` is a park label
+    (park_policy.HUMAN_PR_PARK_LABEL / `human_owned_holds`): the loop stands down on it, a human
+    is paged, and — since the parked-PR carve-out — the scheduler may hand the PR's crate
+    partitions to a sibling. A parked PR that is still ARMED merges on green CI with nobody having
+    decided anything, and the #42 safety net cannot catch it: `enumerate_disarm_items` keys on an
+    armed-SHA MISMATCH, so a converged PR whose head still equals its reviewed-sha marker keeps
+    its latch. Every `set_review_state(.., "needs"/"changes"/"pass")` call is therefore a LATENT
+    park writer. Hanging the disarm on the CONVERGENCE branch — the resolved label differs from
+    the requested state AND the resolved label is the human hold — is what makes that latency
+    safe without (a) firing a disarm around `ready_and_arm`'s legitimate `review:pass` stamp, or
+    (b) charging an authoritative GraphQL latch read to every stamp. It converges from the arm
+    path too, and that is CORRECT there: a convergence means the requested `pass` did NOT land, so
+    the arm that preceded it a few lines earlier is arming a PR the loop has just decided a human
+    owns.
+
+    ORDERING IS THE SAFETY PROPERTY, not an implementation detail. On any failure this RAISES and
+    the caller writes NO label, so the PR is left with the AMBIGUOUS namespace it already had —
+    which `get_review_state` already reads as the same fail-closed `needs-user` — rather than
+    entering the new parked-and-armed state a label-first ordering creates.
+
+    THE PROOF RE-READ IS LOAD-BEARING IN BOTH DIRECTIONS, which is why an individual mutation
+    failure is COLLECTED rather than raised immediately: a retraction that RAISED while the latch
+    is provably gone is an idempotent success (the latch can vanish between the deciding read and
+    the mutation — GitHub then rejects the disable on an already-unarmed PR, issue #487), and a
+    retraction that REPORTED SUCCESS while the latch survives still refuses (a merge-queue entry
+    already mid-merge cannot be dequeued).
+
+    Returns the ordered tuple of mutations actually issued — `()` for the overwhelmingly common
+    unarmed no-op, which costs one read and no mutations."""
+    node_id, queued, auto_merge = _merge_latch_state(repo, pr_number)
+    mutations = []
+    if queued:
+        mutations.append(CONVERGENCE_DISARM_DEQUEUE)
+    if auto_merge:
+        mutations.append(CONVERGENCE_DISARM_DISABLE_AUTO)
+    if not mutations:
+        return ()
+    failures = []
+    for mutation in mutations:
+        try:
+            _queue_disarm_mutation(mutation, node_id)
+        except WorkerPrError as exc:
+            # The PROOF re-read below adjudicates, never this — see the docstring.
+            failures.append(f"{mutation}: {' '.join(str(exc).split())[:120]}")
+    _, still_queued, still_auto_merge = _merge_latch_state(repo, pr_number)
+    if still_queued or still_auto_merge:
+        surviving = ",".join(name for name, live in (("merge-queue", still_queued),
+                                                     ("auto-merge", still_auto_merge)) if live)
+        raise WorkerPrError(
+            f"ambiguity convergence REFUSED for {repo}#{pr_number}: the {surviving} latch is "
+            f"still live after {','.join(mutations)}"
+            + (f" ({'; '.join(failures)})" if failures else
+               " (the retraction reported success — a merge-queue entry already mid-merge cannot "
+               "be dequeued)")
+            + " — review:needs-user was NOT written, so the PR keeps its ambiguous review "
+              "namespace (which get_review_state already reads as the fail-closed hold) instead "
+              "of becoming parked-and-armed")
+    if failures:
+        print(f"convergence disarm for {repo}#{pr_number} converged idempotently despite "
+              f"{'; '.join(failures)} — the proof re-read shows both latch forms absent")
+    return tuple(mutations)
+
+
 def set_review_state(repo, pr_number, state, abort_on_machine_park=False, live_review=None):
     """Apply the mutually-exclusive review:* label for `state` and drop the OTHER review:* labels.
 
@@ -2069,6 +2146,13 @@ def set_review_state(repo, pr_number, state, abort_on_machine_park=False, live_r
       between the add and the removes below, or a manual mislabel) to the fail-closed human hold
       (review:needs-user) instead of the requested state: a split state reads inconsistently
       downstream, so it stops at a human rather than resolving to a guessed "clean" value.
+      That convergence is a PARK WRITE the caller never asked for, so it — alone among this
+      primitive's paths — routes through `_disarm_before_convergence_park` first (registry #686):
+      the auto-merge latch is retracted and PROVEN gone before the hold becomes visible, and an
+      unprovable latch RAISES with nothing written, leaving the PR in the ambiguous-but-armed
+      state it already had rather than the new parked-and-armed one. Requesting `needs-user`
+      EXPLICITLY does not take this branch and is never gated on a latch read: `needs_user`'s own
+      injection/tamper park must never be blocked by a GraphQL failure.
 
     `state="parked"` (the machine capacity park review:parked) rides the same machinery: it is
     a review:* label, so writing it drops the stale review state, a later legitimate transition
@@ -2134,6 +2218,10 @@ def set_review_state(repo, pr_number, state, abort_on_machine_park=False, live_r
     if len(live_review) > 1 and label != "review:needs-user":
         print(f"ambiguous live review labels {sorted(live_review)} — converging to the "
               f"fail-closed human hold review:needs-user instead of '{state}' (issue #138)")
+        # [registry #686] This branch — and ONLY this branch — parks a PR the caller never asked
+        # to park, so it retracts the auto-merge latch BEFORE the hold becomes visible. A failure
+        # raises out of here with NOTHING written.
+        _disarm_before_convergence_park(repo, pr_number)
         label, state = "review:needs-user", "needs-user"
         converged = True
     _ensure_label(repo, label)
@@ -7200,25 +7288,66 @@ def _self_test():
     # at the label primitive). I/O is monkeypatched; nothing hits GitHub.
     srs_globals = globals()
     srs_real = {name: srs_globals[name]
-                for name in ("_gh_json", "_ensure_label", "_remove_label", "_write_outputs")}
+                for name in ("_gh_json", "_ensure_label", "_remove_label", "_write_outputs",
+                             "_run_gh")}
     try:
-        srs_state = {"live": [], "posted": [], "removed": [], "output": {}}
+        # `latch` is the LIVE (queued, auto_merge) merge-latch pair the stubbed GraphQL read
+        # reports; `latch_sticks` makes a mutation report success WITHOUT clearing it (the
+        # already-mid-merge queue entry). `ops` records, IN ORDER, every latch read, every disarm
+        # mutation and every label write, so the ORDERING — disarm strictly before the label —
+        # is directly assertable rather than merely plausible (registry #686).
+        srs_state = {"live": [], "posted": [], "removed": [], "output": {},
+                     "latch": (False, False), "latch_sticks": False, "mutate_rc": 0, "ops": []}
+
+        def srs_latch_doc():
+            queued, auto_merge = srs_state["latch"]
+            srs_state["ops"].append(f"latch-read:{int(queued)}{int(auto_merge)}")
+            return {"data": {"repository": {"pullRequest": {
+                "id": "PR_node_5",
+                "mergeQueueEntry": {"id": "MQE_1"} if queued else None,
+                "autoMergeRequest": {"enabledAt": "2026-08-03T00:00:00Z"} if auto_merge else None,
+            }}}}
 
         def srs_gh(args, **kwargs):
+            if "graphql" in args:                        # the authoritative latch READ
+                return srs_latch_doc()
             if "-X" in args and "POST" in args:          # the label ADD
                 srs_state["posted"].append(kwargs.get("input_doc", {}).get("labels"))
+                srs_state["ops"].append("label-add")
                 return {}
             return srs_state["live"]                      # the live-labels GET
 
+        def srs_run_gh(args, **kwargs):
+            # Only the GraphQL disarm MUTATIONS reach _run_gh here. The mutation is identified by
+            # the query text the REAL _queue_disarm_mutation BUILT, matched against GitHub's
+            # literal mutation names — never against the module constants under test, which would
+            # make a re-point of either name invisible to every assertion below.
+            query = next((arg[len("query="):] for arg in args
+                          if isinstance(arg, str) and arg.startswith("query=")), "")
+            for name in ("dequeuePullRequest", "disablePullRequestAutoMerge"):
+                if f"{name}(input:" in query:
+                    srs_state["ops"].append(f"mutate:{name}")
+                    if not srs_state["latch_sticks"]:
+                        queued, auto_merge = srs_state["latch"]
+                        srs_state["latch"] = (
+                            False if name == "dequeuePullRequest" else queued,
+                            False if name == "disablePullRequestAutoMerge" else auto_merge)
+                    return types.SimpleNamespace(returncode=srs_state["mutate_rc"],
+                                                 stdout="{}", stderr="already unarmed")
+            raise AssertionError(f"unstubbed gh mutation {args}")
+
         srs_globals["_gh_json"] = srs_gh
+        srs_globals["_run_gh"] = srs_run_gh
         srs_globals["_ensure_label"] = lambda repo, label: None
         srs_globals["_remove_label"] = (
             lambda repo, pr, other: srs_state["removed"].append(other))
         srs_globals["_write_outputs"] = lambda values: srs_state["output"].update(values)
 
-        def run_set(live, state):
+        def run_set(live, state, latch=(False, False), latch_sticks=False, mutate_rc=0):
             srs_state["live"] = [{"name": name} for name in live]
-            srs_state["posted"], srs_state["removed"] = [], []
+            srs_state["posted"], srs_state["removed"], srs_state["ops"] = [], [], []
+            srs_state["latch"], srs_state["latch_sticks"] = latch, latch_sticks
+            srs_state["mutate_rc"] = mutate_rc
             set_review_state("o/r", 5, state)
             return srs_state["posted"], srs_state["removed"]
 
@@ -7234,6 +7363,109 @@ def _self_test():
         amb_posted, _amb_removed = run_set(["review:needs", "review:changes"], "pass")
         check("ambiguous review labels converge to the human hold",
               amb_posted, [["review:needs-user"]])
+
+        # ---- [registry #686] THE CONVERGENCE IS A PARK WRITE, SO IT DISARMS FIRST. The label the
+        # convergence actually writes is a human-owned hold, and a parked PR that is still ARMED
+        # merges on green CI with nobody having decided anything — `enumerate_disarm_items` keys on
+        # an armed-SHA MISMATCH, so a converged PR at its reviewed head is invisible to that net.
+        # These assertions are read off the OBSERVED `ops`/`posted` trace, never off the constants
+        # the code writes from. `_merge_latch_state` and `_queue_disarm_mutation` run FOR REAL —
+        # only the `gh` process seam is stubbed — and both were at 0% line coverage before. ----
+        check("#686: what the convergence ACTUALLY posted is a park label per the shared "
+              "park_policy classifier (not a literal this test hard-codes)",
+              _park_policy().human_owned_holds(amb_posted[0]), ["review:needs-user"])
+        # The two mutation names are written here AND in `_queue_disarm_mutation`'s dispatch, so
+        # bind the copies: each must be a name that dispatcher ACCEPTS, and a name it does not
+        # know must raise. Without this, re-pointing one copy alone would only ever surface
+        # indirectly (as an un-retracted latch), which is a much harder red to read.
+        srs_names = []
+        for _name in (CONVERGENCE_DISARM_DEQUEUE, CONVERGENCE_DISARM_DISABLE_AUTO, "dequeuePR"):
+            try:
+                _queue_disarm_mutation(_name, "PR_node_5")
+                srs_names.append("accepted")
+            except WorkerPrError:
+                srs_names.append("refused")
+        check("#686: both retraction names are ones _queue_disarm_mutation dispatches, and an "
+              "unknown name is refused there (the two copies cannot drift apart silently)",
+              srs_names, ["accepted", "accepted", "refused"])
+        # (1) THE UNARMED NO-OP — the overwhelmingly common park: exactly ONE latch read, no
+        #     mutation, and the hold still lands. A regression that skipped the read entirely
+        #     would show zero `latch-read` ops here.
+        run_set(["review:needs", "review:changes"], "pass")
+        check("#686: an UNARMED convergence costs one latch read, no mutation, and still parks",
+              srs_state["ops"], ["latch-read:00", "label-add"])
+        # (2) A LATCHED auto-merge is retracted BEFORE the hold becomes visible, and the proof
+        #     re-read confirms it. THE ORDER IS THE ASSERTION: `mutate:` strictly precedes
+        #     `label-add`. A label-first ordering — the exact defect #686 names — reorders these
+        #     two ops and fails here even though every other assertion in this block still passes.
+        run_set(["review:needs", "review:changes"], "pass", latch=(False, True))
+        check("#686: an ARMED convergence disables auto-merge, PROVES it gone, THEN parks",
+              srs_state["ops"],
+              ["latch-read:01", "mutate:disablePullRequestAutoMerge", "latch-read:00",
+               "label-add"])
+        # (3) A QUEUED PR is DEQUEUED FIRST — disabling auto-merge on a queued PR does not remove
+        #     it from the queue, so the reverse order leaves a PR that merges anyway (issue #69).
+        run_set(["review:needs", "review:changes"], "changes", latch=(True, True))
+        check("#686: both latch forms retract, dequeue BEFORE disable-auto, then the hold lands",
+              srs_state["ops"],
+              ["latch-read:11", "mutate:dequeuePullRequest",
+               "mutate:disablePullRequestAutoMerge", "latch-read:00", "label-add"])
+        # (4) THE FAIL-CLOSED DIRECTION. The mutation REPORTS SUCCESS but the latch survives (a
+        #     merge-queue entry already mid-merge). Nothing is written: the PR keeps the ambiguous
+        #     namespace it already had — which get_review_state ALREADY reads as this same hold —
+        #     rather than becoming parked-and-armed. This is the assertion that goes red if the
+        #     disarm is made advisory (wrapped in a try/except, or its result ignored).
+        srs_stuck = None
+        try:
+            run_set(["review:needs", "review:changes"], "pass", latch=(True, False),
+                    latch_sticks=True)
+        except WorkerPrError as exc:
+            srs_stuck = str(exc)
+        check("#686: an UNPROVABLE latch REFUSES the park — no label add, no label remove",
+              (srs_stuck is not None, srs_state["posted"], srs_state["removed"]),
+              (True, [], []))
+        check("#686: ...and the refusal names the surviving latch form and says nothing landed",
+              ("merge-queue" in (srs_stuck or "")
+               and "was NOT written" in (srs_stuck or "")), True)
+        check("#686: ...having tried the retraction and re-read to PROVE it, not merely refused",
+              srs_state["ops"],
+              ["latch-read:10", "mutate:dequeuePullRequest", "latch-read:10"])
+        # (5) THE OTHER DIRECTION OF THE SAME PROOF RE-READ, and the reason a mutation failure is
+        #     COLLECTED rather than raised where it happens: the latch vanished between the
+        #     deciding read and the mutation, so GitHub REJECTS the disable on an already-unarmed
+        #     PR (issue #487). That is an idempotent SUCCESS — the park must land, not abort. A
+        #     helper that re-raised the first mutation error would refuse this park forever.
+        _idem, _idem_raised = io.StringIO(), None
+        try:
+            with contextlib.redirect_stdout(_idem):
+                run_set(["review:needs", "review:changes"], "pass", latch=(False, True),
+                        mutate_rc=1)
+        except WorkerPrError as exc:      # caught so this reports a FAIL, never an aborted suite
+            _idem_raised = str(exc)
+        check("#686: a mutation that FAILS on an already-unarmed PR still parks (idempotent), "
+              "and says so rather than reporting a clean disarm",
+              (_idem_raised, srs_state["ops"], srs_state["posted"],
+               "converged idempotently" in _idem.getvalue()),
+              (None, ["latch-read:01", "mutate:disablePullRequestAutoMerge", "latch-read:00",
+                      "label-add"], [["review:needs-user"]], True))
+        # (6) THE OTHER HALF of "only this branch": no NON-convergent path may pay a latch read.
+        #     A regression that disarmed on every stamp — the shape #685 rejected because it would
+        #     fire around ready_and_arm's legitimate review:pass — shows a `latch-read` op here.
+        #     An EXPLICIT needs-user escalation is included on purpose: needs_user's injection and
+        #     tamper parks must never be blockable by a GraphQL failure.
+        srs_no_latch = {}
+        for _label, _live, _state in (
+                ("clean transition", ["review:needs"], "changes"),
+                ("the arm's own review:pass stamp", ["review:needs"], "pass"),
+                ("an explicit needs-user escalation", ["review:needs"], "needs-user"),
+                ("a refused write under a live hold", ["review:needs-user"], "pass")):
+            run_set(_live, _state, latch=(True, True))
+            srs_no_latch[_label] = [op for op in srs_state["ops"] if op != "label-add"]
+        check("#686: NO non-convergent path reads the latch, even with BOTH latch forms live",
+              srs_no_latch,
+              {"clean transition": [], "the arm's own review:pass stamp": [],
+               "an explicit needs-user escalation": [],
+               "a refused write under a live hold": []})
         # A normal single-state transition applies the requested label and never removes it.
         norm_posted, norm_removed = run_set(["review:needs"], "changes")
         check("normal transition adds the requested review label",
@@ -12452,6 +12684,13 @@ def _self_test():
 
     def oc_gh_json(args, **_kw):
         path = args[1] if len(args) > 1 else ""
+        if "graphql" in args:
+            # [registry #686] set_review_state's ambiguity convergence is a park write, so it reads
+            # the authoritative merge latch before the hold lands. These fixtures are DRAFTS with
+            # nothing latched — the unarmed no-op — so the convergence proceeds; the ordering and
+            # the fail-closed arm are pinned in the set_review_state block above.
+            return {"data": {"repository": {"pullRequest": {
+                "id": "PR_node_41", "mergeQueueEntry": None, "autoMergeRequest": None}}}}
         if "/issues/" in path:
             return {"labels": [{"name": name} for name in oc_state.get("issue_labels", ())]}
         return {"state": oc_state.get("state", "open"),
