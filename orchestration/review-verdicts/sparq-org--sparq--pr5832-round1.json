@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5832,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "990e2b57ca27b09f594107d97ba8da25f6c6679a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is documentation-only apart from an in-situ workflow comment and accurately records the decision to keep the hermetic determinism gate separate from the browser-provisioned accessibility job. The stated gating relationships, provisioning differences, C3 behavior, and policy-table identities are consistent with the checked-in workflow, advisory-registry checker, and E2E gating policy. No correctness, soundness, test-validity, or security issue is introduced.",
+  "verdict": "approve"
+ }
+}
