@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2037,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e41f6021d68c0a434d3a795196287ae3ef1961e8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The warning is emitted only inside `if not isinstance(item, dict)`. A row with a valid salted label but a present malformed `utilization_1h` (for example `\"busy\"`) passes that guard, `_obs_fraction` returns `None`, and the row is omitted from `lease_utilizations` without any diagnostic. If valid rows are alongside it, the code still publishes a confident mean/max over the survivors\u2014the exact partial-sample failure described by this change. This is not hypothetical in the existing contract: the self-test fixture already includes an unparseable utilization and describes it as excluded from the aggregate. The new accept-path test contains only readable values, so it cannot detect this omission.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Distinguish an absent/null utilization (if that remains an intentionally unmeasured row) from a present value that `_obs_fraction` cannot read, and send the latter through the lease drop log before continuing. Add a literal malformed-utilization case beside a valid row and assert both the survivor aggregate and the exact warning; also assert the intended behavior for missing/null utilization explicitly.",
+    "severity": "major",
+    "title": "Unreadable utilization rows are still silently removed from the aggregate"
+   }
+  ],
+  "progress": null,
+  "summary": "The new diagnostic covers only non-object lease entries, so the same misleading partial-sample condition remains silent when a structurally valid lease row carries an unreadable utilization. Because the stated control is meant to announce rows subtracted from the published mean/max, this is an incomplete fix and the added tests do not exercise the remaining path.",
+  "verdict": "request_changes"
+ }
+}
