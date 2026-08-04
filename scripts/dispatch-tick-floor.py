@@ -288,12 +288,21 @@ GATED_JOB = "plan"
 GATED_JOBS = (GATED_JOB, "secrets-guard")
 FLOOR_STEP_ID = "floor"
 
+# THE ONE DEFINITION of "which minutes past the hour does this cron fire at" (#1046), CONSUMED
+# rather than copied (#1279). This file used to expand the minute field itself and got a stepped
+# RANGE wrong — it read the step and dropped the range's START, so `7-59/15` (groom.yml's live
+# cron) expanded to :00/:15/:30/:45 instead of :07/:22/:37/:52. It was latent only because the one
+# workflow it is applied to writes explicit minutes, which is exactly how a second definition
+# survives: it is never asked the question that separates it from the first (#958).
+CRON_MINUTES_SCRIPT = "scripts/ci-latency-alert.py"
+
 # Every file the self-test asserts against. The floor job sparse-checks-out exactly this set and
 # _test_selftest_inputs_are_checked_out asserts that it does — a trimmed checkout would make the
 # YAML-seam assertions silently unreachable in the live path, which is the exact fail-open class
 # this unit exists to close.
 REQUIRED_FILES = (
     "scripts/dispatch-tick-floor.py",
+    CRON_MINUTES_SCRIPT,
     DISPATCH_WORKFLOW,
 )
 
@@ -752,17 +761,74 @@ def _sparse_paths(job, path="registry"):
     return {line.strip() for line in str(spec).splitlines() if line.strip()}
 
 
-def _cron_minutes(workflow):
-    """The set of minutes-past-the-hour an explicit-minute cron fires at."""
+def _cron_minutes_module(root=None):
+    """Load the single definition of cron-minute expansion (#1046, #1279).
+
+    Lazily, and only from the self-test: the live floor never expands a cron, so an admitted tick
+    carries no new import. Same importlib idiom as regate-sweep.py's `_cron_map_module`.
+
+    RAISES when the owner is absent, and that polarity is the point: a fallback to a private copy
+    is how the second definition comes back, and it would come back GREEN."""
+    import importlib.util
+
+    base = _repo_root() if root is None else root
+    path = os.path.join(base, CRON_MINUTES_SCRIPT)
+    if not os.path.isfile(path):
+        raise TickFloorError(
+            f"{CRON_MINUTES_SCRIPT} is missing from the working copy at {base} — it owns the "
+            "cron-minute expansion this file consumes, and without it the schedule assertion "
+            "cannot run. Add it to the job's sparse-checkout list.")
+    spec = importlib.util.spec_from_file_location("registry_cron_minutes", path)
+    if spec is None or spec.loader is None:
+        raise TickFloorError(f"cannot load {CRON_MINUTES_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _cron_minutes(workflow, expand=None):
+    """The set of minutes-past-the-hour this workflow's single cron fires at.
+
+    THE EXPANSION IS NOT DEFINED HERE (#1279) — `ci-latency-alert.cron_minutes` owns it, handles
+    `a-b/step` and is self-tested there in both directions. What IS defined here is the
+    one-cron-per-workflow contract the caller depends on: the consumer counts minutes PER HOUR, so
+    reading only the first of several schedules would under-count and make the budget invariant
+    pass on a schedule it never saw. Anything it cannot expand RAISES rather than reducing to the
+    empty set, which would satisfy that invariant vacuously — and since #1279 that includes a
+    field that is only PARTLY unreadable, which is the shape an empty-set refusal cannot catch:
+    the owner refuses an out-of-range atom instead of discarding it, so a minute list cannot come
+    back rounded down to a plausible schedule the workflow will never actually fire on."""
     triggers = workflow.get("on", workflow.get(True)) or {}
     crons = [entry["cron"] for entry in (triggers.get("schedule") or []) if "cron" in entry]
     if len(crons) != 1:
         raise TickFloorError(f"expected exactly one cron schedule, found {len(crons)}")
-    minute = crons[0].split()[0]
-    if "/" in minute:
-        step = int(minute.split("/")[1])
-        return set(range(0, 60, step))
-    return {int(part) for part in minute.split(",")}
+    expand = expand or _cron_minutes_module().cron_minutes
+    return set(expand(crons[0]))
+
+
+def _scheduled_minutes(workflow):
+    """-> (minutes|None, error). `_cron_minutes`, REPORTING instead of raising.
+
+    The budget row reads it, and that row sits in `_test_budget_arithmetic` — the second function
+    the suite runs — so a raise there would abort the NINE that follow: one mutant masking the
+    rest, and a mutation run that scores that crash as a kill (AGENTS.md pre-flight item 4,
+    `crash-after-partial-run`). Reporting is NOT failing open: a
+    missing owner, a second schedule or an unexpandable cron comes back as (None, error) and the
+    caller's row reds on it, naming the error."""
+    try:
+        return _cron_minutes(workflow), None
+    except Exception as exc:  # noqa: BLE001 - ANY derivation failure must red, never abort
+        return None, exc
+
+
+def _raised(thunk):
+    """Did `thunk` raise? -> bool. A row that asserts a REFUSAL needs the refusal itself, not the
+    absence of a wrong answer."""
+    try:
+        thunk()
+    except Exception:  # noqa: BLE001 - the row asserts THAT it refused, not how
+        return True
+    return False
 
 
 def _self_test():
@@ -774,6 +840,7 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got} (want {want})")
 
+    _test_cron_minute_expansion(chk)
     _test_budget_arithmetic(chk)
     _test_floor_predicate(chk)
     _test_preflight_budget_predicate(chk)
@@ -787,6 +854,95 @@ def _self_test():
 
     print("dispatch-tick-floor self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
+
+
+def _test_cron_minute_expansion(chk):
+    """WHOSE definition of "which minutes does this cron fire at" (#1279).
+
+    This file used to expand the minute field itself, and got a stepped RANGE wrong: it read the
+    step and dropped the range's START. The one workflow it is applied to writes explicit minutes,
+    so the wrong branch was never taken and the budget invariant below read a correct value out of
+    a broken expander — which is why the rows here feed the SHAPES the live path does not, not
+    just the one it does.
+
+    Every row feeds a cron LITERAL rather than a parsed workflow, so this whole function runs
+    without PyYAML and without a checkout of the lane whose cron it names."""
+    def minutes(expr):
+        return sorted(_cron_minutes({"on": {"schedule": [{"cron": expr}]}}))
+
+    # THE DEFECT. `7-59/15` is groom.yml's live cron; the private copy this replaced answered
+    # [0, 15, 30, 45], which shares NOT ONE minute with the truth — so this row cannot go green on
+    # a re-introduced private expander, and the expected value is computed by hand rather than read
+    # from the code under test.
+    chk("cron: a stepped RANGE expands from the range's START, not from :00 (`7-59/15` is "
+        "groom.yml's live cron; the private copy this replaced answered [0, 15, 30, 45])",
+        minutes("7-59/15 * * * *"), [7, 22, 37, 52])
+    # ...and the shapes that kept the defect latent still expand exactly as they always did.
+    chk("cron: an explicit minute LIST is unchanged (dispatch.yml's own cron — the one shape the "
+        "live path exercises, and the reason the defect was latent)",
+        minutes("3,13,23,33,43,53 * * * *"), [3, 13, 23, 33, 43, 53])
+    chk("cron: a bare step from :00 is unchanged", minutes("*/10 * * * *"),
+        [0, 10, 20, 30, 40, 50])
+    chk("cron: a single fixed minute is a single minute", minutes("41 6 * * 1"), [41])
+    chk("cron: a range with no step expands to every minute in it", minutes("5-8 * * * *"),
+        [5, 6, 7, 8])
+    # THE REFUSAL PROBE ITSELF, first: every row below reads `_raised(...) is True`, so a probe
+    # that could only ever answer True would satisfy all of them while proving nothing. This is the
+    # one row that makes it able to say NO.
+    chk("cron: the refusal probe answers False for a call that does NOT raise (a probe that cannot "
+        "say no makes every refusal row below vacuous)",
+        (_raised(lambda: minutes("3 * * * *")), _raised(lambda: 1 / 0)), (False, True))
+    # THE REJECT DIRECTION, and it is load-bearing rather than tidy: `len(minutes) <=
+    # ticks_per_hour` is vacuously TRUE for the empty set, so an expander that swallowed a cron it
+    # could not read would turn the budget invariant green while asserting nothing at all.
+    for label, expr in (("a non-numeric minute", "abc * * * *"),
+                        ("an inverted range", "50-10 * * * *"),
+                        ("a zero step", "*/0 * * * *"),
+                        ("an empty minute field", ", * * * *"),
+                        ("a cron with the wrong field count", "3,13 * * *")):
+        chk(f"cron: {label} RAISES rather than expanding to nothing (an empty set satisfies the "
+            "budget invariant vacuously)", _raised(lambda e=expr: minutes(e)), True)
+    # THE PARTIALLY-invalid field, which the rows above cannot reach: they are all WHOLLY
+    # unreadable, and an expander that merely DISCARDS what it cannot use refuses those anyway by
+    # running out of values. This one keeps six perfectly good minutes — dispatch's own schedule,
+    # exactly — beside a minute the hour does not have, so a discarding expander answers `{3, 13,
+    # 23, 33, 43, 53}` and hands the budget row below the same `(None, 6, True)` it gets from the
+    # real cron. The row would go green on a workflow whose six claimed firings do not exist. :60
+    # is used by no valid expansion anywhere in this suite, so this cannot pass by collision.
+    chk("cron: a minute list that is valid EXCEPT for one impossible atom RAISES — discarding "
+        "the :60 would answer with dispatch's own six minutes and confirm a schedule that never "
+        "fires", _raised(lambda: minutes("3,13,23,33,43,53,60 * * * *")), True)
+    chk("cron: a range whose END runs past :59 RAISES rather than being truncated to :59",
+        _raised(lambda: minutes("55-70 * * * *")), True)
+    # The one-cron-per-workflow contract this file's own consumer depends on, in both directions.
+    chk("cron: a workflow with no schedule at all RAISES",
+        _raised(lambda: _cron_minutes({"on": {"push": {}}})), True)
+    chk("cron: a workflow with TWO crons RAISES — the consumer counts minutes PER HOUR, and "
+        "reading only the first would under-count the schedule it is checked against",
+        _raised(lambda: _cron_minutes(
+            {"on": {"schedule": [{"cron": "3 * * * *"}, {"cron": "8 * * * *"}]}})), True)
+    # THE REPORTING WRAPPER'S OWN FAILURE PATH, which is the pair the budget row reads. Nothing
+    # else executes it — the tree under test is healthy, so `_scheduled_minutes` never takes its
+    # `except` — and an unexecuted branch is an unkillable mutant (AGENTS.md pre-flight item 1): a
+    # wrapper that swallowed the error and reported an EMPTY schedule would satisfy that row's
+    # inequality while asserting nothing.
+    reported, reported_error = _scheduled_minutes({"on": {"push": {}}})
+    chk("cron: a derivation failure is REPORTED as (None, error), never swallowed into an empty "
+        "schedule", (reported, isinstance(reported_error, TickFloorError)), (None, True))
+    healthy, healthy_error = _scheduled_minutes({"on": {"schedule": [{"cron": "7-59/15 * * * *"}]}})
+    chk("cron: ... and a derivation that WORKS reports no error alongside the expanded minutes",
+        (sorted(healthy or ()), healthy_error), ([7, 22, 37, 52], None))
+    # THE OWNERSHIP ITSELF. A checkout without the owner must RAISE: a fallback to a private copy
+    # is how the second definition comes back, and it comes back green.
+    chk("cron: the expansion is OWNED by ci-latency-alert.py, and a checkout without it RAISES "
+        "instead of falling back to a private copy",
+        (callable(getattr(_cron_minutes_module(), "cron_minutes", None)),
+         _raised(lambda: _cron_minutes_module(os.path.join(_repo_root(), "no-such-tree")))),
+        (True, True))
+    # ...and the owner is checked out on the LIVE path, not merely present in this working copy.
+    # Without this, the rows above pass in pr-gate and the floor job dies on its own self-test.
+    chk("cron: ... and that owner is in the set the floor job is asserted to check out",
+        CRON_MINUTES_SCRIPT in REQUIRED_FILES, True)
 
 
 def _test_budget_arithmetic(chk):
@@ -826,9 +982,21 @@ def _test_budget_arithmetic(chk):
         ceiling <= OBSERVED_BREAKING_REQUESTS_PER_HOUR / 2, True)
     # The invariant the header states in words: the doorbell cannot outpace the schedule.
     workflow = _load_workflow(DISPATCH_WORKFLOW)
-    scheduled_per_hour = len(_cron_minutes(workflow))
-    chk("budget: the floor admits no more ticks/hour than the cron alone already schedules",
-        (ticks_per_hour, scheduled_per_hour <= ticks_per_hour), (6.0, True))
+    # DERIVED by the shared expander (#1279), and REPORTED rather than raised: this function runs
+    # second in the suite, so a raise here would abort the nine that follow it.
+    scheduled, cron_error = _scheduled_minutes(workflow)
+    # The COUNT is pinned, not just the inequality. `len(scheduled) <= ticks_per_hour` is
+    # vacuously true for the empty set, so on its own it cannot tell a derivation that read the
+    # schedule from one that read nothing — and the expected value comes from
+    # MIN_TICK_INTERVAL_SECONDS while the observed one comes from the YAML, so the row is not
+    # comparing the file against itself. This IS the header's stated invariant: the floor admits
+    # EXACTLY the rate the cron alone already schedules.
+    chk("budget: the floor admits no more ticks/hour than the cron alone already schedules — and "
+        "the schedule was actually DERIVED (an empty or unreadable derivation reds here rather "
+        "than satisfying the inequality vacuously)",
+        (cron_error, len(scheduled) if scheduled is not None else None,
+         scheduled is not None and len(scheduled) <= ticks_per_hour),
+        (None, int(ticks_per_hour), True))
 
 
 def _test_floor_predicate(chk):

@@ -359,7 +359,24 @@ M4_INDETERMINATE_STATES = ("not-sampled", "no-concluded-run")
 # cron expansion
 # ---------------------------------------------------------------------------------
 def _expand_field(spec: str, lo: int, hi: int) -> set[int]:
-    """Expand one cron field to the set of values it matches."""
+    """Expand one cron field to the set of values it matches.
+
+    OUT OF RANGE IS A REFUSAL, NOT A FILTER (#1279). This used to expand every atom and then
+    drop whatever fell outside `lo..hi`, which reads as fail-closed and is not: it only ever
+    raises when the WHOLE field is out of range, so `3,13,23,33,43,53,60` — the dispatch
+    schedule plus one impossible minute — came back as exactly the six valid minutes. A caller
+    asking "how many times an hour does this fire" then gets a truthful-looking six for a cron
+    that GitHub will not run at all, and every count it derives is green on a broken schedule.
+    Rejecting the atom (and each range ENDPOINT) instead means a malformed field can never be
+    silently rounded down to a plausible one.
+
+    The emptiness refusal below is DEAD under this grammar once the range check is in place —
+    an accepted part has `a <= b` and `step >= 1`, so it contributes at least `a` — and it is
+    kept anyway, declared unreachable, as the structural backstop for a future term form that
+    does not hold that property (the same call dashboard-gen.py's own expander makes for the
+    same reason). It is a refusal, so the honest thing is to say it cannot execute rather than
+    to delete it and leave an empty set reaching a consumer that reads it as "fires never".
+    """
     if not spec:
         raise CronError("empty field")
     out: set[int] = set()
@@ -387,9 +404,10 @@ def _expand_field(spec: str, lo: int, hi: int) -> set[int]:
             if not part.isdigit():
                 raise CronError(f"not a number: {part!r}")
             a = b = int(part)
+        if a < lo or b > hi:
+            raise CronError(f"value outside {lo}-{hi} in {spec!r}")
         out |= set(range(a, b + 1, step))
-    out = {v for v in out if lo <= v <= hi}
-    if not out:
+    if not out:  # unreachable under the grammar above - see the docstring
         raise CronError(f"field matches nothing: {spec!r}")
     return out
 
@@ -1434,6 +1452,50 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("cron_minutes ignores the hour/day fields — a weekly 06:41 lane still HOLDS :41, "
         "because the question this answers is `is this minute taken`",
         cron_minutes("41 6 * * 1") == {41})
+
+    # --- OUT OF RANGE IS REFUSED, NOT FILTERED (#1279) --------------------------------
+    # The loop below only ever fed WHOLLY invalid fields, which the old post-hoc filter
+    # happened to catch by emptying the set. The fail-open case is the MIXED field, and it
+    # needed its own rows.
+    def _raises_cron(thunk):
+        try:
+            thunk()
+        except CronError:
+            return True
+        except Exception:  # a different exception is not this refusal
+            return False
+        return False
+
+    # The probe first: every row under it reads `_raises_cron(...) is True`, so a probe that
+    # could only answer True would satisfy all of them while asserting nothing.
+    chk("the CronError probe answers False for a call that does not raise, and False for a "
+        "call that raises something else — it can say no",
+        (_raises_cron(lambda: cron_minutes("3 * * * *")),
+         _raises_cron(lambda: 1 / 0)) == (False, False))
+    # THE DEFECT. Every atom but the last is a real dispatch minute, so an expander that DROPS
+    # the impossible :60 instead of refusing it answers with exactly the six-minute set of a
+    # VALID schedule — a consumer counting firings per hour then confirms six firings for a cron
+    # GitHub will not run at all. :60 appears in no valid minute expansion, so this row cannot
+    # pass by colliding with a value the harness already uses.
+    chk("cron_minutes REFUSES a minute list that is valid except for one out-of-range atom — "
+        "filtering :60 away would answer with the six real dispatch minutes and read as green",
+        _raises_cron(lambda: cron_minutes("3,13,23,33,43,53,60 * * * *")))
+    chk("cron_minutes REFUSES a range whose END runs past :59 instead of truncating it to :59",
+        _raises_cron(lambda: cron_minutes("55-70 * * * *")))
+    # ...and the refusal is about what cron cannot fire at, not about largeness: the boundary
+    # values still expand, so a mutant that rejected the whole field would red here.
+    chk("cron_minutes still accepts the boundary minutes :00 and :59",
+        cron_minutes("0,59 * * * *") == {0, 59})
+    # The same refusal on a field with a DIFFERENT bound, so the check reads each field's own
+    # `hi` rather than hard-coding 59: hour 24 does not exist, and `1,24` filtered down to `1`
+    # would be a plausible 01:xx lane.
+    chk("expected_firings REFUSES an HOUR list that is valid except for the impossible 24 — the "
+        "bound is per field, not a hard-coded :59",
+        _raises_cron(lambda: expected_firings("3 1,24 * * *", H6, NOW)))
+    chk("...while the same hour list with 24 replaced by a real hour still expands (the hour "
+        "bound refuses 24, it does not refuse lists)",
+        expected_firings("3 1,23 * * *", D1, NOW) == 2)
+
     for bad in ("", "* * * *", "* * * * * *", "60 * * * *", "*/0 * * * *", 41, None):
         try:
             cron_minutes(bad)
