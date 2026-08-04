@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 2034,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "caab10ba072248b37f2bbef831b4ec39f1682ba3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new assertions run only when dispatch.yml happens to execute `account-usage.py --self-test` during its probe step. `_persist_one` and the `--persist-limits` command path do not validate the premise. If the persist step is moved to another workflow, or a second workflow adds the command, that workflow can enter the read/edit window directly; a later or concurrent dispatch self-test turning red does not prevent the other workflow's write. This contradicts the stated goal that a repoint which makes concurrent automated writers possible is enforced rather than merely detected elsewhere.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Put the prerequisite validation on the production `--persist-limits` path before any issue read/write, or use a serialization mechanism that every writer must acquire. Test a second workflow invoking persistence and prove that invocation itself refuses before calling `gh issue edit`.",
+    "severity": "blocker",
+    "title": "The premise check does not guard every persistence invocation"
+   },
+   {
+    "body": "`_workflows_containing` performs a raw substring search over the entire YAML file. A comment containing `--persist-limits` therefore counts as an invocation. Removing or renaming the real run command while retaining that token in explanatory prose leaves the exact `[\"dispatch.yml\"]` assertion green. The added synthetic test only checks filename suffix selection and never proves that comments or unrelated scalar text are excluded, so the marquee wiring assertion is vacuous under this realistic mutation.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Parse or narrowly extract executable `run:` content and strip YAML/shell comments before locating an exact argument token. Add a test where the token occurs only in a comment and require no invocation, plus a test where deleting the real run command makes the repository assertion fail.",
+    "severity": "major",
+    "title": "Workflow invocation discovery is satisfiable by comments and prose"
+   },
+   {
+    "body": "The broker guard classifies a body replacement only when the reconstructed command contains the substring `--body`. GitHub CLI also permits body replacement with short flags such as `-b` (body) and `-F` (body-file). A future `gh issue edit \"$num\" -b \"$new\"` is a body-replacing automated writer but passes the new assertion. None of the positive controls exercises these valid spellings.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Tokenize each command and reject every body-changing option accepted by `gh issue edit`, including short forms and attached-value forms as applicable. Add positive controls for each supported body/body-file spelling using mutant values absent from the real fixture.",
+    "severity": "major",
+    "title": "Body-write detector misses valid short-form gh flags"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposed serialization-premise checks are not an effective enforcement boundary. They execute only in dispatch.yml's probe preflight, not in the persistence entrypoint, so a newly added or moved writer can run without ever executing the check intended to stop it. The two source readers also accept prose as an invocation and miss valid body-replacing gh forms. These gaps directly undermine the marquee claim that an automated lost-update window cannot silently become reachable.",
+  "verdict": "request_changes"
+ }
+}
