@@ -99,6 +99,22 @@ total is a whole NUMBER OF ROWS greater than the slice beside it — a missing, 
 fractional or already-satisfied total is "no truncation known" and draws nothing, so a document
 published before #1868 or edited by hand degrades to the old silence instead of a fabricated count.
 
+**A DROPPED `flow.queue` row is counted too, and the page states it (issue #1896).** A malformed
+row is dropped and named on stdout (#982), but the panel an operator reads is the layer that
+matters: `flow.queue: []` is what an idle fleet publishes AND what a snapshot whose rows were all
+refused publishes, so the queue list read `no backlog` either way and nobody reads a green build's
+log. Unlike a lane window — which publishes `null` when it cannot be read, the shape #1879 keys off
+— a dropped queue row leaves nothing on the wire at all, so the published document carries
+`flow.queue_dropped`: the number of queue inputs this build REFUSED. It is an OUTPUT-side key on
+the same terms as the totals above (counted here, never read from the collector — supplying it
+neither fabricates a loss nor hides one, and both directions are self-tested), published on every
+build including the `0` of one that dropped nothing, and it counts every refusal including the ones
+whose warning the #1570 cap withheld. The page renders `N queue rows unreadable` beside whatever
+did parse, and it drops that tick from the queue-depth sparkline: a sum over the survivors is not a
+smaller backlog, it is an unknown one. A count that is absent, non-integral, negative or otherwise
+not a number of rows is "no drop known" and draws nothing, so a pre-#1896 data.json degrades to the
+old silence rather than to a fabricated loss.
+
 Validation is otherwise FAIL-CLOSED as before: an absent file hides the panel; a present document
 with the wrong `schema` fails the dashboard build LOUD; malformed rows inside a well-formed
 document are dropped (the model-health tolerance) — EXCEPT privacy violations, which are

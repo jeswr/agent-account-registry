@@ -2169,7 +2169,20 @@ def _obs_flow(flow):
     # 26-class backlog and a 12-class one stop rendering identically. See `_obs_capped`.
     queue, queue_total = _obs_capped(queue, 12)
     ci_queue, ci_queue_total = _obs_capped(ci_queue, 12)
-    return {"queue": queue, "queue_total": queue_total,
+    # [#1896] ...and the queue publishes how many inputs it REFUSED, which `queue_total` cannot
+    # say: it counts survivors, so a snapshot whose rows were ALL dropped publishes `queue: []`
+    # beside `queue_total: 0` — the exact shape of a genuinely idle fleet. #1879's lane windows had
+    # a `null` on the wire to key off; a dropped queue row simply is not there, so the loss needs a
+    # count of its own or the page cannot tell the two apart (AGENTS.md pre-flight item 11: the
+    # #982 announcement is real evidence, and nobody reads a green build's log).
+    #
+    # `drops.dropped` is every refused input, including the ones whose warning the #1570 cap
+    # withheld and the whole-container refusal above — the page must never read a backlog as
+    # measured because the diagnostic ran out of budget. Published UNCONDITIONALLY, including the
+    # `0` of a build that dropped nothing (AGENTS.md pre-flight item 8), for the reason
+    # `_obs_capped` publishes its total unconditionally: a census that emits only when it has
+    # something to say is one a mutant can silence on exactly the quiet tick an operator reads.
+    return {"queue": queue, "queue_total": queue_total, "queue_dropped": drops.dropped,
             "lease_utilization_1h": lease_utilization,
             "review_rounds": review_rounds,
             "parks_1h": parks_1h, "arm_to_merge_minutes_24h": arm_to_merge,
@@ -6171,6 +6184,10 @@ esac
         "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.3},
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3.0}],
                  "queue_total": 2,
+                 # [#1896] ...beside the count of inputs this build REFUSED, which `queue_total`
+                 # cannot express: three rows in, the `9z` one dropped, so a page reading only the
+                 # survivors sees a two-class backlog with no sign that a third class was lost.
+                 "queue_dropped": 1,
                  # [#374] three validated lease rows in, ZERO published: only the mean/max of the
                  # utilizations that parsed (0.8, 0.4 -> 0.6/0.8). The unparseable third row proves
                  # the aggregate is taken over reporting rows, and the count itself never appears.
@@ -6848,7 +6865,11 @@ esac
     _QUEUE_DROP = "dashboard-gen: dropped observability queue input ({})"
 
     def obs_queue(rows):
-        """(published `flow.queue`, the queue-drop warnings this build printed)."""
+        """(published `flow.queue`, published `flow.queue_dropped`, the drop warnings printed).
+
+        [#1896] The published COUNT rides along with every row below rather than sitting in rows of
+        its own: the build log and the count are two renderings of the same refusal, so each case
+        pins both and a count that stopped tracking the warnings reds wherever it diverged."""
         fixture = copy.deepcopy(obs_fixture)
         fixture["flow"]["queue"] = rows
         stream = io.StringIO()
@@ -6857,7 +6878,10 @@ esac
                 document = _normalize_observability(fixture)
         except DashboardError as error:
             document = ObsRefusal(refused=str(error))
-        return (document["flow"]["queue"],
+        # `.get`, not a subscript: a build that stopped publishing the count at all must red the
+        # rows below by NAME, not raise `KeyError` out of the helper and abort every check after it
+        # (AUTHOR pre-flight item 4, crash-after-partial-run — that mutant records as a kill).
+        return (document["flow"]["queue"], document["flow"].get("queue_dropped"),
                 [line for line in stream.getvalue().splitlines()
                  if line.startswith("dashboard-gen: dropped observability queue")])
 
@@ -6866,7 +6890,7 @@ esac
     check("[#982] INTEGER queue classes publish an empty queue — and now name themselves once per "
           "dropped row instead of rendering as `no backlog` on a green build",
           obs_queue([{"class": 1, "depth": 4}, {"class": 2, "depth": 0}]),
-          ([], [_QUEUE_DROP.format(
+          ([], 2, [_QUEUE_DROP.format(
               "row `class` (type int) is not a class STRING such as '1'/'2a'/'4'")] * 2))
     # ...and the whole snapshot still normalizes: this is a drop diagnostic, NOT a new fatality.
     # Turning the drop into a raise (or into a `flow: None`) turns this row red.
@@ -6884,7 +6908,7 @@ esac
           "it can never fire on the accept path)",
           obs_queue([{"class": "2a", "depth": 1}, {"class": "4", "depth": 9}]),
           ([{"class": "2a", "depth": 1, "oldest_age_minutes": None},
-            {"class": "4", "depth": 9, "oldest_age_minutes": None}], []))
+            {"class": "4", "depth": 9, "oldest_age_minutes": None}], 0, []))
     # One warning per drop REASON, each naming the field that failed — a single shared message
     # would leave a `depth` mismatch reading as a `class` mismatch. The non-object row is the
     # branch a `--self-test` line-coverage run showed had never executed at all (pre-flight 1).
@@ -6911,7 +6935,7 @@ esac
          "row `depth` (type NoneType) is not a non-negative integer"),
     ):
         check(f"[#982] {case} is dropped LOUDLY, by the field that failed",
-              obs_queue(rows), ([], [_QUEUE_DROP.format(detail)]))
+              obs_queue(rows), ([], 1, [_QUEUE_DROP.format(detail)]))
     # ...and the ONE collector value any of these messages quotes is sanitized and BOUNDED on the
     # way out. Echo `queue_class` raw instead of `_obs_text(queue_class, 16)` and a hostile or
     # merely enormous class writes itself into the build log that is diagnosing it.
@@ -6921,8 +6945,198 @@ esac
     ):
         check(f"[#982] a {case} class is not echoed into the build log that diagnoses it",
               obs_queue([{"class": queue_class, "depth": 1}]),
-              ([], [_QUEUE_DROP.format(
+              ([], 1, [_QUEUE_DROP.format(
                   f"row `class` {quoted} is not one of the queue classes")]))
+    # ---- [#1896] ...AND THE PANEL AN OPERATOR READS HAS TO BE ABLE TO TELL. #982 made the drop
+    # legible in the BUILD LOG and stopped there, so `dashboard/app.js` still rendered a queue whose
+    # rows were ALL refused exactly like an idle one: `queue: []` is what both publish, and nobody
+    # reads a green build's log. That is the same land-one-layer-short shape #1879 fixed on the lane
+    # windows (AGENTS.md pre-flight item 11), and it needed a generator-side signal first — unlike a
+    # window's `null`, a dropped queue row leaves NOTHING on the wire to key off. So the count of
+    # refused inputs is published, and the rows below pin it at BOTH layers.
+    check("[#1896] a queue whose rows were ALL dropped no longer publishes the same document as a "
+          "genuinely EMPTY one — the arrays are identical and the counts are not. That collision is "
+          "the whole issue: without the count no consumer can tell a lost backlog from no backlog",
+          (obs_queue([{"class": index, "depth": 1} for index in range(3)])[:2], obs_queue([])[:2]),
+          (([], 3), ([], 0)))
+    # The two counts on one document answer different questions and must not collapse into each
+    # other: `queue_total` counts the rows that SURVIVED (#1868), `queue_dropped` the inputs that
+    # did not. Publishing either in place of the other — or the published slice's length — reds
+    # here, which is why the input is built so that the two counts are DIFFERENT numbers (2 and 3):
+    # a fixture where they coincide cannot tell the three apart (pre-flight item 4).
+    partly_dropped = copy.deepcopy(obs_fixture)
+    partly_dropped["flow"]["queue"] = [
+        {"class": "2a", "depth": 1}, {"class": "4", "depth": 9},         # published
+        {"class": 1, "depth": 4}, {"class": "9z", "depth": 2}, {"class": "3", "depth": "x"}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        partly_dropped_flow = obs_normalized(partly_dropped)["flow"]
+    # Projected only if it IS a list: on a refusal every subscript yields the ObsRefusal itself and
+    # iterating THAT would abort the suite from inside the row (AUTHOR pre-flight item 4).
+    partly_dropped_queue = partly_dropped_flow["queue"]
+    check("[#1896] survivors and refusals are counted SEPARATELY over one input: two classes "
+          "published, two counted as published, THREE counted as refused",
+          (partly_dropped_flow.get("queue_total"), partly_dropped_flow.get("queue_dropped"),
+           [row["class"] for row in partly_dropped_queue]
+           if isinstance(partly_dropped_queue, list) else partly_dropped_queue),
+          (2, 3, ["2a", "4"]))
+    # The count is every refusal, never the printed ones. The #1570 cap withholds warnings past 12,
+    # and a panel that read a 20-row loss as a measured backlog — or as a 12-row one — because the
+    # DIAGNOSTIC ran out of budget would be the same silence one number over. The 20 and the 12 are
+    # literals here: deriving either from OBS_DROP_WARN_MAX is pre-flight 2(c)'s tautology.
+    flooded_queue, flooded_dropped, flooded_warnings = obs_queue(
+        [{"class": index, "depth": 1} for index in range(20)])
+    check("[#1896] the published count is the REAL total of refused inputs, not the number of "
+          "warnings the #1570 cap let through",
+          (flooded_queue, flooded_dropped, len(flooded_warnings)), ([], 20, 12))
+    # ...and it is COUNTED here, never read from the collector — AGENTS.md pre-flight item 5, *who
+    # can write the thing this reads*. That snapshot lives on a branch this build does not own, so a
+    # passthrough would let it BOTH fabricate a loss on the public page and, in the direction that
+    # matters, zero a real one back into `no backlog`. `_obs_capped` refuses a collector-supplied
+    # total for the same reason. Both directions, and the fixture values (99 / 0) are ones no
+    # counted result here can collide with.
+    for case, rows, supplied, expected in (
+        ("cannot fabricate a loss over rows that all parsed",
+         [{"class": "2a", "depth": 1}], 99, 0),
+        ("cannot zero a REAL loss back into an idle-looking queue",
+         [{"class": index, "depth": 1} for index in range(3)], 0, 3),
+    ):
+        forged = copy.deepcopy(obs_fixture)
+        forged["flow"]["queue"] = rows
+        forged["flow"]["queue_dropped"] = supplied
+        with contextlib.redirect_stdout(io.StringIO()):
+            forged_flow = obs_normalized(forged)["flow"]
+        check(f"[#1896] a collector-supplied `queue_dropped` {case}",
+              forged_flow.get("queue_dropped"), expected)
+    # ---- ...and the PAGE, EXECUTED against dashboard/app.js under the shared DOM shim — a lexical
+    # assertion here is satisfiable by a comment (the #612 round-4 lesson), and the layer this issue
+    # is about is precisely the rendered one. Every scenario is a REAL `_normalize_observability`
+    # document, so the count the page reads is the one the generator writes rather than a shape this
+    # test invented; the hostile ones are post-edited, for values this generator cannot emit but a
+    # hand-edited or future data.json can.
+    _OBS_QUEUE_DROP_PAGE_BODY = r"""
+  const out = {};
+  for (const [name, documents] of Object.entries(input.scenarios)) {
+    // A FRESH page per scenario: obsTrend is module state that accumulates across renders, so one
+    // shared scope would carry one scenario's sparkline points into the next.
+    const page = new Function(source + "; return { renderObservability };")();
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers", "warning"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      for (const document of documents) page.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    const card = ids["obs-grid"].children.find((kid) =>
+      kid.tagName === "article" && kid.children[0]
+      && kid.children[0].textContent === "Queue & flow");
+    // The lease-utilization block on the same card is an `obs-reasons` div too, so the CAPTION is
+    // what selects the queue list — and its absence is the `no backlog` render under test.
+    const list = card ? card.children.find((kid) =>
+      kid.className === "obs-reasons" && kid.children[0]
+      && kid.children[0].textContent === "task queue depth · oldest age") : null;
+    const spark = card ? card.children.find((kid) =>
+      kid.className === "obs-spark-wrap"
+      && flat(kid).join(" ").includes("queue depth trend")) : null;
+    out[name] = {
+      error,
+      // null == the panel drew no queue list AT ALL. Cell text beside cell class, so a row that
+      // rendered without its class (the anti-starvation clamp) cannot pass as one that did.
+      rows: list ? list.children.filter((kid) => kid.className === "obs-reason-row")
+        .map((row) => row.children.map((cell) => [cell.textContent, cell.className])) : null,
+      // Everything under the caption that is NOT a queue row: the drop note, and any truncation
+      // note beside it, by class — so a drop announced in the wrong class reds rather than hides.
+      notes: list ? list.children
+        .filter((kid) => kid.className !== "obs-reason-row"
+                && kid.className !== "obs-spark-caption")
+        .map((kid) => [kid.className, kid.textContent]) : null,
+      depthPlotted: spark ? spark.children.some((kid) => kid.tagName === "svg") : null,
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+
+    def obs_queue_scenario(rows, inject=None):
+        """Two published snapshots one minute apart carrying `rows` as `flow.queue` — two ticks,
+        because the depth sparkline needs two recorded points before it plots anything at all.
+        `inject` post-edits the PUBLISHED `flow`, for counts this generator cannot emit but the page
+        must survive; it is skipped on a refusal so a broken fixture reds a named row instead of
+        aborting."""
+        documents = []
+        for offset in (0, 60):
+            fixture = copy.deepcopy(obs_fixture)
+            fixture["generated_at"] = now + offset
+            fixture["flow"]["queue"] = copy.deepcopy(rows)
+            with contextlib.redirect_stdout(io.StringIO()):
+                document = obs_normalized(fixture)
+            if inject is not None and isinstance(document.get("flow"), dict):
+                inject(document["flow"])
+            documents.append(document)
+        return documents
+
+    _BACKLOG_ROWS = [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.34},
+                     {"class": "4", "depth": 9, "oldest_age_minutes": 3}]
+    _ALL_DROPPED_ROWS = [{"class": index, "depth": 1} for index in range(3)]
+    # `legacy` is the pre-#1896 published shape of the SAME partly-dropped fleet — a data.json a
+    # browser still holds, or one hand-edited — and it must degrade to the old silence rather than
+    # to a fabricated loss. The five `hostile` scenarios are every unusable count a future or
+    # tampered producer can put in a JSON document; each carries its value on BOTH ticks, so the
+    # rendered note and the sparkline both witness it.
+    _HOSTILE_COUNTS = (("a string", "3"), ("a negative", -2), ("a fraction", 1.5),
+                       ("a boolean", True), ("an explicit null", None))
+    queue_drop_scenarios = {
+        "backlog": obs_queue_scenario(_BACKLOG_ROWS),
+        "empty": obs_queue_scenario([]),
+        "unreadable": obs_queue_scenario(_ALL_DROPPED_ROWS),
+        "partial": obs_queue_scenario(_BACKLOG_ROWS + [{"class": 9, "depth": 2}]),
+        "legacy": obs_queue_scenario(_BACKLOG_ROWS + [{"class": 9, "depth": 2}],
+                                     inject=lambda flow: flow.pop("queue_dropped", None)),
+    }
+    for case, count in _HOSTILE_COUNTS:
+        queue_drop_scenarios[f"hostile:{case}"] = obs_queue_scenario(
+            _BACKLOG_ROWS, inject=lambda flow, value=count: flow.update({"queue_dropped": value}))
+    queue_drop_page = _executed_page(
+        _page_harness("renderObservability", _OBS_QUEUE_DROP_PAGE_BODY),
+        {"scenarios": queue_drop_scenarios})
+
+    def obs_queue_render(name):
+        rendered = queue_drop_page.get(name)
+        return ((rendered.get("rows"), rendered.get("notes"), rendered.get("depthPlotted"),
+                 rendered.get("error")) if isinstance(rendered, dict) else queue_drop_page)
+
+    _BACKLOG_RENDER = [[["class 2a", "obs-lane"], ["1 deep · 12.3m", "obs-reason-count bad"]],
+                       [["class 4", "obs-lane"], ["9 deep · 3m", "obs-reason-count"]]]
+    # The pair this issue is about, and they are asserted TOGETHER: `empty` renders no queue list at
+    # all — the `no backlog` panel — while `unreadable` states the loss under the caption. A page
+    # that dashed every queue, or one that dropped the affordance, fails on the other row.
+    check("[#1896] EXECUTED page script: a queue the generator could NOT read renders the loss on "
+          "the panel, with no depth row to stand behind it",
+          obs_queue_render("unreadable"),
+          ([], [["obs-dropped", "3 queue rows unreadable — no queue depth measured"]], False, None))
+    check("[#1896] EXECUTED page script: ...and a genuinely EMPTY queue still renders NOTHING — the "
+          "control the row above rests on. A panel that announced a loss on every quiet tick would "
+          "pass that row and fail this one",
+          obs_queue_render("empty"), (None, None, True, None))
+    check("[#1896] EXECUTED page script: a PARTLY dropped queue renders the rows that parsed AND "
+          "says the depths beside them are incomplete — a page keyed on `queue.length` alone would "
+          "state nothing here, which is the survivors reading as the whole fleet",
+          obs_queue_render("partial"),
+          (_BACKLOG_RENDER,
+           [["obs-dropped", "1 queue row unreadable — the depths below are incomplete"]],
+           False, None))
+    check("[#1896] EXECUTED page script: a queue that lost NOTHING renders its depths and no note "
+          "at all — the affordance marks a real refusal, so it can never fire on the accept path",
+          obs_queue_render("backlog"), (_BACKLOG_RENDER, [], True, None))
+    check("[#1896] EXECUTED page script: a LEGACY data.json — the same partly-dropped fleet "
+          "published before the count existed — degrades to the old silence rather than to "
+          "`undefined queue rows unreadable`, and the page does not throw reaching for the key",
+          obs_queue_render("legacy"), (_BACKLOG_RENDER, [], True, None))
+    for case, _count in _HOSTILE_COUNTS:
+        check(f"[#1896] EXECUTED page script: {case} is not a count of rows — the page states "
+              "nothing rather than a fabricated loss, and its depth trend is unaffected",
+              obs_queue_render(f"hostile:{case}"), (_BACKLOG_RENDER, [], True, None))
     # ---- [#1570] THE DIAGNOSTIC ITSELF MUST BE BOUNDED. Both drop warnings above emit ONE LINE
     # PER DROPPED ROW over a list nothing bounds on the way IN (`_obs_capped` cuts both of them on
     # the way OUT, after the loop), so a snapshot on the public `ledger` branch carrying 100k

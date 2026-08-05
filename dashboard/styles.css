@@ -238,6 +238,10 @@ td.obs-unmeasured { color: var(--muted); }
 /* Issue #1868: the display-cap affordance — `showing 12 of 50`, muted, sitting with the rows it
    accounts for. Before it, an array four times its cap rendered exactly like one at it. */
 .obs-truncated { margin: 4px 0 12px; color: var(--muted); font-size: .68rem; font-variant-numeric: tabular-nums; }
+/* Issue #1896: rows the BUILD REFUSED, which is a different fact from the cap above — a truncation
+   hid rows it could read, this hid rows nobody could — so it takes the warn tone, not the muted
+   one, and its own class: a drop note collected as a truncation would read as a display slice. */
+.obs-dropped { margin: 4px 0 12px; color: var(--warn); font-size: .68rem; font-variant-numeric: tabular-nums; }
 .obs-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .obs-chip { padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .68rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
