@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-05T01:27:47Z",
+  "generated_at": "2026-08-05T01:55:13Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -26,14 +26,14 @@
     "jeswr/agent-account-registry": {
       "issues_open": 989,
       "issues_ready": 632,
-      "issues_closed_1h": 1,
-      "issues_closed_24h": 12,
+      "issues_closed_1h": 0,
+      "issues_closed_24h": 10,
       "prs_open": 48,
       "prs_draft": 32,
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
-      "prs_merged_24h": 9,
+      "prs_merged_24h": 8,
       "review_changes_backlog": 7,
       "needs_user_parked": 15,
       "review_lane_health": "idle",
