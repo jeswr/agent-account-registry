@@ -80,7 +80,7 @@ the thing anyone relies on for the §1 property.
 anywhere I found; filed as a follow-up.)*
 
 **(b) The tree guard is shared by four lanes, three of which never read this file.**
-`ledger-invariant.py` runs in `dashboard.yml:175,367`, `dispatch.yml:1140,1676`, `groom.yml:54` and
+`ledger-invariant.py` runs in `dashboard.yml:175,367`, `dispatch.yml:1140,1676`, `groom-sweep.yml:54` and
 `review-fix.yml:231,1204` — every one a bare `run:` with no `continue-on-error`, so its
 `SystemExit(1)` fails the job. Today that fail-closed severity is justified: a tree-shape violation
 means the branch has become an **execution** surface (`data/README.md`: a `workflow_dispatch` at

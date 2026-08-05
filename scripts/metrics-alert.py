@@ -3,7 +3,7 @@
 #
 # MEASURED job census across the crons that carry an alert leg:
 #   dispatch.yml = {plan, secrets-guard, claim, plan-alert}
-#   groom.yml    = {groom, groom-alert}
+#   groom-sweep.yml    = {groom, groom-alert}
 #   metrics.yml  = {metrics, dashboard-publish}   <-- NO alert job
 # If the metrics job dies, ledger:data/metrics.json keeps its last good content, dashboard.yml keeps
 # copying that content to site/metrics.json, and the published page renders a full snapshot with an
@@ -16,7 +16,7 @@
 #   (A) JOB-FAILURE  (`python3 scripts/metrics-alert.py`, hosted in metrics.yml)
 #       Keys on `needs.metrics.result`. Catches a metrics job that RAN and FAILED.
 #
-#   (B) STALENESS    (`python3 scripts/metrics-alert.py --stale-check`, hosted in groom.yml)
+#   (B) STALENESS    (`python3 scripts/metrics-alert.py --stale-check`, hosted in groom-sweep.yml)
 #       Keys on the age of ledger:data/metrics.json. Catches a metrics job that never ran at all —
 #       which produces NO failed job for (A) to key on. A workflow cannot detect its own
 #       non-execution, so this half MUST live on an independent schedule in a different workflow.
@@ -27,11 +27,11 @@
 # The shape that matters is a RING, not a chain — a chain of watchers always terminates in an
 # unwatched one. Live mesh, verified in the checked-in workflows:
 #   metrics job FAILS          -> metrics.yml   `metrics-alert`   (A, this script)
-#   metrics never RUNS         -> groom.yml     `metrics-stale`   (B, this script)
-#   groom never RUNS           -> dashboard.yml `cron-keepalive`  (re-dispatches groom.yml at 1800s)
+#   metrics never RUNS         -> groom-sweep.yml     `metrics-stale`   (B, this script)
+#   groom never RUNS           -> dashboard.yml `cron-keepalive`  (re-dispatches groom-sweep.yml at 1800s)
 #   dashboard never RUNS       -> metrics.yml   `dashboard-publish` staleness fallback
 # No participant is its own watcher. Honest residual: a SIMULTANEOUS stall of dashboard.yml AND
-# groom.yml is unobserved; that is a strictly smaller hole than the one this unit closes.
+# groom-sweep.yml is unobserved; that is a strictly smaller hole than the one this unit closes.
 #
 # PAGING POLICY. This is one of only two things in the whole estate permitted to reach the
 # maintainer, because it is the single failure that makes every OTHER signal invisible. Everything
@@ -101,7 +101,7 @@ REQUIRED_FILES = (
     "scripts/metrics-alert.py",
     "scripts/metrics.py",
     ".github/workflows/metrics.yml",
-    ".github/workflows/groom.yml",
+    ".github/workflows/groom-sweep.yml",
 )
 
 GENERATED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -357,7 +357,7 @@ def main_job_alert():
 
 
 def main_stale_check():
-    """(B) the SNAPSHOT-STALENESS alert. Hosted in groom.yml on an INDEPENDENT schedule, because a
+    """(B) the SNAPSHOT-STALENESS alert. Hosted in groom-sweep.yml on an INDEPENDENT schedule, because a
     workflow cannot detect its own non-execution and a cron that silently under-delivers produces no
     failed job for (A) to key on."""
     registry_repo = os.environ["REGISTRY_REPO"]
@@ -978,7 +978,7 @@ def _test_workflow_seam(chk):
     import yaml  # lazy: available on ubuntu-latest (verified live, run 30279870348) and in pr-gate
 
     metrics_wf = yaml.safe_load(_require(".github/workflows/metrics.yml"))
-    groom_wf = yaml.safe_load(_require(".github/workflows/groom.yml"))
+    groom_wf = yaml.safe_load(_require(".github/workflows/groom-sweep.yml"))
     collector = _job(metrics_wf, "metrics")
     alert = _job(metrics_wf, "metrics-alert")
     stale = _job(groom_wf, "metrics-stale")

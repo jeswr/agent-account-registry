@@ -34,7 +34,7 @@ each changes what the runbook must say, so none is cosmetic.
 
 ### 2.1 Correction A — step (2) is already done; the bindings landed ahead of the values
 
-#271: "worker.yml, review-fix.yml, groom.yml, dashboard.yml, pat-validity.yml, set-up-account.yml,
+#271: "worker.yml, review-fix.yml, groom-sweep.yml, dashboard.yml, pat-validity.yml, set-up-account.yml,
 verify-app.yml, account-whoami.yml, fingerprint-accounts.yml and backfill-provenance.yml ALL read
 repo-scope secrets today … emptying repo scope without binding their secret-bearing jobs to
 protected environments breaks them silently."
@@ -59,7 +59,7 @@ originals to move them). Every job in the ten workflows #271 names — 24 of the
 |---|---|
 | `worker.yml` | `claim`, `final_state`, `model_health`, `provenance`, `publish`, `worker` |
 | `review-fix.yml` | `claim`, `model_health`, `outcome`, `run`, `unresolvable` |
-| `groom.yml` | `dispatch-stall`, `groom`, `groom-alert`, `metrics-stale` |
+| `groom-sweep.yml` | `dispatch-stall`, `groom`, `groom-alert`, `metrics-stale` |
 | `dashboard.yml` | `build`, `cron-keepalive`, `probe` |
 | `pat-validity.yml` | `probe` |
 | `set-up-account.yml` | `login` |
@@ -129,7 +129,7 @@ Against #271's list:
 | `ALERT_TOKEN` / `ALERT_REPO` | ❌ **not migrated by any phase** | see below |
 | `REGISTRY_SECRETS_PAT` | ❌ | already env-only and correct — `set-up-account.yml:384` documents `--env dispatch-secrets` as its canonical home *because* "a repo-scope copy would re-trip the secrets-guard" |
 
-`ALERT_TOKEN`/`ALERT_REPO` are read by jobs in five files (`dispatch.yml`, `groom.yml`,
+`ALERT_TOKEN`/`ALERT_REPO` are read by jobs in five files (`dispatch.yml`, `groom-sweep.yml`,
 `metrics.yml`, `pat-validity.yml`, `review-fix.yml`), every read `|| ''`-optional. If they are
 **unset**, nothing happens. If either is set **at repo scope**, the migration does not move it and
 M6 classifies it as an unexpected stray — but M6 runs *after* M5 has already deleted the 12

@@ -360,8 +360,8 @@ jobs:
   # That makes the watchers a RING rather than a chain, and a chain of watchers always terminates in
   # an unwatched one:
   #   metrics job FAILS     -> metrics.yml   `metrics-alert`
-  #   metrics never RUNS    -> groom.yml     `metrics-stale`      (this job)
-  #   groom never RUNS      -> dashboard.yml `cron-keepalive`     (re-dispatches groom.yml at 1800s)
+  #   metrics never RUNS    -> groom-sweep.yml     `metrics-stale`      (this job)
+  #   groom never RUNS      -> dashboard.yml `cron-keepalive`     (re-dispatches groom-sweep.yml at 1800s)
   #   dashboard never RUNS  -> metrics.yml   `dashboard-publish`  (staleness fallback)
   # Deliberately NOT hosted in dashboard.yml: registry #656 (dashboard live-refresh) is in flight
   # there, and dashboard.yml already hosts the fleet-wide cron keepalive, which would make one
@@ -397,7 +397,7 @@ jobs:
             scripts/metrics-alert.py
             scripts/metrics.py
             .github/workflows/metrics.yml
-            .github/workflows/groom.yml
+            .github/workflows/groom-sweep.yml
           sparse-checkout-cone-mode: false
 
       # The snapshot metrics.py CAS-publishes (scripts/metrics.py PUBLISHED_PATH) lives on the
@@ -445,7 +445,7 @@ jobs:
   # that stops the whole pipeline is exactly the class that also disables its alarm. The gate
   # cannot be loosened; the alarm has to live outside the workflow it watches.
   #
-  # Hosted here for the same reason `metrics-stale` is: groom.yml runs on an independent schedule,
+  # Hosted here for the same reason `metrics-stale` is: groom-sweep.yml runs on an independent schedule,
   # is not dispatch, and is itself watched by dashboard.yml's cron keepalive. It costs two API
   # reads per groom tick.
   #
@@ -467,7 +467,7 @@ jobs:
       contents: read  # the sparse checkout below
       issues: write   # upsert/close the two rolling ops-alert issues
     steps:
-      # The script, plus every file its --self-test asserts against: dispatch.yml and groom.yml for
+      # The script, plus every file its --self-test asserts against: dispatch.yml and groom-sweep.yml for
       # the `if:`/`needs:`/permissions/call-site seam and the two cron cadences, and
       # dispatch-tick-floor.py for the cross-file threshold contract (the failure-streak threshold
       # is denominated in TICKS, and how long N ticks take is set entirely by the #819 floor).
@@ -483,7 +483,7 @@ jobs:
             scripts/dispatch-stall-alert.py
             scripts/dispatch-tick-floor.py
             .github/workflows/dispatch.yml
-            .github/workflows/groom.yml
+            .github/workflows/groom-sweep.yml
           sparse-checkout-cone-mode: false
 
       # PyYAML backs the workflow-parse assertions (regex-over-YAML is how five permissive
@@ -578,7 +578,7 @@ jobs:
           sparse-checkout: |
             scripts/ci-latency-alert.py
             scripts/selftest-suite.txt
-            .github/workflows/groom.yml
+            .github/workflows/groom-sweep.yml
             .github/workflows
             policy/repos.toml
           sparse-checkout-cone-mode: false
@@ -658,7 +658,7 @@ jobs:
             scripts/gh_retry.py
             scripts/plan-snapshot.py
             scripts/selftest-suite.txt
-            .github/workflows/groom.yml
+            .github/workflows/groom-sweep.yml
           sparse-checkout-cone-mode: false
       # PyYAML backs the workflow-parse assertions (regex-over-YAML is how five permissive
       # misparses got into the secrets guard). Probe first so the runner image's own copy is used
@@ -736,7 +736,7 @@ jobs:
     steps:
       # KEEP THIS LIST IN SYNC — REQUIRED_FILES in scripts/groom-mint-alert.py is asserted against
       # this very block, in both directions, so a trimmed checkout reds instead of making the
-      # YAML-seam assertions silently unreachable on the live path. groom.yml is an INPUT, not
+      # YAML-seam assertions silently unreachable on the live path. groom-sweep.yml is an INPUT, not
       # incidental: the artifact-name grammar and the streak threshold are both contracts against
       # it, and the self-test reds if either side drifts.
       - name: Check out ONLY the watchdog's inputs (pinned, sparse, no persisted token)
@@ -747,7 +747,7 @@ jobs:
           sparse-checkout: |
             scripts/groom-mint-alert.py
             scripts/selftest-suite.txt
-            .github/workflows/groom.yml
+            .github/workflows/groom-sweep.yml
           sparse-checkout-cone-mode: false
 
       # PyYAML backs the workflow-parse assertions (regex-over-YAML is how five permissive

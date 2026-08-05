@@ -41,8 +41,8 @@ repo". It is not private. `README.md:1` — *"# agent-account-registry (public)"
 Two consequences follow, and both are why "the delta is retention, not access" needs a
 qualifier:
 
-- **`permissions:` does not gate the cache write.** `groom.yml`'s job block is deliberately
-  least-privilege (`actions: read`, `contents: write`, `issues: write`, `.github/workflows/groom.yml:29-32`).
+- **`permissions:` does not gate the cache write.** `groom-sweep.yml`'s job block is deliberately
+  least-privilege (`actions: read`, `contents: write`, `issues: write`, `.github/workflows/groom-sweep.yml:29-32`).
   A cache save is understood to run against the Actions cache service on the runner's runtime
   token rather than on that block's `GITHUB_TOKEN` scopes — ⚠️ **unverified from inside the
   offline worker container; confirm before citing it as a fact.** The conclusion does not depend
@@ -67,18 +67,18 @@ a real change only for content that is not already public.**
 
 ## 3. The test this repo already applies to durable Actions storage
 
-The precedent is inside `groom.yml` itself, and it is not the fingerprint rule — it is a
+The precedent is inside `groom-sweep.yml` itself, and it is not the fingerprint rule — it is a
 **publicity** rule. groom already writes to Actions durable storage: it uploads a per-tick
-mint-outcome marker (`.github/workflows/groom.yml:225-263`) whose **name** carries raw owner
+mint-outcome marker (`.github/workflows/groom-sweep.yml:225-263`) whose **name** carries raw owner
 logins (`groom-mint-tick.ok-sparq-org.skip-jeswr`). The step's own comment states the test it
-passed (`.github/workflows/groom.yml:212-215`):
+passed (`.github/workflows/groom-sweep.yml:212-215`):
 
 > Owner logins are not secret: policy/repos.toml is public, the resolve step above already tees
 > them into this log, and groom.py prints the same skip line. Nothing token-derived is readable
 > here — the name keys on `steps.<mint>.outcome`, NEVER on `.outputs.token`.
 
 and its retention is **chosen and then asserted**, not defaulted: `retention-days: 1`
-(`.github/workflows/groom.yml:263`), pinned from the reader's side by
+(`.github/workflows/groom-sweep.yml:263`), pinned from the reader's side by
 `groom-mint-alert.py --self-test`, which parses the upload step's `retention-days` out of the YAML
 and asserts a *relationship* to the live cron period and page size rather than a duplicated
 literal (`scripts/groom-mint-alert.py:1700-1711`).
@@ -205,7 +205,7 @@ could be recorded as met while nothing was actually bounded:
   into a general CONFIRM: an **authenticated cleanup** that enumerates cache entries and deletes
   the expired ones, fails closed, and is pinned by its own seam test (the Actions cache delete API
   — ⚠️ **unverified from inside the offline worker container**; note it would need
-  `actions: write`, widening `groom.yml`'s least-privilege block, which is a real cost to weigh
+  `actions: write`, widening `groom-sweep.yml`'s least-privilege block, which is a real cost to weigh
   against a body cache); or the maintainer **explicitly accepting** platform-controlled retention
   as the bound, with this record naming it as accepted-not-proved.
 

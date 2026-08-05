@@ -64,11 +64,11 @@ ALERT_MARKER = "<!-- ratelimit-alert:v1 key=shared-rest-budget -->"
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
 
-GROOM_WORKFLOW = ".github/workflows/groom.yml"
+GROOM_WORKFLOW = ".github/workflows/groom-sweep.yml"
 GROOM_JOB = "ratelimit-budget"
 PLAN_SNAPSHOT = "scripts/plan-snapshot.py"
 SUITE_FILE = "scripts/selftest-suite.txt"
-# KEEP IN SYNC with the sparse-checkout in groom.yml's `ratelimit-budget` job. The self-test
+# KEEP IN SYNC with the sparse-checkout in groom-sweep.yml's `ratelimit-budget` job. The self-test
 # asserts both directions, so a checkout that drops an input reds instead of making the YAML-seam
 # assertions silently unreachable on the live path.
 REQUIRED_FILES = (
@@ -988,7 +988,7 @@ def _test_workflow_seam(chk):
 
     wf = yaml.safe_load((REPO_ROOT / GROOM_WORKFLOW).read_text(encoding="utf-8"))
     jobs = wf.get("jobs") or {}
-    chk(f"seam: groom.yml hosts a `{GROOM_JOB}` job", GROOM_JOB in jobs, True)
+    chk(f"seam: groom-sweep.yml hosts a `{GROOM_JOB}` job", GROOM_JOB in jobs, True)
     job = jobs.get(GROOM_JOB) or {}
 
     # A watcher hosted inside the watched job cannot observe the watched job's absence — and a

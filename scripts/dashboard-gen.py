@@ -224,11 +224,11 @@ FLEET_COMPOSITION_KEYS = frozenset({
 
 
 # [#1353 BLOCKED] Thresholds that CANNOT be re-sized to satisfy the #680 bound: setting
-# groom.yml=1200 / retriage.yml=2400 in .github/workflows/dashboard.yml makes GitHub refuse
+# groom-sweep.yml=1200 / retriage.yml=2400 in .github/workflows/dashboard.yml makes GitHub refuse
 # to ingest the workflow (action_required, jobs total_count=0 — measured on master
 # 2026-07-31T03:04Z, PR #1363, reverted by #1364). Mechanism unknown; tracked in #1353.
 # REMOVE THIS SET the moment #1353 is resolved — it is the weaker of the two states.
-_THRESHOLD_BOUND_EXEMPT = frozenset({"groom.yml", "retriage.yml"})
+_THRESHOLD_BOUND_EXEMPT = frozenset({"groom-sweep.yml", "retriage.yml"})
 
 
 # [#1084] The nominal cadence of every workflow the CROSS-REPO keepalive leg watches, keyed by
@@ -4944,8 +4944,8 @@ def _self_test():
           "quietly stops watching a workflow must go red here rather than silently narrow the "
           "bound below to whatever is left",
           sorted(keepalive_cadences),
-          ["conflict-resolver.yml", "curate.yml", "groom.yml", "metrics.yml", "retriage.yml"])
-    # [#1353 BLOCKED] groom.yml and retriage.yml SHOULD be re-sized to 1200 and 2400 to satisfy
+          ["conflict-resolver.yml", "curate.yml", "groom-sweep.yml", "metrics.yml", "retriage.yml"])
+    # [#1353 BLOCKED] groom-sweep.yml and retriage.yml SHOULD be re-sized to 1200 and 2400 to satisfy
     # the bound below. They are not, and this is a deliberate, documented exemption rather than an
     # oversight: setting those two values in `.github/workflows/dashboard.yml` makes GitHub REFUSE
     # TO INGEST THE WORKFLOW — every run concludes `action_required` with `jobs total_count=0`,
@@ -4957,7 +4957,7 @@ def _self_test():
           "of the workflow it watches (offenders listed as workflow -> (threshold, cadence)): at "
           "or under one cadence it kicks a punctual cron behind its own fire; at or over two, one "
           "dropped fire costs a whole extra cycle on a fleet losing ~40% of its fires "
-          "[groom.yml/retriage.yml exempt while #1353 blocks their re-sizing]",
+          "[groom-sweep.yml/retriage.yml exempt while #1353 blocks their re-sizing]",
           {name: (keepalive_specs[name][0], cadence)
            for name, cadence in keepalive_cadences.items()
            if name not in _THRESHOLD_BOUND_EXEMPT
@@ -4966,11 +4966,11 @@ def _self_test():
     check("[#1353] the exemption above is NOT silent — every exempt workflow is still watched, and "
           "the set is pinned so a future re-size that drops one cannot quietly widen it",
           sorted(_THRESHOLD_BOUND_EXEMPT & set(keepalive_cadences)),
-          ["groom.yml", "retriage.yml"])
+          ["groom-sweep.yml", "retriage.yml"])
 
     # --- #1084: the WIDENING direction, on the three thresholds the row above cannot see. The
     # strict bound covers three registry legs; the #1353 pair is excused from it ENTIRELY (so
-    # `groom.yml:1800` -> `:99999` is invisible), and the CROSS-REPO leg is not in that row's
+    # `groom-sweep.yml:1800` -> `:99999` is invisible), and the CROSS-REPO leg is not in that row's
     # population at all because sparq-org/sparq is not checked out here for
     # `_workflow_cadence_seconds` to read. With every fixture age below derived from the threshold
     # itself, `rearm-sweeper.yml:1200` -> `:99999` left the whole suite green (#1084 measured 187
@@ -5191,7 +5191,7 @@ def _self_test():
            "<self> curate.yml": ["dashboard.yml/registry-keepalive"],
            "<self> dashboard.yml": ["metrics.yml/dashboard-publish"],
            "<self> dispatch.yml": ["dashboard.yml/registry-keepalive"],
-           "<self> groom.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> groom-sweep.yml": ["dashboard.yml/registry-keepalive"],
            "<self> metrics.yml": ["dashboard.yml/registry-keepalive"],
            "<self> retriage.yml": ["dashboard.yml/registry-keepalive"],
            "sparq-org/sparq rearm-sweeper.yml": ["dashboard.yml/sparq-keepalive-dispatch"]})
@@ -5410,10 +5410,10 @@ esac
         (code, kicked), (0, ["dispatch.yml"]), log)
     # ...and the run-anchored legs are untouched by all of the above.
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)],
-                                           runs={"groom.yml": [_ka_run(99_999)]})
+                                           runs={"groom-sweep.yml": [_ka_run(99_999)]})
     keepalive_check(
         "[#922] the run-anchored legs still key on run age, and only the stale one is kicked",
-        (code, kicked), (0, ["groom.yml"]), log)
+        (code, kicked), (0, ["groom-sweep.yml"]), log)
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)])
     keepalive_check(
         "[#922] control: a fleet that is fresh on BOTH anchors is kicked not at all",
@@ -5440,7 +5440,7 @@ esac
     # #680: the bound above is arithmetic across two files; these two rows are the BEHAVIOUR it
     # buys, driven through the real leg. Every age is derived from the watched workflow's OWN
     # cadence and never from the spec list the leg reads, so moving a threshold to either side of
-    # the bound flips one of them: at 2x cadence (where groom.yml and retriage.yml sat) the
+    # the bound flips one of them: at 2x cadence (where groom-sweep.yml and retriage.yml sat) the
     # missed-a-fire row goes quiet for exactly those two, and at 1x cadence the punctual row starts
     # kicking. The pair is deliberately one row per direction — a single-direction row is satisfied
     # by a leg that kicks everything, or by one that kicks nothing.
@@ -5454,7 +5454,7 @@ esac
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)], runs=missed)
     keepalive_check(
         "[#680] ...and EVERY non-exempt run-anchored workflow that has missed exactly one fire is "
-        "kicked inside that same cycle. groom.yml/retriage.yml are EXEMPT while #1353 blocks their "
+        "kicked inside that same cycle. groom-sweep.yml/retriage.yml are EXEMPT while #1353 blocks their "
         "re-sizing: at exactly 2x cadence a single dropped fire still reads FRESH, so they are not "
         "kicked — that is the cost of the exemption, asserted here so it stays visible",
         (code, kicked),

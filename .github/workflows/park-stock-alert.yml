@@ -5,7 +5,7 @@
 # no dashboard. Measured 2026-08-01, items had waited up to nine days. This routes it to the same
 # upsert-and-close `ops-alert` transport the ci-latency/plan/usage alerts already use.
 #
-# ⚠️ IT IS ITS OWN WORKFLOW ON PURPOSE. The first attempt added this step to groom.yml and groom
+# ⚠️ IT IS ITS OWN WORKFLOW ON PURPOSE. The first attempt added this step to groom-sweep.yml and groom
 # STOPPED INGESTING (action_required, jobs=0) — the eighth instance of the unexplained class in
 # registry #1566, reverted in #1581. A NEW workflow file has ZERO blast radius on existing lanes: if
 # GitHub declines to ingest THIS file, only this alert stops, and every other lane is untouched.

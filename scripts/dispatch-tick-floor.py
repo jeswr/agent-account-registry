@@ -290,7 +290,7 @@ FLOOR_STEP_ID = "floor"
 
 # THE ONE DEFINITION of "which minutes past the hour does this cron fire at" (#1046), CONSUMED
 # rather than copied (#1279). This file used to expand the minute field itself and got a stepped
-# RANGE wrong — it read the step and dropped the range's START, so `7-59/15` (groom.yml's live
+# RANGE wrong — it read the step and dropped the range's START, so `7-59/15` (groom-sweep.yml's live
 # cron) expanded to :00/:15/:30/:45 instead of :07/:22/:37/:52. It was latent only because the one
 # workflow it is applied to writes explicit minutes, which is exactly how a second definition
 # survives: it is never asked the question that separates it from the first (#958).
@@ -870,12 +870,12 @@ def _test_cron_minute_expansion(chk):
     def minutes(expr):
         return sorted(_cron_minutes({"on": {"schedule": [{"cron": expr}]}}))
 
-    # THE DEFECT. `7-59/15` is groom.yml's live cron; the private copy this replaced answered
+    # THE DEFECT. `7-59/15` is groom-sweep.yml's live cron; the private copy this replaced answered
     # [0, 15, 30, 45], which shares NOT ONE minute with the truth — so this row cannot go green on
     # a re-introduced private expander, and the expected value is computed by hand rather than read
     # from the code under test.
     chk("cron: a stepped RANGE expands from the range's START, not from :00 (`7-59/15` is "
-        "groom.yml's live cron; the private copy this replaced answered [0, 15, 30, 45])",
+        "groom-sweep.yml's live cron; the private copy this replaced answered [0, 15, 30, 45])",
         minutes("7-59/15 * * * *"), [7, 22, 37, 52])
     # ...and the shapes that kept the defect latent still expand exactly as they always did.
     chk("cron: an explicit minute LIST is unchanged (dispatch.yml's own cron — the one shape the "

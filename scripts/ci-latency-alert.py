@@ -65,7 +65,7 @@ against a 613/tick dispatch budget. It also never walks the repo-wide `actions/r
 listing, which is capped at 1000 results and is exhausted by under six hours of this
 repo's volume.
 
-NOT A PAGER FOR THE COMMIT UNDER TEST. Hosted as its own job in groom.yml with NO `needs:`
+NOT A PAGER FOR THE COMMIT UNDER TEST. Hosted as its own job in groom-sweep.yml with NO `needs:`
 and NO `if:` — a watcher hosted inside the watched job cannot observe the watched job's
 absence — and the alert step carries `continue-on-error: true`, matching the sibling
 watchdogs, so a watchdog fault can never red the grooming sweep. The SIGNAL is a rolling
@@ -104,18 +104,18 @@ ALERT_LABEL = "ops-alert"
 MARKER_PREFIX = "ci-latency-alert:v1"
 MAINTAINER_HANDLE = os.environ.get("MAINTAINER_HANDLE", "jeswr")
 
-# KEEP IN SYNC with the sparse-checkout in groom.yml's `ci-latency` job. The self-test
+# KEEP IN SYNC with the sparse-checkout in groom-sweep.yml's `ci-latency` job. The self-test
 # asserts both directions, so a checkout that drops an input reds instead of making the
 # YAML-seam assertions silently unreachable on the live path.
 REQUIRED_FILES = (
     "scripts/ci-latency-alert.py",
-    ".github/workflows/groom.yml",
+    ".github/workflows/groom-sweep.yml",
     # M3's floor is DERIVED from this file's `worker_timeout_minutes` (see EXEC_FLOOR_SECONDS).
     # Without it in the checkout the derivation assertion would be unreachable on the live
     # path while staying green in pr-gate — the exact silent divergence #1140 was about.
     "policy/repos.toml",
 )
-GROOM_WORKFLOW = ".github/workflows/groom.yml"
+GROOM_WORKFLOW = ".github/workflows/groom-sweep.yml"
 POLICY_FILE = "policy/repos.toml"
 WORKFLOWS_DIR = ".github/workflows"
 
@@ -2329,7 +2329,7 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             _violations == [])
         wf = yaml.safe_load((root / GROOM_WORKFLOW).read_text())
         jobs = wf.get("jobs", {})
-        chk("seam: groom.yml hosts a `ci-latency` job", "ci-latency" in jobs)
+        chk("seam: groom-sweep.yml hosts a `ci-latency` job", "ci-latency" in jobs)
         job = jobs.get("ci-latency", {})
         # A watcher hosted inside the watched job cannot observe the watched job's absence.
         chk("seam: the watchdog job has NO `needs:`", "needs" not in job)
@@ -2386,7 +2386,7 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                 chk("seam: checkout does not persist credentials",
                     with_.get("persist-credentials") is False)
                 # EXACT LINE match, never containment: `.github/workflows` is a
-                # SUBSTRING of `.github/workflows/groom.yml`, so a containment check
+                # SUBSTRING of `.github/workflows/groom-sweep.yml`, so a containment check
                 # passes even when the directory entry — which is what M1 actually reads
                 # every lane's cron from — has been dropped. That mutant SURVIVED a
                 # containment check.
