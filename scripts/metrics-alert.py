@@ -51,11 +51,25 @@
 # routing, close-ONLY-on-explicit-success, sanitized fail-loud `gh` wrapper, and a soft-fail on a
 # successful-but-malformed `gh issue list`.
 #
-# DEBT (issue #591, PR #590): `_alert_route` is the SIXTH private copy of the same locked decision
-# (22c). PR #590 introduces `scripts/alert_route.py` as the shared home. It is not on master yet, so
-# this file carries a byte-compatible private copy with the IDENTICAL signature
-# `(alert_repo, alert_token, registry_repo)` — migration is a one-line import swap plus adding
-# `scripts/alert_route.py` to both sparse-checkout lists.
+# DEBT (issue #591). `_alert_route` is the SIXTH private copy of the same locked decision (22c) —
+# the presence-only tier, `(alert_repo, alert_token, registry_repo) -> (repo, token|None)`. THERE IS
+# NO SHARED HOME TO FOLD ONTO: PR #590 proposed `scripts/alert_route.py` and never landed, so that
+# module does not exist on master and has to be AUTHORED — which tier and which arity it exposes is
+# a design decision, not a mechanical move. Two things an earlier version of this note understated,
+# both established in research/1021-alert-route-consolidation.md §3:
+#   - The copies do NOT all share one signature. This body is byte-compatible with the other five
+#     presence-only copies and with nothing beyond them: `scripts/worker-pr.py` returns
+#     `REGISTRY_ALERT_TOKEN or alert_token` on fallback where every copy here returns `None` (its
+#     fallback destination is the PUBLIC registry, which `ALERT_TOKEN` cannot write), and
+#     `scripts/pat-validity.py` / `scripts/usage-alert.py` return a 3-tuple carrying a `redact`
+#     flag. A shared router has to model the fallback-token axis AND the redaction axis.
+#   - Migration is NOT "a one-line import swap". Two host jobs sparse-check-out exactly ONE file
+#     (`scripts/plan-alert.py` in dispatch.yml, `scripts/groom-alert.py` in groom.yml), and the
+#     route is called at the top of `main()` in every copy — so the load-lazily-by-path hedge
+#     (`_load_gh_retry` in scripts/ci-latency-alert.py) does not apply: the route IS the first read.
+#     Every affected sparse-checkout list must therefore GROW, and each growth must be asserted at
+#     the YAML seam (the REQUIRED_FILES idiom below) or the live job ships without the module and
+#     reds on its first call while pr-gate, which has the whole tree, stays green — the #1140 shape.
 import ast
 import json
 import os
@@ -113,10 +127,11 @@ class MetricsAlertError(Exception):
 
 def _alert_route(alert_repo, alert_token, registry_repo):
     """(repo, token) for the alert issue — locked decision 22c / issue #39, identical semantics and
-    signature to scripts/alert_route.py's `alert_route` (see the DEBT note in the header): the
-    private ALERT_REPO is the destination ONLY when ALERT_TOKEN can write there; a half-configured
-    deployment (repo set, token missing) falls back to the registry repo under the ambient token
-    (token=None means "use the ambient GH_TOKEN") instead of silently losing the alert."""
+    signature to the other five presence-only private copies — there is no shared module to defer
+    to, see the DEBT note in the header: the private ALERT_REPO is the destination ONLY when
+    ALERT_TOKEN can write there; a half-configured deployment (repo set, token missing) falls
+    back to the registry repo under the ambient token (token=None means "use the ambient GH_TOKEN")
+    instead of silently losing the alert."""
     if alert_repo and alert_token:
         return alert_repo, alert_token
     return registry_repo, None
