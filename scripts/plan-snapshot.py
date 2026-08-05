@@ -164,7 +164,23 @@ LIST_PAGE_LIMIT = 50        # issues/pulls ceiling: 5000 entries, repo-level, sw
 # Per-SHA ceiling backstop: 4000 entries (the f37d13f emergency bump — churned sparq heads
 # really do pass 1000, e.g. PR #2540 at 1061), and it now degrades PER ITEM, never per sweep.
 CHECK_RUN_PAGE_LIMIT = 40
-WORKER_PR_STATUS_LIMIT = 100
+# [OPUS-5] Raised 100 -> 150 (maintainer directive 2026-08-05). sparq crossed the old ceiling
+# at 140 worker PRs while groom -- the lane that reaps stale worker PRs -- was ingestion-rejected
+# for 20h+, so the backlog grew unchecked and the WHOLE repo degraded to no prstatus.
+#
+# ⚠️ THIS IS NOT FREE, and the number to watch is the SHARED budget, not this constant. The
+# PR-detail + check-runs legs walk one PR at a time (~4.9 requests/PR measured at 121 PRs), so
+# per-tick cost scales linearly with this limit:
+#
+#     limit=100  ~ 511 req/tick   6 ticks/hr =  61% of the 5,000/hr repo-wide budget
+#     limit=150  ~ 755 req/tick   6 ticks/hr =  91%   <- HERE
+#
+# 91% leaves almost no room for the ~350 other workflow runs/hr that share the same bucket, and
+# budget exhaustion is what the dispatch floor (#819) exists to prevent. So this raise BORROWS
+# against the floor: either the floor lengthens (6 -> ~4 ticks/hr), or #1303 lands (moves the
+# check-runs walk to GraphQL, ~613 -> ~139/tick) and the cost problem disappears entirely.
+# #1303 is the real fix; this is the stopgap that keeps sparq dispatching meanwhile.
+WORKER_PR_STATUS_LIMIT = 150
 WORKER_HEAD_PREFIX = "sparq-agent/"
 MERGEABLE_POLL_ATTEMPTS = 3
 MERGEABLE_POLL_INTERVAL_SECONDS = 1
