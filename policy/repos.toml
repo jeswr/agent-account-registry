@@ -99,6 +99,12 @@ max_concurrent = 40
 worker_timeout_minutes = 90
 gate_profile = "crate-scoped"
 arm_auto_merge = true         # arming now actually happens — ONLY in the review-fix approve path
+# [#1451] Authors whose PRs in THIS repo the review lane may act on. sparq carries
+# arm_auto_merge = true and max_concurrent = 40, so this widens the ARM boundary, not just
+# review. The "did the enable widen too far?" property is pinned by the EXACT-population
+# guards in mint-provenance.py / auto-mint-provenance.py, NOT by keeping some other repo
+# enabled-but-un-enrolled — see #1540 (that coupling made a workflow outage block this).
+review_enrolment_authors = ["jeswr"]
 require_usage = true          # hold (fail-closed) if the usage probe is unavailable
 usage_safety_margin = 0.15    # admit only accounts with >=15% headroom in BOTH windows
 max_attempts = 3              # per-issue worker attempts (also bounds the deferred-retry loop)

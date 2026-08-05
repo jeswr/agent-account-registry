@@ -1842,35 +1842,40 @@ def _self_test():                                                       # noqa: 
     enrolled_live = sorted(
         (name, sorted(policy_resolve.review_enrolment_authors(name, policy_doc)))
         for name in _enabled_rows)
-    check("the shipped policy enrols EXACTLY the registry, and only `jeswr` (one-repo rollout; "
-          "sparq is a deliberate follow-up)",
+    # [#1451] REPOINTED, not relaxed — the pinned population GROWS to name both enrolled repos,
+    # exactly as the paragraph above prescribes. This is now the SOLE guard of "the enable did not
+    # widen too far": it reds on a THIRD repo being enrolled and on either list being emptied.
+    check("the shipped policy enrols EXACTLY the registry and sparq, and only `jeswr`",
           [row for row in enrolled_live if row[1]],
-          [("jeswr/agent-account-registry", ["jeswr"])])
+          [("jeswr/agent-account-registry", ["jeswr"]), ("sparq-org/sparq", ["jeswr"])])
     # NON-VACUOUS in the other direction too: the same reader, over the same LIVE rows, surfaces an
     # EMPTY list for a repo that is not enrolled — so the assertion above is a fact about the
     # shipped policy rather than about a reader that returns whatever it is given.
-    check("...and the reader still reports an un-enrolled repo as empty",
-          sorted(policy_resolve.review_enrolment_authors("sparq-org/sparq", policy_doc)), [])
+    # [#1451] The reader must DISCRIMINATE, not echo. This used to ask about a live
+    # enabled-but-un-enrolled repo, which forced the estate to keep one permanently staged just to
+    # feed a test — and #1540 showed that coupling can make an unrelated workflow outage block a
+    # policy change. The discrimination property belongs to the READER, so it is proven against a
+    # constructed doc and holds no matter what the shipped policy contains.
+    _unenrolled_doc = {"repos": {"example/enabled-not-enrolled": dict(
+        policy_doc["repos"]["jeswr/agent-account-registry"], enabled=True)}}
+    _unenrolled_doc["repos"]["example/enabled-not-enrolled"].pop("review_enrolment_authors", None)
+    check("...and the reader reports an ENABLED but un-enrolled repo as empty (it discriminates)",
+          sorted(policy_resolve.review_enrolment_authors(
+              "example/enabled-not-enrolled", _unenrolled_doc)), [])
+    check("...while the SAME reader on the SAME shape WITH the key returns it (not a constant [])",
+          sorted(policy_resolve.review_enrolment_authors(
+              "example/enabled-not-enrolled",
+              {"repos": {"example/enabled-not-enrolled": dict(
+                  _unenrolled_doc["repos"]["example/enabled-not-enrolled"],
+                  review_enrolment_authors=["someone"])}})), ["someone"])
 
 
-    probe_doc = copy.deepcopy(policy_doc)
-    # ...and the probe must pick an ENABLED row that does NOT already carry the key. Round-1
-    # review: picking `sorted(_enabled_rows)[0]` selects the registry, which ALREADY resolves to
-    # ["jeswr"], so setting it to ["jeswr"] is a value-identical no-op and the check below proves
-    # nothing about the reader. A real transition needs a row whose CURRENT value is empty.
-    # (A disabled row cannot serve either: it RAISES instead of reporting empty, testing the
-    # exception rather than the reader.)
-    _probe_candidates = [name for name in sorted(_enabled_rows)
-                         if not policy_resolve.review_enrolment_authors(name, policy_doc)]
-    assert _probe_candidates, (
-        "the positive-transition probe needs an ENABLED policy row with NO review_enrolment_authors; "
-        "every enabled row already carries one, so this probe can no longer prove a transition")
-    probe_repo = _probe_candidates[0]
-    check("...the probe row genuinely starts EMPTY, so the check below is a real transition",
-          sorted(policy_resolve.review_enrolment_authors(probe_repo, policy_doc)), [])
-    probe_doc["repos"][probe_repo]["review_enrolment_authors"] = ["jeswr"]
-    check("...and the same reader WOULD surface one",
-          sorted(policy_resolve.review_enrolment_authors(probe_repo, probe_doc)), ["jeswr"])
+    # [#1451] The live-policy "positive transition" probe that stood here is SUPERSEDED by the
+    # discrimination pair above. It required an ENABLED row that carried NO
+    # review_enrolment_authors, so every enabled row becoming enrolled — the successful END STATE
+    # of this rollout — made it assert itself impossible. The pair above proves the identical
+    # property (same reader: absent key -> [], present key -> the value) against a constructed
+    # doc, so it holds for ANY shipped policy including one where every repo is enrolled.
 
     # ---- the workflow seam --------------------------------------------------------------------
     seam = mint_workflow_seam_report()
