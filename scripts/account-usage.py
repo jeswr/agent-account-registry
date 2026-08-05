@@ -38,6 +38,7 @@
 # downstream reads any of it, and Stage A is exactly the change that emits nothing readable: see the
 # OBSERVATION blocks at `_raw_header_fields` and `_assemble_opus5` for why gating a SOLE-tier
 # premium bucket before it has ever been observed is a fleet outage rather than a safeguard.
+import ast
 import contextlib
 import importlib.util
 import io
@@ -679,6 +680,270 @@ def _issue_view(number, registry_repo, run):
     return issue.get("body") or "", count, True
 
 
+# ---- [#317] SERIALIZATION PREMISE: this lane vs the other account-catalog writers ---------------
+# #317 asked for a shared serialization mechanism between `persist_limits` and set-up-account.yml —
+# a claim-ref / advisory lock in the `acct-claims` namespace, held across the limits write,
+# mirroring the broker's first-writer-wins ref. That lock is REFUSED. What ships instead is the
+# ENFORCEMENT of the two wiring facts that keep the automated write window EMPTY, via the three
+# readers below and the `[#317]` rows in `_self_test`. Reasons, in the order they were decided:
+#
+#   1. MEASUREMENT FIRST — #317's premise is half true, and the false half is the load-bearing one.
+#      The two lanes' RUNS can indeed overlap (`registry-dispatcher` vs `set-up-account-login` are
+#      different concurrency groups). But the broker has no body-replacing write to lose: it writes
+#      an account-record body EXACTLY ONCE, with `gh issue create` (set-up-account.yml:824), and
+#      both of its `gh issue edit` calls are label-only (:1216, :1490 — `--remove-label` /
+#      `--add-label`, no `--body`). A create cannot be clobbered by our edit of a different issue,
+#      and our edit re-reads the fresh body first (#198). So the residual window is against
+#      OUT-OF-BAND MANUAL edits, exactly as `_persist_one` says.
+#   2. A MUTEX CANNOT BIND THE WRITER THAT ACTUALLY REACHES THE WINDOW. A human editing an issue
+#      body in the web UI observes no ref protocol, so serializing the two automated writers against
+#      each other narrows nothing that is reachable today — while the count-shape guard already
+#      DETECTS the manual case and refuses loudly.
+#   3. THE NAMESPACE HAS NO RELEASE, BY DESIGN, AND THAT IS WHAT MAKES IT SOUND. `acct-claims` refs
+#      are never deleted — "a run that fails after claiming burns its slot rather than releasing it,
+#      so a different credential can never overwrite an in-flight one" (set-up-account.yml:653). A
+#      lock is the same primitive with the opposite requirement: it MUST be released, and a holder
+#      that dies mid-hold (a cancelled run, a 15-minute job timeout) leaves a ref no automation may
+#      remove. That fail-closes ACCOUNT ENROLLMENT — the highest-consequence path in this repo — to
+#      protect a `limits:` line whose sole consumer is one dashboard capacity FALLBACK
+#      (research/1051-catalog-clobber-auto-restore.md §5). Backwards trade, and §7 of that record
+#      says to settle where the line is STORED before investing further in this guard.
+#
+# So the honest cure is to stop the premise from rotting silently. Both halves are falsifiable
+# offline, from the checked-out workflow files, and both go RED on the repoint that would make the
+# window reachable by automation: (a) the persist entrypoint leaving the one workflow whose runs are
+# serialized, and (b) the broker acquiring a body-replacing write.
+#
+# [#317 review round 1] Those two facts are checked by `serialization_premise_errors` on the
+# PRODUCTION `--persist-limits` path, before the first issue read — not only by `--self-test`.
+# A check that lives in a self-test binds whichever workflow happens to run that self-test; the
+# repoint this guards against is a SECOND workflow entering the read/edit window, and a red row in
+# dispatch.yml's probe step does not stop that workflow's write. Now the refusal travels with the
+# writer: any invocation, from any workflow, reads the same checked-out tree and refuses itself.
+# The entrypoint spells this token as a LITERAL rather than referencing the constant — see the
+# comment at `__main__` — so the two are pinned equal by `_entrypoint_argv_flags`'s `[#317]` rows
+# instead of by sharing a name. Renaming either one alone reds the self-test.
+PERSIST_FLAG = "--persist-limits"          # the argv token the entrypoint dispatches on
+PERSIST_WORKFLOW = "dispatch.yml"          # the ONE workflow allowed to invoke it
+PERSIST_CONCURRENCY = ("registry-dispatcher", "false")   # ...whose runs must serialize, uncancelled
+BROKER_WORKFLOW = "set-up-account.yml"     # the enrollment broker, which must stay create-only
+# Every option through which `gh issue edit` can REPLACE a body. Long forms by name (`--body=x`
+# attached form included), short forms by letter. `VALUE_SHORTHANDS` are the `gh issue edit`
+# shorthands that CONSUME a value, which is what makes `-Ro/body-repo` not a body write: pflag binds
+# the cluster remainder to `-R`, so scanning past it would read an argument's text as a flag.
+BODY_WRITE_OPTIONS = ("body", "body-file")
+BODY_WRITE_SHORTHANDS = "bF"
+VALUE_SHORTHANDS = "bFmtR"
+
+
+def _strip_shell_comment(line):
+    """PURE: `line` with any trailing UNQUOTED `#` comment removed.
+
+    A `#` counts as a comment opener only at the start of the line or after whitespace, and only
+    outside single/double quotes — so `--body "a # b"` keeps its text and a YAML/shell comment
+    inside a `run:` block scalar is dropped. Comments must not be able to satisfy a wiring
+    assertion (prose is not an invocation) NOR to defeat one (a real command is not a comment)."""
+    quote = ""
+    for index, char in enumerate(line):
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1] in " \t"):
+            return line[:index]
+    return line
+
+
+def _run_script_lines(text):
+    """PURE: the executable lines of every `run:` step body in a workflow document, comments removed.
+
+    Prose is EXCLUDED by construction: `name:`/`description:` scalars, `uses:`, `if:` and every
+    comment live outside a `run:` body, so a `--persist-limits` mentioned in explanatory text is not
+    an invocation — which is the whole difference between reading the wiring and grepping the file
+    (#317 review round 1). Both spellings are read: the inline `run: cmd` and the block scalar
+    `run: |`, whose body is the following lines indented past the `run` key's own column."""
+    lines = text.split("\n")
+    script, index = [], 0
+    while index < len(lines):
+        match = re.match(r"^(\s*(?:-\s+)?)run:(.*)$", lines[index])
+        index += 1
+        if not match:
+            continue
+        key_column, inline = len(match.group(1)), match.group(2).strip()
+        if inline and not inline.startswith(("|", ">")):
+            script.append(inline)                       # `run: cmd` on one line
+            continue
+        while index < len(lines):                       # `run: |` — the indented block body
+            body = lines[index]
+            if body.strip() and len(body) - len(body.lstrip()) <= key_column:
+                break
+            script.append(body)
+            index += 1
+    return [stripped for stripped in (_strip_shell_comment(line) for line in script)
+            if stripped.strip()]
+
+
+def _invokes_command(text, token):
+    """PURE: True when `token` appears as an EXACT argv token in a `run:` script line of `text`.
+
+    Exact-token, because that is how the entrypoint is actually selected: main() dispatches on
+    `PERSIST_FLAG in sys.argv`, so `--persist-limits-extra` is no more an invocation than the word
+    is in a sentence. Substring containment over the whole file — the previous reader — counted
+    both (AGENTS.md pre-flight item 6: pin exact-match at the YAML seam, never containment)."""
+    return any(token in line.split() for line in _run_script_lines(text))
+
+
+def _entrypoint_argv_flags(source):
+    """PURE: the string LITERALS a module's `if __name__ == "__main__":` block tests `sys.argv` for.
+
+    The counterpart of `_invokes_command`, on the other side of the same seam: that one reads which
+    token a workflow PASSES, this one reads which tokens the entrypoint DECLARES. Both must name
+    the same flag, and pr-gate's required CLI-signature step is what compares them — it parses the
+    script's AST and counts only a LITERAL operand, so a dispatch spelled through a named constant
+    declares nothing at all and every workflow-passed flag reads as drift. Deliberately scoped to
+    the `__main__` block: a literal somewhere else in the module cannot dispatch anything, so it
+    must not be able to answer "does the entrypoint still select this flag?". Fail-closed by
+    construction — an unparseable module raises rather than reporting an empty declaration set."""
+    flags = set()
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name) and node.test.left.id == "__name__"):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Compare):
+                continue
+            operands = [inner.left, *inner.comparators]
+            if any(isinstance(operand, ast.Attribute) and operand.attr == "argv"
+                   for operand in operands):
+                flags |= {operand.value for operand in operands
+                          if isinstance(operand, ast.Constant) and isinstance(operand.value, str)}
+    return flags
+
+
+def _workflow_concurrency(text):
+    """PURE: the DOCUMENT-level `concurrency:` mapping of a workflow file, as {key: raw value text}.
+
+    Anchored at column 0, which in a workflow document can only be the document's own key — a
+    job-level `concurrency:` is indented under `jobs:` and must never be able to satisfy an
+    assertion about the WORKFLOW's serialization. Anything but exactly one such block reads as `{}`
+    (fail closed: an absent or ambiguous declaration must never report as 'serialized')."""
+    blocks = re.findall(r"(?m)^concurrency:[ \t]*\n((?:[ \t]+[^\n]*\n)+)", text)
+    if len(blocks) != 1:
+        return {}
+    mapping = {}
+    for line in blocks[0].split("\n"):
+        entry = line.strip()
+        if entry.startswith("#"):
+            continue
+        key, sep, value = entry.partition(":")
+        if sep:
+            mapping[key.strip()] = value.strip()
+    return mapping
+
+
+def _gh_issue_edit_invocations(text):
+    """PURE: every `gh issue edit ...` command in a shell/workflow document, one reassembled
+    LOGICAL line each (backslash continuations joined, whitespace collapsed).
+
+    Continuations are joined BEFORE the command is judged, because that is where this reader would
+    otherwise be vacuous: set-up-account.yml's own label edit spans two physical lines, so a reader
+    working line-by-line would report every continued `--body` write as body-free — the exact
+    acquisition the caller's assertion exists to catch. Comments are stripped (quote-aware) so prose
+    can neither satisfy nor defeat an assertion about code."""
+    logical, buffer = [], ""
+    for line in text.split("\n"):
+        entry = _strip_shell_comment(line).strip()
+        if not entry:
+            continue
+        if entry.endswith("\\"):
+            buffer += entry[:-1].strip() + " "
+            continue
+        logical.append(buffer + entry)
+        buffer = ""
+    if buffer:
+        logical.append(buffer)
+    return [" ".join(command.split()) for command in logical
+            if re.search(r"\bgh issue edit\b", command)]
+
+
+def _edits_issue_body(command):
+    """PURE: True when a reassembled `gh issue edit` command REPLACES the issue body.
+
+    Every spelling `gh issue edit` accepts, not just `--body` (#317 review round 1): the long forms
+    `--body` / `--body-file`, their `=`-attached forms, and the shorthands `-b` / `-F`, attached
+    value included (`-b"$new"`). A shorthand CLUSTER is scanned only as far as the first shorthand
+    that takes a value, because pflag binds the remainder to that flag — otherwise `-Ro/body-repo`
+    would read its own argument as a `-b`."""
+    for token in command.split():
+        if token.startswith("--"):
+            if token[2:].split("=", 1)[0] in BODY_WRITE_OPTIONS:
+                return True
+        elif token.startswith("-") and len(token) > 1:
+            for char in token[1:].split("=", 1)[0]:
+                if char in BODY_WRITE_SHORTHANDS:
+                    return True
+                if char in VALUE_SHORTHANDS:
+                    break                      # the cluster remainder is this flag's VALUE
+    return False
+
+
+def _read_workflow(workflows_dir, name):
+    """The text of ONE workflow file. Raises (never returns "") when it cannot be read: a file this
+    guard cannot see must not read as a file that declares nothing."""
+    with open(os.path.join(workflows_dir, name), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _workflows_invoking(token, workflows_dir):
+    """The sorted names of the workflow files under `workflows_dir` that INVOKE `token` from a
+    `run:` step (see `_invokes_command` — prose and comments do not count).
+
+    Used to pin WHERE an entrypoint is invoked from. An unreadable directory raises rather than
+    returning an empty list: 'no workflow runs this' and 'I could not look' must never be the same
+    answer to a serialization question."""
+    names = []
+    for name in sorted(os.listdir(workflows_dir)):
+        if not name.endswith((".yml", ".yaml")):
+            continue
+        if _invokes_command(_read_workflow(workflows_dir, name), token):
+            names.append(name)
+    return names
+
+
+def serialization_premise_errors(workflows_dir):
+    """The reasons `_persist_one`'s read->write window is no longer provably free of AUTOMATED
+    writers, as a list of short strings — EMPTY means the premise holds.
+
+    Called from `persist_limits` BEFORE the first issue read, so the refusal binds the invocation
+    that would do the writing (#317 review round 1): a second workflow that starts persisting tier
+    limits reads this same checked-out tree and refuses ITSELF, instead of being reported later by
+    whichever lane happens to run a self-test. Fail-closed in every direction — an unreadable
+    workflow tree is a reason, not a pass. The cost of a false refusal is one stale `limits:` line
+    (a dashboard capacity FALLBACK); the cost of a false pass is a silently clobbered account
+    record, so the asymmetry runs this way on purpose."""
+    try:
+        invokers = _workflows_invoking(PERSIST_FLAG, workflows_dir)
+        persist_text = _read_workflow(workflows_dir, PERSIST_WORKFLOW)
+        broker_text = _read_workflow(workflows_dir, BROKER_WORKFLOW)
+    except OSError:
+        return ["the workflow tree is unreadable, so the write window cannot be proven free of "
+                "other automated writers"]
+    errors = []
+    if invokers != [PERSIST_WORKFLOW]:
+        errors.append(f"the persist entrypoint is invoked from {invokers or 'no workflow'}, not "
+                      f"from {PERSIST_WORKFLOW} alone")
+    concurrency = _workflow_concurrency(persist_text)
+    if (concurrency.get("group"), concurrency.get("cancel-in-progress")) != PERSIST_CONCURRENCY:
+        errors.append(f"{PERSIST_WORKFLOW} no longer serializes its runs as {PERSIST_CONCURRENCY}")
+    body_writes = [command for command in _gh_issue_edit_invocations(broker_text)
+                   if _edits_issue_body(command)]
+    if body_writes:
+        errors.append(f"{BROKER_WORKFLOW} now has {len(body_writes)} body-replacing "
+                      "`gh issue edit` call(s)")
+    return errors
+
+
 def _persist_one(number, handle, line, registry_repo, run, schema_errors):
     """Merge the single `limits:` line into ONE account issue via a GUARDED read-merge-write (issue
     #198). `gh issue edit --body` REPLACES the whole body and GitHub's issue API has no conditional
@@ -695,8 +960,11 @@ def _persist_one(number, handle, line, registry_repo, run, schema_errors):
     bounded by PERSIST_ATTEMPTS. Automated writers cannot even reach the window — dispatch.yml
     self-serializes (`registry-dispatcher`, cancel-in-progress: false) and set-up-account only
     CREATES catalog issues (fail-closed on re-registration) — so this guard covers out-of-band
-    manual edits, and its soundness does not depend on that workflow config. Returns True on
-    success (incl. an idempotent no-op), False otherwise — the caller PROPAGATES it."""
+    manual edits, and its soundness does not depend on that workflow config. [#317] BOTH halves of
+    that premise are now ENFORCED rather than asserted in this prose (`serialization_premise_errors`,
+    run by `persist_limits` before its first read), because prose is what a repoint walks straight
+    past — and a refusal on the writer's own path binds a writer a self-test cannot. Returns True
+    on success (incl. an idempotent no-op), False otherwise — the caller PROPAGATES it."""
     for _ in range(PERSIST_ATTEMPTS):
         body0, count0, ok = _issue_view(number, registry_repo, run)
         if not ok:
@@ -731,7 +999,7 @@ def _persist_one(number, handle, line, registry_repo, run, schema_errors):
     return False
 
 
-def persist_limits(usage_path, run=None):
+def persist_limits(usage_path, run=None, workflows_dir=None):
     """Write probed tier limits into the account issues' front-matter (title == handle) so the
     capacity model stops flying blind. Best-effort but HONEST (issue #198): every gh failure is
     PROPAGATED as a non-zero return (the step is continue-on-error, so this surfaces the failure as a
@@ -739,8 +1007,19 @@ def persist_limits(usage_path, run=None):
     so a concurrent metadata edit is never silently overwritten (a clobber inside the write window is
     detected via the body-edit count and surfaced as failure, not confirmed as success). select-and-claim's _parse_account
     ignores unknown keys, so the extra line is inert for the allocator. Privacy: prints carry no
-    handles or counts (locked decision 22b). `run` is injectable for the self-test ONLY."""
+    handles or counts (locked decision 22b). [#317] The FIRST thing this does — before any issue
+    read or write — is re-prove the serialization premise `_persist_one`'s guard rests on, from the
+    checked-out workflow tree, and refuse the whole pass if it no longer holds; that is what makes
+    a second automated writer refuse ITSELF rather than merely red somebody else's self-test. `run`
+    and `workflows_dir` are injectable for the self-test ONLY."""
     run = run or subprocess.run
+    workflows_dir = workflows_dir or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".github", "workflows")
+    premise = serialization_premise_errors(workflows_dir)
+    if premise:
+        print("::warning::account-usage: the empty automated-write-window premise no longer holds "
+              f"({'; '.join(premise)}); refusing tier-limit writes")
+        return 1
     registry_repo = os.environ["REGISTRY_REPO"]
     try:
         account_catalog = _load_account_catalog(os.path.dirname(os.path.abspath(__file__)))
@@ -1659,16 +1938,36 @@ def _self_test(escaped=None):
         fh.close()
         return fh.name
 
+    # A minimal workflow tree that HOLDS the serialization premise, written from the constants the
+    # guard reads. The merge fixtures below run against it (not the repository's own tree) so they
+    # measure the MERGE: a real wiring break must red its own named `[#317]` rows with the check
+    # count intact, never make every fixture refuse and abort this section on the first empty
+    # `edits` list — a crash-after-partial-run records as a kill while the rows below it never run
+    # (AGENTS.md item 4). The `[#317]` rows below pass their own trees explicitly, and one passes
+    # `workflows_dir=None` to exercise the production DEFAULT.
+    premise_tree = tempfile.mkdtemp()
+    for _name, _text in (
+            (PERSIST_WORKFLOW, f"concurrency:\n  group: {PERSIST_CONCURRENCY[0]}\n"
+                               f"  cancel-in-progress: {PERSIST_CONCURRENCY[1]}\n"
+                               f"jobs:\n  j:\n    steps:\n      - run: py x {PERSIST_FLAG} u.json\n"),
+            (BROKER_WORKFLOW, 'jobs:\n  j:\n    steps:\n'
+                              '      - run: gh issue edit "$n" --add-label status:available\n')):
+        with open(os.path.join(premise_tree, _name), "w", encoding="utf-8") as _handle:
+            _handle.write(_text)
+
     # `persist_limits` reports through STDOUT workflow commands, and every failure fixture below
     # drives one on purpose. Captured for the same reason `_load_backoffs_captured` captures the
     # ledger fixtures' stderr — and, like it, capturing is what lets the loudness be ASSERTED
     # rather than merely hidden.
     def _persist_captured(*args, **kwargs):
+        kwargs.setdefault("workflows_dir", premise_tree)   # explicit None => the production default
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = persist_limits(*args, **kwargs)
         return rc, buf.getvalue()
 
+    chk("persist: the merge fixtures' own workflow tree HOLDS the premise (fixture control)",
+        serialization_premise_errors(premise_tree), [])
     saved_repo = os.environ.get("REGISTRY_REPO")
     os.environ["REGISTRY_REPO"] = "o/r"
     limits_usage = {"acct01": {"5h_limit": "100", "7d_limit": "700"}}
@@ -1810,8 +2109,238 @@ def _self_test(escaped=None):
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}]))})
     chk("persist: non-map usage snapshot skips cleanly",
         (_persist_captured(lpath, run=run)[0], edits), (0, []))
+    # ---- [#317] the SERIALIZATION PREMISE, ENFORCED on the writer's own path -------------------
+    # The rows above prove the guard DETECTS a lost foreign edit. It cannot PREVENT one — the issue
+    # API has no conditional write — so what keeps the AUTOMATED window empty is wiring, and until
+    # now that wiring lived only in `_persist_one`'s docstring. `serialization_premise_errors` reads
+    # it out of the checked-out workflow files, offline, on the PRODUCTION `--persist-limits` path.
+    # That placement is the point (review round 1): a self-test row binds whichever lane runs the
+    # self-test, while the repoint being guarded against is a SECOND workflow entering the
+    # read/edit window — and a red row in dispatch.yml's probe step cannot stop that workflow's
+    # write. On the production path the refusal travels with the writer, so the new invocation
+    # refuses ITSELF, before its first issue read.
+    dg = _load_sibling(script_dir, "dashboard-gen.py", "registry_dashboard_gen")
+    workflows_dir = os.path.join(os.path.dirname(script_dir), ".github", "workflows")
+    real_persist = _read_workflow(workflows_dir, PERSIST_WORKFLOW)
+    real_broker = _read_workflow(workflows_dir, BROKER_WORKFLOW)
+
+    def _with_premise_tree(extra, act):
+        """`act` over a synthetic workflow directory holding the two REAL workflow files, with
+        `extra` (name -> text, or None to OMIT that file) applied on top. Every mutant below differs
+        from the shipped tree by exactly one file, so its verdict is attributable to that file."""
+        with tempfile.TemporaryDirectory() as tree:
+            for name, text in {PERSIST_WORKFLOW: real_persist, BROKER_WORKFLOW: real_broker,
+                               **extra}.items():
+                if text is None:
+                    continue
+                with open(os.path.join(tree, name), "w", encoding="utf-8") as handle:
+                    handle.write(text)
+            return act(tree)
+
+    def _premise_errors(extra):
+        return _with_premise_tree(extra, serialization_premise_errors)
+
+    chk("[#317] the shipped tree's premise holds, so production is not refusing today",
+        serialization_premise_errors(workflows_dir), [])
+    chk("[#317] ...and an unchanged synthetic copy of it holds too (mutant baseline)",
+        _premise_errors({}), [])
+    #   (a) persist vs persist — THE repoint #317 is about: a second workflow enters the read/edit
+    #   window. The entrypoint must be invoked from exactly ONE workflow, and that workflow must
+    #   serialize its own runs.
+    second_writer = ("name: other\non: workflow_dispatch\njobs:\n  w:\n    steps:\n"
+                     f"      - run: python3 scripts/account-usage.py {PERSIST_FLAG} usage.json\n")
+    second_errors = _premise_errors({"other-writer.yml": second_writer})
+    chk("[#317] a SECOND workflow invoking the persist entrypoint breaks the premise",
+        (len(second_errors), any("other-writer.yml" in reason for reason in second_errors)),
+        (1, True))
+    #   ...and that break is enforced where it binds: `persist_limits` returns 1 having called gh
+    #   ZERO times, so the second workflow's own invocation never reaches `gh issue edit`. This is
+    #   the row a self-test-only check cannot have.
+    gh_calls = []
+
+    def _recording_gh(args, **_kw):
+        gh_calls.append(args)
+        return _R(0, "[]")
+
+    refused_rc, refused_out = _with_premise_tree(
+        {"other-writer.yml": second_writer},
+        lambda tree: _persist_captured(upath, run=_recording_gh, workflows_dir=tree))
+    chk("[#317] persist_limits REFUSES on the production path, before any gh read or write",
+        (refused_rc, gh_calls), (1, []))
+    chk("[#317] ...and that refusal is LOUD and names the workflow that broke the premise",
+        (len(workflow_commands(refused_out)), "other-writer.yml" in refused_out,
+         "refusing tier-limit writes" in refused_out), (1, True, True))
+    #   CONTROL for both rows above: with that one file removed the SAME call proceeds to the
+    #   catalog read. Without it, a persist that refused for any other reason (temp tree, injected
+    #   runner, missing usage file) would satisfy them for the wrong reason.
+    gh_calls.clear()
+    allowed_rc = _with_premise_tree(
+        {}, lambda tree: _persist_captured(upath, run=_recording_gh, workflows_dir=tree))[0]
+    chk("[#317] CONTROL: with that workflow gone the same call reaches the catalog read",
+        (allowed_rc, [list(args[1:3]) for args in gh_calls]), (0, [["issue", "list"]]))
+    #   ...and the row that binds the PRODUCTION call site rather than an injected tree: an explicit
+    #   `workflows_dir=None` takes `persist_limits`' own default, which must resolve to the shipped
+    #   `.github/workflows` beside this script. A default derived one directory short reads as an
+    #   unreadable tree and refuses every real persist — that failure would otherwise only appear in
+    #   a dispatch run.
+    gh_calls.clear()
+    default_rc = _persist_captured(upath, run=_recording_gh, workflows_dir=None)[0]
+    chk("[#317] persist_limits' DEFAULT workflow tree is the shipped one (production call site)",
+        (default_rc, [list(args[1:3]) for args in gh_calls]), (0, [["issue", "list"]]))
+    #   the other way two persist writers overlap: the ONE workflow stops serializing. Flipping
+    #   `cancel-in-progress` to `true` lets a queued tick kill a run mid write->confirm, and it must
+    #   break the premise by VALUE — the row below pins the shipped declaration the same way.
+    chk("[#317] the persisting workflow losing cancel-in-progress:false breaks the premise",
+        len(_premise_errors({PERSIST_WORKFLOW: real_persist.replace(
+            "cancel-in-progress: false", "cancel-in-progress: true", 1)})), 1)
+    #   (b) fail-closed inputs: 'I could not look' must never answer 'nobody else writes'.
+    chk("[#317] an unreadable workflow tree is a REFUSAL, not a pass",
+        len(serialization_premise_errors(os.path.join(workflows_dir, "no-such-directory"))), 1)
+    chk("[#317] ...and so is a tree missing the enrollment broker entirely",
+        len(_premise_errors({BROKER_WORKFLOW: None})), 1)
+    #   (c) the invocation READER: an exact argv token in a `run:` body — the same test main()
+    #   applies to sys.argv — never a mention in prose. The round-1 reader substring-searched the
+    #   whole file, so a comment counted as an invocation and deleting the real command left the
+    #   assertion green.
+    prose_only = "\n".join(line for line in real_persist.split("\n") if PERSIST_FLAG not in line)
+    prose_only += f"\n      # the persist step ran `{PERSIST_FLAG}` here until it moved\n"
+    chk("[#317] deleting the real run command reds the invocation reader, comment retained",
+        (_invokes_command(real_persist, PERSIST_FLAG), _invokes_command(prose_only, PERSIST_FLAG)),
+        (True, False))
+    chk("[#317] ...and the repository-level scan sees that deletion, not just the reader",
+        _with_premise_tree({PERSIST_WORKFLOW: prose_only},
+                           lambda tree: _workflows_invoking(PERSIST_FLAG, tree)), [])
+    chk("[#317] the invocation reader: prose and comments are not invocations, exact tokens are",
+        [_invokes_command(text, PERSIST_FLAG) for text in (
+            "jobs:\n  j:\n    steps:\n      - run: |\n"
+            f"          # python3 x.py {PERSIST_FLAG} usage.json\n          echo hi\n",
+            f"jobs:\n  j:\n    steps:\n      - name: persist via {PERSIST_FLAG}\n"
+            "        run: echo hi\n",
+            f"jobs:\n  j:\n    steps:\n      - run: echo hi  # {PERSIST_FLAG} usage.json\n",
+            f"jobs:\n  j:\n    steps:\n      - run: python3 x.py {PERSIST_FLAG}-extra usage.json\n",
+            f"jobs:\n  j:\n    steps:\n      - run: python3 x.py {PERSIST_FLAG} usage.json\n",
+            "jobs:\n  j:\n    steps:\n      - run: |\n"
+            f"          python3 x.py {PERSIST_FLAG} usage.json\n")],
+        [False, False, False, False, True, True])
+    #   the scan really does see the workflow directory: a token many workflows DO run. Without it,
+    #   a scan that read nothing (wrong directory, wrong suffix filter) would satisfy the
+    #   single-name answer above for the wrong reason and be measuring an empty sweep.
+    chk("[#317] ...and that scan really does read the workflow directory (control)",
+        (_workflows_invoking(PERSIST_FLAG, workflows_dir),
+         len(_workflows_invoking("python3", workflows_dir)) > 1), ([PERSIST_WORKFLOW], True))
+    #   the scan's own selection, over a directory whose noise this repo's real one happens not to
+    #   have: both workflow suffixes are read, and a same-named non-workflow file is not.
+    with tempfile.TemporaryDirectory() as scan_dir:
+        for name in ("a.yml", "b.yaml", "c.txt", "d.yml.bak", "notes.md"):
+            with open(os.path.join(scan_dir, name), "w", encoding="utf-8") as handle:
+                handle.write("jobs:\n  j:\n    steps:\n"
+                             f"      - run: python3 x.py {PERSIST_FLAG} usage.json\n")
+        chk("[#317] the workflow scan reads .yml and .yaml only, never a neighbouring file",
+            _workflows_invoking(PERSIST_FLAG, scan_dir), ["a.yml", "b.yaml"])
+    #   ...and the OTHER side of that same seam, which the round-1 constant broke: the workflow
+    #   passes `--persist-limits`, and pr-gate's REQUIRED CLI-signature step asks whether this
+    #   script DECLARES it — from the AST, counting only a literal operand. Routing the entrypoint
+    #   through `PERSIST_FLAG` declared nothing, so the shipped, correct wiring reported as
+    #   "scripts/account-usage.py is passed --persist-limits, which the script never declares" and
+    #   the required gate went red. The expected set is built from PERSIST_FLAG, so this row is
+    #   ALSO the pin that keeps the entrypoint's literal and the wiring guard's constant equal:
+    #   renaming either one alone reds it.
+    with open(os.path.abspath(__file__), encoding="utf-8") as handle:
+        own_source = handle.read()
+    chk("[#317] the entrypoint DECLARES its flags as literals (pr-gate reads the AST, not names)",
+        _entrypoint_argv_flags(own_source), {"--self-test", PERSIST_FLAG})
+    #   the reader's own directions, on sources whose token appears nowhere else in this harness: a
+    #   constant-routed dispatch declares NOTHING (the regression), a literal one declares its flag,
+    #   a literal outside the entrypoint block dispatches nothing so it declares nothing, and a
+    #   literal inside the block that is never tested against `sys.argv` is not a declaration either
+    #   (without that last one, a reader that simply collected every string in `__main__` would
+    #   agree with the shipped module and answer the wrong question everywhere else).
+    chk("[#317] ...and the reader's four directions: constant / literal / outside / non-argv",
+        [_entrypoint_argv_flags(source) for source in (
+            'FLAG = "--zzq-token"\nif __name__ == "__main__":\n'
+            "    if FLAG in sys.argv:\n        pass\n",
+            'if __name__ == "__main__":\n    if "--zzq-token" in sys.argv:\n        pass\n',
+            'if "--zzq-token" in sys.argv:\n    pass\n',
+            'if __name__ == "__main__":\n    print("--zzq-token")\n')],
+        [set(), {"--zzq-token"}, set(), set()])
+    concurrency = _workflow_concurrency(dg._repo_file(".github", "workflows", "dispatch.yml"))
+    #   `cancel-in-progress: false` is the half that keeps a queued tick WAITING instead of killing
+    #   a run mid write->confirm, so it is pinned by VALUE — a truthiness read would accept `true`.
+    chk("[#317] the persisting workflow serializes its runs and never cancels one mid-write",
+        (concurrency.get("group"), concurrency.get("cancel-in-progress")),
+        ("registry-dispatcher", "false"))
+    #   the reader's own two directions: a JOB-level group must not satisfy a DOCUMENT-level
+    #   question (set-up-account.yml declares only job-level ones), and an ambiguous document is {}.
+    chk("[#317] the concurrency reader is document-level: a job-level group cannot satisfy it",
+        _workflow_concurrency("jobs:\n  claim:\n    concurrency:\n      group: job-level\n"
+                              "      cancel-in-progress: false\n"), {})
+    #   ...and it reads a document-level block it IS given — through a COMMENT that would otherwise
+    #   forge a key into the mapping. The expected value is the WHOLE mapping, so dropping the
+    #   comment skip adds `# group` and reds this row (a prose claim must never enter the answer).
+    chk("[#317] ...and it does read a document-level block when there is one, comments excluded",
+        _workflow_concurrency("on: push\nconcurrency:\n  # group: forged-by-prose\n  group: g\n"
+                              "  cancel-in-progress: true\n"),
+        {"group": "g", "cancel-in-progress": "true"})
+    chk("[#317] ...and two document-level blocks are ambiguous -> {} (fail closed)",
+        _workflow_concurrency("concurrency:\n  group: a\nconcurrency:\n  group: b\n"), {})
+    #   (d) persist vs the enrollment broker: the broker CREATES account records and never replaces
+    #   a body. If it ever acquires a body-replacing edit, the window stops being empty and the
+    #   mechanism #317 asks for has to be built for real — so that acquisition must refuse the
+    #   persist pass, not land quietly.
+    broker_edits = _gh_issue_edit_invocations(
+        dg._repo_file(".github", "workflows", "set-up-account.yml"))
+    chk("[#317] the enrollment broker issues no body-replacing `gh issue edit` (label edits only)",
+        [command for command in broker_edits if _edits_issue_body(command)], [])
+    #   ...in EVERY spelling `gh issue edit` accepts, not just `--body`: a future `-b "$new"` is a
+    #   body-replacing automated writer and round 1's substring test read it as body-free. Each
+    #   mutant is appended to the real broker file and must break the premise on its own.
+    for spelling in ('--body "$mutant"', '--body=/tmp/mutant-body', '-b "$mutant"', '-b"$mutant"',
+                     '--body-file /tmp/mutant-body', '-F /tmp/mutant-body', '-F/tmp/mutant-body'):
+        chk(f"[#317] a broker body write spelled `{spelling.split()[0]}` breaks the premise",
+            len(_premise_errors({BROKER_WORKFLOW: real_broker
+                                 + f'\n      - run: gh issue edit "$num" -R "$REPO" {spelling}\n'})),
+            1)
+    #   ...and the detector's negative direction, on spellings that are NOT body writes — including
+    #   a flag ARGUMENT that merely contains a `b` (pflag binds a shorthand cluster's remainder to
+    #   the flag, so `-Ro/body-repo` is a repo, not a body).
+    chk("[#317] a label/title edit — or an argument merely containing a `b` — is not a body write",
+        [_edits_issue_body(command) for command in (
+            'gh issue edit "$num" -R "$REPO" --remove-label status:pending --add-label '
+            'status:available',
+            'gh issue edit "$n" -R o/body-repo --add-label x',
+            'gh issue edit "$n" -Ro/body-repo --add-label x',
+            'gh issue edit "$n" --title "a body of work"',
+            'gh issue edit "$n" -t "a body of work"',
+            'gh issue edit "$n" --add-label bug')], [False] * 6)
+    #   CONTROL: the row above is `[]` because every edit it found is label-only, not because the
+    #   extractor found nothing. Bounded below rather than pinned at today's count — an added
+    #   LABEL edit is not the acquisition this guard is watching for, and a control that reds on
+    #   one is a control somebody deletes. `all()` over an empty list is True, so the count half
+    #   is what carries the emptiness.
+    chk("[#317] ...and the extractor DID find that workflow's label edits (control)",
+        (len(broker_edits) >= 2, all("--add-label" in command for command in broker_edits)),
+        (True, True))
+    chk("[#317] ...and it sees a `--body` edit split across a continuation, which is the shape the "
+        "broker's own edits have (positive control)",
+        _gh_issue_edit_invocations('  gh issue edit "$num" -R "$REPO" \\\n'
+                                   '    --body "$new"\n  gh issue comment "$n" --body x\n'),
+        ['gh issue edit "$num" -R "$REPO" --body "$new"'])
+    #   ...including one left OPEN at the end of the document. A reader that drops the unterminated
+    #   continuation loses the last command entirely, which is a body write hiding in plain sight.
+    chk("[#317] ...and a continuation still open at end-of-document is not dropped",
+        _gh_issue_edit_invocations('gh issue edit "$n" \\\n  --body x \\'),
+        ['gh issue edit "$n" --body x'])
+    #   ...and the comment stripper is quote-aware: a `#` INSIDE the body text is body text. A
+    #   naive stripper would truncate the command and could drop the very flag being looked for.
+    chk("[#317] ...and a `#` inside quotes is body text, not a comment",
+        _gh_issue_edit_invocations('gh issue edit "$n" --body "a # b"\n# gh issue edit "$n" -b x\n'),
+        ['gh issue edit "$n" --body "a # b"'])
+
     os.unlink(lpath)
     os.unlink(upath)
+    for name in sorted(os.listdir(premise_tree)):
+        os.unlink(os.path.join(premise_tree, name))
+    os.rmdir(premise_tree)
     if saved_repo is None:
         os.environ.pop("REGISTRY_REPO", None)
     else:
@@ -2321,7 +2850,14 @@ def _self_test_ledgergate(chk):
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         sys.exit(_run_self_test_contained())
-    if "--persist-limits" in sys.argv:
+    # The dispatch token is spelled as a LITERAL, never as `PERSIST_FLAG`. pr-gate's required
+    # CLI-signature step reads the flags a script DECLARES from its AST — an `add_argument` literal
+    # or an argv membership/index test whose operand is a literal — so a dispatch written through a
+    # named constant declares nothing there and dispatch.yml's shipped `--persist-limits` reads as
+    # signature drift, redding the required `gate` on a correct tree. `_entrypoint_argv_flags` +
+    # its `[#317]` rows pin this literal EQUAL to PERSIST_FLAG, so the guard and the entrypoint
+    # still cannot drift apart (which is the reason the constant exists).
+    if "--persist-limits" in sys.argv:         # == PERSIST_FLAG, the token the wiring guard reads
         index = sys.argv.index("--persist-limits")
         sys.exit(persist_limits(sys.argv[index + 1]))
     sys.exit(main())
