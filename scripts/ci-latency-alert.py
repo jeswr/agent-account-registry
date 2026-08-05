@@ -63,10 +63,7 @@ scheduled lane (9) + 2 live-state queries + at most one baseline query per DISTI
 (workflow, event) with a live in-progress run — order 15-20 requests, hourly-equivalent,
 against a 613/tick dispatch budget. It also never walks the repo-wide `actions/runs`
 listing, which is capped at 1000 results and is exhausted by under six hours of this
-repo's volume. Every one of those reads is BOUNDED-RETRIED through scripts/gh_retry.py
-(#1502), so the worst case is 5x — and only while GitHub is already failing, which is what
-the jittered backoff exists to pay for. A throttle-shaped 403 is itself classified transient
-there, so the retry waits the limiter out instead of hammering it.
+repo's volume.
 
 NOT A PAGER FOR THE COMMIT UNDER TEST. Hosted as its own job in groom.yml with NO `needs:`
 and NO `if:` — a watcher hosted inside the watched job cannot observe the watched job's
@@ -89,7 +86,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import importlib.util
 import json
 import os
 import re
@@ -113,10 +109,6 @@ MAINTAINER_HANDLE = os.environ.get("MAINTAINER_HANDLE", "jeswr")
 # YAML-seam assertions silently unreachable on the live path.
 REQUIRED_FILES = (
     "scripts/ci-latency-alert.py",
-    # Every GitHub read this watchdog makes runs through the shared bounded-retry layer
-    # (#1502). Without it in the checkout the FIRST read raises and the tick is rc=2 with no
-    # alert written for any mode — the exact whole-tick loss the retry exists to end.
-    "scripts/gh_retry.py",
     ".github/workflows/groom.yml",
     # M3's floor is DERIVED from this file's `worker_timeout_minutes` (see EXEC_FLOOR_SECONDS).
     # Without it in the checkout the derivation assertion would be unreachable on the live
@@ -896,12 +888,6 @@ def percentile(values: list[float], q: float) -> float:
 # gh plumbing — mirrors scripts/dispatch-stall-alert.py
 # ---------------------------------------------------------------------------------
 def _gh(args, capture=False, token=None, check=False, label="ci-latency"):
-    # THE ALERT-TRANSPORT path — SINGLE-ATTEMPT and fail-loud. The `issue create/edit/comment/
-    # close` and `label create` calls below are MUTATIONS, and gh_retry's hard scope rule keeps
-    # them here: an ambiguous transient failure does not prove GitHub skipped the attempt, so a
-    # replay duplicates a comment or a state transition. The detector's IDEMPOTENT reads go
-    # through `_gh_json` instead, where they DO get the shared bounded backoff (#1502).
-    #
     # Sanitized fail-loud wrapper: op + returncode only — never stderr (GH_DEBUG=api can
     # echo request bodies) and never argument content beyond the gh subcommand words.
     env = dict(os.environ)
@@ -915,57 +901,9 @@ def _gh(args, capture=False, token=None, check=False, label="ci-latency"):
     return result
 
 
-def _load_gh_retry():
-    """The shared bounded-retry policy for IDEMPOTENT reads (scripts/gh_retry.py).
-
-    BY PATH because the module name has no hyphen while its siblings do — every script in this
-    tree loads a helper this way. LAZILY, at the first read, because `regate-sweep.py` execs
-    THIS module for `schedule_minute_map` alone under a sparse checkout that carries no
-    `gh_retry.py`: a module-scope import would red that lane on a file it never touches. The
-    watchdog's OWN checkout does carry it — `REQUIRED_FILES` puts it at the YAML seam.
-
-    RAISES rather than degrading to an unretried read. A missing retry layer is a broken
-    detector, and the self-test reds on the same absence one step earlier, so there is nothing
-    to silently carry on with.
-    """
-    path = Path(__file__).resolve().with_name("gh_retry.py")
-    spec = importlib.util.spec_from_file_location("registry_gh_retry_for_ci_latency",
-                                                  str(path))
-    if spec is None or spec.loader is None:  # pragma: no cover - defensive
-        raise AlarmError(f"cannot load the shared gh retry policy at {path}")
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except OSError as exc:
-        raise AlarmError(f"cannot load the shared gh retry policy at {path}: {exc}") from exc
-    return module
-
-
 def _gh_json(args, label="ci-latency"):
-    """Parsed JSON from ONE IDEMPOTENT `gh` READ, or None when the read never landed.
-
-    RETRIED, BOUNDED, through scripts/gh_retry.py (#1502). Every argv that reaches here is a
-    `gh api` GET carrying no request body — exactly the population that layer's hard scope rule
-    admits — so a single transient 5xx, secondary-rate-limit 403, connection reset or truncated
-    body now costs a bounded backoff instead of the whole watchdog tick. Before this, one blip
-    on the workflow listing, on a lane's schedule-run listing or on the live-run listing raised
-    on the spot and took M1, M3 and M4 down together to rc=2, with no alert written for any
-    mode. Nothing in this watchdog WRITES, so no CAS/ledger concern applies.
-
-    THE FAIL-LOUD POSTURE IS DELIBERATELY UNCHANGED, and returning None rather than a default
-    is what keeps it: the attempts are bounded, and once they are spent `_api` still raises. A
-    population that was never read must never be resolved into a report of health.
-    """
-    result = _load_gh_retry().run_gh(list(args))
+    result = _gh(args, capture=True, check=True, label=label)
     if result.returncode != 0:
-        # Sanitized exactly as `_gh` is: op, rc and the retry layer's own counters — never
-        # stderr (GH_DEBUG=api can echo request bodies into a PUBLIC run log) and never
-        # argument content beyond the gh subcommand words.
-        print(f"::warning::{label}: gh {args[0]} "
-              f"{args[1] if len(args) > 1 else ''} failed after "
-              f"{getattr(result, 'gh_attempts', 1)} attempt(s) "
-              f"(rc={result.returncode}, http={getattr(result, 'gh_http_status', None)}, "
-              f"class={getattr(result, 'gh_retry_reason', None)})")
         return None
     try:
         return json.loads(result.stdout or "null")
@@ -2320,155 +2258,6 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             ("30333511110", "the run the capacity inference was drawn from"),
             ("30318886362", "the re-run behind the fabricated known positive")):
         chk(f"gap evidence retained: {_anchor} ({_why})", _anchor in _src)
-
-    # --- #1502: IDEMPOTENT READS RETRY, and the fail-loud posture SURVIVES the retries ---
-    # One transient 5xx or secondary-403 on the workflow listing, on a lane's schedule-run
-    # listing or on the live-run listing used to raise on the spot and take the ENTIRE tick —
-    # M1, M3 and M4 together — to rc=2 with no alert written for any mode.
-    #
-    # Driven at the PROCESS BOUNDARY, underneath the real gh_retry loop, counting REAL `gh`
-    # invocations: "scripts/gh_retry.py is imported" is not the property that lost the tick,
-    # and an assertion on the import would stay green with the retry never engaging — which is
-    # precisely how registry #729 shipped an inert retry.
-    import time as _time_mod  # local: only the rows below need it
-
-    _retry_mod = _load_gh_retry()
-    # THE CHECKOUT CONTRACT, derived from the LOADER rather than restated here: the file the
-    # read path actually resolves must be one the watchdog's sparse checkout is REQUIRED to
-    # carry. Drop it from REQUIRED_FILES and the seam loop below silently stops asserting it,
-    # so the live job can ship without it — every read then raises on its first call while
-    # pr-gate, which has the whole tree, stays green. That divergence is the #1140 shape.
-    chk("#1502 the retry layer the read path LOADS is itself a REQUIRED_FILE",
-        str(Path(_retry_mod.__file__).resolve()
-            .relative_to(Path(__file__).resolve().parents[1])) in REQUIRED_FILES)
-    # THE OTHER SIDE OF THE LAZY LOAD, in a checkout that genuinely lacks the retry layer.
-    # Both directions matter and they pull opposite ways: `regate-sweep.py` execs THIS module
-    # for its cron map under a sparse checkout carrying no `gh_retry.py`, so importing it at
-    # module scope would red that lane on a file it never touches — while the READ path must
-    # NOT quietly degrade to an unretried call, which is exactly how registry #729's retry
-    # shipped inert. So: exec succeeds, first read raises.
-    with tempfile.TemporaryDirectory() as _thin:
-        _thin_copy = Path(_thin) / "scripts" / "ci-latency-alert.py"
-        _thin_copy.parent.mkdir()
-        _thin_copy.write_text(Path(__file__).read_text(encoding="utf-8"), encoding="utf-8")
-        _thin_spec = importlib.util.spec_from_file_location("ci_latency_thin_checkout",
-                                                            str(_thin_copy))
-        _thin_mod = importlib.util.module_from_spec(_thin_spec)
-        # REPORTED, never propagated: a module-scope import of the retry layer raises HERE,
-        # and letting it escape would abort every assertion below instead of naming this one.
-        _thin_exec = "execs"
-        try:
-            _thin_spec.loader.exec_module(_thin_mod)
-        except Exception as exc:  # noqa: BLE001 - ANY exec failure IS the finding
-            _thin_exec = f"failed with {type(exc).__name__}"
-        chk(f"#1502 a checkout WITHOUT scripts/gh_retry.py still EXECS this module "
-            f"({_thin_exec}) — regate-sweep.py loads it for the derived cron map under "
-            f"exactly that checkout",
-            _thin_exec == "execs"
-            and callable(getattr(_thin_mod, "schedule_minute_map", None)))
-        _thin_verdict = "returned"
-        try:
-            getattr(_thin_mod, "_load_gh_retry", lambda: None)()
-        except getattr(_thin_mod, "AlarmError", AlarmError):
-            _thin_verdict = "raised"
-        chk("#1502 ...and the READ path then fails CLOSED on the absent retry layer, rather "
-            "than silently degrading to an unretried read", _thin_verdict == "raised")
-    _OK = (0, '{"workflows": [], "workflow_runs": []}', "")
-    _503 = (1, "", "HTTP 503: unavailable")
-    _404 = (1, "", "gh: Not Found (HTTP 404)")
-
-    def _drive(script, call):
-        """-> (call()'s value, the argvs `gh` was actually invoked with, the sleeps slept).
-
-        `script` answers invocations in order; its LAST entry repeats. Both stubs are stdlib
-        module attributes that gh_retry resolves at call time or binds when `_load_gh_retry`
-        execs it (`sleep_backoff`'s default sleeper), so the LIVE code path is what runs here —
-        no test-only argument is threaded through production to make this reachable.
-        """
-        spawned, sleeps, seq = [], [], list(script)
-
-        def _run(cmd, **kwargs):
-            spawned.append(list(cmd))
-            rc, out, err = seq[min(len(spawned) - 1, len(seq) - 1)]
-            return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr=err)
-
-        _real_run, _real_sleep = subprocess.run, _time_mod.sleep
-        subprocess.run, _time_mod.sleep = _run, sleeps.append
-        try:
-            return call(), spawned, sleeps
-        finally:
-            subprocess.run, _time_mod.sleep = _real_run, _real_sleep
-
-    def _read():
-        """The production read chain, reporting the raise instead of propagating it."""
-        try:
-            return _api("o/r", "actions/workflows?per_page=100")
-        except AlarmError as exc:
-            return f"RAISED: {exc}"
-
-    _val, _spawned, _slept = _drive([_503, _503, _OK], _read)
-    chk("#1502 a transient 5xx on an idempotent read is RETRIED and the read LANDS — before "
-        "this the FIRST failure raised and the read was simply lost",
-        _val == {"workflows": [], "workflow_runs": []} and len(_spawned) == 3
-        and len(_slept) == 2)
-    # The argv is taken FROM the code under test rather than restated here, so this cannot pass
-    # against a shape `_api` no longer builds.
-    chk("#1502 every read executes `gh api …` — gh_retry prepends the binary itself, so an "
-        "argv that carried `gh` would run `gh gh api …` and fail 100% of reads (#1137)",
-        _spawned and all(cmd[:2] == ["gh", "api"] for cmd in _spawned))
-    chk("#1502 the argv this watchdog builds is ADMITTED by gh_retry's own scope parser — a "
-        "refused argv gets exactly one attempt and the whole adoption would be inert",
-        _spawned and all(_retry_mod.read_cli_reject(cmd[1:]) is None for cmd in _spawned))
-    # FAIL LOUD AFTER the retries. The retry must bound the loss, never convert an unread
-    # population into a report of health: this is the posture #1502 required be preserved.
-    _log = io.StringIO()
-    with contextlib.redirect_stdout(_log):
-        _val, _spawned, _slept = _drive([_503], _read)
-    chk("#1502 a PERSISTENT transient still fails LOUD once the bounded attempts are spent — "
-        "no fallback default, no health reported over a population that was never read",
-        isinstance(_val, str) and _val.startswith("RAISED:")
-        and len(_spawned) == _retry_mod.MAX_ATTEMPTS
-        and len(_slept) == _retry_mod.MAX_ATTEMPTS - 1)
-    chk("#1502 the exhausted read reports how many attempts it spent, and STILL never echoes "
-        "gh's stderr (GH_DEBUG=api can carry a request body into a PUBLIC run log)",
-        f"{_retry_mod.MAX_ATTEMPTS} attempt" in _log.getvalue()
-        and "unavailable" not in _log.getvalue())
-    # QUANTIFIER DIRECTION. "Some read failures are worth retrying" must never widen into
-    # "every one is", or a permanent 404 would burn five jittered attempts to reach the same
-    # refusal on every lane of every tick.
-    with contextlib.redirect_stdout(io.StringIO()):
-        _val, _spawned, _slept = _drive([_404], _read)
-    chk("#1502 a 404 is a REFUSAL, not a blip: exactly one attempt and no backoff",
-        isinstance(_val, str) and _val.startswith("RAISED:") and len(_spawned) == 1
-        and _slept == [])
-    # gh EXITED 0 and handed back a body nothing can parse. Not a transport failure, so not
-    # retried — but still not a population that was read, so still fail-loud.
-    with contextlib.redirect_stdout(io.StringIO()):
-        _val, _spawned, _slept = _drive([(0, "not json at all", "")], _read)
-    chk("#1502 an unparseable body on a SUCCESSFUL read is not retried and still fails loud",
-        isinstance(_val, str) and _val.startswith("RAISED:") and len(_spawned) == 1
-        and _slept == [])
-    # WHAT THE FIX DELIVERS INTO (the issue's actual claim, measured at the exit code rather
-    # than at the helper): a single transient on the FIRST read of a whole pass. `--dry-run`
-    # keeps the alert transport out of it; `{"workflows": []}` leaves every lane `active`, so
-    # M1/M3/M4 all run their real populations off the real workflow tree.
-    with contextlib.redirect_stdout(io.StringIO()):
-        _rc_tick, _spawned, _slept = _drive(
-            [_503, _OK],
-            lambda: main(["--repo", "o/r", "--dry-run", "--now", "2026-07-28T12:00:00Z"]))
-    chk("#1502 THE TICK SURVIVES a single transient 5xx — rc 0, not the rc=2 that lost M1, M3 "
-        "and M4 together (this is the defect, asserted where it was paid)",
-        _rc_tick == 0 and len(_spawned) > 1 and len(_slept) == 1)
-    # ...and the control for it: an endpoint that is DOWN for the whole bounded budget must
-    # still take the tick to rc=2. A retry that swallowed the failure would be far worse than
-    # the defect it replaced, and only this row separates the two.
-    with contextlib.redirect_stdout(io.StringIO()):
-        _rc_down, _spawned, _slept = _drive(
-            [_503],
-            lambda: main(["--repo", "o/r", "--dry-run", "--now", "2026-07-28T12:00:00Z"]))
-    chk("#1502 CONTROL: a persistently unavailable API still takes the tick to rc=2 — the "
-        "retry bounds the loss, it does not hide it",
-        _rc_down == 2 and len(_spawned) == _retry_mod.MAX_ATTEMPTS)
 
     # --- YAML SEAM. Neither `bash -n` nor actionlint can see which inputs a watchdog
     # keys on, so the hosting job is asserted structurally, by EXACT match. ---

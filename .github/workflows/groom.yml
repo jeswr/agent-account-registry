@@ -577,7 +577,6 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts/ci-latency-alert.py
-            scripts/gh_retry.py
             scripts/selftest-suite.txt
             .github/workflows/groom.yml
             .github/workflows
