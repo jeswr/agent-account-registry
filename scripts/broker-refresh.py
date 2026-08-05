@@ -15,6 +15,10 @@
 #     changes — then (c) extracts ONLY {access_token, expires_at} and returns that. The refresh token
 #     stays inside the registry. The maintainer never re-authenticates: the refresh token is valid
 #     until explicitly revoked, and the CLI auto-refreshes the short-lived access token on demand.
+#   * That CLI refresh can ROTATE the refresh token, so the broker has TWO outputs on TWO channels
+#     (issue #305): the access-token-only capability to `--out-file` (the worker's), and the FULL
+#     rotated credential to `--rotated-out` (HOST-PRIVATE, mode 0600, for the account secret). See
+#     `broker()` / `emit_rotated_credential()`.
 #
 # This module ships the PURE, security-critical parts (isolation + access-token-only extraction) with
 # unit tests over the real credential layouts. The live CLI refresh (refresh_via_cli) is the mechanism
@@ -630,25 +634,56 @@ def refresh_via_cli(provider, home):
         return json.load(f)
 
 
-def broker(provider, cred):
-    """Full path (registry Actions): isolate -> refresh -> extract access-token-only capability."""
+def broker(provider, cred, *, refresher=None):
+    """Full path (registry Actions): isolate -> refresh -> SPLIT the result across two channels.
+
+    Returns {"capability", "durable", "rotated"}:
+      * capability — the ACCESS-TOKEN-ONLY document handed to the worker;
+      * durable    — the FULL refreshed credential exactly as the provider CLI left it on disk. It
+                     carries the (possibly rotated) refresh token, so it is HOST-PRIVATE: it goes to
+                     `--rotated-out`, never to the worker;
+      * rotated    — whether the CLI's refresh produced a refresh token DIFFERENT from the stored one.
+
+    WHY THE DURABLE CHANNEL EXISTS (issue #305). The refresh performed here can ROTATE the refresh
+    token: the Anthropic `refresh_token` grant may return a new one, and `codex login status`
+    rewrites auth.json with whatever the exchange returned. That rotated material used to live ONLY
+    inside the ephemeral $HOME this function deletes on the way out, so the registry-stored
+    ACCTNN_TOKEN secret kept the PREVIOUS refresh token. Providers that invalidate the previous grant
+    on rotation (OpenAI detects replay) then make every LATER broker run fail permanently — the exact
+    outage the broker exists to prevent. So the rotated credential must leave this function, on a
+    channel the worker never sees.
+
+    `refresher` is a seam for the hermetic self-test ONLY — the same shape as `refresh_access_token`'s
+    `poster`. Live callers leave it None and get `refresh_via_cli`, so `--self-test` never runs a
+    provider CLI and never touches a live login."""
     home = tempfile.mkdtemp(prefix="broker-")
     try:
         os.chmod(home, 0o700)
         _write_isolated(provider, cred, home)
-        refreshed = refresh_via_cli(provider, home)
+        refreshed = (refresher or refresh_via_cli)(provider, home)
         cap = extract_access_token(provider, refreshed)
         assert_no_refresh_leak(cap)
-        return cap
+        # VALUE-level guard on BOTH grants. `assert_no_refresh_leak` inspects key NAMES only, so a
+        # CLI layout change (or an extraction bug) that landed refresh material under `access_token`
+        # would sail straight through it into the worker. Check the capability against the stored
+        # refresh token AND the rotated one — the rotated grant is brand new and strictly worse to
+        # leak than the one it replaces.
+        stored_refresh = extract_refresh_token(provider, cred)
+        rotated_refresh = extract_refresh_token(provider, refreshed)
+        for secret in (stored_refresh, rotated_refresh):
+            assert_no_refresh_material(cap, secret)
+        return {"capability": cap, "durable": refreshed,
+                "rotated": bool(rotated_refresh) and rotated_refresh != stored_refresh}
     finally:
         subprocess.run(["rm", "-rf", home], check=False)
 
 
-def write_capability(cap, path):
-    """Persist the short-lived capability to a caller-supplied file at mode 0600.
-    The capability carries the access token, so it must go to a PRIVATE file — NEVER stdout (in
-    Actions or ordinary automation stdout becomes a log entry, breaking the token-never-printed
-    invariant), and NEVER through a pre-existing permissive file or a symlink planted at `path`.
+def write_capability(document, path):
+    """Persist a token-bearing document to a caller-supplied file at mode 0600. Shared by BOTH
+    broker channels: the short-lived worker capability and the HOST-PRIVATE rotated credential.
+    Either carries token material, so it must go to a PRIVATE file — NEVER stdout (in Actions or
+    ordinary automation stdout becomes a log entry, breaking the token-never-printed invariant),
+    and NEVER through a pre-existing permissive file or a symlink planted at `path`.
 
     Opening the destination directly with O_CREAT|O_TRUNC would (a) truncate+write the token into an
     already-existing mode-0644 file and only narrow the mode AFTERWARD — a window in which the secret
@@ -661,7 +696,7 @@ def write_capability(cap, path):
     fd, tmp = tempfile.mkstemp(prefix=".broker-cap.", dir=dest_dir)  # mkstemp guarantees mode 0600
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(cap, f)
+            json.dump(document, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)  # atomic; overwrites a symlink at `path`, never follows it
@@ -683,6 +718,40 @@ def emit_live_capability(cap, out_file):
                          "(the access token must never be printed to stdout)")
     write_capability(cap, out_file)
     return f"broker-refresh: wrote capability to {out_file} (mode 0600); access token not printed"
+
+
+def emit_rotated_credential(result, out_file):
+    """The HOST-PRIVATE channel for a ROTATED FULL credential (issue #305). `result` is `broker()`'s
+    return value.
+
+    When the refresh rotated the refresh token, the full durable credential is written to `out_file`
+    under the SAME private-file discipline the capability uses (fresh mode-0600 inode, atomic
+    replace, never through a symlink or a pre-existing permissive file). The registry-Actions caller
+    then pushes that file into the account secret with the same env-bound write worker-live.sh's
+    `write_back` performs:
+
+        gh secret set "$SECRET_REF" --repo "$REGISTRY_REPO" --env dispatch-secrets < "$ROTATED_OUT"
+
+    (`--env dispatch-secrets` is not optional: post-#101 that environment is the canonical home of
+    ACCTNN_TOKEN, and a repo-scope write would both re-trip the secrets-guard and leave the
+    env-bound consumers resolving the PRE-rotation token.)
+
+    FAIL CLOSED when a rotation has nowhere to go. The provider has ALREADY replaced the grant by the
+    time we get here, so returning quietly would strand the replacement in a temp dir `broker()` is
+    about to delete and leave the stored secret holding a spent refresh token — a permanently dead
+    account, discovered only on the NEXT run. Raising surfaces it NOW, while a maintainer can re-mint.
+
+    Returns a confirmation line naming the destination and the rotation verdict, carrying NO token
+    material (it is printed to a PUBLIC Actions log)."""
+    if not result.get("rotated"):
+        return "broker-refresh: rotated=false; the stored account credential needs no update"
+    if not out_file:
+        raise ValueError(
+            "the provider ROTATED this account's refresh token and no --rotated-out destination was "
+            "supplied; refusing to discard it (the stored account secret would keep a spent grant)")
+    write_capability(result["durable"], out_file)
+    return (f"broker-refresh: rotated=true; wrote the full rotated credential to {out_file} "
+            "(mode 0600) — persist it to the account secret; no token printed")
 
 
 # ---- self-test (mocked; never touches a live login) ---------------------------------------------
@@ -1189,6 +1258,111 @@ def _self_test():
             chk("symlink-dest final content is the capability", json.load(f) == co)
     finally:
         subprocess.run(["rm", "-rf", d], check=False)
+
+    # ---- (g) THE ROTATED-CREDENTIAL PRIVATE CHANNEL (issue #305) --------------------------------
+    # The CLI refresh inside broker() can ROTATE the refresh token. Two things must hold, and BOTH
+    # are asserted here through the REAL broker(): the rotation reaches the caller on a HOST-PRIVATE
+    # mode-0600 channel, and it NEVER appears in the worker-facing capability. Driven with the
+    # `refresher` seam — no provider CLI, no network, no live login.
+    def _layout(provider, access, refresh):
+        """A credential in the provider's REAL on-disk shape (values fake)."""
+        if provider == "openai":
+            return {"auth_mode": "oauth",
+                    "tokens": {"id_token": "ID", "access_token": access, "refresh_token": refresh,
+                               "account_id": "acct"},
+                    "last_refresh": "2026-07-29T00:00:00Z"}
+        if provider == "anthropic":
+            return {"claudeAiOauth": {"accessToken": access, "refreshToken": refresh,
+                                      "expiresAt": 1_899_999_999, "scopes": ["x"],
+                                      "subscriptionType": "max"}}
+        raise ValueError(provider)
+
+    d = tempfile.mkdtemp(prefix="broker-rotation-")
+    try:
+        for provider in PROVIDERS:
+            stored = _layout(provider, "ACCESS_v1", "REFRESH_STORED")
+            homes, materialized, modes = [], [], []
+
+            def rotate(prov, home):
+                # Stand in for the provider CLI: read what the broker isolated (so the isolation
+                # contract is asserted, not assumed), then hand back a credential the CLI would have
+                # rewritten with a NEW refresh token.
+                path = os.path.join(home, cred_relpath(prov))
+                homes.append(home)
+                modes.append(stat.S_IMODE(os.stat(path).st_mode))
+                with open(path) as handle:
+                    materialized.append(json.load(handle))
+                return _layout(prov, "ACCESS_v2", "REFRESH_ROTATED")
+
+            result = broker(provider, stored, refresher=rotate)
+            chk(f"{provider}: broker isolates the stored credential at mode 0600 before refreshing",
+                materialized == [stored] and modes == [0o600])
+            chk(f"{provider}: the ephemeral $HOME the refresh ran in is DELETED — which is exactly "
+                "why the rotation needs a channel out",
+                len(homes) == 1 and not os.path.exists(homes[0]))
+            chk(f"{provider}: broker flags the CLI's refresh-token ROTATION",
+                result["rotated"] is True)
+            chk(f"{provider}: the durable channel carries the ROTATED refresh token",
+                extract_refresh_token(provider, result["durable"]) == "REFRESH_ROTATED")
+            chk(f"{provider}: the worker capability carries the FRESH access token",
+                result["capability"]["access_token"] == "ACCESS_v2")
+            chk(f"{provider}: NEITHER the stored NOR the rotated refresh token reaches the worker "
+                "capability", "REFRESH_ROTATED" not in json.dumps(result["capability"])
+                and "REFRESH_STORED" not in json.dumps(result["capability"]))
+            chk(f"{provider}: assert_no_refresh_leak still holds on the worker capability",
+                assert_no_refresh_leak(result["capability"]))
+            # the private channel itself: mode 0600, full credential, log-safe confirmation
+            rotated_path = os.path.join(d, f"rotated-{provider}.json")
+            message = emit_rotated_credential(result, rotated_path)
+            # `written` is folded INTO the assertions rather than guarding them, so a regression that
+            # writes nothing reports these as FAIL instead of crashing the suite mid-run.
+            written = os.path.exists(rotated_path)
+            chk(f"{provider}: the rotated credential file is mode 0600",
+                written and stat.S_IMODE(os.stat(rotated_path).st_mode) == 0o600)
+            persisted = None
+            if written:
+                with open(rotated_path) as handle:
+                    persisted = json.load(handle)
+            chk(f"{provider}: the private channel holds the FULL credential the account secret needs",
+                persisted is not None and persisted == result["durable"]
+                and extract_refresh_token(provider, persisted) == "REFRESH_ROTATED")
+            chk(f"{provider}: the rotation confirmation is safe to log (verdict + path, no token)",
+                "rotated=true" in message and "REFRESH_ROTATED" not in message
+                and "ACCESS_v2" not in message)
+            # A refresh that returns the SAME grant is not a rotation: nothing to persist, and
+            # nothing is written (so the caller's write-back stays a no-op).
+            quiet = broker(provider, stored,
+                           refresher=lambda prov, home: _layout(prov, "ACCESS_v2", "REFRESH_STORED"))
+            unwritten = os.path.join(d, f"unrotated-{provider}.json")
+            message = emit_rotated_credential(quiet, unwritten)
+            chk(f"{provider}: a refresh returning the SAME grant does not claim rotation and writes "
+                "nothing", quiet["rotated"] is False and not os.path.exists(unwritten)
+                and "rotated=false" in message)
+            # FAIL CLOSED: a rotation with nowhere to go must RAISE. Silently dropping it is the
+            # #305 outage itself — the provider has already replaced the grant.
+            refused = False
+            try:
+                emit_rotated_credential(result, None)
+            except ValueError:
+                refused = True
+            chk(f"{provider}: a rotation with NO destination is refused, never dropped (fail closed)",
+                refused)
+            # NON-VACUITY of the worker-capability guard. A refresh whose result carries refresh
+            # material in the ACCESS-TOKEN slot — the leak a key-name-only check waves through — must
+            # make broker() RAISE rather than hand that capability to the worker. Asserted for the
+            # rotated grant AND the stored one.
+            for leaked_secret in ("REFRESH_ROTATED", "REFRESH_STORED"):
+                caught = False
+                try:
+                    broker(provider, stored,
+                           refresher=lambda prov, home, value=leaked_secret:
+                               _layout(prov, value, "REFRESH_ROTATED"))
+                except AssertionError:
+                    caught = True
+                chk(f"{provider}: broker REFUSES a capability carrying the {leaked_secret} refresh "
+                    "VALUE under the access-token key (non-vacuous)", caught)
+    finally:
+        subprocess.run(["rm", "-rf", d], check=False)
     print("broker-refresh self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -1200,6 +1374,10 @@ def main():
     ap.add_argument("--cred-file", help="path to the stored credential JSON (registry Actions only)")
     ap.add_argument("--out-file", help="write the short-lived capability here at mode 0600 (REQUIRED "
                     "for the live path; the access token is never printed to stdout)")
+    ap.add_argument("--rotated-out", help="write the ROTATED FULL account credential here at mode "
+                    "0600 when the refresh rotates the refresh token (REQUIRED for the live path). "
+                    "This is the HOST-PRIVATE channel the worker never sees; the caller persists it "
+                    "to the account secret (see emit_rotated_credential)")
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
@@ -1208,10 +1386,22 @@ def main():
             print("broker-refresh: refusing to emit a live capability without --out-file "
                   "(the access token must never be printed to stdout)", file=sys.stderr)
             return 2
+        # REQUIRED, not optional (issue #305). The refresh this path performs may rotate the stored
+        # grant, and a broker with nowhere to put the replacement is a credential-DESTROYING
+        # operation: the provider invalidates the old token and the registry keeps storing it. Demand
+        # the destination BEFORE the exchange, not after it has already happened.
+        if not args.rotated_out:
+            print("broker-refresh: refusing to run the live path without --rotated-out (the refresh "
+                  "may rotate the stored refresh token, and discarding the replacement would leave "
+                  "the account secret holding a spent grant)", file=sys.stderr)
+            return 2
         with open(args.cred_file) as f:
             cred = json.load(f)
-        cap = broker(args.provider, cred)
-        print(emit_live_capability(cap, args.out_file))  # a path, never the token itself
+        result = broker(args.provider, cred)
+        # Rotation FIRST: if the private channel fails, fail before a worker is handed a capability
+        # minted from a grant whose replacement was just lost.
+        print(emit_rotated_credential(result, args.rotated_out))     # a path + verdict, no token
+        print(emit_live_capability(result["capability"], args.out_file))  # a path, never the token
         return 0
     print("broker-refresh: pure extraction + isolation ready; live refresh runs in registry Actions "
           "against an account secret. See --self-test.")
