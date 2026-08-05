@@ -117,6 +117,21 @@ POLICY_FIELDS = {
 # thresholds + the per-target readiness-engine selector). policy-resolve accepts-and-ignores them
 # so the dispatch/groom resolver never rejects a policy augmented for the metrics collector; the
 # collector does its own strict validation of their contents.
+# [issue #243] Optional orchestrator task-queue controls (defaults 60 / 10 / 3 -> a policy that
+# predates the queue resolves exactly as before). Consumed by scripts/task-queue.py through
+# .github/workflows/drain.yml:
+#   cache_ttl_minutes     = positive int — how long a drained `cache_key` counts as WARM. The
+#                           warm-cache preference is an OPTIMISATION, not a correctness gate, so the
+#                           default follows the maintainer's Anthropic figure (60) and stays
+#                           deliberately conservative for tiers with shorter prompt-cache TTLs.
+#   heal_max_wait_minutes = positive int — the ANTI-STARVATION CLAMP. A class-2 (self-healing) task
+#                           that has waited this long overrides ANY warm-cache preference. Without
+#                           it a hot class-4 streak starves a cold outage repair, inverting the
+#                           maintainer directive that self-healing comes first.
+#   drain_batch           = positive int — how many tasks one drain tick may pick. Every pick is
+#                           independently re-validated against live state and still passes through
+#                           the unchanged validation/lease/trust path, so this bounds work per tick,
+#                           never what is permitted.
 # [OPUS-5] review_enrolment_authors (issue #657, research/657-orchestrator-pr-admission.md §6):
 # the MASTER-PROTECTED half of orchestrator-PR admission.
 #
@@ -148,7 +163,8 @@ POLICY_FIELDS = {
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
                           "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
                           "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness",
-                          "review_enrolment_authors"}
+                          "review_enrolment_authors", "cache_ttl_minutes", "heal_max_wait_minutes",
+                          "drain_batch"}
 
 # A canonical GitHub USER login: ASCII alphanumeric with internal single hyphens, <= 39 chars.
 # Deliberately excludes the "[bot]" suffix — see the OPTIONAL_POLICY_FIELDS note above.
@@ -264,7 +280,12 @@ def _policy_row(target_repo, policy_doc):
         margin = row["usage_safety_margin"]
         if not isinstance(margin, (int, float)) or isinstance(margin, bool) or not (0.0 <= margin < 1.0):
             raise PolicyError(f"usage_safety_margin for {target_repo!r} must be a float in [0, 1)")
-    for field in ("max_review_rounds", "review_queue_ttl_minutes"):
+    for field in ("max_review_rounds", "review_queue_ttl_minutes",
+                  # [issue #243] The task-queue controls. A zero/negative/boolean clamp is refused
+                  # rather than clamped silently: `heal_max_wait_minutes = 0` would escalate EVERY
+                  # class-2 task and `drain_batch = 0` would drain nothing forever, and both would
+                  # look like a working queue.
+                  "cache_ttl_minutes", "heal_max_wait_minutes", "drain_batch"):
         if field in row and not _positive_int(row[field]):
             raise PolicyError(f"{field} for {target_repo!r} must be a positive integer")
     if "cross_provider_fallback" in row and not isinstance(row["cross_provider_fallback"], bool):
@@ -550,6 +571,10 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "max_review_rounds": int(policy.get("max_review_rounds", 3)),
         "review_queue_ttl_minutes": int(policy.get("review_queue_ttl_minutes", 30)),
         "cross_provider_fallback": bool(policy.get("cross_provider_fallback", False)),
+        # [issue #243] Task-queue controls (drain.yml -> task-queue.py).
+        "cache_ttl_minutes": int(policy.get("cache_ttl_minutes", 60)),
+        "heal_max_wait_minutes": int(policy.get("heal_max_wait_minutes", 10)),
+        "drain_batch": int(policy.get("drain_batch", 3)),
         "security_paths": list(policy.get("security_paths", [])),
         "trusted_bots": list(policy.get("trusted_bots", [])),
         "allow_actions_bot_issues": policy["allow_actions_bot_issues"],
@@ -762,6 +787,32 @@ agent = "docs-agent"
     check("review-loop controls overridable",
           (review_impl["max_review_rounds"], review_impl["review_queue_ttl_minutes"],
            review_impl["cross_provider_fallback"]), (5, 45, True))
+    # [issue #243] Task-queue controls: defaulted, overridable, and range-validated. A policy that
+    # predates the queue must resolve to 60/10/3 (drain.yml reads these three verbatim).
+    check("task-queue controls default 60/10/3",
+          (impl["cache_ttl_minutes"], impl["heal_max_wait_minutes"], impl["drain_batch"]),
+          (60, 10, 3))
+    queue_over = tomllib.loads(
+        '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+        'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+        'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+        'cache_ttl_minutes=15\nheal_max_wait_minutes=5\ndrain_batch=8\n')
+    queue_impl = resolve("o/r", "impl", queue_over, routing)
+    check("task-queue controls overridable",
+          (queue_impl["cache_ttl_minutes"], queue_impl["heal_max_wait_minutes"],
+           queue_impl["drain_batch"]), (15, 5, 8))
+    # Each is range-validated INDEPENDENTLY: a zero clamp would escalate every class-2 task and a
+    # zero batch would drain nothing forever — both silently, both looking like a working queue.
+    for bad_field, bad_value in (("cache_ttl_minutes", "0"), ("heal_max_wait_minutes", "0"),
+                                 ("drain_batch", "0"), ("drain_batch", "true")):
+        bad_queue = tomllib.loads(
+            '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+            'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+            'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+            f'{bad_field}={bad_value}\n')
+        rejects(f"{bad_field}={bad_value} refused", bad_field,
+                lambda doc=bad_queue: resolve("o/r", "impl", doc, routing))
+
     # security_paths (B3 / defects #2,#4): validated + surfaced (consumed by review-fix.yml).
     check("security_paths default empty", impl["security_paths"], [])
     sec_paths = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
