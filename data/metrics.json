@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-08-05T20:51:23Z",
+  "generated_at": "2026-08-05T21:15:14Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 2154,
+      "issues_open": 2155,
       "issues_ready": 239,
       "issues_closed_1h": 0,
       "issues_closed_24h": 4,
@@ -35,7 +35,7 @@
       "prs_merged_1h": 1,
       "prs_merged_24h": 2,
       "review_changes_backlog": 7,
-      "needs_user_parked": 15,
+      "needs_user_parked": 16,
       "review_lane_health": "idle",
       "review_lane_runs_1h": 0,
       "worker_attempts_1h": 0,
