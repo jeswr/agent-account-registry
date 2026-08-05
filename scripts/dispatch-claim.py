@@ -9229,7 +9229,6 @@ def _review_fix_workflow_values(source=None):
     release_if = re.search(r"(?m)^    if: (.+)$", release_span)
     release_needs = re.search(r"(?m)^    needs: (.+)$", release_span)
     outcome_if = re.search(r"(?m)^    if: (.+)$", outcome_span)
-    run_if = re.search(r"(?m)^    if: (.+)$", run_span)
     assert release_if and release_needs and outcome_if, "review-fix.yml if/needs not parsable"
     return {
         "resolve_s": _fixed_minutes("resolve") * 60,
@@ -9263,10 +9262,11 @@ def _review_fix_workflow_values(source=None):
         # The dispatcher refuses to spend a reviewer lease on a head whose reviewed-sha marker is
         # already bound BECAUSE (1) the claim job's `already_done` step writes acquired=false and
         # (2) the run job — the only job that executes a model — is gated on acquired == 'true'.
-        # Both live in YAML that no python half can see, and a `count(...)`/substring assertion in
-        # this module would not notice either of them being edited away. Parse them, so the
-        # invariant is pinned to the workflow it is derived from.
-        "run_if": run_if.group(1) if run_if else "",
+        # Both live in YAML that no python half can see, so (1) is parsed here and (2) is pinned
+        # STRUCTURALLY by `_review_launch_gate_violations`. [#717] There is deliberately no
+        # `run_if` key any more: the run job's gate had a second, text-regex definition here that
+        # the #708 assertion compared by SUBSTRING, and a substring of an `if:` line cannot see a
+        # disjunctive bypass. One definition, parsed, compared for equality (#958).
         # Tempered so the match cannot run past the end of the already_done STEP into a sibling
         # step that happens to write acquired=false (the rc=3 none-free branch does).
         "claim_skips_already_done": bool(re.search(
@@ -9313,17 +9313,19 @@ _WK_ADOPT_PACKAGE_END = r"(?m)^[ \t]*if account != os\.environ\[\"EXPECTED_ACCOU
 _WK_ADOPT_PACKAGE_CALL = "lease_schema.plan_package(areas)"
 
 
-def _workflow_step_python(workflow, job, anchor, end_anchor, what, source=None):
-    """`_review_fix_step_python` generalised over the WORKFLOW file, so the same PARSED extraction
-    can pin worker.yml's two copies of the partition reduction (the review of #702 measured that
-    both could be reverted to the pre-#112 rule with the whole enrolled suite staying green).
+def _workflow_document(workflow, what, source=None):
+    """PARSE one `.github/workflows/<workflow>` into its document, for a seam pin named `what`.
 
     [#1405] The lazy import is the ONE failure here that is about the container rather than about
     the workflow, so it raises `WorkflowSeamUnmeasurable` instead of the bare `ModuleNotFoundError`
-    that every consumer of this helper used to inherit — the swallowing probes turned it into "the
-    workflow does not admit the class", and the direct self-test callers died on a traceback that
-    named neither the dependency nor the fix. Every OTHER failure below stays an `AssertionError`,
-    because every other failure IS a finding about the seam."""
+    that every consumer used to inherit — the swallowing probes turned it into "the workflow does
+    not admit the class", and the direct self-test callers died on a traceback that named neither
+    the dependency nor the fix. Every OTHER failure here stays an `AssertionError`, because every
+    other failure IS a finding about the seam.
+
+    Lifted out of `_workflow_step_python` (verbatim, messages included) so the JOB-level seam pins
+    parse through exactly the same reader as the STEP-level ones — one definition of "read this
+    workflow", not two that drift (#958)."""
     try:
         # self-test-only, same lazy import shape as resolve-conflicts.validate_syntax_blob
         import yaml
@@ -9339,11 +9341,20 @@ def _workflow_step_python(workflow, job, anchor, end_anchor, what, source=None):
         assert path.is_file(), f"{workflow} not found for the {what} pin: {path}"
         source = path.read_text(encoding="utf-8")
     try:
-        document = yaml.safe_load(source)
+        return yaml.safe_load(source)
     except yaml.YAMLError as exc:
         raise AssertionError(
             f"{workflow} does not parse as YAML, so the {what} pin cannot be derived: "
             f"{exc}") from None
+
+
+def _workflow_step_python(workflow, job, anchor, end_anchor, what, source=None):
+    """`_review_fix_step_python` generalised over the WORKFLOW file, so the same PARSED extraction
+    can pin worker.yml's two copies of the partition reduction (the review of #702 measured that
+    both could be reverted to the pre-#112 rule with the whole enrolled suite staying green).
+
+    Parsing (and its two failure classes) lives in `_workflow_document`."""
+    document = _workflow_document(workflow, what, source=source)
     steps = (((document or {}).get("jobs") or {}).get(job) or {}).get("steps")
     assert isinstance(steps, list), (
         f"{workflow} exposes no jobs.{job}.steps list, so the {what} pin cannot be derived — "
@@ -9536,6 +9547,59 @@ def _partition_seam_violations(workflow, document):
                            f"(found {env.get(key)!r}) — re-pointing it at the neighbouring "
                            f"packages/package output feeds the reduction the wrong input")
     return sorted(out)
+
+
+# ---- [issue #717] THE REVIEW-LAUNCH GATE, AS A PARSED NODE ------------------------------------
+# review-fix.yml's `run` job is the ONLY job in that workflow that executes a model, and its `if:`
+# is the whole of the gate: the claim job writes `acquired=false` when the head is already reviewed
+# (or when no lease could be taken), and this expression is what turns that into "no model runs".
+# The dispatcher's review-launch invariant (#708) is DERIVED from that, so the gate is pinned here.
+#
+# ONE expected expression, compared for EQUALITY. It used to be the substring test
+# `"needs.claim.outputs.acquired == 'true'" in <the raw if: line>`, and the review of #714 measured
+# the hole: `if: <the guard> || <anything>` still CONTAINS the substring while un-gating the job
+# completely. Worse, the only thing that killed that mutant was the raw-text mutation loop's
+# anchor-drift tripwire — whose own message tells a maintainer to "re-point it" when the anchor
+# moves, which is exactly what a live added disjunct does. A guard whose documented remediation
+# defeats it converts diligence into a false negative, so the substance assertion, not a tripwire,
+# has to be the thing that reds.
+_RF_RUN_GATE = "${{ needs.claim.outputs.acquired == 'true' }}"
+
+
+def _review_launch_gate_violations(document, expected=_RF_RUN_GATE):
+    """Is review-fix.yml's model-executing `run` job still gated on the claim job's `acquired`?
+
+    Returns a list of violation strings; empty means intact. Takes the PARSED document (not text)
+    so the self-test can mutate one node in memory and demand the violation back, and so a reflow,
+    a re-indent or a folded `if: >` scalar is the parser's problem rather than a regex's.
+
+    EQUALITY against `expected`, never containment — an added disjunct (inside the interpolation
+    or concatenated onto it), a weakened comparison (`!= 'false'`), `always()`, `if: false` and a
+    deleted `if:` must ALL red, and only an exact match sees the two disjunct shapes. `str()` on
+    the declared value rather than `value or ""`: PyYAML parses `if: false` to the boolean
+    `False`, which `or ""` would report identically to no guard at all — the same verdict, but a
+    message that sends the reader looking for a key that is right there."""
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    if not isinstance(jobs, dict):
+        return ["review-fix.yml exposes no `jobs:` mapping, so the review-launch gate cannot be "
+                "read AT ALL — this is a finding about the workflow, not a skipped check (#717)"]
+    job = jobs.get("run")
+    if not isinstance(job, dict):
+        return [f"review-fix.yml has no `run` job mapping (found {job!r}): the model-executing "
+                f"job was renamed or deleted, so the #708 review-launch invariant now rests on a "
+                f"job this check cannot see — re-point `_review_launch_gate_violations` (#717)"]
+    if "if" not in job:
+        return ["review-fix.yml's `run` job declares NO `if:` at all, so the ONLY job that runs "
+                "a model would run on EVERY dispatch — including one the claim job refused "
+                "because the head is already reviewed or no lease was taken (#708/#717)"]
+    declared = str(job["if"])
+    if declared != expected:
+        return [f"review-fix.yml's `run` job `if:` must be EXACTLY {expected!r}, found "
+                f"{declared!r} (#708/#717). An ADDED DISJUNCT un-gates the model job while still "
+                f"containing the guard; `always()`/`if: false` and a weakened comparison are the "
+                f"other directions. If the gate legitimately changed, move `_RF_RUN_GATE` with it "
+                f"— never relax this back to a substring test."]
+    return []
 
 
 def _review_fix_step_python(anchor, end_anchor, what, job="resolve", source=None):
@@ -10192,39 +10256,98 @@ def _self_test():
         "review-fix.yml's claim job must still write acquired=false on already_done (#708): the "
         "dispatcher's review-launch invariant refuses marker-bound heads BECAUSE that step skips "
         "the model")
-    assert "needs.claim.outputs.acquired == 'true'" in _wf["run_if"], (
-        "review-fix.yml's run job must stay gated on claim.acquired (#708): "
-        f"{_wf['run_if']!r}")
-    # NON-VACUITY at the seam. A substring/count assertion cannot catch `if: false`, so mutate the
-    # workflow STRUCTURALLY and require each mutant to be caught. (Measured on this project: every
-    # uncaught mutant of an earlier fix lived at the YAML seam, not in the python.)
+    # [#717] Fact (3), STRUCTURALLY: the run job's `if:` must be EXACTLY the gate, on the PARSED
+    # node. This assertion was `"needs.claim.outputs.acquired == 'true'" in <the raw if: line>`,
+    # and a disjunctive bypass (`<the guard> || <anything>`) satisfies a substring test while
+    # un-gating the model job completely. It is stated BEFORE the mutants on purpose: a live
+    # disjunct must red on the SUBSTANCE, not on a mutation-anchor tripwire whose own message
+    # tells the maintainer to re-point it and sail past a broken gate.
+    _rf_doc = _workflow_document("review-fix.yml", "review-launch run-job gate (#717)")
+    assert _review_launch_gate_violations(_rf_doc) == [], (
+        _review_launch_gate_violations(_rf_doc))
+    # NON-VACUITY at the seam, on PARSED nodes: mutate ONE node in memory and demand the violation
+    # back. (Measured on this project: every uncaught mutant of an earlier fix lived at the YAML
+    # seam, not in the python. Of the eight rows below, the substring form this replaced accepted
+    # TWO — both disjunctive bypasses, the class #717 is about; the other six it did catch.)
+    _rf_run_job = _rf_doc["jobs"]["run"]
+
+    def _rf_gate_doc(run_job=None, jobs=None):
+        """The LIVE document with jobs.run (or the whole jobs mapping) replaced — a shallow
+        rebuild, so no mutant can leak back into the document the live assertion above read."""
+        if jobs is None:
+            jobs = {**_rf_doc["jobs"], "run": run_job} if run_job is not None else {
+                k: v for k, v in _rf_doc["jobs"].items() if k != "run"}
+        return {**_rf_doc, "jobs": jobs}
+
+    for _gate_mutant, _gate_label, _gate_needle in (
+            (_rf_gate_doc({**_rf_run_job,
+                           "if": "${{ needs.claim.outputs.acquired == 'true' "
+                                 "|| inputs.mode == 'fix' }}"}),
+             "a DISJUNCTIVE BYPASS — the guard is still there, and it no longer guards",
+             "EXACTLY"),
+            (_rf_gate_doc({**_rf_run_job, "if": "${{ always() }}"}),
+             "the gate replaced by always()", "EXACTLY"),
+            # ...and the disjunct APPENDED to the whole interpolation rather than added inside it.
+            # This row is what makes the check an equality rather than "the expected expression
+            # appears somewhere in the value": that weaker reader passes every other row here and
+            # accepts this one, whose rendered `if:` is a non-empty — truthy — string.
+            (_rf_gate_doc({**_rf_run_job,
+                           "if": "${{ needs.claim.outputs.acquired == 'true' }} "
+                                 "|| ${{ always() }}"}),
+             "the guard kept VERBATIM and a disjunct concatenated onto it", "EXACTLY"),
+            (_rf_gate_doc({**_rf_run_job,
+                           "if": "${{ needs.claim.outputs.acquired != 'false' }}"}),
+             "a WEAKENED comparison — an unset output is not 'false', so the model job runs",
+             "EXACTLY"),
+            (_rf_gate_doc({k: v for k, v in _rf_run_job.items() if k != "if"}),
+             "the `if:` deleted outright", "declares NO `if:`"),
+            # The needle here is the RENDERED value on purpose: PyYAML hands back the BOOLEAN, and
+            # a `value or ""` reader reports a neutered job identically to one with no guard at
+            # all — same verdict, an actionable message turned into a misleading one.
+            (_rf_gate_doc({**_rf_run_job, "if": False}),
+             "`if: false` — the fail-closed-forever direction, reported as the boolean it is",
+             "found 'False'"),
+            (_rf_gate_doc(),
+             "the `run` job renamed or deleted", "no `run` job mapping"),
+            (_rf_gate_doc(jobs="gutted"),
+             "the whole jobs mapping replaced by a scalar", "no `jobs:` mapping")):
+        _gate_violations = _review_launch_gate_violations(_gate_mutant)
+        assert _gate_violations, f"#717 review-launch gate mutant NOT caught: {_gate_label}"
+        assert any(_gate_needle in v for v in _gate_violations), (
+            _gate_label, _gate_needle, _gate_violations)
+    # ...and the reader is JOB-SCOPED: editing a NEIGHBOURING job's `if:` must NOT red, or the
+    # rows above would pass for a reader that merely scans the whole document for the expression.
+    assert _review_launch_gate_violations(_rf_gate_doc(jobs={
+        **_rf_doc["jobs"], "publish": {**_rf_doc["jobs"]["publish"], "if": "${{ always() }}"}
+    })) == [], "the #717 gate reader is not scoped to the `run` job"
+    # ...and the whole path end to end, through a REAL yaml parse of mutated workflow TEXT — a
+    # reader that only works on hand-built dicts would pass every row above. Line-anchored (#584
+    # f3) and required to hit EXACTLY ONE line, so a second copy of the gate is a finding too.
     _rf_text = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
                 / "review-fix.yml").read_text(encoding="utf-8")
-    for _mutant, _field, _want in (
-            (_rf_text.replace(
-                "    if: ${{ needs.claim.outputs.acquired == 'true' }}\n"
-                "    runs-on: ubuntu-latest\n"
-                "    timeout-minutes: ${{ inputs.mode == 'review'",
-                "    if: ${{ always() }}\n"
-                "    runs-on: ubuntu-latest\n"
-                "    timeout-minutes: ${{ inputs.mode == 'review'"),
-             "run_if", "needs.claim.outputs.acquired == 'true'"),
-            (_rf_text.replace("printf 'acquired=false\\n' >> \"$GITHUB_OUTPUT\"\n"
-                              "          printf 'This head was already reviewed",
-                              "printf 'acquired=true\\n' >> \"$GITHUB_OUTPUT\"\n"
-                              "          printf 'This head was already reviewed"),
-             "claim_skips_already_done", True)):
-        assert _mutant != _rf_text, (
-            "the #708 YAML-seam mutation matched nothing — the anchor drifted, re-point it")
-        _mutated = _review_fix_workflow_values(source=_mutant)
-        if _field == "run_if":
-            assert _want not in _mutated[_field], (
-                "an ungated review-fix run job must FLIP the #708 seam assertion red, but the "
-                f"extractor still reported {_mutated[_field]!r}")
-        else:
-            assert _mutated[_field] is not _want, (
-                "a claim step that no longer writes acquired=false must FLIP the #708 seam "
-                "assertion red")
+    _rf_disjunct_text, _rf_disjunct_n = re.subn(
+        r"(?m)^(?P<indent>[ \t]*)if: \$\{\{ needs\.claim\.outputs\.acquired == 'true' \}\}$",
+        r"\g<indent>if: ${{ needs.claim.outputs.acquired == 'true' || inputs.mode == 'fix' }}",
+        _rf_text)
+    assert _rf_disjunct_n == 1, (
+        "the #717 disjunctive-bypass mutation must match the run job's gate line EXACTLY ONCE "
+        f"(matched {_rf_disjunct_n}) — re-point it, and note that the substance assertion above "
+        "reds on its own if the LIVE gate is what moved")
+    assert _review_launch_gate_violations(
+        _workflow_document("review-fix.yml", "the #717 disjunctive-bypass mutant",
+                           source=_rf_disjunct_text)), (
+        "a disjunctive bypass of review-fix.yml's run-job gate parsed clean — the substance "
+        "assertion is back to being a substring test (#717)")
+    # Fact (2)'s own mutant stays a TEXT edit: it lives inside a `run:` shell body.
+    _claim_mutant = _rf_text.replace("printf 'acquired=false\\n' >> \"$GITHUB_OUTPUT\"\n"
+                                     "          printf 'This head was already reviewed",
+                                     "printf 'acquired=true\\n' >> \"$GITHUB_OUTPUT\"\n"
+                                     "          printf 'This head was already reviewed")
+    assert _claim_mutant != _rf_text, (
+        "the #708 YAML-seam mutation matched nothing — the anchor drifted, re-point it")
+    assert _review_fix_workflow_values(
+        source=_claim_mutant)["claim_skips_already_done"] is not True, (
+        "a claim step that no longer writes acquired=false must FLIP the #708 seam assertion red")
     # And the predicate itself: execute review-fix.yml's REAL `already_done` block on exactly the
     # {body, head_sha} pair this module refuses to dispatch, so the refusal is justified by the
     # LIVE workflow rather than by a re-implemented copy that can drift from it.
@@ -10246,6 +10369,10 @@ def _self_test():
     print("  ok   #708: the review-launch invariant is pinned to review-fix.yml's LIVE "
           "already_done predicate, its acquired=false skip, and its acquired-gated run job — "
           "each seam mutated structurally")
+    print("  ok   #717: review-fix.yml's model-executing `run` job carries EXACTLY the acquired "
+          "gate, compared on the parsed node — a disjunctive bypass, a weakened comparison, "
+          "always(), `if: false`, a deleted `if:`, a renamed job and a gutted jobs mapping are "
+          "all killed by that equality (not by a mutation-anchor tripwire)")
     print("  ok   #560: review-fix.yml exports the defer reason, admits the staged-nothing "
           "outcome path, invokes fix-lane-defer, and still releases the fix lease "
           "unconditionally")
