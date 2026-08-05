@@ -1,0 +1,160 @@
+# [registry #446] THE STUCK-ESCALATION SWEEP. 36 draft PRs were measured terminally parked on the
+# human-owned `review:needs-user` terminal (19 sparq, 17 registry) with nothing that resolves
+# them: the active review set drains and merges stop. `reconcile-park-misescalation.py` is a
+# deliberately ONE-SHOT, hand-run correction of the #797 mis-escalation population, and the #797
+# ladder only keeps FUTURE capacity parks machine-owned — neither sweeps the terminal itself.
+# This cron does, giving every parked PR ONE machine-readable disposition per episode.
+#
+# The whole adjudication argument lives in scripts/adjudicate-stuck.py's header, and the reason
+# there is no third (arming) disposition lives in
+# research/967-adjudicator-override-arm-authority.md. Read both before widening anything here:
+# this sweep never arms, never writes a pass label, never merges, and never touches a test, a
+# gate, or a verdict — it decides only whether a PR may re-enter the loop, and hands the
+# correctness question to the cross-provider review round that re-entry buys.
+name: adjudicate-stuck
+
+on:
+  workflow_dispatch:
+  schedule:
+    # :05/:35 — free of every other registry cron: conflict-resolver (1/21/41), dispatch
+    # (3/13/...), groom + retriage (7/22/37/52), regate-sweep (9/29/49), metrics (11/26/41/56),
+    # curate (17/47), pat-validity (16/36/56) and dashboard + groom-leases (*/15). Twice an hour
+    # is a drain cadence, not a hot path: the population only grows at review-outcome speed.
+    - cron: '5,35 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: registry-adjudicate-stuck
+  # NOT cancel-in-progress: a tick cancelled between the audit comment and the label writes would
+  # leave an explained-but-unmoved PR, and the next tick would refuse it as already adjudicated.
+  # Letting the tick finish is what keeps the receipt and the transaction it authorises together.
+  cancel-in-progress: false
+
+jobs:
+  adjudicate:
+    name: Adjudicate PRs parked on the human terminal
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # SECRET-EXFIL GUARD (issue #101): App secrets live only in this environment, whose
+    # default-branch deployment policy rejects a dispatch of a modified non-default-branch copy
+    # of this workflow before the mint can read them.
+    environment: dispatch-secrets
+    permissions:
+      contents: read
+    steps:
+      # No `ref:` — the adjudication logic, the park taxonomy and the disposition set are read
+      # from the DEFAULT BRANCH. A pull request must not be able to widen the set of parks that
+      # can be automatically re-admitted, and pinning a ref here would be exactly that hole.
+      - name: Checkout the registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python (pinned)
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      # Per-owner token mint (issue #168): policy enables targets under TWO owners, so a single
+      # owner-scoped token 404s every read on the other owner's repos. groom.py
+      # --print-owner-repos is the self-tested collector both this sweep and groom share, and it
+      # fails LOUD unless the enabled owner set is exactly {sparq-org, jeswr}.
+      - name: Resolve enabled target repos per owner from policy
+        id: owners
+        run: |
+          set -euo pipefail
+          python3 scripts/groom.py --print-owner-repos --policy-file policy/repos.toml \
+            | tee -a "$GITHUB_OUTPUT"
+
+      # Hold OWNERSHIP is read through the SAME per-owner mint: for every non-App actor that
+      # applied a hold the sweep reads `collaborators/{login}/permission` on the target repo
+      # (adjudicate-stuck._maintainer_probe — who counts as human is the target's collaborator
+      # permission, never a configured handle). That read needs only the metadata scope every
+      # installation token already carries, so no permission below is widened for it, and a
+      # lookup this token cannot answer fails CLOSED: the park stays exactly where it is.
+      #
+      # continue-on-error on each mint: a missing install for one owner DEFERS that owner's
+      # parked PRs to the next tick (loudly, below) — it never adjudicates them with the wrong
+      # credential, and never aborts the other owner's sweep.
+      - name: Mint sparq-org target-scoped App token (PR/issue labels + comments only)
+        id: token-sparq
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: sparq-org
+          repositories: ${{ steps.owners.outputs.sparq_names }}
+          permission-issues: write         # source-issue hold + the audit comment
+          permission-pull-requests: write  # the review-lane label swap
+
+      - name: Mint jeswr target-scoped App token (PR/issue labels + comments only)
+        id: token-jeswr
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: jeswr
+          repositories: ${{ steps.owners.outputs.jeswr_names }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      # NO `contents: write` anywhere in this job, and no arm-scoped mint: the sweep writes
+      # comments and labels, and there is deliberately no credential in scope that could ready,
+      # merge, or push to a PR it re-admits.
+      - name: Self-test, then adjudicate at most five parked PRs per repo
+        env:
+          SPARQ_TOKEN: ${{ steps.token-sparq.outputs.token }}
+          SPARQ_SLUG: ${{ steps.token-sparq.outputs.app-slug }}
+          SPARQ_NAMES: ${{ steps.owners.outputs.sparq_names }}
+          JESWR_TOKEN: ${{ steps.token-jeswr.outputs.token }}
+          JESWR_SLUG: ${{ steps.token-jeswr.outputs.app-slug }}
+          JESWR_NAMES: ${{ steps.owners.outputs.jeswr_names }}
+        run: |
+          set -euo pipefail
+          python3 scripts/adjudicate-stuck.py --self-test
+          swept=0
+          failed=""
+          for owner in sparq-org jeswr; do
+            case "$owner" in
+              sparq-org)
+                token="${SPARQ_TOKEN:-}"; slug="${SPARQ_SLUG:-}"; names="${SPARQ_NAMES:-}" ;;
+              *)
+                token="${JESWR_TOKEN:-}"; slug="${JESWR_SLUG:-}"; names="${JESWR_NAMES:-}" ;;
+            esac
+            # The marker scans that make every disposition one-shot count only comments THIS App
+            # wrote. Without the slug an unrestricted scan would let anyone able to comment pin a
+            # PR out of the population — or forge a re-admission — so a missing slug DEFERS.
+            if [[ -z "$token" || -z "$slug" || -z "$names" ]]; then
+              echo "::warning::no usable App mint for ${owner}; its parked PRs are DEFERRED to the next tick rather than adjudicated with the wrong credential"
+              continue
+            fi
+            IFS=',' read -r -a repos <<< "$names"
+            for name in "${repos[@]}"; do
+              [[ -n "$name" ]] || continue
+              echo "== ${owner}/${name} =="
+              # `swept` counts repos the sweep actually COMPLETED, not invocations: the script
+              # exits nonzero when it could not read the population, when a write did not land,
+              # or when every eligible PR errored, and a counter incremented merely because
+              # python3 ran cannot tell any of those apart from a drained backlog. The failure is
+              # RECORDED rather than fatal here so one broken repo never skips the sweep of the
+              # rest; the run still fails below.
+              if GH_TOKEN="$token" python3 scripts/adjudicate-stuck.py \
+                --repo "${owner}/${name}" \
+                --bot-login "${slug}[bot]" \
+                --limit 5 \
+                --apply
+              then
+                swept=$((swept + 1))
+              else
+                echo "::error::the adjudication sweep FAILED for ${owner}/${name}"
+                failed="${failed} ${owner}/${name}"
+              fi
+            done
+          done
+          # A sweep that swept nothing is a silent outage, not a quiet tick: every enabled owner
+          # failing to mint looks identical to "the backlog is empty" in the run list.
+          [[ "$swept" -gt 0 ]] || { echo '::error::no enabled target repo was swept'; exit 1; }
+          [[ -z "$failed" ]] || { echo "::error::sweep failed on:${failed}"; exit 1; }
