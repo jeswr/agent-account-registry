@@ -1192,7 +1192,7 @@ _selftest_sandbox_intercepts() {
 #
 # It is NOT the only place in the repo. MEASURED: 21 further invocations across 10 production
 # workflows run an enrolled self-test DIRECTLY as a preflight, 15 of them in token-bearing jobs --
-# `groom.yml:445` runs `groom-alert.py --self-test` with both GH_TOKEN and ALERT_TOKEN in scope.
+# `groom-sweep.yml:445` runs `groom-alert.py --self-test` with both GH_TOKEN and ALERT_TOKEN in scope.
 # Those are outside this sandbox and are tracked in issue #991; they are a separate change because
 # several of those workflows use sparse checkouts that do not contain worker-live.sh at all.
 run_enrolled_selftest() {

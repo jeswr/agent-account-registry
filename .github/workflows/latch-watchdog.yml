@@ -55,7 +55,7 @@ jobs:
       - name: Install the syntax-only YAML parser
         run: python3 -m pip install --disable-pip-version-check pyyaml
 
-      # Same authoritative policy-derived per-owner target scopes as groom.yml / conflict-resolver.
+      # Same authoritative policy-derived per-owner target scopes as groom-sweep.yml / conflict-resolver.
       - name: Resolve enabled target repos per owner from policy
         id: owners
         run: |

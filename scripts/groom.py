@@ -73,7 +73,7 @@ STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
 DEFUSE_PR_MARKER = "<!-- registry-groom-auto-defuse:v1 -->"
 # Registry provenance records — same location and <owner>--<name>--pr<N>.json naming as
 # worker-pr.provenance_path / dispatch-claim's fail-closed review lookup. Groom runs from the
-# registry checkout root (groom.yml), so the directory is reachable relatively.
+# registry checkout root (groom-sweep.yml), so the directory is reachable relatively.
 PROVENANCE_DIR = "orchestration/provenance"
 # Reason for age-parking a draft worker PR that has NO VALID registry provenance record —
 # missing, unreadable, or schema-invalid (bad pr_number/provider/alias/issue/head-sha/
@@ -730,7 +730,7 @@ def worker_pr_provenance_enumerable(
 
     Mirrors worker-pr.provenance_path / dispatch-claim's review lookup: the record lives at
     ``orchestration/provenance/<owner>--<name>--pr<N>.json`` in the registry checkout, which is
-    groom's working directory (groom.yml runs from the checkout root). VALIDITY — not mere file
+    groom's working directory (groom-sweep.yml runs from the checkout root). VALIDITY — not mere file
     existence — decides draft ownership: the review enumerator/claimer fail-close on an
     unreadable or schema-invalid record exactly as on a missing one, so a draft carrying such a
     record is owned by no automated loop and must keep the age-park hand-off. (A bare existence
@@ -1386,7 +1386,7 @@ def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
     return limits
 
 
-# Exact owner -> GITHUB_OUTPUT key map for the per-owner App-token mint steps in groom.yml
+# Exact owner -> GITHUB_OUTPUT key map for the per-owner App-token mint steps in groom-sweep.yml
 # (issue #168). The workflow's mint steps are STATIC (one step per known owner), so the
 # resolver below fails LOUD when policy's enabled owner set drifts from this map — a silently
 # dropped owner would reintroduce the wrong-owner-token bug.
@@ -1448,7 +1448,7 @@ def _owner_repo_lines(owners: dict[str, list[str]], source: str) -> list[str]:
 def owner_repo_output_lines(document: Any) -> list[str]:
     """Mint-scope GITHUB_OUTPUT lines for the POLICY-driven sweeps (groom/curate/
     conflict-resolver), covering every enabled repo of every enabled owner."""
-    return _owner_repo_lines(enabled_owner_repos(document), "groom.yml")
+    return _owner_repo_lines(enabled_owner_repos(document), "groom-sweep.yml")
 
 
 def manifest_owner_repo_output_lines(raw: Any) -> list[str]:
@@ -1608,7 +1608,7 @@ _http_transient = _load_module(
 # hand-written fragment of Retry-After handling left in this file after #928 moved the numeric
 # policy to gh_retry, and the residual half of registry #1410's "three divergent parsers".
 # CHECKOUT DEPENDENCY, same class as the two loads above and no wider: all six steps that invoke
-# this script take a FULL checkout today (groom.yml x2, dispatch.yml CLAIM, curate.yml,
+# this script take a FULL checkout today (groom-sweep.yml x2, dispatch.yml CLAIM, curate.yml,
 # conflict-resolver.yml, latch-watchdog.yml, reconcile-conflict-park.yml), and nothing yet PINS
 # that. Make one of them sparse without listing these siblings and `_load_module` raises GroomError
 # at import — the step dies LOUDLY, never silently degrading to a private lookup.
@@ -1759,7 +1759,7 @@ ACCT_BINDING_REF_RE = re.compile(
     r"^refs/acct-requests/[^/]+/(acct[0-9a-z]{2,})/[^/]+/[^/]+/[^/]+$"
 )
 ACCT_BINDING_HANDLE_SLOT_RE = re.compile(r"^acct([0-9]+)$")
-# The names-only ACCTNN_TOKEN inventory groom.yml's least-exposure filter step derives from the
+# The names-only ACCTNN_TOKEN inventory groom-sweep.yml's least-exposure filter step derives from the
 # job's `toJSON(secrets)` context (dispatch.yml's `acct-secrets` pattern): only that tiny inline
 # step ever sees the secrets map, and only NAMES reach this process.
 ACCT_SECRET_NAMES_ENV = "ACCT_SECRET_NAMES"
@@ -1861,7 +1861,7 @@ def account_secret_slots(names: Any) -> set[int]:
 
 
 def parse_acct_secret_names(raw: Any) -> list[str]:
-    """Pure: the ACCTNN_TOKEN secret NAMES groom.yml's least-exposure filter derived from the
+    """Pure: the ACCTNN_TOKEN secret NAMES groom-sweep.yml's least-exposure filter derived from the
     job's secrets context, as a JSON array of strings.
 
     FAIL CLOSED on absent, blank or malformed input. Without a PROVEN secret inventory a slot
@@ -3542,7 +3542,7 @@ def _plan_actions(
 
 
 def target_tokens_map() -> dict[str, str]:
-    """The PER-OWNER target App-token map (issue #168). groom.yml mints one App token per DISTINCT
+    """The PER-OWNER target App-token map (issue #168). groom-sweep.yml mints one App token per DISTINCT
     enabled-policy owner and passes ``{owner: token}`` as JSON in ``TARGET_GH_TOKENS`` — mirroring
     dispatch.yml, whose CLAIM already routes per owner. A single token scoped to one owner 404s
     every read and fails every write on the other owner's repo, aborting the sweep before dead
@@ -11216,7 +11216,7 @@ def _self_test() -> int:
            "ORPHAN-CLAIMS claims=1 account_issues=1 account_secrets=0 bindings=2 burned=0",
            []))
 
-    # The CLI contract, driven through main() exactly as groom.yml drives it: real argument
+    # The CLI contract, driven through main() exactly as groom-sweep.yml drives it: real argument
     # parsing, real environment resolution, the real paginated request sequence. A pure function
     # nothing CALLS is a vacuous guard, so the driver stubs only the HTTP boundary — GitHubAPI's
     # own missing-token refusal and `paginate` stay live.
@@ -11391,13 +11391,13 @@ def _self_test() -> int:
     # ---- THE YAML SEAM for the burned-slot report ------------------------------------------------
     # The measured lesson of this estate: the uncaught mutants live one level ABOVE the Python — a
     # renamed flag, an `if: false`, a dropped env line, a producer moved after its consumer. So the
-    # wiring is asserted STRUCTURALLY against groom.yml, with the same dependency-free line
+    # wiring is asserted STRUCTURALLY against groom-sweep.yml, with the same dependency-free line
     # discipline the worker.yml run-name seam above uses: PyYAML is NOT installed in the `groom`
     # job that runs this self-test (only the watchdog jobs install it). Anything that cannot be
     # located fails CLOSED — "zero steps matched" must never read as a pass.
     try:
         orphan_yaml = (
-            Path(__file__).resolve().parent.parent / ".github" / "workflows" / "groom.yml"
+            Path(__file__).resolve().parent.parent / ".github" / "workflows" / "groom-sweep.yml"
         ).read_text(encoding="utf-8")
         orphan_yaml_lines = orphan_yaml.splitlines()
         orphan_job_start = orphan_yaml_lines.index("  groom:")
@@ -11435,7 +11435,7 @@ def _self_test() -> int:
             # A step-level `if:` key sits at exactly 8 spaces; shell/python bodies are deeper.
             return any(re.match(r"^ {8}if:", line) for line in step)
 
-        check("YAML seam: groom.yml invokes --report-orphan-claims exactly once, inside the "
+        check("YAML seam: groom-sweep.yml invokes --report-orphan-claims exactly once, inside the "
               "`groom` job", len(_orphan_steps_with("--report-orphan-claims")), 1)
         orphan_report_step = _orphan_steps_with("--report-orphan-claims")[0]
         orphan_filter_step = _orphan_steps_with("ALL_SECRETS: ${{ toJSON(secrets) }}")[0]
@@ -11476,7 +11476,7 @@ def _self_test() -> int:
               [flag for flag in ("git/refs", "--delete", "--prune", "--fail-on", "DELETE")
                if flag in orphan_report_text], [])
     except Exception as exc:                       # noqa: BLE001 - fail CLOSED, never skip
-        check(f"YAML seam: groom.yml burned-slot wiring is inspectable "
+        check(f"YAML seam: groom-sweep.yml burned-slot wiring is inspectable "
               f"({type(exc).__name__}: {exc})", False, True)
 
     print("groom self-test", "PASSED" if ok else "FAILED")
@@ -11489,7 +11489,7 @@ def main() -> int:
     parser.add_argument(
         "--print-owner-repos",
         action="store_true",
-        help="print the per-owner enabled-repo GITHUB_OUTPUT lines that scope groom.yml's "
+        help="print the per-owner enabled-repo GITHUB_OUTPUT lines that scope groom-sweep.yml's "
              "App-token mints (issue #168), then exit",
     )
     parser.add_argument(
@@ -11555,7 +11555,7 @@ def main() -> int:
             return report_orphan_claims(args)
         except GroomError as exc:
             # A refusal is the report. Exiting NON-ZERO on an unprovable inventory is what keeps
-            # "could not tell" from reading as "nothing is burned"; groom.yml runs this step
+            # "could not tell" from reading as "nothing is burned"; groom-sweep.yml runs this step
             # continue-on-error so the refusal is loud without ever aborting the repair sweep.
             print(f"groom: {exc}", file=sys.stderr)
             return 1

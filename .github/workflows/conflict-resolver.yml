@@ -42,7 +42,7 @@ jobs:
       - name: Install the syntax-only YAML parser
         run: python3 -m pip install --disable-pip-version-check pyyaml
 
-      # Reuse the same authoritative policy-derived per-owner target scopes as groom.yml. Static
+      # Reuse the same authoritative policy-derived per-owner target scopes as groom-sweep.yml. Static
       # mint steps fail loudly if policy gains an owner before this workflow gains its mint.
       - name: Resolve enabled target repos per owner from policy
         id: owners

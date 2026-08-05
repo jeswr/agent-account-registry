@@ -21,9 +21,9 @@
 # Same argument, same shape, and the same host as scripts/metrics-alert.py's `--stale-check`: a
 # watcher inside the thing it watches is not a watcher. The ring in the checked-in workflows is now
 #
-#     dispatch never PLANS / keeps failing -> groom.yml     `dispatch-stall`   (this script)
+#     dispatch never PLANS / keeps failing -> groom-sweep.yml     `dispatch-stall`   (this script)
 #     metrics job FAILS                    -> metrics.yml   `metrics-alert`
-#     metrics never RUNS                   -> groom.yml     `metrics-stale`
+#     metrics never RUNS                   -> groom-sweep.yml     `metrics-stale`
 #     groom never RUNS                     -> dashboard.yml `cron-keepalive`
 #     dashboard never RUNS                 -> metrics.yml   `dashboard-publish` staleness fallback
 #
@@ -133,7 +133,7 @@ ARTIFACT_PAGE_SIZE = 100
 RUN_PAGE_SIZE = 50
 
 DISPATCH_WORKFLOW = ".github/workflows/dispatch.yml"
-GROOM_WORKFLOW = ".github/workflows/groom.yml"
+GROOM_WORKFLOW = ".github/workflows/groom-sweep.yml"
 HOST_JOB = "dispatch-stall"
 
 # Every file the self-test asserts against. The host job sparse-checks-out exactly this set and
