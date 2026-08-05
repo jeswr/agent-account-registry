@@ -165,6 +165,13 @@ LIST_PAGE_LIMIT = 50        # issues/pulls ceiling: 5000 entries, repo-level, sw
 # really do pass 1000, e.g. PR #2540 at 1061), and it now degrades PER ITEM, never per sweep.
 CHECK_RUN_PAGE_LIMIT = 40
 WORKER_PR_STATUS_LIMIT = 100
+# [OPUS-5 #1641] Warn BEFORE the cliff. The limit above is not a taper: one PR over it and
+# `_worker_pr_status` returns NOTHING for the whole repo, which reads downstream as the perfectly
+# legitimate answer "no PR has status" rather than as a failure. So the overflow is silent, total,
+# and indistinguishable from a quiet repo. Measured 2026-08-01: sparq sat at 96 of 100 with the
+# backlog still growing, and the margin was found by hand rather than by any alarm. This threshold
+# exists so the LAST ten PRs of headroom are loud.
+WORKER_PR_STATUS_WARN_AT = 90
 WORKER_HEAD_PREFIX = "sparq-agent/"
 MERGEABLE_POLL_ATTEMPTS = 3
 MERGEABLE_POLL_INTERVAL_SECONDS = 1
@@ -1049,6 +1056,16 @@ def _pr_status_snapshot(fetch, claim, repo, pulls, concurrency=SNAPSHOT_CONCURRE
         and str((pull.get("head") or {}).get("ref", "")).startswith(WORKER_HEAD_PREFIX)
         and ((pull.get("head") or {}).get("repo") or {}).get("full_name") == repo
     ]
+    if WORKER_PR_STATUS_WARN_AT < len(worker_pulls) <= WORKER_PR_STATUS_LIMIT:
+        # [review round 1] The distance is to the first OVERFLOWING count, not to the limit:
+        # the guard degrades on `> WORKER_PR_STATUS_LIMIT`, so a count equal to the limit is
+        # still processed normally and 100 is one PR of headroom, not zero.
+        print(f"::warning::plan-snapshot: {repo} carries {len(worker_pulls)} worker PRs, within "
+              f"{WORKER_PR_STATUS_LIMIT + 1 - len(worker_pulls)} of the first count that "
+              f"overflows ({WORKER_PR_STATUS_LIMIT + 1}). ABOVE WORKER_PR_STATUS_LIMIT "
+              f"({WORKER_PR_STATUS_LIMIT}) this repo degrades to NO prstatus at all "
+              "(worker-pr-census-overflow) and every snapshot-derived admission stands down. "
+              "Land or close stale worker PRs before that happens.")
     if len(worker_pulls) > WORKER_PR_STATUS_LIMIT:
         # Repo-level census overflow degrades to NO prstatus for this repo (pr_number 0
         # marks the repo-wide skip): issue dispatch continues, every snapshot-derived PR
@@ -1659,6 +1676,34 @@ def _self_test():
     census = [worker_pull(1000 + n, sha_ok) for n in range(WORKER_PR_STATUS_LIMIT + 1)]
     items, skips = _pr_status_snapshot(fake_fetch, claim, repo, census)
     assert items == {} and skips == [{"pr_number": 0, "reason": "worker-pr-census-overflow"}]
+
+    # [#1641] ...and the LAST ten PRs of headroom are LOUD. The overflow assertion above stays
+    # green whether or not anything warned on the way there, so it cannot catch a silent
+    # approach — this pair can. Deleting the warning reds the first; making it unconditional
+    # reds the second, because a warning that always fires is noise and gets ignored.
+    import contextlib as _ctx, io as _io
+    near = _io.StringIO()
+    with _ctx.redirect_stdout(near):
+        try:                      # the warning is emitted BEFORE the per-PR walk, so the
+            _pr_status_snapshot(  # stub fetch failing afterwards does not affect what we assert
+                fake_fetch, claim, repo,
+                [worker_pull(2000 + n, sha_ok)
+                 for n in range(WORKER_PR_STATUS_WARN_AT + 1)])
+        except Exception:
+            pass
+    assert "::warning::" in near.getvalue() and "WORKER_PR_STATUS_LIMIT" in near.getvalue(), \
+        f"approaching the census cliff must WARN: {near.getvalue()!r}"
+    quiet = _io.StringIO()
+    with _ctx.redirect_stdout(quiet):
+        try:
+            _pr_status_snapshot(
+                fake_fetch, claim, repo,
+                [worker_pull(3000 + n, sha_ok)
+                 for n in range(WORKER_PR_STATUS_WARN_AT)])
+        except Exception:
+            pass
+    assert "::warning::" not in quiet.getvalue(), \
+        f"at/below the threshold it must stay QUIET: {quiet.getvalue()!r}"
 
     # Repo-level listings stay sweep-fatal: a runaway issues walk still refuses the snapshot.
     def endless(url):
