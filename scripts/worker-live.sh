@@ -2070,6 +2070,95 @@ _workflow_steps_referencing() {
   ' "$file"
 }
 
+# PURE (self-tested): _model_target_checkout_ref <workflow-file> <job> — print the VERBATIM `ref:`
+# expression of the actions/checkout step that materializes the model's target working tree inside
+# JOB, i.e. the step whose `with:` block says `path: target` exactly.
+#
+# [issues #143, #441] Both lanes resolve routing/model_chain/agent in a `resolve` job from a
+# `target-routing` checkout and then run the model on a SECOND checkout of the same repository.
+# When that second checkout names a moving ref, the two are different revisions and a routing
+# update landing between the jobs runs a stale/out-of-policy model+prompt on an already-claimed
+# lease. The property is therefore about ONE line, so the caller pins it by EXACT MATCH
+# (AGENTS.md item 6) rather than by containment.
+#
+# Four defect shapes are NAMED rather than printed as the empty string an exact-match row would
+# compare against nothing: `<none>` when the step exists with NO `ref:`, `<missing>` when there is
+# no such step in the job, `<not-checkout>` (below) when the selected step is not the pinned
+# checkout, and `<ambiguous>` when the job materializes `path: target` more than once.
+# `ref:` absent is the fail-OPEN shape specifically — actions/checkout reads an empty `ref` as "the
+# repository's default branch", which is the exact defect being removed, so it must read as a defect
+# here too.
+#
+# [#441 review r1] `path: target` alone selects a PROXY, not the action that supplies the model's
+# working tree: swapping this step's `uses:` for a different pinned action — or dropping `uses:`
+# altogether while keeping the `path:`/`ref:` lines — would leave every #143/#441 exact-ref row
+# green while the pinned target checkout no longer exists. So the selected step's `uses:` is parsed
+# and must BE `actions/checkout@<40-hex sha>`; anything else (including the mutable-tag
+# `actions/checkout@v4`) is reported as `<not-checkout>` rather than as the `ref:` it happens to
+# carry. This is a STEP-LOCAL binding of the marquee trust surface — the repo-wide
+# `_assert_workflow_actions_pinned` establishes only that references are commit-pinned, never WHICH
+# action this particular step is — so neither guard can stand in for the other.
+#
+# [#441 review r2] Selection is by UNIQUENESS, not by first match. Returning the first matching
+# step let a second one mask it: a pinned decoy `path: target` checkout inserted ABOVE the real step
+# answers with the expected pinned ref while the real checkout is reverted to the moving default
+# branch — every exact-ref row below stays green, the YAML parses, and both actions are commit
+# pinned, so no other guard sees it. The whole job is therefore scanned and a second matching step
+# is a REFUSAL (`<ambiguous>`), never a tie broken in the file's favour. Matching is on `path:
+# target` alone (the `uses:` binding is applied afterwards, to the one selected step) so that a
+# decoy is counted whatever action it names.
+#
+# The job is matched EXACTLY as a string (never a regex) and its two-space-indented key closes the
+# scan, because each lane has a SECOND `path: target` checkout in its isolated publish job that
+# legitimately pins a different revision (the pre-gate bundle base / the dispatched PR head).
+# A step opens at `- name:` OR at a name-less `- uses:` (the shape several other workflows here
+# use), so a future rewrite into that form cannot silently attribute the `uses:` to its neighbour.
+_model_target_checkout_ref() {
+  local file="$1" job="$2"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  awk -v job="$job" '
+    function usesval(line,   v) {
+      v = line
+      sub(/^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*/, "", v)
+      sub(/[[:space:]]+#.*$/, "", v)   # the ` # v4.2.2` readability comment is not part of the ref
+      sub(/[[:space:]]+$/, "", v)
+      return v
+    }
+    # the selected step must BE the pinned actions/checkout, or its ref is not the binding claimed
+    function verdict(   at, sha) {
+      at = index(uses, "@")
+      if (at == 0 || substr(uses, 1, at - 1) != "actions/checkout") return "<not-checkout>"
+      sha = substr(uses, at + 1)
+      if (length(sha) != 40 || sha !~ /^[0-9a-f]+$/) return "<not-checkout>"
+      return (ref == "" ? "<none>" : ref)
+    }
+    function endstep() {
+      if (started && is_target) { nmatch++; if (nmatch == 1) first = verdict() }
+      started=0; is_target=0; ref=""; uses=""
+    }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      if (injob) endstep()
+      key=$0; sub(/^  /,"",key); sub(/:[[:space:]]*$/,"",key)
+      injob = (key == job); started=0; is_target=0; ref=""; uses=""
+      next
+    }
+    !injob { next }
+    /^[[:space:]]*-[[:space:]]+name:/ { endstep(); started=1; next }
+    /^[[:space:]]*-[[:space:]]+uses:[[:space:]]/ { endstep(); started=1; uses=usesval($0); next }
+    started && /^[[:space:]]*uses:[[:space:]]/ { uses=usesval($0) }
+    started && /^[[:space:]]*path:[[:space:]]*target[[:space:]]*$/ { is_target=1 }
+    started && /^[[:space:]]*ref:[[:space:]]/ {
+      ln=$0; sub(/^[[:space:]]*ref:[[:space:]]*/,"",ln); sub(/[[:space:]]+$/,"",ln); ref=ln
+    }
+    END {
+      if (injob) endstep()
+      if (nmatch == 0) print "<missing>"
+      else if (nmatch > 1) print "<ambiguous>"
+      else print first
+    }
+  ' "$file"
+}
+
 # [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
 # unavailable — so the worker lane must be able to provision actionlint itself, or every legitimate
 # workflow change dies at `command -v`. Provisioning mirrors .github/workflows/pr-gate.yml: the
@@ -5508,6 +5597,184 @@ WFFIX
         && printf before || printf after-or-missing)" "before"
   chk "#575 (LIVE): the publisher takes its base from the PRE-GATE record, not the worker worktree" \
     "$(grep -Fc 'ref: ${{ needs.worker.outputs.bundle_base_sha }}' "$wf" || true)" "1"
+
+  # --- [issues #143, #441] ONE TARGET REVISION PER RUN, asserted on BOTH lanes. Each lane resolves
+  # routing/model_chain/agent in its `resolve` job from a `target-routing` checkout, and its model
+  # job then checks the SAME repository out again and RE-READS the routing metadata from it. Those
+  # were two unbound revisions: a routing update landing between the jobs runs a stale or
+  # out-of-policy model+prompt on an already-claimed lease. The binding is one exported SHA plus one
+  # `ref:`, and BOTH ends are pinned below — an export nothing consumes, and a consumer with nothing
+  # to read, are each half a fix and each individually silent. ---
+  local pinned_ref='${{ needs.resolve.outputs.target_sha }}'
+  chk "#143 (LIVE worker.yml): the model's target checkout is pinned to the resolved routing sha" \
+    "$(_model_target_checkout_ref "$wf" worker)" "$pinned_ref"
+  chk "#441 (LIVE review-fix.yml): ...and the review/fix lane's run job is pinned to the same output" \
+    "$(_model_target_checkout_ref "$rf_wf" run)" "$pinned_ref"
+  # The PRODUCER half. An empty `needs.resolve.outputs.target_sha` expands the `ref:` above to the
+  # empty string, which actions/checkout reads as "the repository's default branch" — so the two
+  # rows above would still match while the lane silently ran unbound again. Hence: the job output is
+  # wired, the step that fills it derives the sha from the routing checkout the route was resolved
+  # against, and it REFUSES anything that is not a 40-hex commit sha rather than exporting a value
+  # the consumer fails OPEN on.
+  local rev_wiring='target_sha: ${{ steps.target_rev.outputs.target_sha }}'
+  chk "#441: both lanes wire the resolve job's target_sha output exactly once" \
+    "$(grep -Fc "$rev_wiring" "$wf" || true):$(grep -Fc "$rev_wiring" "$rf_wf" || true)" "1:1"
+  chk "#441: both target_rev steps derive the sha from the target-routing checkout" \
+    "$(_workflow_step_body "$wf" target_rev | grep -Fc 'git -C target-routing rev-parse HEAD' || true):$(_workflow_step_body "$rf_wf" target_rev | grep -Fc 'git -C target-routing rev-parse HEAD' || true)" \
+    "1:1"
+  chk "#441: ...and each REFUSES a non-40-hex revision instead of exporting an empty sha" \
+    "$(_workflow_step_body "$wf" target_rev | grep -Fc '^[0-9a-f]{40}$' || true):$(_workflow_step_body "$rf_wf" target_rev | grep -Fc '^[0-9a-f]{40}$' || true)" \
+    "1:1"
+  # ...and neither producer is CONDITIONAL. A skipped step's output is the empty string, i.e. the
+  # fail-open default-branch checkout again, from a lane whose every other row above still reads
+  # green (AGENTS.md item 3 — the conditionally-inert mutant, which is not the deleted one).
+  chk "#441: neither target_rev step carries an if: (a skipped producer exports an empty sha)" \
+    "$(_workflow_step_if "$wf" target_rev):$(_workflow_step_if "$rf_wf" target_rev)" ":"
+
+  # NON-VACUITY on the REAL review-fix.yml, in the three regression directions that matter: the ref
+  # reverted to the moving default branch (the exact shape #441 reported), the ref DELETED (the same
+  # unbound checkout written as an omission, invisible to any containment check), and the producer
+  # made conditionally inert (every text assertion above stays green while the consumer's ref
+  # expands to nothing). Each mutant is built by whole-LINE match off an anchor whose count is
+  # asserted first, and each is proven to have changed the tree.
+  local rf_anchor_ref="          ref: \${{ needs.resolve.outputs.target_sha }}"
+  chk "#441: the pinned ref line occurs exactly once in review-fix.yml (mutation anchor)" \
+    "$(grep -Fxc "$rf_anchor_ref" "$rf_wf" || true)" "1"
+  local rf_unpinned="$tmp/review-fix-unpinned.yml" rf_refless="$tmp/review-fix-refless.yml"
+  local rf_inert="$tmp/review-fix-inert-producer.yml"
+  local rf_inert_if="        if: \${{ inputs.mode == 'fix' }}"
+  awk -v old="$rf_anchor_ref" \
+    '$0 == old { print "          ref: ${{ steps.target.outputs.default_branch }}"; next } { print }' \
+    "$rf_wf" > "$rf_unpinned"
+  awk -v old="$rf_anchor_ref" '$0 == old { next } { print }' "$rf_wf" > "$rf_refless"
+  awk -v ifline="$rf_inert_if" '{ print } /^        id: target_rev$/ { print ifline }' \
+    "$rf_wf" > "$rf_inert"
+  chk "#441: a ref reverted to the moving default branch is REPORTED (non-vacuous)" \
+    "$(_model_target_checkout_ref "$rf_unpinned" run)" '${{ steps.target.outputs.default_branch }}'
+  chk "#441: a DELETED ref reads as <none>, never as a silently-empty match (fail closed)" \
+    "$(_model_target_checkout_ref "$rf_refless" run)" "<none>"
+  chk "#441: a CONDITIONAL target_rev producer is REPORTED (non-vacuous)" \
+    "$(_workflow_step_if "$rf_inert" target_rev)" "\${{ inputs.mode == 'fix' }}"
+  chk "#441: the three mutants each really differ from the shipped workflow (mutation hygiene)" \
+    "$(for _m in "$rf_unpinned" "$rf_refless" "$rf_inert"; do
+         cmp -s "$rf_wf" "$_m" && printf 'same ' || printf 'diff '; done)" \
+    "diff diff diff "
+  # ...and the extractor is JOB-SCOPED rather than "the first `path: target` in the file". Each lane
+  # has a SECOND target checkout in its isolated publish job that legitimately pins a DIFFERENT
+  # revision; without these rows the assertions above could pass by measuring the wrong step.
+  chk "#441: the publish jobs' own target checkouts are distinct, and are NOT what was measured" \
+    "$(_model_target_checkout_ref "$wf" publish):$(_model_target_checkout_ref "$rf_wf" publish)" \
+    '${{ needs.worker.outputs.bundle_base_sha }}:${{ needs.resolve.outputs.head_sha }}'
+  chk "#441: a job with no target checkout is NAMED, never answered with a neighbour's ref" \
+    "$(_model_target_checkout_ref "$rf_wf" resolve)" "<missing>"
+  chk "#441: _model_target_checkout_ref fails CLOSED on an unreadable workflow" \
+    "$(_model_target_checkout_ref "$tmp/no-such-workflow.yml" run 2>/dev/null; printf '%s' "$?")" "1"
+  # ...and the step that ENDS its job is read from the extractor's END path rather than from a
+  # closing `- name:` that never arrives — the boundary #575 records as a source of confidently
+  # wrong reads. Both verdicts have to survive it, or a checkout moved to the end of a job would
+  # silently stop being measured at all.
+  local rf_last_pinned="$tmp/rf-last-pinned.yml" rf_last_refless="$tmp/rf-last-refless.yml"
+  local ck_uses='        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2'
+  printf 'jobs:\n  run:\n    steps:\n      - name: Checkout target\n%s\n        with:\n          ref: ${{ needs.resolve.outputs.target_sha }}\n          path: target\n' \
+    "$ck_uses" > "$rf_last_pinned"
+  printf 'jobs:\n  run:\n    steps:\n      - name: Checkout target\n%s\n        with:\n          path: target\n' \
+    "$ck_uses" > "$rf_last_refless"
+  chk "#441: a target checkout that ENDS its job is read from the END path, never skipped" \
+    "$(_model_target_checkout_ref "$rf_last_pinned" run)" "$pinned_ref"
+  chk "#441: ...and a missing ref still reads <none> on that path too (fail closed)" \
+    "$(_model_target_checkout_ref "$rf_last_refless" run)" "<none>"
+  # ...and the END path applies the same `uses:` binding as the mid-job path, so a checkout moved to
+  # the end of its job cannot be swapped for another action and still answer with its ref.
+  local rf_last_notck="$tmp/rf-last-not-checkout.yml"
+  printf 'jobs:\n  run:\n    steps:\n      - name: Checkout target\n        uses: some-org/some-action@11bd71901bbe5b1630ceea73d27597364c9af683\n        with:\n          ref: ${{ needs.resolve.outputs.target_sha }}\n          path: target\n' \
+    > "$rf_last_notck"
+  chk "#441 r1: ...and a non-checkout step on the END path is REPORTED too (fail closed)" \
+    "$(_model_target_checkout_ref "$rf_last_notck" run)" "<not-checkout>"
+  # A name-LESS `- uses:` step (the shape groom-leases/retriage/triage-issue use) opens a step, so
+  # the ref and the action still belong to the same step rather than to the preceding one.
+  local rf_nameless="$tmp/rf-nameless-uses.yml"
+  printf 'jobs:\n  run:\n    steps:\n      - name: Checkout registry\n        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n      - uses: some-org/some-action@11bd71901bbe5b1630ceea73d27597364c9af683\n        with:\n          ref: ${{ needs.resolve.outputs.target_sha }}\n          path: target\n' \
+    > "$rf_nameless"
+  chk "#441 r1: a name-less '- uses:' opens a step, so its action is not read from its neighbour" \
+    "$(_model_target_checkout_ref "$rf_nameless" run)" "<not-checkout>"
+  # ...and a 40-CHARACTER ref is not a 40-hex sha: `@` + right length is the shape a tag or branch
+  # name can be made to satisfy, so the hex requirement has to be its own live clause.
+  local rf_nonhex="$tmp/rf-nonhex-ref.yml"
+  printf 'jobs:\n  run:\n    steps:\n      - name: Checkout target\n        uses: actions/checkout@release-candidate-for-the-v4-line-abcdef\n        with:\n          ref: ${{ needs.resolve.outputs.target_sha }}\n          path: target\n' \
+    > "$rf_nonhex"
+  chk "#441 r1: a 40-character NON-HEX checkout ref is REPORTED, not accepted as a commit pin" \
+    "$(_model_target_checkout_ref "$rf_nonhex" run)" "<not-checkout>"
+
+  # ...and the `uses:` binding on the REAL review-fix.yml: `path: target` alone is a PROXY for the
+  # action that supplies the model's working tree, so a step swapped to a DIFFERENT pinned action,
+  # stripped of `uses:` entirely, or reverted to a MUTABLE tag would otherwise leave every row above
+  # green with no pinned target checkout in the lane at all. Each mutant edits the ONE `uses:` line
+  # that follows the step's own name anchor (whose count is asserted first) and is proven to differ.
+  local rf_anchor_step="      - name: Checkout target at the resolved routing revision (pinned, no persisted token)"
+  chk "#441 r1: the model target checkout step name occurs exactly once in review-fix.yml (anchor)" \
+    "$(grep -Fxc "$rf_anchor_step" "$rf_wf" || true)" "1"
+  local rf_swapped="$tmp/review-fix-swapped-action.yml" rf_nouses="$tmp/review-fix-no-uses.yml"
+  local rf_tagged="$tmp/review-fix-tagged-action.yml"
+  awk -v anchor="$rf_anchor_step" \
+    -v repl='        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0' '
+    $0 == anchor { print; armed=1; next }
+    armed && /^        uses:[[:space:]]/ { print repl; armed=0; next }
+    { print }' "$rf_wf" > "$rf_swapped"
+  awk -v anchor="$rf_anchor_step" '
+    $0 == anchor { print; armed=1; next }
+    armed && /^        uses:[[:space:]]/ { armed=0; next }
+    { print }' "$rf_wf" > "$rf_nouses"
+  awk -v anchor="$rf_anchor_step" -v repl='        uses: actions/checkout@v4' '
+    $0 == anchor { print; armed=1; next }
+    armed && /^        uses:[[:space:]]/ { print repl; armed=0; next }
+    { print }' "$rf_wf" > "$rf_tagged"
+  chk "#441 r1: a target checkout swapped to a DIFFERENT pinned action is REPORTED (non-vacuous)" \
+    "$(_model_target_checkout_ref "$rf_swapped" run)" "<not-checkout>"
+  chk "#441 r1: ...a step with NO uses: is REPORTED, never read as a checkout (fail closed)" \
+    "$(_model_target_checkout_ref "$rf_nouses" run)" "<not-checkout>"
+  chk "#441 r1: ...and a MUTABLE-tag actions/checkout@v4 is REPORTED, not accepted as pinned" \
+    "$(_model_target_checkout_ref "$rf_tagged" run)" "<not-checkout>"
+  chk "#441 r1: the three uses-mutants each really differ from the shipped workflow (hygiene)" \
+    "$(for _m in "$rf_swapped" "$rf_nouses" "$rf_tagged"; do
+         cmp -s "$rf_wf" "$_m" && printf 'same ' || printf 'diff '; done)" \
+    "diff diff diff "
+
+  # ...and the MASKING duplicate, which no row above could see: a correctly pinned DECOY target
+  # checkout inserted ABOVE the real step, whose ref is reverted to the moving default branch at the
+  # same time. Under first-match selection the extractor answers with the decoy's pinned ref and the
+  # marquee row stays green on a lane whose model tree is unbound again; the job must be REFUSED
+  # instead. The decoy is emitted as literal lines (so the real ref line remains the single input
+  # match rewritten by the second rule), off the step-name anchor whose count is asserted above.
+  local rf_decoy="$tmp/review-fix-decoy-target.yml"
+  awk -v anchor="$rf_anchor_step" -v old="$rf_anchor_ref" -v ck="$ck_uses" '
+    $0 == anchor {
+      print "      - name: Checkout target (decoy)"
+      print ck
+      print "        with:"
+      print "          ref: ${{ needs.resolve.outputs.target_sha }}"
+      print "          path: target"
+      print; next
+    }
+    $0 == old { print "          ref: ${{ steps.target.outputs.default_branch }}"; next }
+    { print }' "$rf_wf" > "$rf_decoy"
+  chk "#441 r2: a pinned DECOY target checkout MASKING an unbound real one is REPORTED (non-vacuous)" \
+    "$(_model_target_checkout_ref "$rf_decoy" run)" "<ambiguous>"
+  # ...and the mutant really is the masking shape rather than a harmless duplicate: two target
+  # checkouts in the run job, the real one unbound, and the file changed at all.
+  chk "#441 r2: ...and that mutant really unbinds the real checkout behind the decoy (hygiene)" \
+    "$(cmp -s "$rf_wf" "$rf_decoy" && printf same || printf diff):$(grep -Fxc "$rf_anchor_ref" "$rf_decoy" || true):$(grep -Fxc '          ref: ${{ steps.target.outputs.default_branch }}' "$rf_decoy" || true)" \
+    "diff:1:1"
+  # A decoy is a defect whatever action it names, so the count is taken BEFORE the `uses:` binding:
+  # a second `path: target` step that is not a checkout at all must refuse too, not be silently
+  # discounted so the real (unbound) step becomes unique again.
+  local rf_decoy_notck="$tmp/rf-decoy-not-checkout.yml"
+  printf 'jobs:\n  run:\n    steps:\n      - name: Stage target\n        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0\n        with:\n          path: target\n      - name: Checkout target\n%s\n        with:\n          path: target\n' \
+    "$ck_uses" > "$rf_decoy_notck"
+  chk "#441 r2: ...a NON-checkout second 'path: target' step refuses too, never discounted" \
+    "$(_model_target_checkout_ref "$rf_decoy_notck" run)" "<ambiguous>"
+  # (Uniqueness is JOB-scoped, not file-scoped: each shipped lane has a legitimate SECOND target
+  # checkout in its publish job, so a file-wide count would refuse the real workflows. The two
+  # pinned-ref rows above are exactly that proof and stay green.)
 
   # --- [issue #568] publish only ever runs from a snapshot re-attested IN THE FRESH PUBLISHER.
   # The pre-model `trust` step ran before the (tens-of-minutes) model + gate, so the publish/PR

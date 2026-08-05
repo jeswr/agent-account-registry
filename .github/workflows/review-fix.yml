@@ -97,6 +97,10 @@ jobs:
     outputs:
       target_owner: ${{ steps.inputs.outputs.target_owner }}
       target_name: ${{ steps.inputs.outputs.target_name }}
+      # [issue #441] The exact target commit the `policy` step below resolved routing/model_chain/
+      # agent against — consumed by the `run` job's target checkout so the whole decision is bound
+      # to ONE revision. Same invariant worker.yml carries for its lane (issue #143).
+      target_sha: ${{ steps.target_rev.outputs.target_sha }}
       head_branch: ${{ steps.pr.outputs.head_branch }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       base_ref: ${{ steps.pr.outputs.base_ref }}
@@ -236,6 +240,24 @@ jobs:
           repository: ${{ inputs.target_repo }}
           path: target-routing
           persist-credentials: false
+
+      # Bind the whole review/fix decision to ONE target revision (issue #441; the identical
+      # two-unbound-revision defect worker.yml fixed for its lane in #143): routing/model_chain/
+      # agent are resolved from THIS checkout's HEAD, but the `run` job later checked out the
+      # moving default branch and RE-READ the routing metadata from it — so a routing update
+      # landing between the two jobs could run a stale/out-of-policy model+prompt for the rest of
+      # the loop. Export the exact commit SHA the route was resolved against and pin the run job's
+      # target checkout to it. Fails the job when it is not a 40-hex commit sha: a missing/empty
+      # value would make the consumer's `ref:` empty, which actions/checkout silently reads as
+      # "the default branch" — i.e. exactly the unbound revision this step exists to remove.
+      - name: Pin the resolved target routing revision
+        id: target_rev
+        run: |
+          set -euo pipefail
+          sha="$(git -C target-routing rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::resolved target revision is not a 40-hex commit sha'; exit 1; }
+          printf 'target_sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf 'review-fix: routing resolved against target revision %s\n' "$sha"
 
       - name: Snapshot the PR and bind it to registry provenance (fail closed)
         id: pr
@@ -1445,11 +1467,18 @@ jobs:
       # checkout of this same public repository already does. `persist-credentials: false` means
       # NEITHER path leaves a credential in `.git/config`, so `worker-live.sh review`'s one remote
       # git op has always been anonymous and is unchanged by the drop.
-      - name: Checkout target default branch (pinned, no persisted token)
+      # [issue #441] Pinned to the SHA the `resolve` job resolved the route against, NOT the moving
+      # default-branch tip: the `selected` step below re-reads routing metadata from this checkout,
+      # and the review/fix model runs on it, so both must be the exact revision policy + the account
+      # claim were bound to. A routing change that lands after resolve is picked up by the next
+      # dispatch tick, never mid-loop on an already-claimed lease. fetch-depth: 0 makes the SHA
+      # fetchable; worker-live.sh still fetches and switches to the PR head branch itself, and the
+      # branch NAME travels separately as `target_default_branch` for the publish/rebase paths.
+      - name: Checkout target at the resolved routing revision (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ inputs.target_repo }}
-          ref: ${{ steps.target.outputs.default_branch }}
+          ref: ${{ needs.resolve.outputs.target_sha }}
           path: target
           token: ${{ steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token || github.token }}
           fetch-depth: 0
