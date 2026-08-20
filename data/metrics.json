@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-20T12:20:34Z",
+  "generated_at": "2026-08-20T12:41:15Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -46,6 +46,18 @@
     }
   },
   "alerts": [
+    {
+      "target": "sparq-org/sparq",
+      "classification": "backlog-growing",
+      "fire": true,
+      "summary": "open PRs 163 > 40 and net PR flow +1.0/hr (open 1.0 > close 0.0) sustained over 2 snapshots",
+      "metrics": {
+        "prs_open": 163,
+        "net_pr_flow": 1.0,
+        "pr_open_rate": 1.0,
+        "pr_close_rate": 0.0
+      }
+    },
     {
       "target": "sparq-org/sparq",
       "classification": "ready-starved",
