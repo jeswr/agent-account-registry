@@ -2400,7 +2400,7 @@ def _self_test():
     check("PRIVACY: a salt-less run with NOTHING to report adds no spurious warning",
           [line for line in clean_saltless if "PROVENANCE_SALT is unset" in line], [])
 
-    # The CLI contract, driven through main() exactly as groom-sweep.yml drives it: the default REPORTS
+    # The CLI contract, driven through main() exactly as groom-core.yml drives it: the default REPORTS
     # (exit 0 — a skew row must never take the sweep down), and the opt-in gate mode exits
     # non-zero. Both are asserted on the SAME skewed input, so neither can pass by accident.
     import tempfile
@@ -2472,14 +2472,14 @@ def _self_test():
     try:
         import yaml  # lazy, self-test only: a hard self-test-suite dependency already
         from pathlib import Path as _Path
-        groom_path = (_Path(__file__).resolve().parent.parent / ".github" / "workflows" / "groom-sweep.yml")
+        groom_path = (_Path(__file__).resolve().parent.parent / ".github" / "workflows" / "groom-core.yml")
         groom_doc = yaml.safe_load(groom_path.read_text(encoding="utf-8"))
         groom_jobs = groom_doc.get("jobs") or {}
         audit_steps = [(job_name, job, step)
                        for job_name, job in groom_jobs.items()
                        for step in (job.get("steps") or [])
                        if "--audit-catalog" in str(step.get("run", ""))]
-        check("YAML seam: groom-sweep.yml has exactly one step invoking --audit-catalog",
+        check("YAML seam: groom-core.yml has exactly one step invoking --audit-catalog",
               len(audit_steps), 1)
         seam_job_name, seam_job, seam_step = audit_steps[0]
         check("YAML seam: the audit step runs THIS script with the policy file",
@@ -2499,7 +2499,7 @@ def _self_test():
         check("YAML seam: the audit step is not conditioned away by a job-level skip",
               (seam_job_name in groom_jobs, bool(seam_job.get("steps"))), (True, True))
     except Exception as exc:                       # noqa: BLE001 - fail CLOSED, never skip
-        check(f"YAML seam: groom-sweep.yml audit wiring is inspectable ({type(exc).__name__}: {exc})",
+        check(f"YAML seam: groom-core.yml audit wiring is inspectable ({type(exc).__name__}: {exc})",
               False, True)
 
     # DYNAMIC-CONCURRENCY ACCOUNTING: dispatch-claim.py feeds read_accounts output straight into

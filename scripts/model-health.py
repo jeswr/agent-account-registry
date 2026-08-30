@@ -2933,7 +2933,7 @@ def _cmd_decide(args):
     except HealthError as exc:
         # Every ledger reader fails LOUD (review r3, issue #28): an unreadable/missing ledger is
         # the exact outage class this branch exists to surface, so warn-and-exit-0 would hide it.
-        # groom-sweep.yml's decide step is continue-on-error, so the maintenance sweep still completes
+        # groom-core.yml's decide step is continue-on-error, so the maintenance sweep still completes
         # while this step goes visibly red.
         print(f"::error::model-health decide: cannot read ledger ({exc})")
         return 1
@@ -5716,7 +5716,7 @@ def _test_fleet_idle_gate(chk):
 
 def _test_decide_exit(chk):
     """_cmd_decide exits NONZERO when the ledger cannot be read (review r3) — every ledger
-    reader fails LOUD; groom-sweep.yml's continue-on-error keeps the sweep alive while the step
+    reader fails LOUD; groom-core.yml's continue-on-error keeps the sweep alive while the step
     goes red, so this must never be softened back to warn-and-exit-0."""
     import argparse as _ap
     global GitHubAPI
