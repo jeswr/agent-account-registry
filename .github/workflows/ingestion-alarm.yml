@@ -1,7 +1,7 @@
-# [OPUS-5] INDEPENDENT ingestion-rejection alarm (registry #1706).
+# [SPARQ agent] INDEPENDENT ingestion-rejection alarm (registry #1706).
 #
 # WHY A SEPARATE FILE. `ci-latency-alert.py` already classifies this exact condition
-# (`rejected-zero-jobs`), but it is invoked from groom-sweep.yml among others — and on 2026-08-01
+# (`rejected-zero-jobs`), but it is invoked from groom-core.yml among others — and on 2026-08-01
 # groom itself was ingestion-rejected, so the detector went down with the lane it watches.
 # A 9h dispatch outage and a 19h groom outage both passed unnoticed as a result. An alarm
 # whose availability correlates with the fault is worse than none, because auditing "do we
@@ -45,15 +45,27 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          CRITICAL_LANES="dispatch.yml groom-core.yml worker.yml review-fix.yml"
+          no_completed_marker() { printf ' %s(no completed run)' "$1"; }
+
+          # Dependency-free executable seam tests: a typo or future edit that drops the recovery
+          # lane, or that turns an absent run back into a silent pass, fails this alarm itself.
+          [ "$CRITICAL_LANES" = "dispatch.yml groom-core.yml worker.yml review-fix.yml" ]
+          [ "$(no_completed_marker groom-core.yml)" = " groom-core.yml(no completed run)" ]
+
           BAD=""
-          for wf in dispatch.yml groom-sweep.yml worker.yml review-fix.yml; do
+          for wf in $CRITICAL_LANES; do
             # ONLY the latest COMPLETED run. A queued/in-progress run legitimately has no
             # jobs yet, and treating "no jobs YET" as "no jobs EVER" is the exact conflation
             # this alarm exists to detect — the first version made that mistake and flagged a
             # pending dispatch run as rejected.
             id=$(gh api "repos/$REPO/actions/workflows/$wf/runs?per_page=1&status=completed" \
                    -q '.workflow_runs[0].id // empty' || true)
-            [ -z "$id" ] && { echo "$wf: no completed run"; continue; }
+            if [ -z "$id" ]; then
+              echo "$wf: no completed run"
+              BAD="$BAD$(no_completed_marker "$wf")"
+              continue
+            fi
             jobs=$(gh api "repos/$REPO/actions/runs/$id/jobs" -q '.total_count' || echo unknown)
             concl=$(gh api "repos/$REPO/actions/runs/$id" -q '.conclusion // .status' || echo unknown)
             echo "$wf: run=$id conclusion=$concl jobs=$jobs"
@@ -69,7 +81,7 @@ jobs:
             # command-not-found line to stderr. shellcheck sees it (SC2288/SC2027/SC2006), and the
             # required gate runs shellcheck through actionlint, so the mangling was gate-visible.
             printf '%s\n' \
-              "> 🤖 SPARQ agent" "" \
+              "> 🤖 **SPARQ agent** — I am @jeswr's agent for the jeswr/sparq RDF/SPARQL engine. @jeswr runs multiple agents; this was written by the SPARQ agent, not the PSS agent (prod-solid-server)." "" \
               "**Ingestion rejection detected.** These lanes' most recent runs executed ZERO jobs:" "" \
               '```' "$BAD" '```' "" \
               "\`action_required\` + \`jobs=0\` means GitHub created the run and ran nothing — the workflow FILE was refused. This is silent: no failing check, no red, just lanes not running." "" \
