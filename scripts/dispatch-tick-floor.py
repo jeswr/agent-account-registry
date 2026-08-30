@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-5] MINIMUM INTERVAL BETWEEN EXECUTED DISPATCH TICKS (issue #819).
+# [SPARQ agent] MINIMUM INTERVAL BETWEEN EXECUTED DISPATCH TICKS (issue #819).
 #
 # WHAT BROKE. PR #787 cut the PLAN snapshot step from 10m02s to ~1m30s and the whole tick from
 # 15-28 min to ~7 min. That is a real 6.4x and it is NOT being reverted. What it removed by
@@ -17,15 +17,15 @@
 #
 # THE BUDGET ARITHMETIC, and why the constant below is what it is.
 #
-#   requests per executed tick  = 613
+#   historical measured tick    = 613 requests at the old 100-PR census cap
 #       measured 2026-07-27 by the instrumented run recorded in scripts/plan-snapshot.py's module
-#       docstring (issue #721): 613 requests, 28,334 rows, median request 0.843 s, split
-#       23 listings / 116 PR-detail / 474 check-runs.
+#       docstring (issue #721): 23 listings / 116 PR-detail / 474 check-runs.
+#   current cold-cache ceiling  = 23 + (5.9 * 150) = 908 requests at the live 150-PR cap
 #   observed SAFE band          = 4-7 executed ticks/h, i.e. ~2,450-4,291 requests/h,
 #       sustained for the thirteen hours 04Z-17Z above with zero rate-limit failures.
 #   observed BREAKING rate      = 13 executed ticks/h, i.e. ~7,969 requests/h -> 403 at 18:26:17Z.
 #
-# 613 IS NOT A CONSTANT OF NATURE — it scales with the number of WORKER PRs on the target, because
+# 613 WAS NEVER A CONSTANT OF NATURE — cost scales with the number of WORKER PRs on the target,
 # the PR-detail and check-runs legs walk one PR at a time (together ~96% of the requests). Pinning
 # the floor to a single measured total would make it silently wrong the moment the backlog grew,
 # and a backlog spike would become an outage trigger in its own right. So the arithmetic is
@@ -33,23 +33,22 @@
 # function's CEILING rather than at today's backlog.
 #
 # The ceiling exists and is enforced in code, which is what makes this tractable:
-# plan-snapshot.WORKER_PR_STATUS_LIMIT caps per-PR status at 100 worker PRs and degrades the whole
+# plan-snapshot.WORKER_PR_STATUS_LIMIT caps per-PR status at 150 worker PRs and degrades the whole
 # repo to NO prstatus above it (`worker-pr-census-overflow`), so per-tick cost cannot grow past
-# ~613 no matter how far the backlog runs. The instrumented run was taken at, or very near, that
-# cap — sparq carried ~121 open PRs at the time — so the measurement IS the worst case, and a
-# backlog reduction only ever moves the real cost DOWN from it. That is the honest direction for
-# an error in a rate limiter to point.
+# 908 no matter how far the backlog runs. The 613-request run calibrates 5.9 per-PR reads at the
+# former 100-PR cap; extending that conservative model to the live cap prices the state a cold
+# cache can really reach. A backlog reduction only moves the real cost DOWN from that ceiling.
 #
 # So the true ceiling lies somewhere in (4.3k, 8.0k] requests/hour. GitHub does not publish the
 # effective ceiling for this token in this configuration, and `GET /rate_limit` reports a DIFFERENT
 # bucket that reads healthy while every request 403s (issue #796) — so the floor is derived from
 # the OBSERVED band, never from a recalled documented constant.
 #
-#   floor F minutes  =>  at most 60/F executed ticks/h  =>  at most (60/F) * 613 requests/h
-#   F = 10  ->  6 ticks/h  ->  ~3,678 requests/h
+#   floor F minutes  =>  at most 60/F executed ticks/h  =>  at most (60/F) * 908 requests/h
+#   F = 15  ->  4 ticks/h  ->  ~3,632 requests/h
 #
 # which is (a) inside the 4-7 tick/h band that ran clean all day, (b) 46% of the rate that broke
-# it, and (c) exactly the rate the cron alone already schedules (`3,13,23,33,43,53`). That last
+# it, and (c) exactly the rate the cron alone already schedules (`3,18,33,48`). That last
 # equality is the invariant worth stating: THE FLOOR MAKES THE DOORBELL STRUCTURALLY UNABLE TO
 # EXCEED THE SCHEDULE. _test_budget_arithmetic below asserts the multiplication, so the constant
 # cannot drift away from the reasoning that produced it.
@@ -207,7 +206,7 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------------------------
 # THE FLOOR. Derived in the header block above; NOT a tuning knob and deliberately NOT
 # env-overridable (a threshold readable from the workflow is a second place to get it wrong).
-MIN_TICK_INTERVAL_SECONDS = 10 * 60
+MIN_TICK_INTERVAL_SECONDS = 15 * 60
 
 # The instrumented per-tick request count the arithmetic above is built on (issue #721), and the
 # linear model it calibrates. Splits from the same instrumented run: 23 listings (repo-level, does
@@ -217,7 +216,7 @@ SNAPSHOT_LISTING_REQUESTS = 23
 # plan-snapshot.WORKER_PR_STATUS_LIMIT. Duplicated as a plain int rather than imported because
 # this module is loaded in jobs that do not check out plan-snapshot.py; the self-test asserts the
 # two agree whenever that file IS present, so they cannot drift silently.
-WORKER_PR_STATUS_LIMIT = 100
+WORKER_PR_STATUS_LIMIT = 150
 SNAPSHOT_REQUESTS_PER_WORKER_PR = 5.9   # 590 / 100 worker PRs, the cap the run was taken at
 
 
@@ -249,32 +248,36 @@ SHARED_HOURLY_BUDGET = 5000
 # plan-snapshot.py makes the per-PR check-runs reads CONDITIONAL against a cross-tick ETag store,
 # and measured against the live targets 213-222 of 222 of them answer 304 — which does not
 # decrement the bucket — so a warm tick now spends roughly 23 listings + 116 detail + ~19
-# billable check-runs reads, not 613.
+# billable check-runs reads, not the 908-request cold-cache ceiling.
 #
 # The floor is NOT lowered to that number. A cold store is a real state (first tick after a cache
 # eviction, a mass force-push, a restore that finds nothing) and in that state the tick really
-# does cost 613. Admitting a tick at the warm price would let exactly the cold tick through with
+# can cost 908 at the live 150-PR cap. Admitting a tick at the warm price would let exactly the
+# cold tick through with
 # too little budget to finish — reopening the #819 exhaustion this file exists to prevent. An
 # error in a rate limiter must point at spending less, not more, so the gate keeps costing the
 # tick at its ceiling.
 #
 # The WIN is therefore not visible in this constant; it is visible in the number this gate reads.
-# Ticks that spend ~190-200 instead of 613 leave `x-ratelimit-remaining` high, so far more ticks
+# Ticks that spend ~190-200 instead of 908 leave `x-ratelimit-remaining` high, so far more ticks
 # clear the same threshold. (That figure is the UNDER-LOAD one: the 304 rate is ~87-90% when the
 # targets are busy, against 96-100% measured in a quieter window. The conservative number is the
 # one quoted, here and in the PR.) plan-snapshot.py prints the per-tick split ("SNAPSHOT conditional reads:
 # N of M ... billable") so the realised saving is auditable on every tick rather than assumed.
-MEASURED_REQUESTS_PER_TICK = 613
+HISTORICAL_MEASURED_REQUESTS_PER_TICK = 613
+# The live admission price is the conservative cold-cache ceiling at the current census cap.
+# Keep it computed from the model so a cap change cannot leave a plausible stale literal behind.
+COLD_CACHE_REQUESTS_PER_TICK = round(requests_per_tick(WORKER_PR_STATUS_LIMIT))
 # The highest hourly request rate observed to run clean, and the rate that broke. Both are
 # measured, both are asserted against the floor by _test_budget_arithmetic.
-OBSERVED_SAFE_REQUESTS_PER_HOUR = 7 * MEASURED_REQUESTS_PER_TICK      # 10Z: 7 executed ticks
-OBSERVED_BREAKING_REQUESTS_PER_HOUR = 13 * MEASURED_REQUESTS_PER_TICK  # 18Z: 13 executed ticks
+OBSERVED_SAFE_REQUESTS_PER_HOUR = 7 * HISTORICAL_MEASURED_REQUESTS_PER_TICK
+OBSERVED_BREAKING_REQUESTS_PER_HOUR = 13 * HISTORICAL_MEASURED_REQUESTS_PER_TICK
 
 # The artifact whose creation time IS the "this tick executed" record. Uploaded by the floor job
 # itself, immediately after it decides to proceed and before any target read happens.
 TICK_MARKER_ARTIFACT = "dispatch-tick"
-# One page is plenty: at the floor's own ceiling of 6/h with 1-day retention there are at most
-# ~144 of these, and the newest is always on the first page.
+# One page is plenty: at the floor's own ceiling of 4/h with 1-day retention there are at most
+# ~96 of these, and the newest is always on the first page.
 ARTIFACT_PAGE_SIZE = 100
 
 DISPATCH_WORKFLOW = ".github/workflows/dispatch.yml"
@@ -880,7 +883,7 @@ def _test_cron_minute_expansion(chk):
     # ...and the shapes that kept the defect latent still expand exactly as they always did.
     chk("cron: an explicit minute LIST is unchanged (dispatch.yml's own cron — the one shape the "
         "live path exercises, and the reason the defect was latent)",
-        minutes("3,13,23,33,43,53 * * * *"), [3, 13, 23, 33, 43, 53])
+        minutes("3,18,33,48 * * * *"), [3, 18, 33, 48])
     chk("cron: a bare step from :00 is unchanged", minutes("*/10 * * * *"),
         [0, 10, 20, 30, 40, 50])
     chk("cron: a single fixed minute is a single minute", minutes("41 6 * * 1"), [41])
@@ -904,14 +907,14 @@ def _test_cron_minute_expansion(chk):
             "budget invariant vacuously)", _raised(lambda e=expr: minutes(e)), True)
     # THE PARTIALLY-invalid field, which the rows above cannot reach: they are all WHOLLY
     # unreadable, and an expander that merely DISCARDS what it cannot use refuses those anyway by
-    # running out of values. This one keeps six perfectly good minutes — dispatch's own schedule,
-    # exactly — beside a minute the hour does not have, so a discarding expander answers `{3, 13,
-    # 23, 33, 43, 53}` and hands the budget row below the same `(None, 6, True)` it gets from the
-    # real cron. The row would go green on a workflow whose six claimed firings do not exist. :60
+    # running out of values. This one keeps four perfectly good minutes — dispatch's own schedule,
+    # exactly — beside a minute the hour does not have, so a discarding expander answers
+    # `{3, 18, 33, 48}` and hands the budget row below the same shape it gets from the real cron.
+    # The row would go green on a workflow whose four claimed firings do not exist. :60
     # is used by no valid expansion anywhere in this suite, so this cannot pass by collision.
     chk("cron: a minute list that is valid EXCEPT for one impossible atom RAISES — discarding "
-        "the :60 would answer with dispatch's own six minutes and confirm a schedule that never "
-        "fires", _raised(lambda: minutes("3,13,23,33,43,53,60 * * * *")), True)
+        "the :60 would answer with dispatch's own four minutes and confirm a schedule that never "
+        "fires", _raised(lambda: minutes("3,18,33,48,60 * * * *")), True)
     chk("cron: a range whose END runs past :59 RAISES rather than being truncated to :59",
         _raised(lambda: minutes("55-70 * * * *")), True)
     # The one-cron-per-workflow contract this file's own consumer depends on, in both directions.
@@ -950,17 +953,26 @@ def _test_budget_arithmetic(chk):
     measured (see the header); this asserts the MULTIPLICATION, so nobody can quietly halve the
     floor and leave the justification standing."""
     ticks_per_hour = 3600 / MIN_TICK_INTERVAL_SECONDS
-    ceiling = ticks_per_hour * MEASURED_REQUESTS_PER_TICK
-    chk("budget: the floor admits at most 6 executed ticks/hour", ticks_per_hour, 6.0)
-    chk("budget: 6 ticks/h x 613 requests = 3678 requests/h", ceiling, 3678.0)
+    ceiling = ticks_per_hour * COLD_CACHE_REQUESTS_PER_TICK
+    chk("budget: the #2078 live plan is pinned as cap/cold-cost/admission-threshold",
+        (WORKER_PR_STATUS_LIMIT, COLD_CACHE_REQUESTS_PER_TICK, budget_floor()),
+        (150, 908, 1008))
+    chk("budget: the historical evidence remains measured history, not retuned live controls",
+        (HISTORICAL_MEASURED_REQUESTS_PER_TICK, OBSERVED_SAFE_REQUESTS_PER_HOUR,
+         OBSERVED_BREAKING_REQUESTS_PER_HOUR),
+        (613, 4291, 7969))
+    chk("budget: the floor admits at most 4 executed ticks/hour", ticks_per_hour, 4.0)
+    chk("budget: 4 ticks/h x 908 requests = 3632 requests/h", ceiling, 3632.0)
     # The cost model, and the clamp that makes a floor derived from ONE measurement stay valid as
     # the backlog moves. Without the clamp assertion, a growing backlog silently invalidates the
     # arithmetic above and a backlog spike becomes an outage trigger.
-    chk("budget: the cost model reproduces the instrumented measurement at the worker-PR cap",
-        round(requests_per_tick(WORKER_PR_STATUS_LIMIT)), MEASURED_REQUESTS_PER_TICK)
+    chk("budget: the cost model reproduces the 613-request instrumented observation at the old "
+        "100-PR cap", round(requests_per_tick(100)), HISTORICAL_MEASURED_REQUESTS_PER_TICK)
+    chk("budget: the live 150-PR cap is priced at the conservative cold-cache ceiling",
+        round(requests_per_tick(WORKER_PR_STATUS_LIMIT)), COLD_CACHE_REQUESTS_PER_TICK)
     chk("budget: per-tick cost is MONOTONE in the worker-PR count (a bigger backlog is a bigger "
         "tick — the floor is sized at the ceiling, not at today's backlog)",
-        requests_per_tick(20) < requests_per_tick(60) < requests_per_tick(100), True)
+        requests_per_tick(20) < requests_per_tick(60) < requests_per_tick(150), True)
     chk("budget: ... and CLAMPS at the WORKER_PR_STATUS_LIMIT census overflow, so no backlog can "
         "push a tick past the measured worst case",
         (requests_per_tick(500), requests_per_tick(5000)),
@@ -1004,8 +1016,8 @@ def _test_floor_predicate(chk):
     floor = MIN_TICK_INTERVAL_SECONDS
     chk("floor: a tick 3 min after the last executed tick HOLDS",
         decide(now - 3 * 60, now)[0], "hold")
-    chk("floor: a tick 11 min after the last executed tick RUNS",
-        decide(now - 11 * 60, now)[0], "run")
+    chk("floor: a tick 16 min after the last executed tick RUNS",
+        decide(now - 16 * 60, now)[0], "run")
     chk("floor: EXACTLY at the floor runs; one second inside it holds (the comparison is `<`, and "
         "an off-by-one here is either a stalled pipeline or an unbounded one)",
         (decide(now - floor, now)[0], decide(now - floor + 1, now)[0]), ("run", "hold"))
@@ -1048,8 +1060,8 @@ def _test_preflight_budget_predicate(chk):
     # this ONE repository, of which dispatch was 52. Every one of them spends from this bucket.
     chk("preflight: the wall-clock floor's own hourly ceiling is a MAJORITY of the whole SHARED "
         "bucket, so no constant can be safe — the other ~356 runs/h in this repository can empty "
-        "it inside a legal 6-tick hour, which is why the gate reads the LIVE remaining budget",
-        ((3600 // MIN_TICK_INTERVAL_SECONDS) * MEASURED_REQUESTS_PER_TICK
+        "it inside a legal 4-tick hour, which is why the gate reads the LIVE remaining budget",
+        ((3600 // MIN_TICK_INTERVAL_SECONDS) * COLD_CACHE_REQUESTS_PER_TICK
          > SHARED_HOURLY_BUDGET // 2), True)
     chk("preflight: ... and the gate's threshold is a small fraction of that bucket, so the gate "
         "throttles dispatch rather than reserving the bucket for it",
@@ -1160,8 +1172,8 @@ def _test_an_unaffordable_tick_issues_no_snapshot_requests(chk):
         store.append({"name": TICK_MARKER_ARTIFACT,
                       "created_at": datetime.fromtimestamp(clock["now"], tz=timezone.utc)
                       .strftime("%Y-%m-%dT%H:%M:%SZ")})
-        snapshot_calls["n"] += MEASURED_REQUESTS_PER_TICK
-        budget["remaining"] -= MEASURED_REQUESTS_PER_TICK
+        snapshot_calls["n"] += COLD_CACHE_REQUESTS_PER_TICK
+        budget["remaining"] -= COLD_CACHE_REQUESTS_PER_TICK
         return "executed"
 
     chk("unaffordable: a tick with a full budget executes", tick(), "executed")
@@ -1171,7 +1183,7 @@ def _test_an_unaffordable_tick_issues_no_snapshot_requests(chk):
     baseline = snapshot_calls["n"]
     chk("unaffordable: past the wall-clock floor but with an EMPTY bucket, the tick DEFERS",
         tick(), "noop-budget")
-    chk("unaffordable: ... and it issued ZERO snapshot requests (it spent 1, not 613)",
+    chk("unaffordable: ... and it issued ZERO snapshot requests (it spent 1, not a cold tick)",
         snapshot_calls["n"] - baseline, 0)
     anchor_before = len(store)
     for _ in range(9):
@@ -1237,7 +1249,7 @@ def _test_a_too_soon_tick_issues_no_snapshot_requests(chk):
         store.append({"name": TICK_MARKER_ARTIFACT,
                       "created_at": datetime.fromtimestamp(clock["now"], tz=timezone.utc)
                       .strftime("%Y-%m-%dT%H:%M:%SZ")})
-        snapshot_calls["n"] += MEASURED_REQUESTS_PER_TICK   # PLAN's 613 authenticated reads
+        snapshot_calls["n"] += COLD_CACHE_REQUESTS_PER_TICK  # PLAN's cold-cache ceiling
         return "executed"
 
     first = tick()
@@ -1267,10 +1279,10 @@ def _test_a_too_soon_tick_issues_no_snapshot_requests(chk):
         if tick() == "executed":
             executed += 1
         clock["now"] += 30
-    chk("regression: a doorbell ringing every 30 s for an hour executes at most 6 ticks",
-        executed <= 6, True)
-    chk("regression: ... i.e. at most 3678 snapshot requests in that hour",
-        snapshot_calls["n"] <= 3678, True)
+    chk("regression: a doorbell ringing every 30 s for an hour executes at most 4 ticks",
+        executed <= 4, True)
+    chk("regression: ... i.e. at most 3632 snapshot requests in that hour",
+        snapshot_calls["n"] <= 3632, True)
 
 
 def _test_live_path(chk):

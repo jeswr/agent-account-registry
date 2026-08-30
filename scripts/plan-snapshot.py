@@ -169,17 +169,15 @@ CHECK_RUN_PAGE_LIMIT = 40
 # for 20h+, so the backlog grew unchecked and the WHOLE repo degraded to no prstatus.
 #
 # ⚠️ THIS IS NOT FREE, and the number to watch is the SHARED budget, not this constant. The
-# PR-detail + check-runs legs walk one PR at a time (~4.9 requests/PR measured at 121 PRs), so
-# per-tick cost scales linearly with this limit:
+# PR-detail + check-runs legs walk one PR at a time. The dispatch floor deliberately prices the
+# cold-cache ceiling with its older, more conservative 5.9 requests/PR calibration:
 #
-#     limit=100  ~ 511 req/tick   6 ticks/hr =  61% of the 5,000/hr repo-wide budget
-#     limit=150  ~ 755 req/tick   6 ticks/hr =  91%   <- HERE
+#     limit=100  = 613 req/tick   (the 2026-07-27 instrumented observation)
+#     limit=150  = 908 req/tick   4 ticks/hr = 73% of the 5,000/hr shared budget <- HERE
 #
-# 91% leaves almost no room for the ~350 other workflow runs/hr that share the same bucket, and
-# budget exhaustion is what the dispatch floor (#819) exists to prevent. So this raise BORROWS
-# against the floor: either the floor lengthens (6 -> ~4 ticks/hr), or #1303 lands (moves the
-# check-runs walk to GraphQL, ~613 -> ~139/tick) and the cost problem disappears entirely.
-# #1303 is the real fix; this is the stopgap that keeps sparq dispatching meanwhile.
+# The live floor is therefore 15 minutes (four ticks/hour): 4*908=3,632/h, below the historical
+# 4,291/h rate that ran clean. #1303 (moving the check-runs walk to GraphQL) remains the real cost
+# fix; this is the conservative stopgap that keeps the 150-PR census internally budgeted.
 WORKER_PR_STATUS_LIMIT = 150
 WORKER_HEAD_PREFIX = "sparq-agent/"
 MERGEABLE_POLL_ATTEMPTS = 3

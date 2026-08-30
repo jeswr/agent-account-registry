@@ -4859,8 +4859,8 @@ def _self_test():
                          dispatch_workflow)),
           True)
     check("[#922] the dispatch threshold clears the tick floor with a whole missed tick of slack "
-          "(a threshold at or under the floor would kick a perfectly healthy held dispatcher)",
-          keepalive_specs["dispatch.yml"][0] >= 2 * tick_floor.MIN_TICK_INTERVAL_SECONDS, True)
+          "(exactly two floor intervals: less kicks a healthy hold; more delays recovery)",
+          keepalive_specs["dispatch.yml"][0], 2 * tick_floor.MIN_TICK_INTERVAL_SECONDS)
 
     # --- #680: a keepalive threshold is a CADENCE CONTROL, not a courtesy. Measured over the 7
     # days to 2026-07-25 GitHub delivered only ~60% of this fleet's scheduled fires, and this leg

@@ -1,6 +1,6 @@
 name: account-fleet dashboard
 
-# [OPUS-5] THE PUBLISH PATH (#656 follow-up). metrics.yml CAS-publishes the current throughput
+# [SPARQ agent] THE PUBLISH PATH (#656 follow-up). metrics.yml CAS-publishes the current throughput
 # snapshot to ledger:data/metrics.json, and THIS workflow is the only thing that copies it into Pages
 # artifact (`cp ledger/data/metrics.json site/metrics.json` in `build`). While the two ran on
 # INDEPENDENT crons, a fresh snapshot had to wait for the dashboard's next fire and then for the
@@ -471,14 +471,14 @@ jobs:
           # PROCEED (scripts/dispatch-tick-floor.py TICK_MARKER_ARTIFACT), before the snapshot
           # runs — so a tick that later FAILS still counts as executed, and a no-op tick has no
           # marker at all. It is the same executed-tick anchor scripts/dispatch-stall-alert.py
-          # keys on, and it is what makes the kick CURATIVE here: a >1200s gap can only mean the
-          # 600s floor is not the thing holding ticks back, so the run this kick starts finds a
+          # keys on, and it is what makes the kick CURATIVE here: a >1800s gap can only mean the
+          # 900s floor is not the thing holding ticks back, so the run this kick starts finds a
           # stale anchor, proceeds, and executes the tick that was missing.
           #
           # This leg is NOT retired in favour of that watchdog: dispatch-stall-alert PAGES A HUMAN,
           # the keepalive RE-DISPATCHES. Losing it would turn every cron-delivery gap on the
           # busiest workflow in the fleet into a manual recovery.
-          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200:dispatch-tick groom-sweep.yml:1800 retriage.yml:3600; do
+          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1800:dispatch-tick groom-sweep.yml:1800 retriage.yml:3600; do
             wf="${spec%%:*}"; rest="${spec#*:}"; limit="${rest%%:*}"
             if [ "$rest" != "$limit" ]; then marker="${rest#*:}"; else marker=""; fi
             # LIVE-RUN GUARD (#559): a QUEUED or IN_PROGRESS run of the target counts as FRESH —

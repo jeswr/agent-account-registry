@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-5] WATCH THE DISPATCHER — alarm on the CONDITION (a stalled pipeline), not on the run
+# [SPARQ agent] WATCH THE DISPATCHER — alarm on the CONDITION (a stalled pipeline), not on the run
 # (issue #819).
 #
 # THE DEFECT THIS EXISTS FOR. dispatch.yml already carries a per-run failure alert: the `plan-alert`
@@ -80,31 +80,31 @@ ALERT_LABEL = "ops-alert"
 STREAK_ALERT_TITLE = ("⚠️ The dispatch pipeline is STALLED — consecutive executed ticks are "
                       "failing and nothing is being dispatched")
 STREAK_ALERT_MARKER = "<!-- dispatch-stall-alert:v1 key=dispatch-failure-streak -->"
-# Three. At the #819 tick floor's ceiling of six executed ticks/hour this is ~30 minutes of a dead
-# pipeline — comfortably inside the 45-minute staleness threshold below, so the faster signal
-# really is the faster one (asserted by _test_thresholds_agree_with_the_floor). Two would page on
-# an unlucky pair of transients; four would put this behind (B) and make it dead weight.
+# Three. At the #819 tick floor's ceiling of four executed ticks/hour this is ~45 minutes of a dead
+# pipeline. Preserve the established three-consecutive-failure evidence bar; the staleness window
+# below moves to 60 minutes so this signal remains strictly faster without paging on a transient
+# pair (asserted by _test_thresholds_agree_with_the_floor).
 FAILURE_STREAK_THRESHOLD = 3
 
 # --- (B) the PLAN-STALENESS alert ---------------------------------------------------------------
 STALE_ALERT_TITLE = ("⚠️ The dispatch pipeline has not completed a PLAN — the issue drain and the "
                      "review loop have stopped")
 STALE_ALERT_MARKER = "<!-- dispatch-stall-alert:v1 key=dispatch-plan-stale -->"
-# 45 minutes. NOT a tuning knob and deliberately NOT env-overridable (a threshold readable from the
+# 60 minutes. NOT a tuning knob and deliberately NOT env-overridable (a threshold readable from the
 # workflow is a second place to get it wrong, and this alert is permitted to page a human). Sizing:
-# >= 3 dispatch cron periods (the cron is `3,13,23,33,43,53`, i.e. 10 min), and the host workflow
-# fires every 15 min so at least three deliveries land inside the window.
+# >= 4 dispatch cron periods (the cron is `3,18,33,48`, i.e. 15 min), and the host workflow
+# fires every 15 min so at least four deliveries land inside the window.
 # _test_threshold_vs_cadence asserts both, against the LIVE workflow files, so neither side can
 # drift silently.
-STALE_THRESHOLD_SECONDS = 45 * 60
+STALE_THRESHOLD_SECONDS = 60 * 60
 
 # --- (C) the RING-EFFICIENCY metric (issue #1326) ----------------------------------------------
 RING_ALERT_TITLE = ("⚠️ The dispatcher is mostly administering itself — dispatch RUNS per EXECUTED "
                     "tick is far above what the tick floor can ever admit")
 RING_ALERT_MARKER = "<!-- dispatch-stall-alert:v1 key=dispatch-ring-efficiency -->"
 # THE THRESHOLD, DERIVED — not chosen. The #819 floor admits at most
-# `3600 / MIN_TICK_INTERVAL_SECONDS` = 6 executed ticks/hour, and dispatch's cron fires exactly 6
-# times/hour (`3,13,23,33,43,53`). Those two numbers being EQUAL is the whole derivation: a
+# `3600 / MIN_TICK_INTERVAL_SECONDS` = 4 executed ticks/hour, and dispatch's cron fires exactly 4
+# times/hour (`3,18,33,48`). Those two numbers being EQUAL is the whole derivation: a
 # dispatcher rung only by its own schedule sits at a ratio of ~1.0, because every scheduled ring
 # lands on the floor boundary. `_test_ring_threshold_is_derived_from_the_floor` asserts that
 # equality against the LIVE floor constant and the LIVE cron, so a change to either side reds this
@@ -121,9 +121,11 @@ RING_ALERT_MARKER = "<!-- dispatch-stall-alert:v1 key=dispatch-ring-efficiency -
 # well under both measurements — asserted, in both directions, below.
 RING_RUNS_PER_EXECUTED_TICK_THRESHOLD = 3
 # Minimum concluded runs in the window before the ratio is allowed to mean anything. At the cron's
-# 6/hour this is two hours of evidence; below it a single slow tick swings the ratio by a whole
-# point and the alarm would be reporting noise. Under the sample the verdict is `unknown`, which
-# `decide` reads as "do nothing" — it never pages AND never closes a live alert.
+# 4/hour this is three hours of evidence; preserving the 12-run sample avoids weakening the
+# evidence bar merely because the dispatcher is now scheduled less often. Below it a slow tick
+# can swing the ratio materially and the alarm would be reporting noise.
+# Under the sample the verdict is `unknown`, which `decide` reads as "do nothing" — it never pages
+# AND never closes a live alert.
 RING_MIN_RUNS = 12
 
 # The artifacts the halves key on. Both are written by dispatch.yml and by nothing else.
@@ -806,8 +808,8 @@ def _test_plan_staleness(chk):
         stale_verdict(newest_plan_epoch(page(90)), now)[0], "stale")
     chk("stale: EXACTLY at the threshold is fresh; one second past it is stale (the comparison is "
         "`>`, and an off-by-one here is a page or a blind spot)",
-        (stale_verdict(newest_plan_epoch(page(45)), now)[0],
-         stale_verdict(newest_plan_epoch(page(45)), now + 1)[0]), ("fresh", "stale"))
+        (stale_verdict(newest_plan_epoch(page(60)), now)[0],
+         stale_verdict(newest_plan_epoch(page(60)), now + 1)[0]), ("fresh", "stale"))
     chk("stale: an EXPIRED artifact does not count as a completed PLAN",
         stale_verdict(newest_plan_epoch(page(5, expired=True)), now)[0], "stale")
     chk("stale: a `dispatch-tick` marker is NOT a completed PLAN (an executed tick that then died "
@@ -934,7 +936,7 @@ def _test_thresholds_agree_with_the_floor(chk):
     floor = _load_floor()
     streak_seconds = FAILURE_STREAK_THRESHOLD * floor.MIN_TICK_INTERVAL_SECONDS
     chk("thresholds: the failure streak is reachable strictly sooner than the staleness threshold",
-        (streak_seconds, streak_seconds < STALE_THRESHOLD_SECONDS), (1800, True))
+        (streak_seconds, streak_seconds < STALE_THRESHOLD_SECONDS), (2700, True))
 
 
 def _test_ring_threshold_is_derived_from_the_floor(chk):
@@ -948,25 +950,27 @@ def _test_ring_threshold_is_derived_from_the_floor(chk):
     cron_per_hour = 60 // _cron_period_minutes(_load_workflow(DISPATCH_WORKFLOW))
     chk("ring/floor: the schedule alone rings at EXACTLY the rate the floor can admit, which is "
         "what makes 1.0 the healthy ratio the threshold is a multiple of",
-        (ceiling_per_hour, cron_per_hour, ceiling_per_hour == cron_per_hour), (6, 6, True))
+        (ceiling_per_hour, cron_per_hour, ceiling_per_hour == cron_per_hour), (4, 4, True))
     chk("ring/floor: the threshold keeps real headroom over that structural ideal, and still fires "
         "well below both measured pathologies (8.2 in #1208, 13.5 in #1326) — a threshold set AT "
         "the measured pathology can never catch the drift toward it",
         (RING_RUNS_PER_EXECUTED_TICK_THRESHOLD > 1,
          RING_RUNS_PER_EXECUTED_TICK_THRESHOLD < 8), (True, True))
-    chk("ring/floor: the minimum sample spans at least two hours of the schedule, so one slow "
-        "tick cannot swing the published ratio", RING_MIN_RUNS >= 2 * cron_per_hour, True)
+    chk("ring/floor: the minimum sample spans at least three hours of the schedule, so one slow "
+        "tick cannot swing the published ratio", RING_MIN_RUNS >= 3 * cron_per_hour, True)
+    chk("ring/floor: the conservative sample remains exactly 12 concluded runs",
+        RING_MIN_RUNS, 12)
 
 
 def _test_threshold_vs_cadence(chk):
     """Both sides of the delivery contract, against the LIVE workflow files."""
     dispatch_period = _cron_period_minutes(_load_workflow(DISPATCH_WORKFLOW))
     groom_period = _cron_period_minutes(_load_workflow(GROOM_WORKFLOW))
-    chk("cadence: the staleness threshold is at least 3 dispatch cron periods",
-        (dispatch_period, STALE_THRESHOLD_SECONDS // 60 >= 3 * dispatch_period), (10, True))
-    chk("cadence: the HOST workflow fires at least three times inside the threshold (a watchdog "
+    chk("cadence: the staleness threshold is at least 4 dispatch cron periods",
+        (dispatch_period, STALE_THRESHOLD_SECONDS // 60 >= 4 * dispatch_period), (15, True))
+    chk("cadence: the HOST workflow fires at least four times inside the threshold (a watchdog "
         "that runs less often than its own threshold cannot deliver on it)",
-        (groom_period, 3 * groom_period <= STALE_THRESHOLD_SECONDS // 60), (15, True))
+        (groom_period, 4 * groom_period <= STALE_THRESHOLD_SECONDS // 60), (15, True))
 
 
 def _test_page_coverage(chk):
