@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-08-30T11:43:21Z",
+  "generated_at": "2026-08-30T11:58:25Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 2170,
+      "issues_open": 2171,
       "issues_ready": 239,
       "issues_closed_1h": 0,
       "issues_closed_24h": 1,
