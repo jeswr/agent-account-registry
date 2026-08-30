@@ -1,0 +1,52 @@
+# [SPARQ agent] Minimal default-branch recovery lane for #2076. This deliberately starts from the
+# known-ingesting groom-leases.yml shape after both groom-sweep.yml and the independently extracted
+# groom-core.yml were rejected before job creation. It runs the real registry/ledger repair sweep
+# without target App credentials: registry-state recovery proceeds, while unavailable target
+# issue/PR repair is logged and skipped. Add credential-bearing target repair only after this
+# exact default-branch workflow has proved that GitHub creates and runs its job.
+name: groom-recovery-minimal
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: groom-recovery-minimal-singleton
+  cancel-in-progress: false
+
+jobs:
+  groom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      REGISTRY_GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout the data-plane ledger branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ledger
+          ref: ledger
+          persist-credentials: false
+
+      - name: Assert the ledger branch is still data-only
+        run: python3 scripts/ledger-invariant.py ledger
+
+      - name: Repair registry and ledger orchestration state
+        run: |
+          set -euo pipefail
+          printf '::add-mask::%s\n' "$REGISTRY_GH_TOKEN"
+          python3 scripts/groom.py \
+            --registry-repo "$GITHUB_REPOSITORY" \
+            --policy-file policy/repos.toml \
+            --policy-resolver scripts/policy-resolve.py \
+            --ledger-root ledger
