@@ -2,7 +2,7 @@
 # [OPUS-5] A DURABLE CREDENTIAL GAP ON ONE OWNER MUST NOT LOOK LIKE A GREEN TICK (issue #269).
 #
 # THE DEFECT THIS EXISTS FOR. The issue #168 fix made each per-owner target App-token mint in
-# groom.yml `continue-on-error`, and that is correct: policy enables targets under two distinct
+# groom-sweep.yml `continue-on-error`, and that is correct: policy enables targets under two distinct
 # owners, and one owner's missing install must never abort the sweep before dead leases are
 # released. groom.py then resolves the token for each target repo's OWNER and, finding none,
 # DEFERS that owner's issue/PR repair with a log line:
@@ -24,7 +24,7 @@
 # `success` either way). Step conclusions cannot be trusted to express it (whether the REST jobs
 # endpoint reports `failure` for a step that failed under `continue-on-error` is an undocumented
 # detail, and a detector that silently reads "healthy" if that guess is wrong is a fail-OPEN
-# detector — the one kind this repo may not ship). So groom.yml records it itself, in the one
+# detector — the one kind this repo may not ship). So groom-sweep.yml records it itself, in the one
 # place a listing can read without downloading anything and without a token: the artifact NAME.
 #
 #     groom-mint-tick ( .ok-<owner> | .skip-<owner> )*
@@ -37,7 +37,7 @@
 # RECOVERY observable: an owner that starts minting again — or that is dropped from the workflow
 # entirely — stops appearing in any skip set on the newest tick, which is the close signal.
 #
-# WHERE IT IS HOSTED. groom.yml, as its own job with NO `needs:` and NO `if:`, exactly like the
+# WHERE IT IS HOSTED. groom-sweep.yml, as its own job with NO `needs:` and NO `if:`, exactly like the
 # `metrics-stale` and `dispatch-stall` watchdogs it sits beside and for the same reason: a watchdog
 # suppressed by the failure of the sweep it shares a workflow file with is not a watchdog. The cost
 # of that choice is bounded and stated — the job runs CONCURRENTLY with the sweep, so this tick's
@@ -53,7 +53,7 @@
 # PRIVACY. The alert body names an OWNER LOGIN (`sparq-org`, `jeswr`) and nothing else that is not
 # a machine-derived integer or a run URL. That is not an account handle in the locked-decision-22
 # sense: owner logins are already public in this repo's `policy/repos.toml`, already teed into this
-# very run log by groom.yml's own per-owner repo resolve, and already printed by groom.py's skip
+# very run log by groom-sweep.yml's own per-owner repo resolve, and already printed by groom.py's skip
 # line. No provider account handle, no token, and no byte of any remote payload can reach a body
 # here — so the registry-repo fallback in _alert_route is safe.
 #
@@ -70,7 +70,7 @@ from urllib.parse import quote
 
 ALERT_LABEL = "ops-alert"
 
-# The artifact-name grammar. Written by groom.yml's `mint-marker` step and by nothing else; both
+# The artifact-name grammar. Written by groom-sweep.yml's `mint-marker` step and by nothing else; both
 # halves are asserted against the LIVE workflow by _test_workflow_seam, so a rename on either side
 # reds instead of silently emptying the detector.
 TICK_MARKER_PREFIX = "groom-mint-tick"
@@ -91,7 +91,7 @@ OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 #     ONE tick; two would page on an unlucky pair, which is the noise the paging policy forbids.
 #   - upper bound: this is a credential gap, not a stall — nothing recovers it without a human, so
 #     a threshold past a couple of hours only delays the page it was always going to send.
-# _test_threshold_vs_cadence asserts both against the LIVE cron in groom.yml.
+# _test_threshold_vs_cadence asserts both against the LIVE cron in groom-sweep.yml.
 SKIP_STREAK_THRESHOLD = 4
 
 ARTIFACT_PAGE_SIZE = 100
@@ -124,7 +124,7 @@ ALERT_MARKER_PREFIX = "<!-- groom-mint-alert:v1 key=groom-mint-gap owner="
 ALERT_MARKER_RE = re.compile(
     re.escape(ALERT_MARKER_PREFIX) + r"([A-Za-z0-9][A-Za-z0-9-]{0,38}) -->")
 
-GROOM_WORKFLOW = ".github/workflows/groom.yml"
+GROOM_WORKFLOW = ".github/workflows/groom-sweep.yml"
 HOST_JOB = "mint-gap"
 GROOM_JOB = "groom"
 MARKER_STEP_ID = "mint-marker"
@@ -556,7 +556,7 @@ def main():
     run_url = os.environ.get("RUN_URL", "")
     maintainer = os.environ.get("MAINTAINER_HANDLE", "jeswr")
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-    workflow_url = f"{server}/{registry_repo}/actions/workflows/groom.yml"
+    workflow_url = f"{server}/{registry_repo}/actions/workflows/groom-sweep.yml"
 
     ticks, truncated = read_ticks(registry_repo)
     if ticks is None:
@@ -865,7 +865,7 @@ def _test_provenance(chk):
     chk("provenance: ONE runs listing per allowed event, scoped to the groom workflow FILE, the "
         "default branch and that event",
         (read_tick_runs("o/r", FIXTURE_BRANCH, capture({"workflow_runs": []})), asked),
-        ({}, ["/repos/o/r/actions/workflows/groom.yml/runs"
+        ({}, ["/repos/o/r/actions/workflows/groom-sweep.yml/runs"
               f"?per_page={RUN_PAGE_SIZE}&branch={FIXTURE_BRANCH}&event={event}"
               for event in ALLOWED_TICK_EVENTS]))
     chk("provenance: a REFUSED runs listing is None, never an empty (permissive) run set",
@@ -1210,7 +1210,7 @@ def _test_readers(chk):
         chk("reader: read_ticks with NO injected runner goes through the real gh api reader for "
             "the repo, the groom RUNS listing and the artifacts listing",
             (seen and seen[0][:2], urls[0] if urls else None,
-             any("/actions/workflows/groom.yml/runs?" in url and f"branch={FIXTURE_BRANCH}" in url
+             any("/actions/workflows/groom-sweep.yml/runs?" in url and f"branch={FIXTURE_BRANCH}" in url
                  for url in urls),
              any("/repos/o/r/actions/artifacts" in url for url in urls),
              [sorted(skip) for _ok, skip in ticks]),
@@ -1510,7 +1510,7 @@ def _test_authority_ceiling(chk):
 
 def _test_threshold_vs_cadence(chk):
     """CROSS-FILE, against the LIVE cron. The threshold is denominated in TICKS; how long N ticks
-    take is set entirely by groom.yml's schedule. Retuning that cron without touching this file
+    take is set entirely by groom-sweep.yml's schedule. Retuning that cron without touching this file
     would silently move the page latency by hours in either direction."""
     period = _cron_period_minutes(_load_workflow(GROOM_WORKFLOW))
     gap_minutes = SKIP_STREAK_THRESHOLD * period

@@ -52,7 +52,7 @@ jobs:
       - name: Install the self-test's YAML parser
         run: python3 -m pip install --disable-pip-version-check pyyaml
 
-      # Reuse the same authoritative policy-derived per-owner target scopes as groom.yml and
+      # Reuse the same authoritative policy-derived per-owner target scopes as groom-sweep.yml and
       # conflict-resolver.yml, so a new policy owner cannot silently fall out of this sweep.
       - name: Resolve enabled target repos per owner from policy
         id: owners

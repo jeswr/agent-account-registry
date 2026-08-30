@@ -130,7 +130,7 @@ jobs:
   # [OPUS-5] WATCH THE WATCHER, half (a): the metrics JOB-FAILURE alert.
   #
   # MEASURED job census across the crons: dispatch.yml = {plan, secrets-guard, claim, plan-alert};
-  # groom.yml = {groom, groom-alert}; metrics.yml = {metrics, dashboard-publish}. This workflow was
+  # groom-sweep.yml = {groom, groom-alert}; metrics.yml = {metrics, dashboard-publish}. This workflow was
   # the ONLY cron in the estate with no failure alert, and it is the worst possible one to leave
   # unwatched: it is the sole evaluator of every backlog-vs-drain alert rule and the sole writer of
   # ledger:data/metrics.json. When the `metrics` job dies, the ledger keeps its last good content,
@@ -149,7 +149,7 @@ jobs:
   # job RESULT, so no token, ledger content or account data reaches it.
   #
   # This half CANNOT catch a metrics job that never ran (there is no failed job to key on). That is
-  # what groom.yml's `metrics-stale` job is for — deliberately in a DIFFERENT workflow on an
+  # what groom-sweep.yml's `metrics-stale` job is for — deliberately in a DIFFERENT workflow on an
   # INDEPENDENT schedule, because a workflow cannot detect its own non-execution.
   metrics-alert:
     name: ALERT (hard METRICS-job failure)
@@ -165,7 +165,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # SECRET-EXFIL GUARD (issue #101): this job reads ALERT_TOKEN/ALERT_REPO (the private-alert
-    # routing secrets), so — like the `metrics` job above and groom.yml's `groom-alert` — it is
+    # routing secrets), so — like the `metrics` job above and groom-sweep.yml's `groom-alert` — it is
     # bound to the default-branch-only `dispatch-secrets` environment where those secrets live. It
     # only ever runs from the default branch (schedule/workflow_dispatch), so the branch policy
     # never starves it.
@@ -193,7 +193,7 @@ jobs:
             scripts/metrics-alert.py
             scripts/metrics.py
             .github/workflows/metrics.yml
-            .github/workflows/groom.yml
+            .github/workflows/groom-sweep.yml
           sparse-checkout-cone-mode: false
 
       - name: Alert maintainer that the scheduled METRICS job hard-failed

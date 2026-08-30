@@ -53,7 +53,7 @@ The literal string "ONLY when `ALERT_TOKEN` can write there" appears at **eleven
   `dispatch-stall-alert.py:157` (docstrings); `plan-alert.py:9`, `groom-alert.py:12` (headers);
   `usage-alert.py:404` (inline).
 - **Workflow YAML** — `metrics.yml:200`, `dispatch.yml:2205`, `dispatch.yml:2286`,
-  `groom.yml:748`.
+  `groom-sweep.yml:748`.
 
 Two more sites say "only when `ALERT_TOKEN` **is present**" — `triage-stock-alert.py:393`,
 `park-stock-alert.py:198` — which is accurate. So the correct wording already exists in the tree;
@@ -97,7 +97,7 @@ The DEBT notes also understate the migration. They call it "a one-line import sw
 **(a) Single-file sparse checkouts.** Two live alert jobs check out exactly one file:
 
 ```yaml
-# .github/workflows/dispatch.yml:2271        # .github/workflows/groom.yml:736
+# .github/workflows/dispatch.yml:2271        # .github/workflows/groom-sweep.yml:736
 sparse-checkout: scripts/plan-alert.py       sparse-checkout: scripts/groom-alert.py
 sparse-checkout-cone-mode: false             sparse-checkout-cone-mode: false
 ```

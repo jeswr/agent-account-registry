@@ -31,7 +31,7 @@ separate branch:
   — which `GITHUB_TOKEN` never has** (platform-enforced, on every branch). An actor with a
   workflow-scoped PAT (the repo owner) can already push arbitrary workflows to any unprotected
   branch repo-wide, so `ledger` adds zero net-new execution surface. Defense-in-depth on top:
-  every master's reader workflow and scheduled `groom.yml` run that same validator immediately
+  every master's reader workflow and scheduled `groom-sweep.yml` run that same validator immediately
   after checkout, before consuming ledger content. (A path-restriction push ruleset
   would be stronger still, but push rulesets are not available on a user-owned repo plan.)
 
@@ -39,7 +39,7 @@ Every reader/writer pins the ref via the `LEDGER_REF` constant
 (`REGISTRY_LEDGER_REF` env override, default `ledger`) in `scripts/select-and-claim.py`,
 `scripts/groom.py`, `scripts/model-health.py`, `scripts/metrics.py`, and `scripts/worker-pr.py` (provenance +
 verdict record writes, issue #96); workflow-side readers use an explicit `ref: ledger`
-checkout (`dispatch.yml` PLAN + CLAIM, `review-fix.yml` resolve + run, `groom.yml`,
+checkout (`dispatch.yml` PLAN + CLAIM, `review-fix.yml` resolve + run, `groom-sweep.yml`,
 `dashboard.yml`). Record readers consult the ledger checkout FIRST and fall back to the
 master-checkout copy so pre-outage records stay visible. Readers fail LOUD if the `ledger`
 branch is missing — never silently-empty.

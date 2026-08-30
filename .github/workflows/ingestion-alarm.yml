@@ -1,7 +1,7 @@
 # [OPUS-5] INDEPENDENT ingestion-rejection alarm (registry #1706).
 #
 # WHY A SEPARATE FILE. `ci-latency-alert.py` already classifies this exact condition
-# (`rejected-zero-jobs`), but it is invoked from groom.yml among others — and on 2026-08-01
+# (`rejected-zero-jobs`), but it is invoked from groom-sweep.yml among others — and on 2026-08-01
 # groom itself was ingestion-rejected, so the detector went down with the lane it watches.
 # A 9h dispatch outage and a 19h groom outage both passed unnoticed as a result. An alarm
 # whose availability correlates with the fault is worse than none, because auditing "do we
@@ -46,7 +46,7 @@ jobs:
         run: |
           set -euo pipefail
           BAD=""
-          for wf in dispatch.yml groom.yml worker.yml review-fix.yml; do
+          for wf in dispatch.yml groom-sweep.yml worker.yml review-fix.yml; do
             # ONLY the latest COMPLETED run. A queued/in-progress run legitimately has no
             # jobs yet, and treating "no jobs YET" as "no jobs EVER" is the exact conflation
             # this alarm exists to detect — the first version made that mistake and flagged a
