@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2085,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bd38c7e557efd7b51649409aa34f2addb7b9df5c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2 says `RETENTION_CEILING_RECORDS = 2000` therefore becomes a lower bound on steady-state requests. It is a ceiling on retained record count, not a floor: ordinary windows may contain far fewer records, and the byte ceiling can reduce the retained count further. The pagination-at-2,000 conclusion is therefore not established from this constant. This is central quantitative support for rejecting option A, so merely flagging the external API details as MUST-VERIFY does not cure the internal bound reversal.",
+    "file": "research/427-model-health-per-run-records.md",
+    "fix_hint": "Describe the request count as 1+N for N retained shards, with 2,000 at most a record-count upper bound under the stated ceiling (and separately account for any preservation behavior or byte cap). Use measured record rates/window sizes, or explicitly present scenarios, before claiming a steady-state pagination boundary.",
+    "severity": "major",
+    "title": "Retention ceiling is incorrectly treated as a lower bound on read requests"
+   },
+   {
+    "body": "Option B recommends a compactor that folds tail shards into the base and then deletes them, while readers fetch both. Those operations are not atomic. A reader can fetch the new base before old shards are deleted and count the same outcome twice, or fetch the old base/listing and then lose a shard deleted by the compactor, yielding a partial window. Both alter the order-dependent backoff and credential state that the record itself identifies as safety-critical; the latter can fail open. The text analyzes partial reads for A but presents B as retaining a ~1-request safe read without specifying a generation/manifest, deduplication, retry, or other consistency mechanism.",
+    "file": "research/427-model-health-per-run-records.md",
+    "fix_hint": "Define and analyze a concrete publication protocol for B. It must give readers a coherent snapshot across base and tail (including ordering, identity deduplication, deletion timing, and retry/fail-closed behavior), cover writer/compactor races, and show rolling-version compatibility. If that protocol is intentionally future work, do not recommend B as the sound alternative yet; mark it conditional alongside the latency analysis.",
+    "severity": "major",
+    "title": "Recommended base-plus-tail design omits its read/compaction consistency protocol"
+   }
+  ],
+  "progress": null,
+  "summary": "The record usefully corrects the reader inventory and identifies the full-window/retention problem, but two central parts of its cost and recommendation are not yet sound. It reverses the meaning of the 2,000-record retention ceiling when estimating request count, and it recommends a base-plus-tail compaction design without accounting for the non-atomic publication/deletion races that can make readers double-count or temporarily omit health evidence. Those gaps affect the core comparison and must be resolved before this can serve as the design decision for #427.",
+  "verdict": "request_changes"
+ }
+}
