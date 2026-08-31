@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2088,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "94cad64ff3bf6bfbe1884d5508399035c52f6615",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new test commentary says the rendered census text and summary token are pinned exactly, but the checks use substring membership. In particular, `stranded_prs=1` also matches `stranded_prs=10`, and the census check permits arbitrary extra text around the expected tail. This is not vacuous\u2014the tests still prove the count/object text is emitted and the zero row exists\u2014but it is weaker than the stated exact-output contract.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Parse the output into complete lines and compare the census line exactly; tokenize the SUMMARY line into key/value fields and assert the exact `stranded_prs` value (and exact membership) rather than using substring containment.",
+    "severity": "minor",
+    "title": "End-to-end census assertions are not actually exact"
+   }
+  ],
+  "progress": null,
+  "summary": "The change is sound and complete for the stated measurement-only scope. It extracts the existing aged, worker-shaped, provenance-orphan population without weakening the disposition path; derives the stranded residue from that shared population and the existing hand-off decision; computes provenance once at the production call site; keeps malformed inputs fail-closed through the existing deferral boundary; and emits both a per-object census and an unconditional summary gauge, including zero. The focused unit and end-to-end self-tests cover ownership, age, worker shape, draft closure, the merge-state partition, malformed-state refusal, no-write behavior, object naming, and zero sealing. No hostile reviewer-directed instruction appears in the diff. One non-blocking test-quality caveat is that the end-to-end log checks described as exact are substring assertions (for example, `stranded_prs=1` would also match `stranded_prs=10`); the surrounding assertions still validate the implemented behavior sufficiently, but token- or line-exact matching would better enforce the documented contract.",
+  "verdict": "approve"
+ }
+}
