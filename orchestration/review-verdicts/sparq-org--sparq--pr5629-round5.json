@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5629,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b14f2a8b3b6e991ff9cb4d8c7151ac66e46545f5",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_normalize_path_entry` still does not canonicalize internal `.` or `..` segments. GitHub Actions resolves `target/../coverage-cone-divergence-shard-1.json` to the workspace-root divergence log, but `_glob_to_re` compares the unnormalized spelling to the root-relative target and returns false. The added traversal-shaped fixture contains `${{ matrix.shard }}`, so it is classified as unresolved dynamic input and returns true conservatively before dot-segment matching is exercised; it does not regress the static bypass.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Lexically normalize static workspace-relative entries against a synthetic workspace root before glob matching, resolving `.` and `..` while preserving glob metacharacters; treat paths escaping the workspace conservatively. Add positive fixtures for `target/../coverage-cone-divergence-shard-1.json` and `foo/./../coverage-cone-divergence-shard-1.json`, a directory form normalizing to the workspace root, and an escaping-path case.",
+    "severity": "major",
+    "title": "Static dot-segment upload paths still bypass artifact detection"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 leaves the prior major finding unresolved. `_normalize_path_entry` still strips only leading `./` and trailing `/`; it does not lexically resolve internal `.` or `..` segments. The traversal-shaped fixture remains dynamic because it contains `${{ matrix.shard }}`, so `_upload_could_include` returns true conservatively before dot-segment matching is exercised. A static upload such as `target/../coverage-cone-divergence-shard-1.json` resolves at runtime to the workspace-root divergence log but is still reported as unrelated. Progress is stagnant because the same major artifact-retention bypass remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
