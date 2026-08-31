@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5845,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4e39e8dd68debfbfd8a5fe4bae2b546f200f448c",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security defect. The workflow pin remains consistently updated to v0.15.0, and the indentation-aware parser restricts version discovery to direct children of the action step's with mapping while retaining duplicates and representing absent, empty, duplicated, or misplaced inputs with a non-version sentinel. The focused mutation tests exercise omitted pins, sibling env.version bypasses, and duplicate direct with.version keys, and the complete focused suite passes (9 tests).",
+  "verdict": "approve"
+ }
+}
