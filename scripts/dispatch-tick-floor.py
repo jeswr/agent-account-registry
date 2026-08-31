@@ -213,6 +213,11 @@ from datetime import datetime, timezone
 # env-overridable (a threshold readable from the workflow is a second place to get it wrong).
 MIN_TICK_INTERVAL_SECONDS = 10 * 60
 
+# The CLAIM census now walks the live 150-PR board after PLAN. Production run 33444551254
+# exhausted the old 15-minute job bound before that walk completed; give the bounded job three
+# floor intervals while the workflow concurrency group coalesces later doorbells behind it.
+CLAIM_TIMEOUT_MINUTES = 30
+
 # The instrumented per-tick request count the arithmetic above is built on (issue #721), and the
 # linear model it calibrates. Splits from the same instrumented run: 23 listings (repo-level, does
 # not scale with PRs) and 590 per-PR requests (116 detail + 474 check-runs) across the worker PRs
@@ -1573,6 +1578,9 @@ def _test_workflow_seam(chk):
     # the gate.
     claim = _job(workflow, "claim")
     assert "secrets-guard" in _declared_needs(claim), "claim must need secrets-guard"
+    chk("seam[#2103]: CLAIM keeps the measured three-floor-interval timeout while later "
+        "doorbells coalesce behind the registry-dispatcher concurrency group",
+        claim.get("timeout-minutes"), CLAIM_TIMEOUT_MINUTES)
     chk("seam[#1208]: `claim` carries NO job-level `if:`, so a SKIPPED guard skips it via the "
         "implicit needs-must-succeed gate — gating the guard on the floor can only ever skip "
         "MORE, never admit more", claim.get("if"), None)

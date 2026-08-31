@@ -2,7 +2,7 @@
 # code with no secrets in its environment; CLAIM treats the PLAN artifact as hostile data before
 # any mutation.
 #
-# The four-per-hour cron below is the SINGLE scheduler for the issue drain AND the cross-provider
+# The six-per-hour cron below is the SINGLE scheduler for the issue drain AND the cross-provider
 # review/fix loop: every review -> fix -> re-review -> arm transition is a durable-marker state
 # the sweep re-derives each tick, so the loop's LIVENESS depends on this cron. It was enabled
 # after the REG-4 pilot canary passed end-to-end (issues #2407–#2416 flowed through workers;
@@ -1629,7 +1629,12 @@ jobs:
     name: CLAIM (validate, lease, launch)
     needs: [plan, secrets-guard]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # [SPARQ agent] #2103: the live 150-PR board exhausted the former 15-minute bound in
+    # run 33444551254 while the claim census was still processing. Keep this bounded, but allow
+    # three ten-minute floor intervals; the registry-dispatcher concurrency group serialises the
+    # job and coalesces later doorbells, so a longer live census cannot create overlapping ticks.
+    # scripts/dispatch-tick-floor.py pins this YAML seam to the measured bound.
+    timeout-minutes: 30
     # SECRET-EXFIL GUARD (issue #101). This job holds the App private key, every repository secret
     # (toJSON(secrets)), the per-account ACCT*_TOKEN credentials, the alert token, and a write
     # GITHUB_TOKEN. Because `workflow_dispatch` (top of file) accepts an arbitrary ref and GitHub
@@ -2235,7 +2240,7 @@ jobs:
   # the JOB itself is cancelled (its own `timeout-minutes`, or a run-level cancel), and CLAIM hosts
   # the CAS lease claim, the worker launch AND the `always()` per-tick telemetry recorder (#756).
   # Measured on run 30245515435: PLAN success, then CLAIM cancelled at exactly 1200 s
-  # (timeout-minutes 15 + GitHub's 5-minute post-cancel grace); the CAS-claim step never finished
+  # (the then-current timeout-minutes 15 + GitHub's 5-minute post-cancel grace); the CAS-claim step never finished
   # and the telemetry step never ran. The run-level conclusion was `cancelled` — identical to the
   # 116/117 cancellations in that window that were FREE concurrency coalescing with zero started
   # jobs, so no run-conclusion aggregate can see it. Worse: PLAN had SUCCEEDED, so the PLAN-only

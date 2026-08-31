@@ -34,12 +34,17 @@
 # actively CLOSED any open ops-alert on the very tick CLAIM was killed mid-write.
 #
 # MEASURED on run 30245515435 (2026-07-27): PLAN success (444 s), then CLAIM cancelled after
-# exactly 1200 s = its `timeout-minutes: 15` plus GitHub's 5-minute post-cancel grace. Step 13
+# exactly 1200 s = its then-current `timeout-minutes: 15` plus GitHub's 5-minute post-cancel
+# grace. Step 13
 # ("Strictly validate, CAS claim, and dispatch live workers") never completed; steps 14 (the
 # `always()` health-state recorder) and 15 never ran at all. Run-level conclusion: `cancelled` —
 # byte-identical to the 116 of 117 cancellations in the same window that were FREE
 # concurrency-group coalescing with zero started jobs. No aggregate over run conclusions can tell
 # the two apart, which is why this needs an alert keyed on the JOB result, not the run conclusion.
+#
+# Run 33444551254 reproduced the same class on 2026-08-31: PLAN succeeded, then the live 150-PR
+# claim census exhausted the 15-minute job bound. Issue #2103 raises that bounded window to 30
+# minutes; this alert remains the fail-loud backstop if CLAIM still cannot finish.
 #
 # So decide() now keys on BOTH stage results and names the failing stage. Scope, stated honestly:
 # this covers a cancelled CLAIM *job* (the measured case), because a job killed by its own timeout
