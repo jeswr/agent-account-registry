@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5573,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c5dfb011755259c8097b55f2f841050546ff58a4",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "LABEL_WRITE_PATTERNS recognizes REST/CLI forms and JavaScript-style `.addLabels(...)`, but not GitHub GraphQL mutations such as `addLabelsToLabelable`. This is not hypothetical: `scripts/bd-to-issues.py` constructs `addLabelsToLabelable(...)`, yet `discover_label_writing_scripts()` does not classify it as a label-writing script. If a workflow later invokes that existing script in a step with REGISTRY_RING_TOKEN, KB_DUMP_TOKEN, or another alias PAT in scope, `step_writes_labels()` returns false and both R1/R2 are skipped. That contradicts the file's claims that every label-writing workflow step is enforced and that writer scripts are covered when added.",
+    "file": "scripts/check-label-write-token.py",
+    "fix_hint": "Recognize the relevant GraphQL label mutation operations (at minimum addLabelsToLabelable and removeLabelsFromLabelable, including actual repository spellings) in `text_writes_labels`, and add a positive self-test that invokes a real GraphQL label-writing script with a foreign credential. Also add a negative fixture for GraphQL label reads if the matching approach could confuse reads with writes.",
+    "severity": "major",
+    "title": "GraphQL label writes bypass the identity guard"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The REST-method fix from round 3 remains sound, but round 4 found a separate major coverage gap in the guard's claimed label-write invariant: GraphQL label mutations are not recognized. The repository already contains a real writer using addLabelsToLabelable, yet discovery does not classify it, so a workflow invoking that script with a human/alias PAT would evade R1. This is a regression relative to the prior zero-finding approval because the newly identified gap undermines completeness and is not pinned by a positive fixture.",
+  "verdict": "request_changes"
+ }
+}
