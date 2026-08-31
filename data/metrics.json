@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-31T11:20:57Z",
+  "generated_at": "2026-08-31T11:29:56Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -8,15 +8,15 @@
       "issues_closed_1h": 0,
       "issues_closed_24h": 6,
       "prs_open": 162,
-      "prs_draft": 136,
+      "prs_draft": 137,
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
       "prs_merged_24h": 4,
-      "review_changes_backlog": 11,
+      "review_changes_backlog": 9,
       "needs_user_parked": 16,
-      "review_lane_health": "idle",
-      "review_lane_runs_1h": 0,
+      "review_lane_health": "ok",
+      "review_lane_runs_1h": 2,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
