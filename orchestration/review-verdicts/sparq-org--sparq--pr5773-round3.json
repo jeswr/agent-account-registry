@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5773,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b94b7cc1cf3f4eefa52e14b40d873542533052ca",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes the existing 15-case Solid SPARQL query-semantics floor, registers the real crate-local runner in the central scoreboard, updates the generated artifact totals, and extends the scoreboard's anti-drift/pinning coverage. The runner remains non-vacuous: it loads the vendored manifest, executes every case through PodStore authorization/query paths, rejects unknown expectation types, asserts each result, and enforces both full traversal and the shared minimum case count. The registry is also honest about the Editor's Draft status, query-semantics-only scope, generic test job, and legacy feature exclusion. No correctness, soundness, security, or test-validity defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
