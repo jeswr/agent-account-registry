@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2088,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "94cad64ff3bf6bfbe1884d5508399035c52f6615",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior-round finding remains unchanged. The tests still assert `\"handed off to nobody): 1 [owner/repo#47]\" in stranded_log` and `\"stranded_prs=1\" in stranded_log` (with analogous zero checks). These are substring checks: the summary assertion also accepts `stranded_prs=10`, and the census assertion permits arbitrary prefix/suffix text on the same line. The tests are not vacuous\u2014they prove emission, naming, ownership exclusion, and zero sealing\u2014but they are weaker than the comments' exact-output claim.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Split the captured output into complete lines and compare the census line exactly. Parse the SUMMARY line into whitespace-delimited key/value tokens and assert exact token membership and the exact `stranded_prs` value, rather than substring containment.",
+    "severity": "minor",
+    "title": "End-to-end census assertions are still not exact"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe measurement-only change remains sound: the shared aged-orphan predicate keeps the hand-off and census populations aligned; the stranded gauge is derived from the actual hand-off decision; provenance is computed once at the production call site; malformed state still fails closed at the existing boundary; and both the named census and summary gauge emit unconditionally, including zero. The focused tests cover the population gates, ownership, draft closure, merge-state partition, malformed input, no-write behavior, object naming, and zero sealing. No reviewer-directed prompt injection appears in the diff. The sole prior-round minor test-quality finding remains: despite comments claiming exact output, the end-to-end assertions still use substring membership, so they do not enforce the stated exact-rendering contract. This does not make the coverage vacuous or undermine the implemented behavior, so approval remains appropriate.",
+  "verdict": "approve"
+ }
+}
