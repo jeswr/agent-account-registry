@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5784,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c7a1f6e149a8fde0346511d77cae85f61cbc6e67",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_Harness.__init__` calls `_require_script_tools()` before `_require_jq()`, while `_UNSTUBBED_SCRIPT_TOOLS` already contains `jq`. With jq missing, `_require_script_tools()` always raises first, so the new jq-specific diagnostic can never fire. `test_harness_refuses_to_run_without_jq` only checks generic substrings (`jq` present and two accusations absent), all of which the earlier sweep's message already satisfies; therefore the test remains green even if `_require_jq()` or its call is deleted. The comments/docstring claiming the jq-specific diagnosis is applied to every harness execution are not true on the real path.",
+    "file": "scripts/tests/test_ring_credential_loud.py",
+    "fix_hint": "Use one authoritative precondition. Either fold the desired jq-specific diagnosis into `_require_script_tools()` and remove `_require_jq()`, or arrange dispatch so jq is handled by `_require_jq()` before/excluded from the generic sweep. Make the focused test distinguish the intended diagnostic (for example, assert a jq-specific phrase) and add a mutation-sensitive assertion such that removing the jq-specific path makes it fail. Update the nearby comments to describe the actual ordering.",
+    "severity": "major",
+    "title": "jq-specific precondition is unreachable and its test passes on the wrong exception"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-2 revision introduces a redundant jq-specific precondition after the existing declared-tool sweep, but the sweep already raises whenever jq is absent. Consequently `_require_jq()` is unreachable in exactly the condition it is meant to diagnose, and the new test is vacuous with respect to that load-bearing claim because it accepts the earlier generic AssertionError. This is a new major finding relative to round 1's clean approval, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
