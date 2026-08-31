@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5798,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8080bf07c7a2c13d95f93c52ec4f695013e9cfb1",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`executes_needle` uses `text.startswith(needle)` for command position and unrestricted `needle in text` for interpreter argv. Neither enforces shell-word boundaries or an exact argv subsequence. For example, a pin for `scripts/tests/test_triage_area.py` is satisfied by a directly invoked `scripts/tests/test_triage_area.py.disabled`, and a pin for `triage-area.py --self-test` is satisfied by `python3 scripts/triage-area.py --self-test-disabled`. Thus the checker can report green after the exact pinned suite/option stopped executing, despite the registry and documentation claiming that S1 verifies the declared command still executes. The self-test covers data-position and quoting bypasses but not these superstring mutations.",
+    "file": "scripts/check-workflow-step-guards.py",
+    "fix_hint": "Tokenize the masked command sufficiently to compare the needle as complete shell words: require an exact leading argv sequence for direct execution and an exact contiguous argv subsequence for recognized interpreters (while retaining the explicitly disclosed interpreter-script ambiguity). Add failing `check_tree` fixtures replacing the test script with a suffixed path and `--self-test` with a suffixed option, plus controls showing legitimate trailing arguments remain accepted.",
+    "severity": "major",
+    "title": "S1 accepts command-name and option superstrings as the pinned invocation"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 4 regresses from round 3's clean approval: the command-position refinement still accepts prefix/superstring matches as execution. Both the direct-command and interpreter-argv branches can therefore satisfy a pinned `requires_run` value with a different executable path or option whose spelling merely begins with or contains the needle. This contradicts S1's claim that the declared command still executes, and the mutation table has no boundary/superstring case. Require shell-word/token boundaries (or parsed argv subsequence equality) and add real-path mutations for suffixed script names and suffixed options.",
+  "verdict": "request_changes"
+ }
+}
