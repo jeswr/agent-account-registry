@@ -3099,31 +3099,92 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
     return dispatchable
 
 
+# [SPARQ agent] Registry #2107: CLAIM needs only issue identity + labels here. The former REST
+# list read returned every issue body and its nested metadata: on sparq's measured 2026-08-31
+# board that was 2,356
+# open issue/PR records, and the strict CLAIM step took 5m29 on the successful post-timeout run
+# (33448085955; the preceding 15-minute timeout died in this same pre-census region). GraphQL keeps
+# the SAME complete live open-issue population while projecting only the fields this predicate
+# consumes. `$endCursor` is the spelling `gh api graphql --paginate` advances automatically.
+LIVE_OPEN_ISSUE_LABELS_QUERY = """
+query($owner: String!, $name: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(states: OPEN, first: 100, after: $endCursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        labels(first: 100) {
+          pageInfo { hasNextPage }
+          nodes { name }
+        }
+      }
+    }
+  }
+}
+"""
+
+
 def _live_issue_labels(repo):
     """LIVE open-issue label map for the CLAIM-side busy revalidation — the same linkage
     input the PLAN partition read from its issue snapshot (round-2 P2 parity: the busy
     union and the enumerator must read the same source-issue hold/area state), re-read
-    from the list API at claim time. PR rows in the issues listing are skipped; a source
+    from GitHub at claim time. The GraphQL connection is issues-only (PR rows never enter),
+    and its field projection deliberately carries no bodies or unrelated metadata. A source
     issue absent from the map (closed in the window) reserves `__global__` inside
-    busy_packages_of_pulls exactly as at PLAN time. Malformed listings raise (the whole
-    repo's claim aborts loudly rather than revalidating against garbage)."""
-    pages = _gh_json(["api", "--paginate", "--slurp",
-                      f"repos/{repo}/issues?state=open&per_page=100"])
-    if not isinstance(pages, list):
+    busy_packages_of_pulls exactly as at PLAN time.
+
+    Fail closed on every incomplete or ambiguous shape: a truncated issue connection, a
+    label connection wider than its bound, malformed nodes, or a duplicate issue across pages
+    aborts this repo's claim instead of constructing a friendly partial map. The duplicate guard
+    matters because an issue moving in UPDATED_AT order during cursor pagination can otherwise
+    make whichever copy happened to arrive last silently authoritative."""
+    owner, name = repo.split("/", 1)
+    pages = _gh_json([
+        "api", "graphql", "--paginate", "--slurp",
+        "-f", "query=" + LIVE_OPEN_ISSUE_LABELS_QUERY,
+        "-F", "owner=" + owner, "-F", "name=" + name,
+    ])
+    if not isinstance(pages, list) or not pages:
         raise DispatchError("target issue listing is malformed")
+
     labels_map = {}
-    for page in pages:
-        if not isinstance(page, list):
+    for index, document in enumerate(pages):
+        try:
+            repository = document["data"]["repository"]
+            connection = repository["issues"]
+            page_info = connection["pageInfo"]
+            nodes = connection["nodes"]
+        except (KeyError, TypeError):
+            raise DispatchError("target issue listing page is malformed") from None
+        if (not isinstance(repository, dict) or not isinstance(connection, dict)
+                or not isinstance(page_info, dict) or not isinstance(nodes, list)):
             raise DispatchError("target issue listing page is malformed")
-        for issue in page:
-            if not isinstance(issue, dict) or "pull_request" in issue:
-                continue
+        has_next = page_info.get("hasNextPage")
+        if not isinstance(has_next, bool):
+            raise DispatchError("target issue listing pagination is malformed")
+        if (index < len(pages) - 1 and not has_next) or (index == len(pages) - 1 and has_next):
+            raise DispatchError("target issue listing pagination is incomplete")
+
+        for issue in nodes:
+            if not isinstance(issue, dict):
+                raise DispatchError("target issue listing entry is malformed")
             number = issue.get("number")
-            if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
-                continue
-            labels_map[number] = [
-                label.get("name") for label in (issue.get("labels") or [])
-                if isinstance(label, dict) and isinstance(label.get("name"), str)]
+            labels = issue.get("labels")
+            if (not isinstance(number, int) or isinstance(number, bool) or number <= 0
+                    or not isinstance(labels, dict)
+                    or not isinstance(labels.get("pageInfo"), dict)
+                    or not isinstance(labels.get("nodes"), list)):
+                raise DispatchError("target issue listing entry is malformed")
+            if labels["pageInfo"].get("hasNextPage") is not False:
+                raise DispatchError(f"target issue #{number} label listing is incomplete")
+            if number in labels_map:
+                raise DispatchError(f"target issue #{number} appears more than once")
+            names = []
+            for label in labels["nodes"]:
+                if not isinstance(label, dict) or not isinstance(label.get("name"), str):
+                    raise DispatchError(f"target issue #{number} label entry is malformed")
+                names.append(label["name"])
+            labels_map[number] = names
     return labels_map
 
 
@@ -10388,6 +10449,15 @@ def _self_test():
 
         def fake_gh_json(args):
             path = args[-1]
+            if (args[:2] == ["api", "graphql"]
+                    and any(value == "query=" + LIVE_OPEN_ISSUE_LABELS_QUERY
+                            for value in args)):
+                return [{"data": {"repository": {"issues": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [{"number": live_issue["number"],
+                               "labels": {"pageInfo": {"hasNextPage": False},
+                                          "nodes": live_issue["labels"]}}],
+                }}}}]
             if path == "repos/example/repo":
                 return {"default_branch": "main"}
             if path == "repos/example/repo/branches/main":
@@ -10396,8 +10466,6 @@ def _self_test():
                 return {"type": "file", "content": base64.b64encode(b"").decode()}
             if path == "repos/example/repo/pulls?state=open&per_page=100":
                 return [[]]
-            if path == "repos/example/repo/issues?state=open&per_page=100":
-                return [[live_issue]]
             if path == "repos/example/repo/issues/500":
                 return live_issue
             if path == "repos/example/repo/issues/500/comments?per_page=100":
@@ -20650,31 +20718,73 @@ agent = "impl"
         assert set(_claim_provenance_map(repo, legacy_root)) == {76}
         assert _claim_provenance_map(repo, str(Path(prov_tmp) / "absent")) == {}
 
-    # the live issue-label read: PR rows skipped, malformed listings fail LOUD
+    # [SPARQ agent] The live issue-label read is the production performance boundary: GraphQL
+    # projects ONLY number + label names, paginates the complete issues-only connection, and every
+    # incomplete/ambiguous response fails LOUD. This executes the real function and captures its
+    # exact gh argv; a helper-only test would leave the 2,356-record REST call site intact.
     prev_live_gh = globals()["_gh_json"]
     try:
-        globals()["_gh_json"] = lambda args: [[
-            {"number": 81, "labels": [{"name": "area:crate-b"}, {"name": "needs:user"}]},
-            {"number": 90, "labels": [{"name": "x"}], "pull_request": {}},
-            {"number": "bad", "labels": []},
-            {"number": 82, "labels": [{"name": 5}, "loose", {"name": "role:impl"}]},
-        ]]
+        def issue_node(number, labels, labels_have_next=False):
+            return {"number": number,
+                    "labels": {"pageInfo": {"hasNextPage": labels_have_next},
+                               "nodes": [{"name": label} for label in labels]}}
+
+        def issue_page(nodes, has_next=False, cursor=None):
+            return {"data": {"repository": {"issues": {
+                "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                "nodes": nodes,
+            }}}}
+
+        live_calls = []
+        good_pages = [
+            issue_page([issue_node(81, ["area:crate-b", "needs:user"])],
+                       has_next=True, cursor="page-2"),
+            issue_page([issue_node(82, ["role:impl"])], has_next=False),
+        ]
+        globals()["_gh_json"] = lambda args: live_calls.append(args) or good_pages
         assert _live_issue_labels(repo) == {81: ["area:crate-b", "needs:user"],
                                             82: ["role:impl"]}
-        globals()["_gh_json"] = lambda args: "garbage"
-        try:
-            _live_issue_labels(repo)
-        except DispatchError:
-            pass
-        else:
-            raise AssertionError("a malformed live issue listing must fail loud")
-        globals()["_gh_json"] = lambda args: ["garbage-page"]
-        try:
-            _live_issue_labels(repo)
-        except DispatchError:
-            pass
-        else:
-            raise AssertionError("a malformed live issue page must fail loud")
+        assert len(live_calls) == 1, live_calls
+        live_argv = live_calls[0]
+        assert live_argv[:4] == ["api", "graphql", "--paginate", "--slurp"], live_argv
+        query_fields = [value[len("query="):] for value in live_argv
+                        if isinstance(value, str) and value.startswith("query=")]
+        assert query_fields == [LIVE_OPEN_ISSUE_LABELS_QUERY], live_argv
+        query = query_fields[0]
+        assert ("issues(states: OPEN, first: 100, after: $endCursor)" in query
+                and "number" in query and "labels(first: 100)" in query
+                and "nodes { name }" in query and "body" not in query and "title" not in query
+                and "pullRequests" not in query), query
+        assert _gh_retry.graphql_read_reject(live_argv) is None, live_argv
+
+        malformed_live_pages = (
+            "garbage",
+            [],
+            ["garbage-page"],
+            [issue_page([], has_next=True, cursor="missing-page")],
+            [issue_page([issue_node(81, ["x"], labels_have_next=True)])],
+            [issue_page([issue_node(81, ["x"])]), issue_page([issue_node(81, ["y"])])],
+            [issue_page([{"number": 81, "labels": {"pageInfo": {"hasNextPage": False},
+                                                     "nodes": [{"name": 5}]}}])],
+        )
+        for malformed in malformed_live_pages:
+            globals()["_gh_json"] = lambda args, value=malformed: value
+            try:
+                _live_issue_labels(repo)
+            except DispatchError:
+                pass
+            else:
+                raise AssertionError(
+                    f"a malformed/incomplete live issue listing must fail loud: {malformed!r}")
+        dispatch_calls = [node for node in ast.walk(ast.parse(inspect.getsource(dispatch)))
+                          if isinstance(node, ast.Call)
+                          and isinstance(node.func, ast.Name)
+                          and node.func.id == "_live_issue_labels"]
+        assert len(dispatch_calls) == 1, (
+            "dispatch() must call the projected live issue reader exactly once per repository")
+        print("  ok   [claim throughput] the production live issue read is issues-only, "
+              "field-projected, retryable, completely paginated, and fails closed on every "
+              "malformed/truncated/duplicate shape")
         # round-3 finding 3: a malformed COMMENTS page could hide a durable receipt
         # (round/attempt/park-generation marker) — _pr_comments must RAISE, never drop it.
         good_comment = {"user": {"login": "b[bot]"}, "body": "x",
