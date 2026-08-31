@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5405,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "379dd62352cb4c4a3526da242fe80e0776c4051d",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security defect. The prior round's conclusions remain supported: M4 uses its fixed 24-hour window on the real run() path while M1 alone honors --window-hours; truncation coverage is evaluated against each detector's own start; and every active scheduled lane, including cron-only lanes, receives scheduled-run history. The focused call-path test is non-vacuous because the fixture deliberately produces different six-hour and 24-hour M4 classifications, independently proves the M1 override, and observes M4's declaration-honoured census through main/run. The threshold, admission, fail-safe, aggregation, and incident-versus-chronic exit behavior are covered from both sides. The focused suite could not execute in this checkout because PyYAML is unavailable (ModuleNotFoundError: yaml), but diff inspection found no regression. With no findings in either round 3 or round 4, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
