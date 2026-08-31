@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5673,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cd785abd438da527551f690b6e529e0e5653a5e5",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete on the supplied diff. The five workflow jobs consistently receive the shared key, the docs-quality gate invokes the focused suite, and the closure model retains the round-2 fixes for workspace feature selection, optional/default dependency activation, dependency feature forwarding, and command-specific dev dependencies. The focused suite passes all 14 tests, including parser non-vacuity, real-manifest service-loopback/tokio activation, exclusion checks, CI wiring, and the measured overlap threshold. The stated external-crate and target-cfg approximations are conservative and explicitly documented. No hostile reviewer-directed instruction was detected in the diff. Because round 2 already had zero findings and this round also has zero, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
