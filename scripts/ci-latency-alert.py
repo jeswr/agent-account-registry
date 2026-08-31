@@ -95,8 +95,8 @@ import tempfile
 from pathlib import Path
 
 from cron_map import (MIN_SCHEDULED_LANES, WORKFLOWS_DIR, CronError,
-                      CronMapError, _expand_field, cron_minutes,
-                      schedule_minute_map)
+                      CronMapError, cron_minutes, expand_field,
+                      schedule_minute_map, workflow_crons, workflow_triggers)
 
 try:
     import yaml
@@ -359,11 +359,11 @@ def expected_firings(expr: str, start: dt.datetime, end: dt.datetime) -> int:
     if len(fields) != 5:
         raise CronError(f"expected 5 fields, got {len(fields)}: {expr!r}")
     minute, hour, dom, month, dow = fields
-    mins = _expand_field(minute, 0, 59)
-    hours = _expand_field(hour, 0, 23)
-    doms = _expand_field(dom, 1, 31)
-    months = _expand_field(month, 1, 12)
-    dows = {d % 7 for d in _expand_field(dow, 0, 7)}
+    mins = expand_field(minute, 0, 59)
+    hours = expand_field(hour, 0, 23)
+    doms = expand_field(dom, 1, 31)
+    months = expand_field(month, 1, 12)
+    dows = {d % 7 for d in expand_field(dow, 0, 7)}
     dom_wild = dom.strip() in ("*", "?")
     dow_wild = dow.strip() in ("*", "?")
     if (end - start) > dt.timedelta(days=400):
@@ -391,20 +391,6 @@ def expected_firings(expr: str, start: dt.datetime, end: dt.datetime) -> int:
 # ---------------------------------------------------------------------------------
 # workflow scope
 # ---------------------------------------------------------------------------------
-def workflow_triggers(text: str) -> dict:
-    """-> the parsed `on:` mapping. `on` is YAML 1.1 `true`, hence the two-key lookup."""
-    if yaml is None:  # pragma: no cover
-        raise AlarmError(f"PyYAML unavailable: {_YAML_IMPORT_ERROR}")
-    try:
-        doc = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise AlarmError(f"unparseable workflow YAML: {exc}") from exc
-    if not isinstance(doc, dict):
-        raise AlarmError("workflow YAML is not a mapping")
-    on = doc.get(True, doc.get("on"))
-    return on if isinstance(on, dict) else {}
-
-
 def m1_scope(on: dict) -> tuple[bool, list[str], bool]:
     """-> (in_m1_scope, cron expressions, is_cron_only).
 
@@ -418,9 +404,7 @@ def m1_scope(on: dict) -> tuple[bool, list[str], bool]:
     """
     if "schedule" not in on:
         return False, [], False
-    sched = on.get("schedule") or []
-    crons = [s.get("cron") for s in sched
-             if isinstance(s, dict) and isinstance(s.get("cron"), str)]
+    crons = workflow_crons(on)
     cron_only = set(on) <= INVISIBLE_TRIGGERS
     return bool(crons), crons, cron_only
 
@@ -1268,7 +1252,7 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             chk(f"cron {bad!r} raised the wrong error", False)
 
     # --- cron_minutes: the expansion the DERIVED schedule map is built on (#1046) ---
-    # Every expected value here is hand-computed. Writing it as `_expand_field(...)` would
+    # Every expected value here is hand-computed. Writing it as `expand_field(...)` would
     # read the expectation out of the code under test, which is the assertion shape that
     # cannot fail (AGENTS.md pre-flight 2b).
     chk("cron_minutes */15 -> :00/:15/:30/:45", cron_minutes("*/15 * * * *") == {0, 15, 30, 45})

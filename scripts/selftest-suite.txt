@@ -4,8 +4,8 @@ backfill-provenance.py
 broker-refresh.py
 chain_preference.py
 ci-latency-alert.py
-cron_map.py
 compose-gate.py
+cron_map.py
 cross-resolver-agreement.py
 curate-frontier.py
 dashboard-gen.py

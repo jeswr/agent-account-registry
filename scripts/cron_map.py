@@ -32,8 +32,25 @@ class CronError(ValueError):
     """A cron expression cannot be expanded without guessing."""
 
 
-def _expand_field(spec: str, lo: int, hi: int) -> set[int]:
-    """Expand one cron field, refusing every malformed or out-of-range atom."""
+def expand_field(spec: str, lo: int, hi: int) -> set[int]:
+    """Expand one cron field to the set of values it matches.
+
+    OUT OF RANGE IS A REFUSAL, NOT A FILTER (#1279). This used to expand every atom and then
+    drop whatever fell outside `lo..hi`, which reads as fail-closed and is not: it only ever
+    raises when the WHOLE field is out of range, so `3,13,23,33,43,53,60` — the dispatch
+    schedule plus one impossible minute — came back as exactly the six valid minutes. A caller
+    asking "how many times an hour does this fire" then gets a truthful-looking six for a cron
+    that GitHub will not run at all, and every count it derives is green on a broken schedule.
+    Rejecting the atom (and each range ENDPOINT) instead means a malformed field can never be
+    silently rounded down to a plausible one.
+
+    The emptiness refusal below is DEAD under this grammar once the range check is in place —
+    an accepted part has `a <= b` and `step >= 1`, so it contributes at least `a` — and it is
+    kept anyway, declared unreachable, as the structural backstop for a future term form that
+    does not hold that property. It is a refusal, so the honest thing is to say it cannot
+    execute rather than to leave an empty set reaching a consumer that reads it as "fires
+    never".
+    """
     if not spec:
         raise CronError("empty field")
     out: set[int] = set()
@@ -65,40 +82,70 @@ def _expand_field(spec: str, lo: int, hi: int) -> set[int]:
         if start < lo or end > hi:
             raise CronError(f"value outside {lo}-{hi} in {spec!r}")
         out.update(range(start, end + 1, step))
-    if not out:  # structural backstop for future grammar forms
+    if not out:  # unreachable under the grammar above - see the docstring
         raise CronError(f"field matches nothing: {spec!r}")
     return out
 
 
 def cron_minutes(expr: str) -> set[int]:
-    """Return every minute past the hour held by a five-field cron expression."""
+    """The minutes past the hour `expr` can fire at. THE definition of that expansion (#1046).
+
+    Hour/day/month restrictions are deliberately IGNORED, and that is the fail-closed
+    direction for the one question this answers — *is this minute already taken?*
+    `41 6 * * 1` (pat-validity, weekly) therefore still holds :41. Over-reporting a taken
+    minute costs a schedule author one alternative; under-reporting it hands them a collision.
+    """
     if not isinstance(expr, str):
         raise CronError(f"not a string: {expr!r}")
     fields = expr.split()
     if len(fields) != 5:
         raise CronError(f"expected 5 fields, got {len(fields)}: {expr!r}")
-    return _expand_field(fields[0], 0, 59)
+    return expand_field(fields[0], 0, 59)
 
 
-def _workflow_crons(path: Path) -> list[str]:
+def workflow_triggers(text: str) -> dict:
+    """Return the parsed `on:` mapping; YAML 1.1 parses the key as boolean true."""
     if yaml is None:  # pragma: no cover
         raise CronMapError(f"PyYAML unavailable: {_YAML_IMPORT_ERROR}")
     try:
-        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        doc = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise CronMapError(f"unparseable workflow YAML at {path}: {exc}") from exc
+        raise CronMapError(f"unparseable workflow YAML: {exc}") from exc
     if not isinstance(doc, dict):
-        raise CronMapError(f"workflow YAML is not a mapping: {path}")
+        raise CronMapError("workflow YAML is not a mapping")
     triggers = doc.get(True, doc.get("on"))
-    if not isinstance(triggers, dict) or "schedule" not in triggers:
-        return []
+    return triggers if isinstance(triggers, dict) else {}
+
+
+def workflow_crons(triggers: dict) -> list[str]:
+    """Return string cron declarations from a parsed workflow trigger mapping."""
     schedule = triggers.get("schedule") or []
     return [entry.get("cron") for entry in schedule
             if isinstance(entry, dict) and isinstance(entry.get("cron"), str)]
 
 
+def _workflow_crons(path: Path) -> list[str]:
+    try:
+        return workflow_crons(workflow_triggers(path.read_text(encoding="utf-8")))
+    except CronMapError as exc:
+        raise CronMapError(f"{exc} at {path}") from exc
+
+
 def schedule_minute_map(root) -> dict[str, set[int]]:
-    """Derive ``{workflow path: held minutes}`` from every scheduled workflow."""
+    """THE registry cron-minute map — which minute is taken by which workflow — DERIVED (#1046).
+
+    Before this existed the map was hand-copied into five places, and one copy was already
+    stale: `regate-sweep` asserted :00/:15/:30/:45 was dashboard's after dashboard had moved,
+    which would have walked the next schedule author straight into a collision. That is the
+    #958 shape (one literal, N definitions, consumers blind to a repoint) applied to a
+    schedule. A consumer that needs the map READS THE TREE through this function; prose that
+    names other lanes' minutes is a copy waiting to go stale.
+
+    -> {".github/workflows/<name>.yml": {minutes}} for every workflow carrying a schedule.
+    FAIL CLOSED in both directions a caller could be misled by: a missing workflows directory
+    raises, and an unparseable cron raises rather than dropping the lane from the map. A lane
+    silently absent from this map reads to a collision check as a free minute.
+    """
     workflow_dir = Path(root) / WORKFLOWS_DIR
     if not workflow_dir.is_dir():
         raise CronMapError(f"no workflows directory at {workflow_dir}")
@@ -145,6 +192,16 @@ def _self_test() -> int:
     check("wildcard and range forms expand",
           (cron_minutes("*/20 * * * *"), cron_minutes("5-8 * * * *")),
           ({0, 20, 40}, {5, 6, 7, 8}))
+    triggers = workflow_triggers(
+        "on:\n  schedule:\n    - cron: '11 * * * *'\n    - ignored: true\n  push: {}\n")
+    check("shared trigger parser accepts mapping and cron extractor filters entries",
+          (sorted(triggers), workflow_crons(triggers)), (["push", "schedule"], ["11 * * * *"]))
+    check("shared trigger parser rejects malformed YAML and non-mapping documents",
+          (raises(CronMapError, lambda: workflow_triggers("on: [\n")),
+           raises(CronMapError, lambda: workflow_triggers("- not-a-workflow\n"))),
+          (True, True))
+    check("shared trigger parser treats non-mapping on as no triggers",
+          workflow_triggers("on: [push]\n"), {})
 
     with tempfile.TemporaryDirectory() as tmp:
         workflow_dir = Path(tmp) / WORKFLOWS_DIR
