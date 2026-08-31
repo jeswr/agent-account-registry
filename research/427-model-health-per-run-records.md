@@ -135,10 +135,33 @@ because the contents API's directory response carries entry metadata without fil
 git trees API can return all names in one request but likewise not their content; blobs still cost
 one request each.
 
-`RETENTION_CEILING_RECORDS = 2000` (`model-health.py:128`) therefore becomes a lower bound on
-per-read requests in the steady state. `GitHubAPI.paginate` (`model-health.py:2419-2431`) caps at
-20 pages of 100 and raises `"model-health snapshot may be truncated"` beyond that — 2000 entries
-sits exactly at that ceiling, with no headroom.
+So a read becomes **1 + N requests**: one listing (or trees call), plus one blob fetch per retained
+shard. N is the retained *record count*, and it is not a constant.
+`RETENTION_CEILING_RECORDS = 2000` (`model-health.py:128`) is an **upper** bound on N, not a lower
+one — and not a clean upper bound either. Retention is floor-selected (every record inside
+`RETENTION_FLOOR_SECONDS`, 7 h, `:112`, survives) and the ceiling only clamps that selection when it
+overshoots; `RETENTION_CEILING_BYTES = 750_000` (`:129`) can bind first and push N lower still;
+while `_apply_retention_ceiling` clamps to `max(len(preserved), RETENTION_CEILING_RECORDS)`
+(`:638-639`), so a large preserved set can hold N *above* 2000.
+
+Which N actually occurs is the question, and this record does not answer it. The source states the
+ceiling as *"~4.6x today's live rate"* and *"~285 records/h sustained"* (`:115-117`), i.e. a live
+rate on the order of 60 rec/h, which over a 7 h floor is a few hundred shards rather than two
+thousand. That figure is a comment in the source, not something measured here (§7). Stated as
+scenarios instead of as a single number:
+
+| scenario | N | read cost |
+| --- | --- | --- |
+| the live rate the source states (~60 rec/h, 7 h floor) | a few hundred | 1 listing page + a few hundred GETs |
+| sustained at the tolerated rate (~285 rec/h) | ~2000 | 20 listing pages + ~2000 GETs |
+| ceiling binding with a large preserved set | >2000 | listing exceeds `paginate`'s cap |
+
+The pagination interaction is therefore a worst-case property, not a steady-state one:
+`GitHubAPI.paginate` (`model-health.py:2419-2431`) caps at 20 pages of 100 and raises
+`"model-health snapshot may be truncated"` beyond that, so a *saturated* window lands exactly on
+that cap with no headroom and a preserved-set-inflated window exceeds it, while a window at the
+stated live rate pages comfortably. The per-shard GETs are the cost that binds at every N; the
+listing is only the cost that binds at the top of the range.
 
 > **MUST VERIFY before implementing.** I have not confirmed against current GitHub API docs: (a) the
 > exact directory-listing entry cap on the contents API and whether it is a hard truncation or a
@@ -220,8 +243,9 @@ Stated fairly, because two of these are real:
 **A — full per-run shards, aggregate on read (#427 as written).** Removes write contention and the
 #739 hazard. Costs: read goes from 1 request to 1+N on three consumers including the dispatch hot
 path; retention becomes a separate reaper that must re-derive `prune`'s cross-account preserved set
-and whose every bug fails open; a new partial-read failure class on a fail-open path; and the
-enumeration sits at the pagination ceiling with no headroom. **Not recommended as specified.** The
+and whose every bug fails open; a new partial-read failure class on a fail-open path; and, in the
+saturated case, a listing that lands exactly on `paginate`'s 20x100 cap with no headroom (§2).
+**Not recommended as specified.** The
 read side pays for a write-side problem, and it pays on the paths whose failure mode is "admit a
 capped account".
 
@@ -229,19 +253,60 @@ capped account".
 (no CAS, no read). A compactor folds the tail into `data/model-health.json` and deletes the folded
 shards — and `prune` runs *there*, in the one place that already holds the whole window, which is
 exactly where its cross-account derivation belongs. Readers fetch the base blob (1 GET) plus a tail
-bounded by the compaction interval times the record rate, not by the retention window. The obvious
+bounded by the compaction interval times the record rate, not by the retention window — that is the
+read's *cost*; whether it is a *safe* read is the unresolved consistency item below. The obvious
 host for the compactor is the existing `groom-sweep.yml` cron that already runs `model-health.py
 decide` (`:349`) and therefore already reads the window.
 
-B also has the migration story #427 asks for and A does not: the base blob keeps its exact current
-shape, so a reader deployed before the change reads it and sees a **valid but slightly stale**
-window. The degradation is staleness, not breakage — which matters given #739's finding that this
+B also has the migration story #427 asks for and A does not: the base blob keeps its current shape
+(modulo the dedup field the protocol below turns out to need), so a reader deployed before the
+change reads it and sees a **valid but slightly stale** window. The degradation is staleness, not breakage — which matters given #739's finding that this
 ledger is read during rolling upgrades by pre-merge readers. A's compat path, by contrast, requires
 every reader to learn enumeration before any writer stops writing the blob.
 
-Unresolved for B, and it is not a detail: a record is invisible to `decide` until compaction, so the
-compaction interval becomes alert latency, and it must be shown to stay under the windows the
-outage/transient conditions need. That analysis has not been done here.
+Two things are unresolved for B, and neither is a detail.
+
+*Latency.* A record is invisible to `decide` until compaction, so the compaction interval becomes
+alert latency, and it must be shown to stay under the windows the outage/transient conditions need.
+That analysis has not been done here.
+
+*Consistency.* "Fold the tail into the base, then delete the folded shards" is not atomic against a
+concurrent reader, and the order-dependence §2 uses against A applies to B just as hard:
+
+- reader fetches the **new** base and also a shard the compactor has not deleted yet → the outcome
+  is counted twice → a consecutive-failure chain gains a link, i.e. a backoff that should not exist;
+- reader lists the tail, the compactor folds and deletes, the reader's per-shard GET 404s → partial
+  window → a chain is short a link and `account-usage.py::_load_health_state` fails **open**
+  (`:410-416`).
+
+So B does not get a ~1-request *safe* read for free; it gets it only under a publication protocol,
+and no such protocol exists in this repo today. In outline it would need at least:
+
+1. **Delete only after publish.** The compactor PUTs the new base (CAS on the base sha) and deletes
+   folded shards only once that PUT has landed. Every record is then visible *at least once* to any
+   interleaving, never zero. A crash between the steps leaves duplicates — the tolerable direction —
+   and the next compaction clears them.
+2. **Identity dedup on read**, without which at-least-once is not safe. `_record_identity`
+   (`:2270-2276`) already exists and is already the write-side dedup key, but it returns `None` when
+   `run_id` is missing or non-string, and those records cannot be deduped by it. The shard filename
+   is the natural key — it is the idempotency key on the write side (§4.1) — which means the base
+   must carry it per record: an additive field. #739's ORIGIN_READ posture tolerates additive fields
+   on stored records (`:855`), so an older writer's read-modify-write neither blocks nor erases it,
+   but it is still a change to `RECORD_KNOWN_FIELDS` and so to a fail-closed validator, and it
+   weakens the "the base blob keeps its exact current shape" migration claim above.
+3. **A stale listing must not read as a short tail.** On a 404 for a listed shard the reader re-GETs
+   the base: base sha changed → that shard was folded, drop it; base sha unchanged → the shard is
+   genuinely gone and the read must fail **closed**. That rule terminates, unlike a blanket retry,
+   but it costs a request on the failure path and it obliges `account-usage.py` to grow a
+   fail-closed branch it does not have today.
+4. **A rollout ordering constraint.** An old *reader* sees base-only and is merely stale, as claimed
+   above. An old *writer* is the hazard: it read-modify-writes the base knowing nothing of the tail,
+   so its `prune` runs over an incomplete window and can evict records the tail's context would have
+   preserved — precisely the never-evict classes of §3. No writer may still be appending to the base
+   once the tail exists, which is an ordering constraint B's migration story has to carry.
+
+Until that protocol is written down, costed and reviewed, **B is a direction, not a design**, and
+the "~1 request, safe" claim for it is unproven in the same way A's cost is.
 
 **C — time-bucketed blobs (e.g. one blob per hour).** Contention divides by live bucket count;
 reads cost one request per bucket in the window (~48 at `WINDOW_HOURS`). Retention becomes
@@ -274,11 +339,18 @@ converts the premise of #427 from an assumption into a number. If exhaustion is 
 closed as "mitigated by #200" and the remaining value (the #739 hazard reduction) is not worth
 rebuilding the read path of four consumers.
 
-If the number justifies acting, **take B, not A.** B gets the entire write-side win — zero CAS
-contention, filename-as-idempotency-key, no read before write — while keeping `prune`'s
-cross-account derivation in a single place that holds the whole window, keeping the read at ~1
-request for the hot-path consumers, and degrading to staleness rather than breakage for readers
-deployed before the change.
+If the number justifies acting, **B is the better direction than A — conditionally.** B gets the
+entire write-side win — zero CAS contention, filename-as-idempotency-key, no read before write —
+while keeping `prune`'s cross-account derivation in a single place that holds the whole window,
+keeping the hot-path read near 1 request, and degrading to staleness rather than breakage for
+readers deployed before the change.
+
+The conditions are the two unresolved items in §5, and B should not be adopted before both are
+discharged: (a) the compaction interval must be shown to fit the alert-latency windows, and (b) the
+base/tail publication protocol must be specified and reviewed — ordering, identity dedup, deletion
+timing, the fail-closed rule on a stale listing, and the no-old-writers rollout constraint. Without
+(b), B trades A's partial-read failure class for its own rather than avoiding it, and the safe-read
+advantage that makes it preferable to A does not yet exist.
 
 I would not implement #427 as literally specified. The proposal treats the read path as a mechanical
 migration ("touches every reader of the blob"), but the readers are not incidental: their access
@@ -291,7 +363,14 @@ different from the provenance store the pattern is borrowed from.
   size of the problem is assumption.
 - The GitHub API limits in §2 are stated from recollection and flagged MUST-VERIFY; they should be
   confirmed against current docs before any option is costed.
+- The retained-record count N that sets A's read cost is **not measured**. The scenarios in §2 lean
+  on rate figures written in `model-health.py`'s own comments, not on an observed distribution of
+  window sizes; nothing in this repo records one. Which scenario is the operating point decides how
+  bad A actually is.
 - Option B's compaction interval versus alert-latency requirements is unanalysed.
+- Option B's base/tail publication protocol (§5) is sketched, not specified, and has had no
+  consistency or trust review. Treat the four numbered points as the shape of the obligation, not as
+  a design that has been shown to close the races.
 - No security or trust review of the shard-naming scheme has been done. A filename derived from
   record fields is a **new** place where record content reaches a path, and the privacy invariant
   (decision 22 — no raw handle in any record, log line, or alert body) would need to hold for
