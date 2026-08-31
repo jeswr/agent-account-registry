@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5817,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cfc7fa8250da2f87dcf6c8469f9ee1309ae46fed",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_NON_PLAIN_START still classifies every value beginning with & or ! as a complete non-plain node, and _plain_name_value() consequently returns None. YAML anchors and tags are properties that may prefix another node, including a plain scalar, so values such as name: &label Publish for issue #1135 and name: !custom Publish for issue #1135 can still be silently truncated without detection. The self-tests add no anchor/tag fixtures.",
+    "file": "scripts/check-workflow-step-names.py",
+    "fix_hint": "Lexically consume leading anchor/tag properties and then classify and scan the following node. Keep aliases separate because an alias is itself a complete node. Add failing fixtures for anchored and tagged plain names containing whitespace followed by #1234, plus safe property-prefixed quoted or otherwise non-plain values.",
+    "severity": "major",
+    "title": "Anchored and tagged plain scalars still bypass the gate"
+   },
+   {
+    "body": "_multiline_truncation_offence() still returns None immediately on a blank continuation line. Its own docstring acknowledges that YAML can fold such a blank line into a continuing plain scalar, so a sufficiently indented continuation containing whitespace followed by #1135 after that blank line can evade the gate. No self-test exercises this valid continuation shape.",
+    "file": "scripts/check-workflow-step-names.py",
+    "fix_hint": "Track blank lines according to YAML plain-scalar continuation rules rather than terminating unconditionally. Add a regression fixture where a valid multiline plain name resumes after a blank line and contains a whitespace-prefixed issue reference, together with a safe paragraph-style multiline fixture.",
+    "severity": "major",
+    "title": "Blank lines still bypass multiline scalar detection"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: both round-3 major false-negative classes remain in the submitted scanner. Anchor- and tag-prefixed values are still excluded wholesale, even though those YAML properties can prefix a plain scalar containing a truncating whitespace-# sequence. Multiline scanning still returns at the first blank line despite acknowledging that YAML can continue the plain scalar afterward. No regression fixtures cover either case, so the gate still cannot support its stated claim to flag every affected plain name:/run-name: scalar.",
+  "verdict": "request_changes"
+ }
+}
