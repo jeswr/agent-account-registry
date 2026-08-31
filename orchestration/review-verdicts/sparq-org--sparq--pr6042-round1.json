@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6042,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0f3eb436a5cceb5208b356dae5253bed4b5998bc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "check_workflow classifies only workflow/job/step env mappings and the github-script `github-token` input. A label writer such as `run: GH_TOKEN=${{ secrets.MAINTAINER_PAT }} gh pr edit \"$N\" --add-label needs:user` has an inline mutation but an empty `effective` mapping, so the loop emits no offence. The same gap applies to a secret passed as a command argument or Authorization header. This directly defeats the claimed border: the workflow can still write a label under a maintainer PAT while the gating check passes.",
+    "file": "scripts/check-label-write-tokens.py",
+    "fix_hint": "Inspect executable `run`/github-script text for credential expressions and assignments used by label-writing commands, rejecting any non-approved secret or unprovable token source. Add a self-test for an inline `GH_TOKEN=${{ secrets.MAINTAINER_PAT }}` label write that must fail. If complete shell data-flow analysis is intentionally out of scope, narrow the documented invariant and add a separate enforceable restriction that forbids credential expressions in label-writer bodies.",
+    "severity": "major",
+    "title": "Inline credential expressions bypass token attribution"
+   },
+   {
+    "body": "classify_token returns success for every non-expression value unless it happens to match a small GitHub token-prefix regex. Thus token-shaped fields such as `GH_TOKEN: $MAINTAINER_PAT`, `GH_TOKEN: opaque-token`, or a token format not covered by that regex pass, despite the documented rule that a present credential must be provably github.token or an App token. This is fail-open and also makes the hard-coded-token detection dependent on incomplete prefix recognition.",
+    "file": "scripts/check-label-write-tokens.py",
+    "fix_hint": "For any token-shaped env/input being classified, reject every non-empty value that is not syntactically proven to be an approved expression; only empty values should pass without an approved source. Add negative fixtures for a shell-variable value and an arbitrary literal, plus a positive fixture only if there is a legitimate non-expression form that can be proven safe.",
+    "severity": "major",
+    "title": "Unprovable literal token values are accepted"
+   }
+  ],
+  "progress": null,
+  "summary": "The new gate is fail-open for credential forms that its stated invariant says must be rejected. In particular, a label-writing step can place a PAT expression directly in its run/script body, or assign a literal/shell-expanded value to a token-shaped environment variable, and the checker reports no offence. The fixtures cover only mapping-based `${{ secrets.* }}` credentials, so they do not expose these bypasses.",
+  "verdict": "request_changes"
+ }
+}
