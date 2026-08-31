@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6061,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "104c2699e32042db0a457fbb494386decdedb3d5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change accurately resolves the tracked missing-mode item as non-applicable to this repository. The cited real engine path routes SPARQL ROUND through Num::round and the dedicated half-toward-positive-infinity helper; the focused Rust test exercises positive and negative ties through both helper and public numeric entry points. The focused Noir differential test exercises the externally supplied SPARQL-facing round_double implementation, including the required negative-zero case, while the in-repo compose dependency documents sparq_ieee754 as comparison-only and no round_to_integral call exists under zk/. The text also explicitly distinguishes and avoids concealing the engine's negative-zero defect, and it does not make an unaudited ZK soundness/privacy claim. No correctness, security, or test-validity issue is apparent in the diff-scoped evidence.",
+  "verdict": "approve"
+ }
+}
