@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5883,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0ac00017be32b73c34a94ed0bedbd4b050c84fa6",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2's approval remains supported. The UPDATE workflow supplies the flag-shaped replay template, while legacy query lanes retain the positional default. Both bead and GitHub issue output share select_replay, narrowing parsed mismatches to one seed and using the configured seed window for seedless failures. The self-test exercises both output channels, both CLI shapes, the legacy fallback, and non-baseline mode prefixing. No correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
