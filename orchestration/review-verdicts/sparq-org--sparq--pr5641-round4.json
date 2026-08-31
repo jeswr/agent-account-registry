@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5641,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f9ab5e67c8fa4f75b82038e201747dd2dbe607d8",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "REQUIRED_GUARDS maps .github/workflows/publish.yml to test_release_publish_guard.py, but that test does not read or parse publish.yml; its occurrences of the filename are only prose references. The assertion `assertIn(Path(entry).name, guard.read_text(...))` therefore passes without the claimed validation. The discovery sweep has the same weakness. As a result, publish.yml edits skip the Rust matrix while the carve-out's required second safety obligation is not actually established.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Add a non-selector-gated guard that opens/parses .github/workflows/publish.yml and asserts its load-bearing release invariants, then make this audit verify that concrete relationship rather than a raw filename substring. Alternatively, remove publish.yml from _ORCHESTRATION_SAFE until such a guard exists. Include a mutation test showing a meaningful publish.yml defect makes the guard fail.",
+    "severity": "major",
+    "title": "publish.yml guard check is vacuous"
+   }
+  ],
+  "progress": null,
+  "summary": "The release-lane carve-out is not yet sound because its purported non-vacuity check accepts a filename appearing only in comments or prose. In the current tree, test_release_publish_guard.py does not open or structurally inspect .github/workflows/publish.yml; it merely mentions publish.yml in comments/messages. Nevertheless, the new REQUIRED_GUARDS mapping declares that test as publish.yml's validating guard, and the new assertion passes by substring. Therefore arbitrary changes to publish.yml are classified orchestration-only while the added audit falsely reports that the workflow is validated. The test needs to prove an actual file read/parse and a meaningful invariant for publish.yml, or publish.yml must remain outside the safe allowlist.",
+  "verdict": "request_changes"
+ }
+}
