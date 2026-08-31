@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6031,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "79f915c8fe2a66123679985bee8ddd33d63f34be",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new coin-toss source is correct and complete for its explicitly limited in-process, honest-majority semi-honest simulation scope. Contributions are independently generated per party, committed before sharing, checked against their commitments, shared at the common Shamir threshold, and summed pointwise; the tests exercise reconstruction, quorum consistency, all-party contribution, phase binding, counter exhaustion, round accounting, nonzero rejection, and fail-closed deployment/VSS behavior. The security-sensitive limitations are stated prominently and consistently: the opening check and nonzero test are central simulation artefacts, malicious off-commitment sharing is not detected, VSS is refused, no source is deployable, and external review sq-qhy4 remains pending. The public API documentation and MPC skill are updated consistently. No hostile reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
