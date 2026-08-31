@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2085,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3df6032dc8abdfc3436353fb279ac8a46afad2cf",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The first consistency bullet says that publishing the base before deleting folded shards makes every record visible at least once to any interleaving. A reader that fetches the old base first, then lists the tail after publication and deletion, sees the record in neither source. The later 404/re-fetch rule handles a shard that was listed and then deleted, but it cannot detect an already-empty newer listing. The document correctly treats the protocol as unresolved overall, so this local overstatement is minor rather than a blocker.",
+    "file": "research/427-model-health-per-run-records.md",
+    "fix_hint": "Qualify the at-least-once claim and include reader operation ordering or a generation/manifest check in the future protocol obligation\u2014for example, list the tail before fetching the base and use the existing 404/base-recheck rule, or verify a generation across both reads and retry/fail closed when it changes.",
+    "severity": "minor",
+    "title": "Publish-before-delete does not cover every reader ordering"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The retention ceiling is now correctly treated as a conditional upper bound, with preserved records and the byte ceiling called out and the operating point explicitly left unmeasured. Option B is no longer presented as an already-safe design: the non-atomic base/tail races, identity deduplication, stale-listing behavior, rollout ordering, and latency obligation are surfaced, and the recommendation is expressly conditional on a specified and reviewed publication protocol. One minor overstatement remains in the protocol sketch: publish-before-delete alone does not make every reader interleaving observe each record. That does not block approval because the record repeatedly labels the sketch incomplete and makes adoption conditional on completing the protocol.",
+  "verdict": "approve"
+ }
+}
