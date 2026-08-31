@@ -68,8 +68,8 @@ run of THIS code against the live targets timed every request:
 
 So the step is API-ROUND-TRIP bound, not compute bound. The first fix overlapped the same REST
 request set, bounded by SNAPSHOT_CONCURRENCY. The throughput fix now projects PR detail plus
-both exact gate names through bounded GraphQL aliases: up to five PRs per request, at a measured
-two GraphQL points per PR, from GraphQL's separate 5,000-point bucket. The unfiltered REST legs
+both exact gate names through bounded GraphQL reads, overlapped across PRs at a measured two
+GraphQL points per PR, from GraphQL's separate 5,000-point bucket. The unfiltered REST legs
 walk remains red-only because its names are advisory repair context. A GraphQL failure falls
 back to REST DETAIL ONLY, preserving disarm/conflict safety while gate-dependent admissions
 stand down; it never silently recreates the old check-run fan-out.
@@ -197,12 +197,14 @@ SAFE_SHA = re.compile(r"[0-9a-f]{40}")
 # The PRIMARY limit is unaffected: overlapping reads does not change how many are issued.
 SNAPSHOT_CONCURRENCY = 8
 # GraphQL folds the REST PR-detail read and both gate-name check-run walks into one
-# repository query. Five aliases keeps each response below GitHub's measured resource ceiling
-# (a sparq PR has up to ~46 check suites) while turning 150 PRs into 30 round trips.
+# repository query. A single alias is deliberate: production's older heads can carry 100 check
+# suites, and GitHub rejected even a five-alias query once those heads entered the batch. The
+# one-PR queries overlap at SNAPSHOT_CONCURRENCY, so 150 PRs still avoid serial round-trip time.
 # `rateLimit` in every response is authoritative for GraphQL's SEPARATE 5,000-point
 # bucket; preserving a reserve keeps later registry jobs able to diagnose a failed tick.
-GRAPHQL_PR_BATCH_SIZE = 5
+GRAPHQL_PR_BATCH_SIZE = 1
 GRAPHQL_CHECK_RUNS_PER_SUITE_LIMIT = 10
+GRAPHQL_CHECK_SUITE_PAGE_LIMIT = CHECK_RUN_PAGE_LIMIT
 GRAPHQL_RATE_LIMIT_RESERVE = 100
 # Ceiling on a server-suggested `Retry-After` back-off. Overlapping reads is the way to
 # provoke a secondary rate limit, so the back-off must honour what GitHub asks for — but a
@@ -1175,7 +1177,7 @@ def _pr_status_snapshot(fetch, claim, repo, pulls, concurrency=SNAPSHOT_CONCURRE
 
 
 def _graphql_pr_query(count, claim):
-    """One bounded, variable-only query for ``count`` worker PRs.
+    """One bounded, variable-only query for ``count`` worker PR aliases.
 
     The two check-run aliases deliberately live under EVERY check suite. GitHub's
     ``Commit.checkSuites`` filter does not reliably match a check-run name, while
@@ -1188,6 +1190,7 @@ def _graphql_pr_query(count, claim):
     run_fields = "nodes { name status conclusion startedAt } pageInfo { hasNextPage } totalCount"
     for index in range(count):
         definitions.append(f"$n{index}: Int!")
+        definitions.append(f"$after{index}: String")
         pulls.append(f"""
         p{index}: pullRequest(number: $n{index}) {{
           number state isDraft mergeable headRefOid
@@ -1195,8 +1198,8 @@ def _graphql_pr_query(count, claim):
           commits(last: 1) {{
             nodes {{ commit {{
               oid
-              checkSuites(first: 100) {{
-                pageInfo {{ hasNextPage }}
+              checkSuites(first: 100, after: $after{index}) {{
+                pageInfo {{ hasNextPage endCursor }}
                 nodes {{
                   strictGate: checkRuns(first: {GRAPHQL_CHECK_RUNS_PER_SUITE_LIMIT}, filterBy: {{checkName: {json.dumps(strict_name)}}}) {{ {run_fields} }}
                   draftGate: checkRuns(first: {GRAPHQL_CHECK_RUNS_PER_SUITE_LIMIT}, filterBy: {{checkName: {json.dumps(draft_name)}}}) {{ {run_fields} }}
@@ -1221,7 +1224,10 @@ def _graphql_connection_runs(connection):
     total = connection.get("totalCount")
     if not isinstance(nodes, list) or not isinstance(page_info, dict):
         raise SnapshotItemError("check-runs-malformed")
-    if page_info.get("hasNextPage") is True:
+    has_next = page_info.get("hasNextPage")
+    if not isinstance(has_next, bool):
+        raise SnapshotItemError("check-runs-malformed")
+    if has_next:
         raise SnapshotItemError("check-runs-overflow")
     if (not isinstance(total, int) or isinstance(total, bool) or total != len(nodes)):
         raise SnapshotItemError("check-runs-malformed")
@@ -1262,7 +1268,7 @@ def _rest_detail_only_record(fetch, repo, number):
 
 
 def _graphql_pr_record(fetch, claim, repo, expected_number, node):
-    """Validate and normalize one PR alias from the batched GraphQL response."""
+    """Validate and normalize one PR alias from a GraphQL response."""
     if (not isinstance(node, dict) or node.get("number") != expected_number
             or node.get("state") != "OPEN" or not isinstance(node.get("isDraft"), bool)):
         raise SnapshotItemError("pr-detail-malformed")
@@ -1330,7 +1336,10 @@ def _graphql_pr_record(fetch, claim, repo, expected_number, node):
         suite_page = suites.get("pageInfo") if isinstance(suites, dict) else None
         if not isinstance(suite_nodes, list) or not isinstance(suite_page, dict):
             raise SnapshotItemError("check-runs-malformed")
-        if suite_page.get("hasNextPage") is True:
+        suite_has_next = suite_page.get("hasNextPage")
+        if not isinstance(suite_has_next, bool):
+            raise SnapshotItemError("check-runs-malformed")
+        if suite_has_next:
             raise SnapshotItemError("check-runs-overflow")
         check_runs = []
         for suite in suite_nodes:
@@ -1349,11 +1358,66 @@ def _graphql_pr_record(fetch, claim, repo, expected_number, node):
     return record
 
 
+def _graphql_suite_connection(node):
+    """Return the head commit's check-suite connection, or None for a malformed projection."""
+    commits = node.get("commits") if isinstance(node, dict) else None
+    commit_nodes = commits.get("nodes") if isinstance(commits, dict) else None
+    if not isinstance(commit_nodes, list) or len(commit_nodes) != 1:
+        return None
+    commit = commit_nodes[0].get("commit") if isinstance(commit_nodes[0], dict) else None
+    return commit.get("checkSuites") if isinstance(commit, dict) else None
+
+
+def _graphql_complete_suites(graphql, query, variables, first_node):
+    """Boundedly join every check-suite page for one immutable PR head.
+
+    Older Sparq heads carry more than 100 suites. Treating the first page as complete
+    would either lose their gate or degrade them permanently, so pagination happens in
+    the same one-PR query shape. Every later page is rebound to the first page's PR number
+    and head SHA before any nodes are joined. A malformed cursor/page poisons the suite
+    projection (detail stays intact and `_graphql_pr_record` degrades check runs only).
+    """
+    suites = _graphql_suite_connection(first_node)
+    if not isinstance(suites, dict):
+        return first_node
+    seen_cursors = set()
+    for _page in range(1, GRAPHQL_CHECK_SUITE_PAGE_LIMIT):
+        page_info = suites.get("pageInfo")
+        has_next = page_info.get("hasNextPage") if isinstance(page_info, dict) else None
+        if has_next is not True:
+            return first_node
+        cursor = page_info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            suites["nodes"] = None
+            return first_node
+        seen_cursors.add(cursor)
+        next_variables = dict(variables, after0=cursor)
+        data = graphql(query, next_variables)
+        repository = data.get("repository") if isinstance(data, dict) else None
+        next_node = repository.get("p0") if isinstance(repository, dict) else None
+        if (not isinstance(next_node, dict)
+                or next_node.get("number") != first_node.get("number")
+                or next_node.get("headRefOid") != first_node.get("headRefOid")):
+            suites["nodes"] = None
+            return first_node
+        next_suites = _graphql_suite_connection(next_node)
+        current_nodes = suites.get("nodes")
+        next_nodes = next_suites.get("nodes") if isinstance(next_suites, dict) else None
+        if not isinstance(current_nodes, list) or not isinstance(next_nodes, list):
+            suites["nodes"] = None
+            return first_node
+        current_nodes.extend(next_nodes)
+        suites["pageInfo"] = next_suites.get("pageInfo")
+    # Still hasNextPage at the explicit bound. Leave it true so the record degrades as
+    # check-runs-overflow; never mistake a bounded prefix for a complete gate history.
+    return first_node
+
+
 def _graphql_pr_status_snapshot(graphql, fetch, claim, repo, pulls,
                                 concurrency=SNAPSHOT_CONCURRENCY):
-    """Batched GraphQL equivalent of ``_pr_status_snapshot``.
+    """Bounded, overlapped GraphQL equivalent of ``_pr_status_snapshot``.
 
-    A failed batch falls back to REST DETAIL ONLY: this preserves disarm and conflict
+    A failed PR read falls back to REST DETAIL ONLY: this preserves disarm and conflict
     safety without recreating the hundreds of check-run reads this path removes. Gate
     admissions stand down explicitly until a later tick can read them.
     """
@@ -1371,55 +1435,49 @@ def _graphql_pr_status_snapshot(graphql, fetch, claim, repo, pulls,
     except ValueError as exc:
         raise FetchError(f"invalid owner/repo target {repo!r}") from exc
 
-    status_items, skips = {}, []
-
-    def detail_fallback(pull):
+    def snapshot_one(pull):
         number = pull["number"]
+        variables = {"owner": owner, "name": name, "n0": number, "after0": None}
+        query = _graphql_pr_query(GRAPHQL_PR_BATCH_SIZE, claim)
         try:
-            return number, _rest_detail_only_record(fetch, repo, number), None
-        except SnapshotItemError as exc:
-            return number, None, exc.reason
-
-    for offset in range(0, len(worker_pulls), GRAPHQL_PR_BATCH_SIZE):
-        batch = worker_pulls[offset:offset + GRAPHQL_PR_BATCH_SIZE]
-        variables = {"owner": owner, "name": name}
-        variables.update({f"n{index}": pull["number"]
-                          for index, pull in enumerate(batch)})
-        try:
-            data = graphql(_graphql_pr_query(len(batch), claim), variables)
+            data = graphql(query, variables)
             repository = data.get("repository") if isinstance(data, dict) else None
             if not isinstance(repository, dict):
                 raise FetchError("GitHub GraphQL response has no repository object")
+            node = repository.get("p0")
+            if node is not None:
+                node = _graphql_complete_suites(graphql, query, variables, node)
         except FetchError as exc:
-            print("::warning::plan-snapshot: GraphQL PR-status batch failed; preserving "
-                  f"detail-only safety for {repo} PRs {batch[0]['number']}..{batch[-1]['number']} "
-                  f"and standing gate admissions down ({exc})")
-            # Fold in input order, matching the normal path and the existing REST snapshot.
-            results = _ordered_map(detail_fallback, batch, concurrency)
-            for number, record, reason in results:
-                if record is None:
-                    skips.append({"pr_number": number, "reason": reason})
-                else:
-                    status_items[str(number)] = record
-                    skips.append({"pr_number": number,
-                                  "reason": record["check_runs_degraded"]})
-            continue
-
-        for index, pull in enumerate(batch):
-            number = pull["number"]
-            node = repository.get(f"p{index}")
             try:
-                # A null alias commonly means the PR disappeared after the listing. One
-                # detail read distinguishes that from a malformed GraphQL projection.
-                record = (_rest_detail_only_record(fetch, repo, number) if node is None
-                          else _graphql_pr_record(fetch, claim, repo, number, node))
-            except SnapshotItemError as exc:
-                skips.append({"pr_number": number, "reason": exc.reason})
-                continue
-            status_items[str(number)] = record
-            if "check_runs_degraded" in record:
-                skips.append({"pr_number": number,
-                              "reason": record["check_runs_degraded"]})
+                record = _rest_detail_only_record(fetch, repo, number)
+                return number, record, record["check_runs_degraded"], str(exc)
+            except SnapshotItemError as detail_exc:
+                return number, None, detail_exc.reason, str(exc)
+        try:
+            # A null alias commonly means the PR disappeared after the listing. One
+            # detail read distinguishes that from a malformed GraphQL projection.
+            record = (_rest_detail_only_record(fetch, repo, number) if node is None
+                      else _graphql_pr_record(fetch, claim, repo, number, node))
+        except SnapshotItemError as exc:
+            return number, None, exc.reason, None
+        return number, record, record.get("check_runs_degraded"), None
+
+    status_items, skips = {}, []
+    # Each query has one PR alias because the response bound depends on the target head's
+    # check-suite population. Overlap supplies the latency win without multiplying that
+    # untrusted response population inside one server-side resource budget.
+    for number, record, reason, graphql_error in _ordered_map(
+            snapshot_one, worker_pulls, concurrency):
+        if graphql_error is not None:
+            print("::warning::plan-snapshot: GraphQL PR-status read failed; preserving "
+                  f"detail-only safety for {repo}#{number} and standing gate admissions down "
+                  f"({graphql_error})")
+        if record is None:
+            skips.append({"pr_number": number, "reason": reason})
+            continue
+        status_items[str(number)] = record
+        if reason is not None:
+            skips.append({"pr_number": number, "reason": reason})
     return status_items, skips
 
 
@@ -3081,11 +3139,11 @@ def _self_test():
         assert inertness_attestation(claim, [row13], {13: detail})["items"]["13"] is False
         assert inertness_attestation(claim, [row13], {"13": detail})["items"]["13"] is False
 
-    def graphql_batches_detail_and_gates_without_weakening_degradation():
+    def graphql_status_reads_detail_and_gates_without_weakening_degradation():
         """The fast path removes REST fan-out while preserving every fail-closed tier.
 
-        One more than the batch bound must take two GraphQL requests; a red gate may use the
-        unfiltered REST legs walk. A failed GraphQL batch falls back to detail-only REST,
+        Each PR gets one bounded, overlapped GraphQL request; a red gate may use the
+        unfiltered REST legs walk. A failed GraphQL read falls back to detail-only REST,
         so disarm data survives while every gate-dependent admission stands down.
         """
         heads = {number: f"{number:040x}"
@@ -3111,7 +3169,10 @@ def _self_test():
                 "commits": {"nodes": [{"commit": {
                     "oid": heads[number],
                     "checkSuites": {"nodes": [suite],
-                                    "pageInfo": {"hasNextPage": suite_overflow}},
+                                    "pageInfo": {
+                                        "hasNextPage": suite_overflow,
+                                        "endCursor": "suite-page-2" if suite_overflow else None,
+                                    }},
                 }}]},
             }
 
@@ -3174,17 +3235,28 @@ def _self_test():
         assert all(claim.pr_ci_status(record)["check_runs_degraded"] is True
                    for record in fallback_items.values())
 
-        # A connection beyond the explicit bound degrades only that PR after detail.
-        def overflowing_graphql(_query, _variables):
-            return {"repository": {"p0": node(100, suite_overflow=True)}}
+        # A head beyond one check-suite page is joined, head-bound, and not degraded.
+        page_cursors = []
 
-        overflow_items, overflow_skips = _graphql_pr_status_snapshot(
-            overflowing_graphql, lambda url: (_ for _ in ()).throw(
+        def paginated_graphql(_query, variables):
+            page_cursors.append(variables.get("after0"))
+            return {"repository": {"p0": node(
+                101, suite_overflow=variables.get("after0") is None)}}
+
+        paged_items, paged_skips = _graphql_pr_status_snapshot(
+            paginated_graphql, lambda url: (_ for _ in ()).throw(
                 AssertionError(f"unexpected REST fallback {url}")),
-            claim, repo, worker_pulls[:1])
-        assert overflow_skips == [{"pr_number": 100, "reason": "check-runs-overflow"}]
-        assert overflow_items["100"]["head_sha"] == heads[100]
-        assert overflow_items["100"]["check_runs"] == []
+            claim, repo, worker_pulls[1:2])
+        assert page_cursors == [None, "suite-page-2"], page_cursors
+        assert paged_skips == [] and len(paged_items["101"]["check_runs"]) == 2
+
+        # A connection still carrying hasNextPage at the explicit bound degrades after detail.
+        overflow_record = _graphql_pr_record(
+            lambda url: (_ for _ in ()).throw(AssertionError(f"unexpected REST {url}")),
+            claim, repo, 100, node(100, suite_overflow=True))
+        assert overflow_record["check_runs_degraded"] == "check-runs-overflow"
+        assert overflow_record["head_sha"] == heads[100]
+        assert overflow_record["check_runs"] == []
 
         # Exercise the real transport seam: POST + variables + bearer token, and the
         # response-body rate-limit reserve from GraphQL's separate bucket.
@@ -3287,7 +3359,7 @@ def _self_test():
 
     ok, rows = _run_checks((
         the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed,
-        graphql_batches_detail_and_gates_without_weakening_degradation,
+        graphql_status_reads_detail_and_gates_without_weakening_degradation,
         snapshot_parallel_output_is_identical_to_serial,
         per_pr_reads_actually_overlap,
         repo_listings_overlap_across_repos,
