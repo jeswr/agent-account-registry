@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6028,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1151a069a7b32deb0f89246a35bd0fdcaf71756f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 7 proposes `workflow_run: types: [completed]` and says it fires for sibling workflows without a hard-coded name list. GitHub Actions' workflow_run trigger requires the `workflows` selector; the repository's own fast-fix-ring workflow accordingly specifies `workflows: [\"ci-summary\"]`. The proposed trigger therefore cannot observe arbitrary sibling completions as claimed. Since event-driven wakeups are central to the architecture, this is not a minor YAML omission: a maintained explicit list, a different event source, or reliance on the timer changes the design's correctness and latency analysis.",
+    "file": "research/ci-gate-slotless-aggregation.md",
+    "fix_hint": "Revise the architecture around a supported trigger. Specify and maintain the complete workflow-name list (including how tests prevent drift), use another supported dispatch mechanism, or explicitly make cron the authoritative driver and recalculate the behavior/payoff. Add this platform point to Phase 4 verification rather than presenting wildcard workflow_run dispatch as available.",
+    "severity": "major",
+    "title": "workflow_run cannot subscribe to all sibling workflows without a workflow list"
+   },
+   {
+    "body": "Sections 4 and 7 claim the privileged evaluator runs from the default branch and never from PR-head content, yet the same workflow is proposed with `pull_request` and `merge_group` seed triggers and `checks: write`, plus a checkout and Python execution path. The default-branch isolation property stated for workflow_run/schedule does not automatically cover pull_request/merge_group execution or checkout content. As written, the design neither pins the evaluator code checkout to the trusted default-branch SHA nor separates privileged evaluation from untrusted seed runs, so its justification for the privilege increase is incomplete and potentially unsafe.",
+    "file": "research/ci-gate-slotless-aggregation.md",
+    "fix_hint": "Separate seed registration from privileged evaluation, or fully specify a trusted-code execution path: use only default-branch-triggered privileged workflows, pin checkout/script sources to the default branch, ensure event-derived values are treated only as data, and document/test fork and same-repository PR behavior. Do not grant checks:write to a path that can execute PR or merge-ref code.",
+    "severity": "major",
+    "title": "Seed triggers violate the claimed default-branch-only checks:write trust boundary"
+   }
+  ],
+  "progress": null,
+  "summary": "The revision correctly identifies that completion-only evaluation cannot detect hangs, but the recommended architecture is not implementable or security-complete as written. Its workflow_run trigger assumes an unsupported wildcard form, and its seed triggers contradict the stated trust boundary for a checks:write evaluator. These are load-bearing design defects in a design record intended to constrain later implementation.",
+  "verdict": "request_changes"
+ }
+}
