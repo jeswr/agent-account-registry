@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-31T13:24:19Z",
+  "generated_at": "2026-08-31T13:34:55Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -15,8 +15,8 @@
       "prs_merged_24h": 4,
       "review_changes_backlog": 10,
       "needs_user_parked": 16,
-      "review_lane_health": "unknown",
-      "review_lane_runs_1h": null,
+      "review_lane_health": "ok",
+      "review_lane_runs_1h": 5,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
