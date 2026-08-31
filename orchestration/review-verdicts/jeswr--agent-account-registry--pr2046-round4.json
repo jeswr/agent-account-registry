@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2046,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2b9a8f3ff6ca4b0cc5850c3cd58778381944b12c",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The loop-to-call scan remains `for stmt in _live_nodes(loop)`, so it accepts every park call that is individually live without proving that any execution can reach it after earlier control flow. For example, `for target in targets: if repo: continue; if repo: park_starved_partition_holder(repo, target)` still returns `tick`: both `if` nodes are runtime-conditional and therefore live to this analysis, although `repo` true continues before the call and `repo` false skips the call. The new accepted row uses `if not repo: continue` followed by an unguarded call; it prevents blanket refusal but does not test or solve the correlated-guard counterexample requested in round 3. This leaves a fail-open structural certificate for a batch that parks nothing.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Add the round-3 refusal row with `if repo: continue` followed by the park call under `if repo`, retain an accepting counterpart whose conditions are demonstrably compatible, and make certification prove a compatible path from loop entry to the call (or fail closed when that compatibility cannot be established).",
+    "severity": "major",
+    "title": "Mutually exclusive runtime guards still certify an unreachable park call"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 correlation hole remains. The new row for a guarded `continue` is a useful accepting control, but `_live_nodes(loop)` still establishes only per-node liveness and does not relate the runtime condition that permits fall-through past the `continue` to the condition guarding the park call. Consequently the exact mutually exclusive-guard shape from the prior finding still certifies `tick`. Because the same major soundness defect remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
