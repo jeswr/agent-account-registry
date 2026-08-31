@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5573,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c5dfb011755259c8097b55f2f841050546ff58a4",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "LABEL_WRITE_PATTERNS still lacks GitHub GraphQL label mutations such as addLabelsToLabelable and removeLabelsFromLabelable. scripts/bd-to-issues.py contains a real addLabelsToLabelable mutation, but discover_label_writing_scripts() therefore does not classify it as a label-writing script. A workflow invoking that script with REGISTRY_RING_TOKEN, KB_DUMP_TOKEN, or another foreign PAT in scope will make step_writes_labels() return false and skip R1/R2. This is materially the same major completeness defect reported in round 4.",
+    "file": "scripts/check-label-write-token.py",
+    "fix_hint": "Recognize the repository's GraphQL label mutation spellings, at minimum addLabelsToLabelable and removeLabelsFromLabelable, and add a positive self-test that invokes the real GraphQL-writing script with a foreign credential. Add a negative GraphQL label-read fixture if the chosen matcher could confuse reads and writes.",
+    "severity": "major",
+    "title": "GraphQL label writes still bypass the identity guard"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 does not address round 4's major finding. The new detector still recognizes REST/CLI and JavaScript-style method calls only; it has no pattern for GitHub GraphQL label mutations. The repository's existing scripts/bd-to-issues.py uses addLabelsToLabelable, so discovery still fails to classify that real script as a label writer. Consequently, a workflow step invoking it with a foreign PAT in scope can still bypass both R1 and R2. The added REST method fixtures do not exercise the reported GraphQL gap.",
+  "verdict": "request_changes"
+ }
+}
