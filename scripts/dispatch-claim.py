@@ -2644,8 +2644,8 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
 #     `assemble-census`
 #     read `kept=0` on four consecutive executed ticks (20:12:40Z -> 20:47:36Z), every row deferred
 #     by `reason.global-reservation`, zero impl workers launched; it cleared at 21:07:30Z. Four
-#     holders at one park per tick was ~55 minutes of TOTAL dispatch outage. The live floor is now
-#     15 minutes; the historical incident remains the evidence for batching, while all current
+#     holders at one park per tick was ~55 minutes of TOTAL dispatch outage. The live floor is
+#     10 minutes; the historical incident remains the evidence for batching, while all current
 #     drain-time and headroom arithmetic below is derived from the live floor constants. Before #822
 #     ticks ran every ~7 minutes (briefly ~4), so the same cap was cheap. THE FLOOR IS CORRECT AND
 #     STAYS — it exists because exceeding ~6 ticks/h exhausted the request budget and took the
@@ -2681,17 +2681,17 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
 #       names elsewhere, which is a different set from the PARKED board.)
 #       These counts DRIFT — they moved within hours of being taken, and two read methods
 #       disagreed by one — so the exact numbers are not what the bound rests on. What it rests on
-#       is the margin to the 100/page boundary: at a cap of 12 the live spare affords NINE pages
-#       per holder (12 * (9 + 4) = 156 <= 164) before the budget binds, i.e. ~900 timeline events on
+#       is the margin to the 100/page boundary: at a cap of 12 the live spare affords TWELVE pages
+#       per holder (12 * (12 + 4) = 192 <= 197) before the budget binds, i.e. ~1,200 events on
 #       every holder at once.
-#   spare requests per tick     ~= 165
-#       the floor prices the live 150-PR cold-cache ceiling at 908 requests and admits 4 ticks/h:
-#       3,632/h against OBSERVED_SAFE_REQUESTS_PER_HOUR = 7*613 = 4,291/h, which ran clean for
-#       thirteen hours. Spare = 4,291 - 3,632 = 659/h = ~165 per tick at 4 ticks/h.
-#   12 parks * 5 requests       =  60  <=  165     (36% of the spare, 6.6% of a cold tick)
+#   spare requests per tick     ~= 197
+#       the post-#2099 floor prices both live targets at 518 core requests and admits 6 ticks/h:
+#       3,108/h against OBSERVED_SAFE_REQUESTS_PER_HOUR = 7*613 = 4,291/h.
+#       Spare = 4,291 - 3,108 = 1,183/h = ~197 per tick at 6 ticks/h.
+#   12 parks * 5 requests       =  60  <=  197     (30% of the spare, 11.6% of a cold tick)
 #
 # and 12 is 3x the largest starved board actually measured (4 holders, the window above), so the
-# measured case drains in ONE tick (15 min) rather than FOUR (60 min); the observed outage ran ~55
+# measured case drains in ONE tick (10 min) rather than FOUR (40 min); the observed outage ran ~55
 # min because that window also spans the tick that first measured it and the one that cleared it. A
 # board wider than the bound is paced onto later ticks exactly as before, loudly. _starvation_sweep_self_test asserts BOTH halves
 # of this arithmetic against dispatch-tick-floor.py's own constants, so neither the floor nor this
@@ -2753,7 +2753,7 @@ def starvation_park_targets(planned_items, deferred, occupancy, log=print,
 
     ALL of them, not one (registry #822 composition defect — see STARVATION_PARKS_PER_TICK_MAX).
     `busy` is a UNION, so the partition stays reserved while any holder holds it: parking one of N
-    frees nothing and the next tick — now 15 minutes away — re-measures the identical
+    frees nothing and the next tick — now 10 minutes away — re-measures the identical
     starvation. Under this function's own predicate (`planned_items` empty AND `deferred > 0`)
     there is no dispatch left to protect, so the batch cannot starve anything.
 
@@ -2897,9 +2897,9 @@ def format_unprovenanced_narrowed_census(repo, occupancy):
 #   * an ESCALATION is a WARNING, so OVER-acting is the expensive direction and 1/tick is right on
 #     its own terms — the harm it guards is a buried signal, not a starved lane.
 #
-# The tick cost is stated so nobody has to re-derive it: at the live 15-minute floor, N stuck
-# holders take N * 15 minutes for ALL of them to be NAMED in a run log. The measured population
-# was 3 (sparq-org/sparq #4360/#4509/#4528) = 45 minutes to enumerate. That is VISIBILITY latency
+# The tick cost is stated so nobody has to re-derive it: at the live 10-minute floor, N stuck
+# holders take N * 10 minutes for ALL of them to be NAMED in a run log. The measured population
+# was 3 (sparq-org/sparq #4360/#4509/#4528) = 30 minutes to enumerate. That is VISIBILITY latency
 # on a condition that is already permanent and already counted every tick under
 # `partition-starvation-unprovenanced`, not dispatch outage — which is why it is left at 1.
 STARVATION_ESCALATIONS_PER_TICK_MAX = 1
@@ -3747,7 +3747,7 @@ def enrolment_enable_error(policy_doc, claim_admits, rf_admits, outcome_admits, 
 # that push rate is the quantity the congestion-collapse mode is a function of. The review lane's
 # 17 add reviewer ACCOUNT demand, not CI load, and that is bounded independently and EARLIER by
 # the account allocator, which returns no-slot and defers without mutating anything. At the
-# 15-minute cadence the fix half clears in ONE tick and the 17 in 4 — full drain within 60 minutes.
+# 10-minute cadence the fix half clears in ONE tick and the 17 in 4 — full drain within 40 minutes.
 DRAFT_TIER_BACKLOG_PER_TICK_MAX = 5
 _DRAFT_TIER_NEW = "_draft_tier_newly_reachable"   # private; stripped before the plan row is built
 
@@ -4118,8 +4118,8 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             # Measured on sparq-org/sparq#4847 (2026-07-28..29, under this code): review rounds 4,
             # 5 and 6 all returned `approve` on ONE unchanged head, with `nochange` fix rounds 3, 4
             # and 5 between them and three promote -> arm -> `gate-failed` -> disarm -> redraft
-            # cycles, ~10 minutes each under the then-live floor (the live counterfactual is now
-            # ~15 minutes each). The head's aggregator was a concluded FAILURE throughout.
+            # cycles, ~10 minutes each under the then-live floor (also ~10 minutes under the
+            # current #2100 floor). The head's aggregator was a concluded FAILURE throughout.
             #
             # So: a concluded-FAILURE aggregator on the live head selects the CI kind. This is the
             # SAME precedence GAP-B already applies one branch up ("conflict repair FIRST and alone
@@ -6072,8 +6072,8 @@ def _log_park_census(repo, census, log=print):
 # slowly than it was applied. That is the benign direction (a release is throughput coming back,
 # not an outage), and releases are driven by each PR's provenance record landing, which does not
 # arrive in a batch. An un-park deferred by this ceiling writes nothing and is retried next tick —
-# which is now a 15-minute unit (#822), so the drain of a full cohort is
-# ceil(N / AUTO_READMISSION_PER_TICK_MAX) * 15 minutes. Re-derive this if that ever binds.
+# which is now a 10-minute unit (#822/#2100), so the drain of a full cohort is
+# ceil(N / AUTO_READMISSION_PER_TICK_MAX) * 10 minutes. Re-derive this if that ever binds.
 STARVATION_UNPARKS_PER_TICK_MAX = AUTO_READMISSION_PER_TICK_MAX
 
 # The park cause this sweep owns. It is written into the park receipt and re-read before any
@@ -8464,7 +8464,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         # EVERY inert holder, not the lowest one (registry #822). `busy` is a union: the partition
         # is only released once the LAST holder is parked, so a per-tick cap of 1 multiplied by
         # #822's former 10-minute floor exposed a 4-holder board as ~55 minutes of total dispatch
-        # outage; the live 15-minute floor makes batching even more important. The loop is
+        # outage; the live 10-minute floor makes batching even more important. The loop is
         # per-holder-resilient — one failed park never costs the others.
         #
         # >>> starvation-park-batch — EXECUTED by _starvation_park_batch_seam_self_test against
@@ -15748,7 +15748,7 @@ def _self_test():
     # re-approves the identical tree. Measured on sparq-org/sparq#4847 (2026-07-28..29): review
     # rounds 4, 5 and 6 all `approve` on ONE unchanged head, `nochange` fix rounds 3, 4 and 5
     # between them, three arm -> `gate-failed` -> disarm -> redraft cycles ~10 minutes each under
-    # the then-live floor (the live counterfactual is now ~15 minutes each),
+    # the then-live floor (also ~10 minutes under the current #2100 floor),
     # and a concluded-red aggregator on the head the entire time.
     changes_red = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:changes"],
                        body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
@@ -22886,8 +22886,8 @@ def _starvation_park_batch_seam_self_test():
     parked, counted = _run_starvation_park_batch(list(reversed(board)))
     assert parked == board, (
         f"ONE tick must park ALL {len(board)} inert `{GLOBAL_PACKAGE}` holders — the reservation "
-        f"is a union, so parking a subset frees nothing and the live 15-minute floor makes each "
-        f"un-parked holder another 15 minutes of TOTAL dispatch outage (parked {parked})")
+        f"is a union, so parking a subset frees nothing and the live 10-minute floor makes each "
+        f"un-parked holder another 10 minutes of TOTAL dispatch outage (parked {parked})")
     assert counted == len(board), counted
     print(f"  ok   #822 park batch (EXECUTED production source): {len(board)} inert holders -> "
           f"{len(parked)} label writes on ONE tick, and {counted} counted defer reason(s)")
@@ -23060,7 +23060,7 @@ def _starvation_sweep_self_test():
     #
     # `busy` is a UNION over occupants, so `__global__` stays reserved while ANY holder holds it:
     # parking 1 of N frees NOTHING and the lane is identically starved next tick — the live
-    # 15-minute floor makes each wasted tick a 15-minute unit. MEASURED on sparq-org/sparq
+    # 10-minute floor makes each wasted tick a 10-minute unit. MEASURED on sparq-org/sparq
     # 2026-07-27 under the former 10-minute floor: kept=0 on
     # four consecutive executed ticks 20:12:40Z->20:47:36Z, zero impl workers launched, ~55 min of
     # total dispatch outage. THIS IS THE ASSERTION THE PRE-FIX CODE REDS ON — it returned
@@ -23081,7 +23081,7 @@ def _starvation_sweep_self_test():
                           Path(__file__).resolve().parent / "dispatch-tick-floor.py")
     _drain_ticks = -(-MEASURED_STARVED_HOLDER_BOARD // STARVATION_PARKS_PER_TICK_MAX)
     _drain_minutes = _drain_ticks * _floor.MIN_TICK_INTERVAL_SECONDS // 60
-    assert _drain_ticks == 1 and _drain_minutes == 15, (
+    assert _drain_ticks == 1 and _drain_minutes == 10, (
         f"the widest MEASURED starved board ({MEASURED_STARVED_HOLDER_BOARD} holders) must drain "
         f"in ONE executed tick; at a cap of {STARVATION_PARKS_PER_TICK_MAX} it takes "
         f"{_drain_ticks} tick(s) = {_drain_minutes} min of TOTAL dispatch outage, because the "
@@ -23096,9 +23096,9 @@ def _starvation_sweep_self_test():
         "executed dispatch ticks 2026-07-27 20:12:40Z-20:47:36Z, assemble-census kept=0 with "
         "every row deferred by reason.global-reservation. Change it only with a new measurement, "
         "and re-derive STARVATION_PARKS_PER_TICK_MAX when you do")
-    assert (MEASURED_STARVED_HOLDER_BOARD * _floor.MIN_TICK_INTERVAL_SECONDS // 60) == 60, \
+    assert (MEASURED_STARVED_HOLDER_BOARD * _floor.MIN_TICK_INTERVAL_SECONDS // 60) == 40, \
         "the live SERIAL counterfactual is part of the batching justification: four holders x " \
-        "the live 15-minute floor. If either input moved, the justification moved with it"
+        "the live 10-minute floor. If either input moved, the justification moved with it"
     print(f"  ok   #822 drain time: the measured {MEASURED_STARVED_HOLDER_BOARD}-holder board "
           f"drains in {_drain_ticks} tick ({_drain_minutes} min), not "
           f"{MEASURED_STARVED_HOLDER_BOARD} ticks "
@@ -23162,16 +23162,16 @@ def _starvation_sweep_self_test():
     assert _floor.HISTORICAL_MEASURED_REQUESTS_PER_TICK == 613, (
         "the 613-request observation calibrates the cost model and the observed safe/breaking "
         "rates; preserve it as evidence rather than relabelling the 150-PR projection measured")
-    assert _floor.COLD_CACHE_REQUESTS_PER_TICK == 908, (
-        "the live 150-PR cold-cache ceiling is 23 + 5.9*150; understating it invents batch "
+    assert _floor.COLD_CACHE_REQUESTS_PER_TICK == 518, (
+        "the live two-target core model is 23 + 3.1*150 + 0.2*150; understating it invents batch "
         "headroom and reopens the request-budget outage")
     assert _floor.OBSERVED_SAFE_REQUESTS_PER_HOUR == 7 * 613, (
         "OBSERVED_SAFE_REQUESTS_PER_HOUR is an OBSERVATION — 7 executed ticks in the 10Z hour, "
         "ran clean; 13 (OBSERVED_BREAKING) did not. It sits only on the RIGHT of every `<=` that "
         "reads it, in BOTH files, so overstating it is invisible to all of them. This PR is what "
         "made a second file's bound lean on it, so it is pinned from the consumer")
-    assert _floor.MIN_TICK_INTERVAL_SECONDS == 15 * 60, (
-        "the #822 floor is what turns a per-TICK cap into a per-15-MINUTE cap; if it moves, every "
+    assert _floor.MIN_TICK_INTERVAL_SECONDS == 10 * 60, (
+        "the #822/#2100 floor turns a per-TICK cap into a per-10-MINUTE cap; if it moves, every "
         "drain time in this block and the bound they justify must be re-derived")
 
     # ...and the itemised timeline read is the one line item that is not a constant of the API: a
@@ -24158,7 +24158,7 @@ def _starvation_sweep_self_test():
     assert park_seam == "dispatch", (
         "the production tick must ITERATE starvation_park_targets(...) and call "
         "park_starved_partition_holder for EACH target, un-sliced and without a call-site `cap=` "
-        f"— otherwise the 1-holder-per-tick defect is back at 15 min/holder (found {park_seam!r})")
+        f"— otherwise the 1-holder-per-tick defect is back at 10 min/holder (found {park_seam!r})")
     print("  ok   #822 park call-site seam (AST): the production tick PARKS EVERY selected "
           "holder — a re-scalarised call site, a `[:1]`, or a call-site cap= reds here")
 
