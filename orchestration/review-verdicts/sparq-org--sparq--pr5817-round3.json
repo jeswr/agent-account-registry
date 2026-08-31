@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5817,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cfc7fa8250da2f87dcf6c8469f9ee1309ae46fed",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_NON_PLAIN_START` still treats every value beginning with `&` or `!` as a complete non-plain node. YAML anchors and tags are properties that can prefix a scalar, so `name: &label Publish for issue #1135` and `name: !custom Publish for issue #1135` can still contain a truncated plain scalar while `_plain_name_value()` returns `None`. No new self-test covers these cases.",
+    "file": "scripts/check-workflow-step-names.py",
+    "fix_hint": "Lexically consume anchor/tag properties, then classify and scan the following node. Keep aliases separate because an alias is itself a complete node. Add failing fixtures for anchored and tagged plain names containing ` #1234`, plus safe quoted or otherwise non-plain property-prefixed cases.",
+    "severity": "major",
+    "title": "Anchored and tagged plain scalars still bypass the gate"
+   },
+   {
+    "body": "`_multiline_truncation_offence()` still returns immediately on a blank line, even though its docstring acknowledges that YAML can fold such a line into a continuing plain scalar. A sufficiently indented continuation containing ` #1135` after that blank line can therefore evade the gate. The self-tests still do not exercise this valid continuation shape.",
+    "file": "scripts/check-workflow-step-names.py",
+    "fix_hint": "Handle blank lines according to YAML plain-scalar continuation rules instead of terminating unconditionally. Add a regression fixture in which a valid multiline plain `name:` resumes after a blank line and contains a whitespace-prefixed issue reference, together with a safe paragraph-style multiline fixture.",
+    "severity": "major",
+    "title": "Blank lines still bypass multiline scalar detection"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 is stagnant: both round-2 major false-negative classes remain unchanged. Anchor/tag-prefixed scalar nodes are still excluded wholesale by `_NON_PLAIN_START`, and multiline scanning still terminates at the first blank line despite acknowledging that YAML may continue the scalar afterward. The self-test suite adds no fixtures for either case, so the gate still does not fulfill its stated promise to flag every affected plain `name:`/`run-name:` scalar.",
+  "verdict": "request_changes"
+ }
+}
