@@ -1,16 +1,16 @@
 {
-  "generated_at": "2026-08-31T22:29:30Z",
+  "generated_at": "2026-08-31T22:43:27Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 2194,
-      "issues_ready": 247,
+      "issues_ready": 248,
       "issues_closed_1h": 0,
       "issues_closed_24h": 10,
-      "prs_open": 165,
-      "prs_draft": 135,
+      "prs_open": 164,
+      "prs_draft": 136,
       "prs_opened_1h": 3,
-      "prs_closed_1h": 2,
+      "prs_closed_1h": 3,
       "prs_merged_1h": 0,
       "prs_merged_24h": 6,
       "review_changes_backlog": 14,
@@ -20,19 +20,19 @@
       "worker_attempts_1h": 1,
       "worker_success_rate_1h": 0.0,
       "pr_open_rate": 3.0,
-      "pr_close_rate": 2.0,
-      "net_pr_flow": 1.0
+      "pr_close_rate": 3.0,
+      "net_pr_flow": 0.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 992,
+      "issues_open": 994,
       "issues_ready": 636,
-      "issues_closed_1h": 3,
-      "issues_closed_24h": 14,
-      "prs_open": 49,
+      "issues_closed_1h": 1,
+      "issues_closed_24h": 13,
+      "prs_open": 50,
       "prs_draft": 35,
-      "prs_opened_1h": 1,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 2,
+      "prs_merged_1h": 1,
       "prs_merged_24h": 11,
       "review_changes_backlog": 6,
       "needs_user_parked": 17,
@@ -40,32 +40,31 @@
       "review_lane_runs_1h": 2,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
-      "pr_open_rate": 1.0,
-      "pr_close_rate": 2.0,
-      "net_pr_flow": -1.0
+      "pr_open_rate": 2.0,
+      "pr_close_rate": 1.0,
+      "net_pr_flow": 1.0
     }
   },
   "alerts": [
     {
       "target": "sparq-org/sparq",
-      "classification": "backlog-growing",
+      "classification": "ready-starved",
       "fire": true,
-      "summary": "open PRs 165 > 40 and net PR flow +1.0/hr (open 3.0 > close 2.0) sustained over 2 snapshots",
+      "summary": "ready frontier 248 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
       "metrics": {
-        "prs_open": 165,
-        "net_pr_flow": 1.0,
-        "pr_open_rate": 3.0,
-        "pr_close_rate": 2.0
+        "issues_ready": 248,
+        "issues_closed_1h": 0
       }
     },
     {
-      "target": "sparq-org/sparq",
-      "classification": "ready-starved",
+      "target": "jeswr/agent-account-registry",
+      "classification": "review-lane-stalled",
       "fire": true,
-      "summary": "ready frontier 247 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=6 waits",
       "metrics": {
-        "issues_ready": 247,
-        "issues_closed_1h": 0
+        "review_changes_backlog": 6,
+        "review_lane_runs_1h": 2,
+        "prs_merged_1h": 1
       }
     }
   ]
