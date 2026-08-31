@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6025,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7f4062ad0ae2a775f5d86e13ae9414e40fb018ce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change accurately records the closed shadow-corpus decision. The unconditional `--enforce` wiring means selected PR runs omit outside-cone measurements, while non-selected/full/shadow/error paths expand to full measurement; the cited merge-group test exercises the live job guards, and the stated PR, push, full-trigger, inherited-row, and nightly backstops match the implementation. No correctness, soundness, test-validity, or security issue is introduced.",
+  "verdict": "approve"
+ }
+}
