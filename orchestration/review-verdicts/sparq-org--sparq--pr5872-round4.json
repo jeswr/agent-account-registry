@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5872,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "36dbb74c7a4def7208e116cf4b11f934daafaf45",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "npm_test_targets() scans all of `rest` for `--workspaces`, `-ws`, and workspace selectors without stopping at npm's standalone `--` delimiter. Thus `npm test -- --workspaces` returns ALL_WORKSPACES even though that token is a test-script argument and npm runs only the test selected by the effective working directory. Likewise, `npm run test -- --workspace packages/x` can falsely credit packages/x. This is the same fail-open major issue recorded in round 3, and the test diff still does not exercise either negative case.",
+    "file": "scripts/check-package-test-execution.py",
+    "fix_hint": "Parse npm options only before the first standalone `--`; after that delimiter, treat every token as a script argument and do not recognize workspace flags. Add negative tests proving `npm test -- --workspaces` targets only the effective working directory and `npm run test -- --workspace packages/x` does not credit packages/x, while retaining positive tests for selectors before the delimiter.",
+    "severity": "major",
+    "title": "npm options after `--` are still misread as workspace coverage"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3's major fail-open finding remains unchanged. npm_test_targets() still scans the full argument list for workspace selectors after npm's standalone `--` delimiter, and the added tests still contain no negative cases for selectors passed as script arguments. Consequently, commands such as `npm test -- --workspaces` can falsely credit every workspace even though npm passes `--workspaces` to the package test script. The guard can therefore report repository-wide test coverage that did not execute. Because the same major correctness issue remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
