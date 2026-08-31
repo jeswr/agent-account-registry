@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5860,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8d5bc16fa84046ce93c737262082b699e392fad8",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "select_open_issue() still uses `if f\"{marker} {key}:\" in title`, despite documenting the match as the structured prefix. Thus a noncanonical title such as `note: [marker] suite=x: ...` can still dedupe as though it were the filer's canonical rolling issue. The lane, shard, and coverage selectors retain the equivalent containment check, and the new tests still do not cover preceding text. This is materially the same minor finding as round 3.",
+    "file": "scripts/bench-triage.py",
+    "fix_hint": "Use `title.startswith(f\"{marker} {key}:\")` and equivalent `startswith` checks in the changed lane, shard, and coverage selectors. Add a negative test where arbitrary text precedes an otherwise canonical marker/key fragment.",
+    "severity": "minor",
+    "title": "Structured title match remains unanchored"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3's sole minor finding remains unchanged. The structured key now has a correct right boundary via the colon delimiter, pagination is exhaustive, and the targeted tests cover real matches plus key-prefix collisions. However, all four filer selectors and the coverage probe still use substring containment rather than anchoring the documented structured prefix at the start of the title. A manually edited or mislabeled issue with text before the otherwise canonical marker/key fragment can therefore still be selected. Label scoping and canonical filer-generated titles limit the impact, so this remains a non-blocking hardening issue.",
+  "verdict": "approve"
+ }
+}
