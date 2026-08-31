@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5711,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a82d38b9506579f4e0a3cf5a909e6e25df8e2289",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The workflow now gives coverage-engine-run and coverage-engine-merge the identical rust-cache shared-key while retaining the existing main-only save policy. The focused hermetic test models the relevant key-prefix behavior, checks the live workflow wiring, and includes an explicit non-vacuity guard; all eight tests pass. No correctness, soundness, security, or test-validity defect is evident. Because round 3 was already clean and no finding is present now, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
