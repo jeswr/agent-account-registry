@@ -437,6 +437,20 @@ class GroomConflict(GroomError):
     """A retryable contents-API compare-and-swap conflict."""
 
 
+class GroomInconsistentSnapshot(GroomError):
+    """A target listing that CONTRADICTS ITSELF: one issue or pull number returned twice (#1624).
+
+    A SUBCLASS, never a sibling — every `except GroomError` in this file (the per-repo snapshot
+    try, the mutation-boundary re-reads, main's top-level handler) keeps failing closed on it
+    exactly as before. The only thing the narrower class buys is that ONE caller — the per-repo
+    snapshot phase, through `_consistent_snapshot` — can tell "the data disagrees with itself"
+    apart from "the payload was malformed" or "GitHub refused the read", and so can afford it one
+    clean re-read before deferring the repo's whole sweep. Widening that re-read to plain
+    GroomError would retry a permission refusal and a malformed page too, which is why the class
+    exists rather than a string match on the message.
+    """
+
+
 class RedraftUnavailable(GroomError):
     """A parked-PR redraft failure that is NOT a property of the pull request (issue #644).
 
@@ -2168,7 +2182,9 @@ def _issues(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
                 f"target issue comment count is malformed for {repo}#{number}"
             )
         if number in result:
-            raise GroomError(f"target issue snapshot contains duplicates for {repo}")
+            raise GroomInconsistentSnapshot(
+                f"target issue snapshot contains duplicates for {repo}"
+            )
         result[number] = item
     return result
 
@@ -2184,11 +2200,87 @@ def _pulls(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
         _epoch(pull.get("updated_at"), f"target pull request {repo}#{number}")
         linked_issue_numbers(pull)
         if number in result:
-            raise GroomError(
+            raise GroomInconsistentSnapshot(
                 f"target pull request snapshot contains duplicates for {repo}"
             )
         result[number] = pull
     return result
+
+
+# [#1624] ONE clean re-read before an inconsistent snapshot costs a repo its whole sweep cycle.
+#
+# Deliberately left out of #678 (its proposal 3) because it adds a retry shape to a trust-surface
+# reader. What changed is what a duplicate MEANS: under STABLE_LISTING_ORDER a concurrently created
+# row lands past the cursor and can no longer duplicate an already-read one, so the refusal is no
+# longer "we lost a race" but "this listing disagrees with itself". That is exactly the case a
+# second read is DIAGNOSTIC for — it separates a residual race from genuine inconsistency — and the
+# thing it buys back is a whole ~20-minute cycle of dead-lease reclaim, stuck-issue repair and
+# stale-PR hand-off for that repo.
+#
+# Three properties, each with its own killer in the self-test:
+#
+#   * SCOPED to the inconsistency class. A malformed payload, a refused read, a truncated walk are
+#     NOT re-read: they are not self-contradiction, and retrying a permission refusal buys nothing
+#     but a second 403. That is what `GroomInconsistentSnapshot` is for.
+#   * FAIL-CLOSED on the second answer. A re-read that is ALSO inconsistent propagates unchanged,
+#     so the repo defers exactly as it did before this existed. There is no third attempt and no
+#     "collapse the duplicate and carry on" — groom mutates labels and state off this snapshot.
+#   * BOUNDED at ONE extra listing per repo per tick, shared across the issue AND pull listings.
+#     A persistently inconsistent repo therefore cannot double the sweep's request budget: the
+#     first contradiction spends the repo's token, every later one in the same tick fails closed
+#     immediately. The token is spent when the re-read is ISSUED, not when it succeeds.
+class _SnapshotRereadBudget:
+    """Per-tick allowance of ONE extra target listing per repo (issue #1624)."""
+
+    def __init__(self) -> None:
+        self._spent: set[str] = set()
+
+    def claim(self, repo: str) -> bool:
+        """Reserve `repo`'s single re-read, or False if this tick already spent it."""
+        if repo in self._spent:
+            return False
+        self._spent.add(repo)
+        return True
+
+    def __len__(self) -> int:
+        return len(self._spent)
+
+
+def _snapshot_settle(attempt: int = 1, **injection: Any) -> None:
+    """Wait once for a self-contradictory listing to settle, before the single re-read.
+
+    Delegates to the SHARED `ledger_retry` CONTENTION schedule (full-jitter, 0.5s ceiling at
+    attempt 1) — the same policy the ledger CAS writers wait on — and deliberately NOT to
+    gh_retry's 2s->30s THROTTLE schedule: nothing here was rate-limited, so the seconds-to-a-minute
+    wait a burst limiter needs would only lengthen every sweep. Delegating rather than
+    re-implementing is the point (AGENTS.md: no new hand-rolled retry/sleep loops); the self-test
+    pins the delegation so a re-inlined `time.sleep` reds.
+    """
+    _ledger_retry.sleep_backoff(attempt, **injection)
+
+
+def _consistent_snapshot(
+    read: Callable[[], Any], repo: str, budget: _SnapshotRereadBudget
+) -> Any:
+    """`read()`'s snapshot, allowing ONE re-read per repo per tick on self-contradiction (#1624)."""
+    try:
+        return read()
+    except GroomInconsistentSnapshot as first:
+        if not budget.claim(repo):
+            raise
+        print(
+            f"NOTE repo {repo}: {first} — re-reading this listing ONCE (issue #1624); a re-read "
+            "that is also inconsistent defers this repo's whole sweep"
+        )
+        _snapshot_settle()
+        # No handler here: a second contradiction — or any other failure of the re-read — is the
+        # caller's per-repo deferral, unchanged from before this existed.
+        result = read()
+        print(
+            f"NOTE repo {repo}: the re-read came back consistent — this repo's sweep continues "
+            "(the first listing was a residual race, not inconsistent data)"
+        )
+        return result
 
 
 def _comments(api: GitHubAPI, repo: str, number: int) -> list[dict[str, Any]]:
@@ -3759,6 +3851,9 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     snapshot_attempted = 0
     snapshot_completed = 0
     snapshot_deferrals: list[str] = []
+    # [#1624] The tick's re-read allowance: ONE extra listing per repo, shared by that repo's issue
+    # and pull reads, so a persistently inconsistent repo cannot double the sweep's request budget.
+    reread_budget = _SnapshotRereadBudget()
     # The per-tick audit of the #1303 saving. Printed rather than assumed, for the same reason
     # plan-snapshot prints its conditional-read split: a request-budget win that is not visible
     # in the log of the tick that took it cannot be told apart from a quiet hour.
@@ -3768,8 +3863,14 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         repo_limits = limits[repo]
         snapshot_attempted += 1
         try:
-            repo_issues = _issues(api, repo)
-            repo_pulls = _pulls(api, repo)
+            # [#1624] Both listings go through the same per-repo re-read allowance: a snapshot
+            # that contradicts itself gets one clean re-read before this repo's sweep defers.
+            repo_issues = _consistent_snapshot(
+                lambda: _issues(api, repo), repo, reread_budget
+            )
+            repo_pulls = _consistent_snapshot(
+                lambda: _pulls(api, repo), repo, reread_budget
+            )
             repo_defuse = _collect_defuse_prs(
                 api, repo, repo_pulls, now, defuse_stale_seconds, bot_login
             )
@@ -4496,6 +4597,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         f"age_unpark_deferred={len(unpark_outcome.deferred)} "
         f"detect_deferred={len(detect_outcome.deferred)} "
         f"snapshot_deferred={len(snapshot_outcome.deferred)} "
+        # [#1624] The extra listings this tick spent re-reading a self-contradictory snapshot,
+        # emitted UNCONDITIONALLY including the zero row (AGENTS.md pre-flight item 8): this is a
+        # REQUEST-BUDGET gauge, and one that only appears when it is non-zero cannot be told apart
+        # from a quiet tick — which is precisely the reading needed to notice a repo that pays for
+        # a re-read on every single sweep.
+        f"snapshot_rereads={len(reread_budget)} "
         f"attempt_budget_deferred={len(budget_outcome.deferred)} "
         f"reap_deferred={len(reap_outcome.deferred)}"
     )
@@ -4787,6 +4894,157 @@ def _self_test() -> int:
         _snapshot_refusal([_race_pull(9), {**_race_pull(9), "body": "Fixes #4"}], _pulls),
         "target pull request snapshot contains duplicates for owner/repo",
     )
+    # Both refusals above are raised — and caught here — as GroomError, so the narrowing to
+    # GroomInconsistentSnapshot (#1624) is pinned by the checks that already exist: make it a
+    # sibling of GroomError rather than a subclass and every one of them reds, because the
+    # `except GroomError` in `_snapshot_refusal` (and in the sweep's per-repo try) stops catching
+    # it and the refusal escapes as `raised GroomInconsistentSnapshot`. The class is asserted by
+    # NAME below, where the re-read decision actually turns on it.
+
+    # ---- #1624: ONE clean re-read before an inconsistent snapshot costs a whole sweep cycle -----
+    #
+    # The guard above stays exactly as strict; what changes is the PRICE of a contradiction —
+    # one extra listing to diagnose it, instead of a ~20-minute cycle of dead-lease reclaim,
+    # stuck-issue repair and stale-PR hand-off for that repo. Everything asserted here is counted
+    # in LISTINGS ACTUALLY ISSUED, because "bounded to one extra read" is a claim about requests.
+    class _ScriptedRead:
+        """A snapshot read serving scripted answers in order, counting the listings it issued.
+
+        An Exception answer is RAISED, so a scenario can say `inconsistent, then clean` or
+        `inconsistent twice` without standing up a fixture GitHub. A call past the end of the
+        script returns a loud sentinel rather than another scripted value: an implementation that
+        read a THIRD time must not be able to satisfy an assertion by accident."""
+
+        def __init__(self, *answers: Any) -> None:
+            self.answers = answers
+            self.calls = 0
+
+        def __call__(self) -> Any:
+            self.calls += 1
+            if self.calls > len(self.answers):
+                return "UNSCRIPTED EXTRA LISTING"
+            answer = self.answers[self.calls - 1]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    def _reread(
+        reader: Any, budget: Any, repo: str = "owner/repo"
+    ) -> tuple[Any, int, str]:
+        """(outcome, listings issued, operator log) for one `_consistent_snapshot` call.
+
+        TOTAL: any exception is reported as a VALUE, so a mutant that makes the reader blow up
+        cannot abort the suite and score itself a kill (AGENTS.md item 4)."""
+        captured = io.StringIO()
+        saved_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            outcome: Any = _consistent_snapshot(reader, repo, budget)
+        except Exception as exc:  # noqa: BLE001
+            outcome = f"{type(exc).__name__}: {exc}"
+        finally:
+            sys.stdout = saved_stdout
+        return outcome, reader.calls, captured.getvalue()
+
+    _ISSUE_DUP = "target issue snapshot contains duplicates for owner/repo"
+    _PULL_DUP = "target pull request snapshot contains duplicates for owner/repo"
+    settle_calls: list[int] = []
+    _real_settle = globals()["_snapshot_settle"]
+    globals()["_snapshot_settle"] = lambda attempt=1, **_kw: settle_calls.append(attempt)
+    try:
+        recover_budget = _SnapshotRereadBudget()
+        recovered = _reread(
+            _ScriptedRead(GroomInconsistentSnapshot(_ISSUE_DUP), {7: "clean"}), recover_budget
+        )
+        check(
+            "[#1624] a self-contradictory snapshot is RE-READ once, and a clean re-read is "
+            "ACCEPTED — the repo's whole sweep cycle is saved. Exactly TWO listings, one settle, "
+            "and the operator sees both the re-read and its outcome",
+            (recovered[0], recovered[1], len(recover_budget), settle_calls,
+             "re-reading this listing ONCE" in recovered[2],
+             "came back consistent" in recovered[2]),
+            ({7: "clean"}, 2, 1, [1], True, True),
+        )
+        settle_calls.clear()
+        closed_budget = _SnapshotRereadBudget()
+        still_bad = _reread(
+            _ScriptedRead(GroomInconsistentSnapshot(_ISSUE_DUP),
+                          GroomInconsistentSnapshot(_ISSUE_DUP)),
+            closed_budget,
+        )
+        check(
+            "[#1624] FAIL CLOSED: a re-read that is ALSO inconsistent still REFUSES — the repo "
+            "defers exactly as it did before the re-read existed, the refusal keeps its class and "
+            "message, and there is NO third listing. Swallowing the second refusal (returning the "
+            "duplicated view, or collapsing it) reds here and nowhere else",
+            (still_bad[0], still_bad[1], len(closed_budget)),
+            (f"GroomInconsistentSnapshot: {_ISSUE_DUP}", 2, 1),
+        )
+        settle_calls.clear()
+        shared_budget = _SnapshotRereadBudget()
+        issue_leg = _reread(
+            _ScriptedRead(GroomInconsistentSnapshot(_ISSUE_DUP), {}), shared_budget
+        )
+        pull_leg = _reread(
+            _ScriptedRead(GroomInconsistentSnapshot(_PULL_DUP), {}), shared_budget
+        )
+        check(
+            "[#1624] BOUNDED at ONE extra listing per repo PER TICK, SHARED by the issue and pull "
+            "reads: the issue listing recovers, and the pull listing's contradiction in the same "
+            "tick fails closed on its FIRST read with no settle. A per-CALL allowance makes the "
+            "second leg 2 listings and reds",
+            (issue_leg[1], pull_leg[1], pull_leg[0], len(shared_budget), settle_calls),
+            (2, 1, f"GroomInconsistentSnapshot: {_PULL_DUP}", 1, [1]),
+        )
+        settle_calls.clear()
+        other_leg = _reread(
+            _ScriptedRead(GroomInconsistentSnapshot(_ISSUE_DUP), {}), shared_budget,
+            "owner/other",
+        )
+        check(
+            "[#1624] and the allowance is PER REPO, not per tick: a DIFFERENT repo on the same "
+            "budget still gets its own re-read, so one noisy target cannot starve the others "
+            "(a tick-global token makes this 1 listing and reds)",
+            (other_leg[1], len(shared_budget), settle_calls),
+            (2, 2, [1]),
+        )
+        settle_calls.clear()
+        scope_budget = _SnapshotRereadBudget()
+        malformed = _reread(
+            _ScriptedRead(GroomError("target issue snapshot is malformed for owner/repo"), {}),
+            scope_budget,
+        )
+        check(
+            "[#1624] SCOPED to self-contradiction: a malformed page, a refused read, a truncated "
+            "walk — every other GroomError — is NOT re-read, spends no budget and sleeps not at "
+            "all. Widening the except to GroomError would retry a permission refusal into a "
+            "second 403 and reds here",
+            (malformed[0], malformed[1], len(scope_budget), settle_calls),
+            ("GroomError: target issue snapshot is malformed for owner/repo", 1, 0, []),
+        )
+        # The SETTLE itself: shared policy, not a hand-rolled sleep, and the CONTENTION schedule
+        # rather than the throttle one. Both legs call the REAL `_snapshot_settle` (the global is
+        # stubbed above for the scenarios), so neither can be satisfied by the stub.
+        delegated: list[int] = []
+        _real_ledger_sleep = _ledger_retry.sleep_backoff
+        _ledger_retry.sleep_backoff = lambda attempt, *_a, **_kw: delegated.append(attempt)
+        try:
+            _real_settle()
+        finally:
+            _ledger_retry.sleep_backoff = _real_ledger_sleep
+        observed: list[float] = []
+        _real_settle(1, sleeper=observed.append, draw=lambda _lo, hi: hi)
+        check(
+            "[#1624] the settle DELEGATES to ledger_retry's shared CONTENTION schedule — "
+            "re-inlining a `time.sleep(random.uniform(...))` here reds the first leg (AGENTS.md: "
+            "no new hand-rolled retry/sleep loops), and its 0.5s ceiling is strictly under "
+            "gh_retry's 2s+ THROTTLE schedule, which is for a rate limiter and not for a listing "
+            "that disagreed with itself",
+            (delegated, observed, observed[0] < _gh_retry.backoff_ceiling(1)),
+            ([1], [0.5], True),
+        )
+    finally:
+        globals()["_snapshot_settle"] = _real_settle
 
     # ---- YAML seam: WORKER_RUN_NAME vs the title worker.yml actually renders (issue #1130) ----
     # A regex over a string another file produces drifts silently the moment that file changes:
@@ -8150,6 +8408,14 @@ def _self_test() -> int:
             sequenced = terminal_sweep_env.get("paginate_seq_failures", {}).get((path, nth))
             if sequenced is not None:
                 raise sequenced
+            # [#1624] A call-sequenced PAGE, the response-side twin of the refusal above. The
+            # defect under test is a listing whose CONTENT contradicts itself and then does not
+            # (or does again) on the very next read; only a per-(path, Nth) payload can express
+            # that, and driving it through the SHIPPED `_issues`/`_pulls` guards is what makes the
+            # scenario about the real refusal rather than about an exception the fixture invented.
+            sequenced_page = terminal_sweep_env.get("paginate_seq_pages", {}).get((path, nth))
+            if sequenced_page is not None:
+                return list(sequenced_page)
             if path == _open_issues_path():
                 return terminal_sweep_env["planned_issues"]
             if path == _open_pulls_path():
@@ -8574,6 +8840,7 @@ def _self_test() -> int:
             extra_gets: dict[str, Any] | None = None,
             paginate_refusals: dict[str, GroomError] | None = None,
             paginate_seq_refusals: dict[tuple[str, int], GroomError] | None = None,
+            paginate_seq_pages: dict[tuple[str, int], list[Any]] | None = None,
             leases: tuple[dict[str, Any], ...] | None = None,
             repos: tuple[str, ...] = ("owner/repo",),
             ledger_root: str = "",
@@ -8585,7 +8852,10 @@ def _self_test() -> int:
             revalidated AWAY inside the hand-off loop (the deliberate-skip case). `paginate_refusals`
             refuses a LISTING (issue #649's snapshot and comments reads), `paginate_seq_refusals`
             refuses the Nth call to one listing path (the terminal-reap re-read, which is the SECOND
-            read of `/pulls?state=open`), `repos`/`leases` widen the fixture to a second target so a
+            read of `/pulls?state=open`), `paginate_seq_pages` serves a chosen PAYLOAD on the Nth
+            call to one listing path (issue #1624's self-contradictory snapshot, which must be able
+            to differ between the first read and the re-read), `repos`/`leases` widen the fixture
+            to a second target so a
             head-of-line claim about ONE repo can be witnessed. `ledger_root` points run_sweep at a
             provenance checkout, so a PR can be given a VALID record; `side_effects` fires a
             callable on the Nth (method, path) request, so the world can CHANGE mid-sweep — the two
@@ -8618,6 +8888,7 @@ def _self_test() -> int:
                 http_failures=dict(refusals),
                 paginate_failures=dict(paginate_refusals or {}),
                 paginate_seq_failures=dict(paginate_seq_refusals or {}),
+                paginate_seq_pages=dict(paginate_seq_pages or {}),
             )
             terminal_sweep_releases.clear()
             saved_limits = globals()["load_limits"]
@@ -8644,7 +8915,8 @@ def _self_test() -> int:
                 globals()["load_limits"] = saved_limits
                 terminal_sweep_env.update(
                     pulls=[], gets={}, http_failures={}, planned_issues=[], fresh_issues={},
-                    paginate_failures={}, paginate_seq_failures={}, side_effects={},
+                    paginate_failures={}, paginate_seq_failures={}, paginate_seq_pages={},
+                    side_effects={},
                 )
             return log.getvalue(), error, [set(claims) for claims in terminal_sweep_releases]
 
@@ -10820,6 +11092,167 @@ def _self_test() -> int:
             ),
             ([set()], True, True, True),
         )
+
+        # (2b) [#1624] THE ONE CLEAN RE-READ, driven through the REAL sweep. Everything below is
+        # counted in LISTINGS THE FIXTURE ACTUALLY SERVED, and every refusal is raised by the
+        # SHIPPED `_issues`/`_pulls` duplicate guard off a self-contradictory payload — never by a
+        # GroomError the fixture wrote, which could not tell the re-read apart from any other
+        # deferral. The settle is stubbed to a counter so the suite neither sleeps nor depends on
+        # a clock; the schedule it delegates to is pinned separately, up in the unit checks.
+        dup_issue_page = [dict(parked_issue), dict(parked_issue)]
+        dup_pull_page = [
+            {"number": 91, "body": "",
+             "updated_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat()},
+        ] * 2
+        sweep_settles: list[int] = []
+        saved_sweep_settle = globals()["_snapshot_settle"]
+        globals()["_snapshot_settle"] = lambda attempt=1, **_kw: sweep_settles.append(attempt)
+        try:
+
+            def _issue_reads(repo: str) -> int:
+                return sum(
+                    1 for path in terminal_sweep_env["paginated"]
+                    if path == _open_issues_path(repo)
+                )
+
+            recover_log, recover_error, recover_releases = _sweep_with_refusals(
+                {},
+                repos=("owner/repo", "owner/other"),
+                leases=(repo_lease, other_lease),
+                paginate_seq_pages={
+                    (_open_issues_path(target), 1): dup_issue_page
+                    for target in ("owner/repo", "owner/other")},
+            )
+            check(
+                "MUTATION [#1624] (2b — recovering re-read): a target issue listing that "
+                "contradicts itself is re-read ONCE, comes back clean, and that repo's ENTIRE "
+                "sweep continues — both repos reclaim in the SAME tick instead of losing a "
+                "~20-minute cycle of reclaim, repair and hand-off. Deleting the re-read defers "
+                "both repos and releases NOTHING; the allowance is PER REPO, so a tick-global "
+                "token defers the second one and reds this too",
+                (
+                    recover_releases,
+                    recover_error,
+                    "snapshot_deferred=0" in recover_log,
+                    "snapshot_rereads=2" in recover_log,
+                    (_issue_reads("owner/repo"), _issue_reads("owner/other")),
+                    sweep_settles,
+                ),
+                ([{"e" * 32, "f" * 32}], "", True, True, (2, 2), [1, 1]),
+            )
+            sweep_settles.clear()
+            hard_log, hard_error, hard_releases = _sweep_with_refusals(
+                {},
+                repos=("owner/repo", "owner/other"),
+                leases=(repo_lease, other_lease),
+                paginate_seq_pages={
+                    (_open_issues_path(), ordinal): dup_issue_page for ordinal in (1, 2)},
+            )
+            check(
+                "MUTATION [#1624] (2b — the re-read is ALSO inconsistent): the sweep STILL FAILS "
+                "CLOSED. owner/repo's snapshot is refused with its own cause, its lease is "
+                "RETAINED (an inconsistent view must never release a claim, and must never be "
+                "collapsed into a usable one), owner/other reclaims in the same tick — and the "
+                "walk stops at exactly TWO listings, so a persistently inconsistent repo cannot "
+                "spin. Retrying until clean, or accepting the second duplicate, reds here",
+                (
+                    hard_releases,
+                    "ALERT repo owner/repo:" in hard_log,
+                    "target issue snapshot contains duplicates for owner/repo" in hard_log,
+                    "SKIP lease release claim=eeeeeeee: owner/repo's target snapshot was "
+                    "unreadable" in hard_log,
+                    hard_error,
+                    "snapshot_deferred=1" in hard_log,
+                    "snapshot_rereads=1" in hard_log,
+                    _issue_reads("owner/repo"),
+                    sweep_settles,
+                ),
+                ([{"f" * 32}], True, True, True, "", True, True, 2, [1]),
+            )
+            sweep_settles.clear()
+            budget_log, budget_error, budget_releases = _sweep_with_refusals(
+                {},
+                repos=("owner/repo", "owner/other"),
+                leases=(repo_lease, other_lease),
+                paginate_seq_pages={
+                    (_open_issues_path(), 1): dup_issue_page,
+                    (_open_pulls_path(), 1): dup_pull_page},
+            )
+            budget_pull_reads = sum(
+                1 for path in terminal_sweep_env["paginated"] if path == _open_pulls_path()
+            )
+            check(
+                "MUTATION [#1624] (2b — REQUEST BUDGET): the allowance is ONE extra listing per "
+                "repo per tick, SHARED by that repo's issue and pull reads. The issue listing "
+                "recovers and spends owner/repo's token; the pull listing then contradicts itself "
+                "in the SAME tick and defers on its FIRST read, with no second settle. A "
+                "per-LISTING allowance re-reads the pulls too (2 reads, rereads=2) and reds this — "
+                "that is the shape that lets a persistently inconsistent repo double the sweep's "
+                "request budget",
+                (
+                    budget_releases,
+                    "target pull request snapshot contains duplicates for owner/repo" in budget_log,
+                    budget_error,
+                    "snapshot_deferred=1" in budget_log,
+                    "snapshot_rereads=1" in budget_log,
+                    (_issue_reads("owner/repo"), budget_pull_reads),
+                    sweep_settles,
+                ),
+                ([{"f" * 32}], True, "", True, True, (2, 1), [1]),
+            )
+            sweep_settles.clear()
+            pull_recover_log, pull_recover_error, pull_recover_releases = _sweep_with_refusals(
+                {},
+                repos=("owner/repo", "owner/other"),
+                leases=(repo_lease, other_lease),
+                paginate_seq_pages={(_open_pulls_path(), 1): dup_pull_page},
+            )
+            pull_recover_reads = sum(
+                1 for path in terminal_sweep_env["paginated"] if path == _open_pulls_path()
+            )
+            check(
+                "MUTATION [#1624] (2b — the PULL listing recovers on ITS OWN): the ordering is "
+                "wired at BOTH snapshot reads, so this is what kills the pulls call site by "
+                "itself — unwiring it while leaving the issue read wrapped leaves every other "
+                "check in this file GREEN (measured; AGENTS.md item 4, mutually-masking "
+                "duplicates). A self-contradictory PR listing is re-read once, comes back clean, "
+                "and the repo sweeps: no deferral, one re-read, and the snapshot's THREE pull "
+                "reads against the two a clean reaping tick issues",
+                (
+                    pull_recover_releases,
+                    pull_recover_error,
+                    "snapshot_deferred=0" in pull_recover_log,
+                    "snapshot_rereads=1" in pull_recover_log,
+                    pull_recover_reads,
+                    sweep_settles,
+                ),
+                ([{"e" * 32, "f" * 32}], "", True, True, 3, [1]),
+            )
+            sweep_settles.clear()
+            quiet_log, _quiet_error, _quiet_releases = _sweep_with_refusals(
+                {}, repos=("owner/repo", "owner/other"), leases=(repo_lease, other_lease),
+            )
+            quiet_pull_reads = sum(
+                1 for path in terminal_sweep_env["paginated"] if path == _open_pulls_path()
+            )
+            check(
+                "[#1624] INSTRUMENT VALIDATION + the ZERO ROW: a tick whose snapshots are "
+                "consistent spends NO extra listing and NO settle, and still emits the gauge "
+                "(AGENTS.md item 8 — a counter that only appears when non-zero trains its reader "
+                "to read absence as health). Without this pair the checks above would pass "
+                "against a sweep that simply re-reads every listing twice — the same reaping "
+                "tick issues ONE issue listing per repo and TWO pull listings, not three",
+                (
+                    "snapshot_rereads=0" in quiet_log,
+                    (_issue_reads("owner/repo"), _issue_reads("owner/other")),
+                    quiet_pull_reads,
+                    sweep_settles,
+                ),
+                (True, (1, 1), 2, []),
+            )
+        finally:
+            globals()["_snapshot_settle"] = saved_sweep_settle
+            sweep_settles.clear()
 
         # (3) THE TERMINAL-REAP RE-READ (#509's mutation boundary). Here record-and-continue fails
         # OPEN — an unread issue stays ABSENT from `fresh_reap_issues`, which `_terminal_non_pr_claims`
