@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5885,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ebadd8a415ec1cf2fa9f9d32ab650bf2ee69aedf",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. `native_summary_spoke` centralizes the exact validity predicate used by native blocker counting and drift detection, excluding booleans and malformed/absent summaries. `open_blocker_count` preserves the existing fail-closed maximum while warning only when a well-formed native count differs from the validated open-marker count. The added self-tests exercise native-only and marker-only disagreement, agreement, closed markers, absent and malformed summaries, single-warning behavior, and unchanged dispatch counts; none is vacuous. No correctness, soundness, security, or injection issue is apparent. Compared with round 1, there are still no findings, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
