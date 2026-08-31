@@ -197,11 +197,11 @@ REVIEW_PASS_LABEL = "review:pass"
 SELF_ID = "> \N{ROBOT FACE} **SPARQ agent** \N{EM DASH} regate-sweep"
 
 # The ONE definition of "which minute is taken by which registry cron" (#1046). It is DERIVED
-# from the tree by ci-latency-alert.py's `schedule_minute_map`, which is why this script has to
-# read that script and the whole workflows directory: the collision assertion below reads every
+# from the tree by cron_map.py's `schedule_minute_map`, which is why this script has to read that
+# module and the whole workflows directory: the collision assertion below reads every
 # other lane's own schedule instead of a list somebody wrote down here and stopped updating.
 WORKFLOWS_DIR = ".github/workflows"
-CRON_MAP_SCRIPT = "scripts/ci-latency-alert.py"
+CRON_MAP_SCRIPT = "scripts/cron_map.py"
 
 # Every file the self-test asserts against. The sweep job sparse-checks-out exactly this set plus
 # REQUIRED_DIRS, and _test_workflow_seam asserts that it does: a trimmed checkout would make the
@@ -217,7 +217,7 @@ REQUIRED_FILES = (
 # Directories the self-test asserts against, held separately because they are checked out and
 # verified as DIRECTORIES. `.github/workflows/regate-sweep.yml` is a substring of this entry, so
 # a containment check would pass with the directory dropped — and dropping it is precisely what
-# makes the derived cron map read one lane instead of thirteen (ci-latency-alert.py measured that
+# makes the derived cron map read one lane instead of thirteen (the cron-map seam measured that
 # same mutant surviving a containment check). Exact, per-line membership only.
 REQUIRED_DIRS = (WORKFLOWS_DIR,)
 

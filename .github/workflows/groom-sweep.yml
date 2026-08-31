@@ -577,6 +577,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts/ci-latency-alert.py
+            scripts/cron_map.py
             scripts/selftest-suite.txt
             .github/workflows/groom-sweep.yml
             .github/workflows
@@ -839,4 +840,3 @@ jobs:
           set -uo pipefail
           python3 registry/scripts/groom-alert.py --self-test
           python3 registry/scripts/groom-alert.py
-
