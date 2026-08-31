@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6039,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f2bf01ef4973d6129e07fd5cab3e07586329b209",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly removes an inert divergence-log output from the enforced cone-coverage report. The surrounding workflow computes the cone with --enforce, so outside-cone crates are not measured and meaningful divergence detection is unavailable; the removed file was also not uploaded. The added comment accurately documents the coupled steps required to restore shadow-corpus evidence, while retaining the underlying script option and its test. No correctness, security, or test-validity issue is introduced by this workflow-only cleanup.",
+  "verdict": "approve"
+ }
+}
