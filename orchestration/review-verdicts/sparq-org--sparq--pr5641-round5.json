@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5641,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f9ab5e67c8fa4f75b82038e201747dd2dbe607d8",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ReleaseLaneSafeTests still proves guard coverage with `assertIn(Path(entry).name, guard.read_text(...))`, and its discovery sweep uses the same substring criterion. `test_release_publish_guard.py` structurally reads release-plz.yml and release.yml, but its publish.yml occurrences are prose or assertion messages; it does not open or parse publish.yml. The REQUIRED_GUARDS entry for publish.yml therefore passes without validating any publish.yml invariant, so edits to that workflow can skip the Rust matrix while receiving no concrete guard promised by the carve-out.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Either remove .github/workflows/publish.yml from _ORCHESTRATION_SAFE, or add a non-selector-gated guard that opens/parses publish.yml and asserts its load-bearing invariants. Make this audit verify a concrete read/parse relationship rather than a filename substring, and add a mutation test demonstrating that a meaningful publish.yml defect causes the guard to fail.",
+    "severity": "major",
+    "title": "publish.yml guard validation remains vacuous"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 major finding remains unresolved. The new audit still treats a raw filename substring as proof that a guard reads and validates a workflow. In the checked-out head, test_release_publish_guard.py defines and structurally parses release-plz.yml and release.yml, but publish.yml appears only in prose/messages; nevertheless REQUIRED_GUARDS maps publish.yml to that test, and both the explicit audit and discovery sweep accept those mentions. Thus arbitrary publish.yml changes are classified orchestration-only without a real validating guard, contrary to the documented second obligation. Because this is materially the same major soundness hole as round 4, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
