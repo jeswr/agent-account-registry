@@ -205,15 +205,32 @@ def _repo_confirmed_private(repo, token):
 
 
 def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
-    """(repo, token) — identical semantics to groom-alert/usage-alert/triage-stock-alert: the
-    private ALERT_REPO only when ALERT_TOKEN is present; otherwise the registry repo under the
-    ambient token."""
+    """(repo, token) for the alert issue. ALERT_REPO is selected ONLY when its token is present,
+    it differs from the registry case-insensitively, and a live GET /repos/{ALERT_REPO} under that
+    token confirms a literal `private: true`. Presence is configuration, not verification; every
+    other shape falls back to the registry. This body contains public issue and pull state."""
     if alert_repo and alert_token:
         same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
         check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
         if not same_repo and check(alert_repo, alert_token):
             return alert_repo, alert_token
     return registry_repo, None
+
+
+def _private_probe_rows():
+    global _gh
+    original, calls = _gh, []
+    def response(rc, body):
+        def fake(args, **kwargs):
+            calls.append((args, kwargs)); return type("Result", (), {"returncode": rc, "stdout": body})()
+        return fake
+    try:
+        values = []
+        for rc, body in ((0, '{"private": true}'), (0, '{"private": false}'), (9, '{"private": true}'),
+                         (0, ""), (0, '{"private": "yes"}')):
+            _gh = response(rc, body); values.append(_repo_confirmed_private("org/private", "route-token"))
+    finally: _gh = original
+    return values, calls[0]
 
 
 def read_pulls(repo, max_pages=20):
@@ -353,6 +370,14 @@ def _self_test():
     pp = _load_park_policy()
     PARK, HUMAN = pp.MACHINE_PARK_PR_LABEL, pp.HUMAN_PR_PARK_LABEL
 
+    probe_values, probe_call = _private_probe_rows()
+    for name, got, want in zip(("private true", "public", "failed lookup", "unparseable",
+                                "non-boolean private"), probe_values,
+                               (True, False, False, False, False)):
+        chk(f"visibility probe: {name}", got, want)
+    chk("visibility probe GETs repos/{repo} under route token", probe_call,
+        (["api", "repos/org/private"], {"capture": True, "token": "route-token"}))
+
     def pull(number, *labels):
         return {"number": number, "labels": [{"name": n} for n in labels]}
 
@@ -477,9 +502,10 @@ def _test_alert_route_contract(chk):
     # GUARD 1 — the router's docstring, copied here VERBATIM and compared by EQUALITY (both sides
     # whitespace-flattened, so re-wrapping the source is free and every other edit is not).
     canonical_route_doc = """
-    (repo, token) — identical semantics to groom-alert/usage-alert/triage-stock-alert: the
-    private ALERT_REPO only when ALERT_TOKEN is present; otherwise the registry repo under the
-    ambient token.
+    (repo, token) for the alert issue. ALERT_REPO is selected ONLY when its token is present,
+    it differs from the registry case-insensitively, and a live GET /repos/{ALERT_REPO} under that
+    token confirms a literal `private: true`. Presence is configuration, not verification; every
+    other shape falls back to the registry. This body contains public issue and pull state.
     """
 
     def flat(text):
@@ -581,7 +607,7 @@ def _test_alert_route_contract(chk):
     # what catches it. The dropped-clause input asserts its anchor occurs exactly ONCE first: a
     # `.replace()` that matched nothing would leave that row comparing the text with itself
     # (AGENTS.md mutation-run hygiene).
-    anchor = "only when ALERT_TOKEN is present"
+    anchor = "Presence is configuration, not verification"
     dropped = canonical_route_doc.replace(anchor, "")
     appended = canonical_route_doc + (
         "\n    ALERT_TOKEN has issue-creation privileges at ALERT_REPO.\n")

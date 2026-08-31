@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-5] ALERT ON THE STOCK, NOT THE RUN.
+# [SPARQ agent] ALERT ON THE STOCK, NOT THE RUN.
 #
 # `retriage.yml` reported `success` on every one of its ~48 scheduled runs a day while the
 # population it exists to drain grew for two weeks. Nothing was broken about any individual run:
@@ -400,15 +400,32 @@ def _repo_confirmed_private(repo, token):
 
 
 def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
-    """(repo, token) for the alert issue — identical semantics to groom-alert/usage-alert: the
-    private ALERT_REPO only when ALERT_TOKEN is present; otherwise the registry repo under the
-    ambient token (token=None means "use the ambient GH_TOKEN")."""
+    """(repo, token) for the alert issue. ALERT_REPO is selected ONLY when its token is present,
+    it differs from the registry case-insensitively, and a live GET /repos/{ALERT_REPO} under that
+    token confirms a literal `private: true`. Presence is configuration, not verification; every
+    other shape falls back to the registry. This body contains public issue-routing state."""
     if alert_repo and alert_token:
         same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
         check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
         if not same_repo and check(alert_repo, alert_token):
             return alert_repo, alert_token
     return registry_repo, None
+
+
+def _private_probe_rows():
+    global _gh
+    original, calls = _gh, []
+    def response(rc, body):
+        def fake(args, **kwargs):
+            calls.append((args, kwargs)); return type("Result", (), {"returncode": rc, "stdout": body})()
+        return fake
+    try:
+        values = []
+        for rc, body in ((0, '{"private": true}'), (0, '{"private": false}'), (9, '{"private": true}'),
+                         (0, "not-json"), (0, '{"private": 1}')):
+            _gh = response(rc, body); values.append(_repo_confirmed_private("org/private", "route-token"))
+    finally: _gh = original
+    return values, calls[0]
 
 
 def read_board(repo, max_pages=20):
@@ -537,6 +554,14 @@ def _self_test():
             failures.append(name)
 
     now = datetime(2026, 7, 27, 18, 0, tzinfo=timezone.utc)
+
+    probe_values, probe_call = _private_probe_rows()
+    for name, got, want in zip(("private true", "public", "failed lookup", "unparseable",
+                                "non-boolean private"), probe_values,
+                               (True, False, False, False, False)):
+        chk(f"visibility probe: {name}", got, want)
+    chk("visibility probe GETs repos/{repo} under route token", probe_call,
+        (["api", "repos/org/private"], {"capture": True, "token": "route-token"}))
 
     def iss(number, labels, created="2026-07-27T17:00:00Z", pr=False, title=""):
         row = {"number": number, "labels": [{"name": n} for n in labels], "created_at": created,
@@ -862,9 +887,10 @@ def _test_alert_route_contract(chk):
     # GUARD 1 — the router's docstring, copied here VERBATIM and compared by EQUALITY (both sides
     # whitespace-flattened, so re-wrapping the source is free and every other edit is not).
     canonical_route_doc = """
-    (repo, token) for the alert issue — identical semantics to groom-alert/usage-alert: the
-    private ALERT_REPO only when ALERT_TOKEN is present; otherwise the registry repo under the
-    ambient token (token=None means "use the ambient GH_TOKEN").
+    (repo, token) for the alert issue. ALERT_REPO is selected ONLY when its token is present,
+    it differs from the registry case-insensitively, and a live GET /repos/{ALERT_REPO} under that
+    token confirms a literal `private: true`. Presence is configuration, not verification; every
+    other shape falls back to the registry. This body contains public issue-routing state.
     """
 
     def flat(text):
@@ -966,7 +992,7 @@ def _test_alert_route_contract(chk):
     # what catches it. The dropped-clause input asserts its anchor occurs exactly ONCE first: a
     # `.replace()` that matched nothing would leave that row comparing the text with itself
     # (AGENTS.md mutation-run hygiene).
-    anchor = "only when ALERT_TOKEN is present"
+    anchor = "Presence is configuration, not verification"
     dropped = canonical_route_doc.replace(anchor, "")
     appended = canonical_route_doc + (
         "\n    ALERT_TOKEN has issue-creation privileges at ALERT_REPO.\n")

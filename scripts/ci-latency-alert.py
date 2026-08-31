@@ -925,16 +925,39 @@ def _repo_confirmed_private(repo, token):
 
 def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
     """(repo, token) for the alert issue — locked decision 22c / issue #39, identical
-    semantics and signature to scripts/dispatch-stall-alert.py's private copy: the private
-    ALERT_REPO is the destination ONLY when ALERT_TOKEN can write there; a half-configured
-    deployment (repo set, token missing) falls back to the registry repo under the ambient
-    token instead of silently losing the alert."""
+    semantics and signature to the other alert routers: ALERT_REPO is selected ONLY when its
+    token is present, it differs from the registry case-insensitively, and a live GET
+    /repos/{ALERT_REPO} under that token confirms a literal `private: true`. Presence is
+    configuration, not verification; every other shape falls back to the registry. This body
+    contains only public workflow names, run links, and latency measurements."""
     if alert_repo and alert_token:
         same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
         check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
         if not same_repo and check(alert_repo, alert_token):
             return alert_repo, alert_token
     return registry_repo, None
+
+
+def _private_probe_rows():
+    """Exercise every fail-closed result of this module's live repository probe."""
+    global _gh
+    original, calls = _gh, []
+
+    def response(rc, body):
+        def fake(args, **kwargs):
+            calls.append((args, kwargs))
+            return type("Result", (), {"returncode": rc, "stdout": body})()
+        return fake
+
+    try:
+        values = []
+        for rc, body in ((0, '{"private": true}'), (0, '{"private": false}'),
+                         (9, '{"private": true}'), (0, ""), (0, '{"private": "true"}')):
+            _gh = response(rc, body)
+            values.append(_repo_confirmed_private("org/private", "route-token"))
+    finally:
+        _gh = original
+    return values, calls[0]
 
 
 def _api(repo, path):
@@ -1289,6 +1312,15 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     def chk(name, condition):
         if not condition:
             failures.append(name)
+
+    probe_values, probe_call = _private_probe_rows()
+    chk("visibility probe accepts literal private=true", probe_values[0] is True)
+    chk("visibility probe rejects public repo", probe_values[1] is False)
+    chk("visibility probe rejects failed lookup", probe_values[2] is False)
+    chk("visibility probe rejects unparseable response", probe_values[3] is False)
+    chk("visibility probe rejects non-boolean private", probe_values[4] is False)
+    chk("visibility probe GETs repos/{repo} under route token",
+        probe_call == (["api", "repos/org/private"], {"capture": True, "token": "route-token"}))
 
     NOW = dt.datetime(2026, 7, 28, 12, 0, tzinfo=dt.timezone.utc)
     H6 = NOW - dt.timedelta(hours=6)

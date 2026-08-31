@@ -124,16 +124,32 @@ def _repo_confirmed_private(repo, token):
 
 def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
     """(repo, token) for the alert issue — locked decision 22c / issue #39, identical semantics and
-    signature to scripts/alert_route.py's `alert_route` (see the DEBT note in the header): the
-    private ALERT_REPO is the destination ONLY when ALERT_TOKEN can write there; a half-configured
-    deployment (repo set, token missing) falls back to the registry repo under the ambient token
-    (token=None means "use the ambient GH_TOKEN") instead of silently losing the alert."""
+    signature to the other alert routers: ALERT_REPO is selected ONLY when its token is present,
+    it differs from the registry case-insensitively, and a live GET /repos/{ALERT_REPO} under that
+    token confirms a literal `private: true`. Presence is configuration, not verification; every
+    other shape falls back to the registry. This body contains public workflow health metadata."""
     if alert_repo and alert_token:
         same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
         check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
         if not same_repo and check(alert_repo, alert_token):
             return alert_repo, alert_token
     return registry_repo, None
+
+
+def _private_probe_rows():
+    global _gh
+    original, calls = _gh, []
+    def response(rc, body):
+        def fake(args, **kwargs):
+            calls.append((args, kwargs)); return type("Result", (), {"returncode": rc, "stdout": body})()
+        return fake
+    try:
+        values = []
+        for rc, body in ((0, '{"private": true}'), (0, '{"private": false}'), (9, '{"private": true}'),
+                         (0, "not-json"), (0, '{"private": []}')):
+            _gh = response(rc, body); values.append(_repo_confirmed_private("org/private", "route-token"))
+    finally: _gh = original
+    return values, calls[0]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -583,6 +599,13 @@ def _self_test():
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got} (want {want})")
 
     # --- routing (mirrors the audited plan-alert/groom-alert/usage-alert matrix) --------------
+    probe_values, probe_call = _private_probe_rows()
+    for name, got, want in zip(("private true", "public", "failed lookup", "unparseable",
+                                "non-boolean private"), probe_values,
+                               (True, False, False, False, False)):
+        chk(f"visibility probe: {name}", got, want)
+    chk("visibility probe GETs repos/{repo} under route token", probe_call,
+        (["api", "repos/org/private"], {"capture": True, "token": "route-token"}))
     chk("route: repo+token -> private + token",
         _alert_route("org/private", "tok", "org/registry", lambda r, t: True),
         ("org/private", "tok"))
@@ -708,7 +731,7 @@ def _test_no_hold_labels(chk):
     # this module can construct. Adding a `gh pr merge`, a `gh pr review`, an `--auto` arming call
     # or an `issue edit --add-label` path changes this vocabulary and goes red here. This is the
     # structural form of "an auto-responder must not become an auto-merger".
-    nouns, verbs = set(), set()
+    nouns, verbs, api_shapes = set(), set(), []
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call)
                 and getattr(node.func, "id", getattr(node.func, "attr", "")) == "_gh"):
@@ -723,10 +746,21 @@ def _test_no_hold_labels(chk):
             nouns.add(words[0])
         if len(words) > 1:
             verbs.add(words[1])
+        if words and words[0] == "api":
+            api_shapes.append(
+                (len(argv.elts),
+                 isinstance(argv.elts[1], ast.JoinedStr) if len(argv.elts) > 1 else False,
+                 (argv.elts[1].values[0].value
+                  if len(argv.elts) > 1 and isinstance(argv.elts[1], ast.JoinedStr)
+                  and argv.elts[1].values and isinstance(argv.elts[1].values[0], ast.Constant)
+                  else None),
+                 any(word in {"-X", "--method", "-f", "--input"} for word in words)))
     chk("STRUCTURAL: the COMPLETE set of gh commands this module can construct — no `pr`, no merge, "
         "no arming, no label mutation beyond creating the ops-alert label itself",
         (sorted(nouns), sorted(verbs)),
         (["api", "issue", "label"], ["close", "comment", "create", "edit", "list"]))
+    chk("STRUCTURAL: every api call is a two-argument read of repos/{repo}, with no mutation flag",
+        api_shapes, [(2, True, "repos/", False)])
 
 
 def _test_gh_flows(chk):
