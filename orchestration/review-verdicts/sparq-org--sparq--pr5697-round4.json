@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5697,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6aa6eacb8e177a9e3175b2619b3d8389b4221c75",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The final parenthetical still says this is \"the same anonymous-class output-vocabulary gap as WebOnt-I5.5-005\". That comparison remains unsupported by the entry's own taxonomy: this case concerns reification/output of an in-profile anonymous hasSelf restriction, while WebOnt-I5.5-005 depends on owl:unionOf/list vocabulary outside EL and is skipped. Both conclusions contain anonymous structure, but the classifier reaches the hasSelf concept here; it does not process the relevant WebOnt union concept.",
+    "file": "crates/sparq-conformance/tests/el_suite.rs",
+    "fix_hint": "Remove the final comparison, or explicitly contrast the mechanisms: hasSelf is an in-profile anonymous-restriction reification/output gap; WebOnt-I5.5-005 is blocked because owl:unionOf and its list structure are outside EL and skipped.",
+    "severity": "minor",
+    "title": "The hasSelf output gap is still incorrectly equated with WebOnt-I5.5-005"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3's documentation finding remains materially unchanged. The expanded explanation correctly distinguishes the internal CRs3 reasoning from the realiser's anonymous-class output limitation, but its final parenthetical still calls this the same gap as WebOnt-I5.5-005. The surrounding audit itself says WebOnt-I5.5-005 uses owl:unionOf, which is outside EL and skipped, whereas this hasSelf case reaches an in-profile anonymous restriction internally and fails when reifying/outputting that restriction bnode. Because the same minor accuracy issue remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
