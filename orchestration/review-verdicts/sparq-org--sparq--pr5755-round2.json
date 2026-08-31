@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5755,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9c8421ca15ddd9fc0a88fbbb4fec2c9aaf51e882",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The README and test constant identify the vendor source as ffaea0497de41cd709a742e0c4a90831a500fd97, but vectors/manifest.json has specSource lws-spec@59da847 and each case carries the same older source tag. This may legitimately mean the later checkout retained vectors generated at the earlier revision, but the current prose still does not explain that distinction, leaving provenance review ambiguous.",
+    "file": "crates/sparq-lws-core/conformance/lws-spec/README.md",
+    "fix_hint": "State that ffaea049... is the repository revision copied while 59da847 is the embedded vector-generation/spec-source revision, if accurate; otherwise regenerate or correct the stale embedded provenance fields during re-vendoring.",
+    "severity": "minor",
+    "title": "Vendored revision still differs from embedded fixture provenance"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The conformance harness remains coherent and fail-closed, and the prior provenance ambiguity is still the only finding. The README and VENDORED_REV identify ffaea0497de41cd709a742e0c4a90831a500fd97 as the copied revision, while vectors/manifest.json and each case still identify lws-spec@59da847. That can legitimately distinguish checkout provenance from vector-generation provenance, but the relationship remains unexplained. This is non-blocking, so the PR is approved; progress is stagnant because the same minor finding remains at the same severity.",
+  "verdict": "approve"
+ }
+}
