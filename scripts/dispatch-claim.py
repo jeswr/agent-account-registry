@@ -22977,7 +22977,9 @@ def _starvation_sweep_self_test():
     #   * `partition_scoped=True`  silently reverts the width fix while looking wired;
     #   * `partition_scoped=False` drops package single-flight for the FIX lane too, which DOES
     #     un-serialise concurrent writes to one crate — the failure research/1011 §9.2 is about.
-    # So the value must be an expression that READS `mode`. A literal of either polarity fails.
+    # So the value must be EXACTLY `mode != "review"`. Merely requiring an expression that reads
+    # `mode` is insufficient: the inverted `mode == "review"` also reads it while applying the
+    # dangerous false value to the write lane.
     _alloc_calls = [node for node in _ast.walk(_ast.parse(
         Path(__file__).resolve().read_text(encoding="utf-8")))
         if isinstance(node, _ast.Call)
@@ -22993,11 +22995,18 @@ def _starvation_sweep_self_test():
     assert _scope_kw, (
         "the review/fix allocator.claim call must pass partition_scoped= — without it the review "
         "lane keeps serialising read-only work behind a write-safety rule (#1480)")
-    assert any(isinstance(node, _ast.Name) and node.id == "mode"
-               for node in _ast.walk(_scope_kw[0].value)), (
-        "partition_scoped= must be an expression reading `mode`, never a literal: True silently "
-        "reverts the fix, and False extends it to the FIX lane and un-serialises concurrent "
-        "writes to one crate (research/1011 §9.2)")
+    _scope_value = _scope_kw[0].value
+    assert (isinstance(_scope_value, _ast.Compare)
+            and isinstance(_scope_value.left, _ast.Name)
+            and _scope_value.left.id == "mode"
+            and len(_scope_value.ops) == 1
+            and isinstance(_scope_value.ops[0], _ast.NotEq)
+            and len(_scope_value.comparators) == 1
+            and isinstance(_scope_value.comparators[0], _ast.Constant)
+            and _scope_value.comparators[0].value == "review"), (
+        'partition_scoped= must be exactly `(mode != "review")`: True silently reverts the '
+        'width fix, while False or the inverted `(mode == "review")` applies the false value to '
+        'the FIX lane and un-serialises concurrent writes to one crate (research/1011 §9.2)')
 
     # [review round 1, B3/M14] THE READ-ONLY GATE'S WIRING. The guard above matches only calls
     # carrying ALL of _void_kwargs, and the read-only CLAIM proof gate deliberately carries four of
