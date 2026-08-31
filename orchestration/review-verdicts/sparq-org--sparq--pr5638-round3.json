@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5638,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "095f0160a52bc39c3fb05e65099086bd3f699448",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains clean. The coverage-chain assertions jointly pin push-to-main behavior, the exact needs edges for skip-propagating jobs, and every needs-context reference in job guards. The extractor handles dotted and quoted bracket access and fails closed for opaque or bare needs access; its mutation test exercises all of those cases and verifies that an undeclared dependency changes the pinned set or becomes unclassified. The workflow and research comments accurately describe the enforced chain and make no unsupported performance claim. No correctness, soundness, test-validity, or security issue is evident in the diff. With round 2 also having no findings, progress is stagnant by the required scale rather than improving.",
+  "verdict": "approve"
+ }
+}
