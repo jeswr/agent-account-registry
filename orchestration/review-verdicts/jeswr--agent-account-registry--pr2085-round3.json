@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2085,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3df6032dc8abdfc3436353fb279ac8a46afad2cf",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 5 still claims that publishing the new base before deleting folded shards makes every record visible at least once to any interleaving. A reader that fetches the old base first, then lists the tail after publication and deletion, sees the record in neither source. The later 404/base-re-fetch rule only helps when the reader previously listed the deleted shard; it cannot detect an already-empty newer listing.",
+    "file": "research/427-model-health-per-run-records.md",
+    "fix_hint": "Qualify the at-least-once claim and make reader operation ordering or a generation/manifest validation part of the future protocol obligation. For example, specify a read order plus a generation check across base and tail, retrying or failing closed whenever the generation changes.",
+    "severity": "minor",
+    "title": "Publish-before-delete still does not cover every reader ordering"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 minor finding remains unchanged. The protocol sketch still says publish-before-delete makes every record visible at least once to any reader interleaving, but a reader can fetch the old base before publication and list the tail after deletion, observing neither copy. The later stale-listing/404 rule cannot detect that ordering. This remains non-blocking because the record repeatedly and explicitly treats Option B's protocol as incomplete, unreviewed, and a condition that must be discharged before adoption; no behavior or trust-plane control changes ship in this design-only diff.",
+  "verdict": "approve"
+ }
+}
