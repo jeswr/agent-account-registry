@@ -66,13 +66,13 @@ run of THIS code against the live targets timed every request:
     613 requests, 28,334 rows, median request 0.843 s
     check-runs 474 req / 564.6 s (85%) | pr-detail 116 / 80.5 s | listings 23 / 18.8 s
 
-So the step is API-ROUND-TRIP bound, not compute bound, and the requests were issued one
-at a time. The request SET is not reducible without weakening completeness (the two
-tier-name gate reads exist because REST `check_name` takes one value; the legs walk exists
-because REST cannot filter check runs by conclusion), so the lever is OVERLAP: independent
-reads now run concurrently, bounded by SNAPSHOT_CONCURRENCY, folded back in input order.
-Nothing about WHICH pages are fetched, how a walk terminates, the per-walk ceilings, or the
-`total_count` cross-check changes — see _ordered_map.
+So the step is API-ROUND-TRIP bound, not compute bound. The first fix overlapped the same REST
+request set, bounded by SNAPSHOT_CONCURRENCY. The throughput fix now projects PR detail plus
+both exact gate names through bounded GraphQL aliases: up to five PRs per request, at a measured
+two GraphQL points per PR, from GraphQL's separate 5,000-point bucket. The unfiltered REST legs
+walk remains red-only because its names are advisory repair context. A GraphQL failure falls
+back to REST DETAIL ONLY, preserving disarm/conflict safety while gate-dependent admissions
+stand down; it never silently recreates the old check-run fan-out.
 """
 
 import argparse
@@ -169,15 +169,15 @@ CHECK_RUN_PAGE_LIMIT = 40
 # for 20h+, so the backlog grew unchecked and the WHOLE repo degraded to no prstatus.
 #
 # ⚠️ THIS IS NOT FREE, and the number to watch is the SHARED budget, not this constant. The
-# PR-detail + check-runs legs walk one PR at a time. The dispatch floor deliberately prices the
-# cold-cache ceiling with its older, more conservative 5.9 requests/PR calibration:
+# The legacy REST fallback read PR detail plus check-runs one PR at a time. The dispatch floor's
+# current 15-minute bound still prices that older, conservative 5.9 requests/PR calibration:
 #
 #     limit=100  = 613 req/tick   (the 2026-07-27 instrumented observation)
 #     limit=150  = 908 req/tick   4 ticks/hr = 73% of the 5,000/hr shared budget <- HERE
 #
 # The live floor is therefore 15 minutes (four ticks/hour): 4*908=3,632/h, below the historical
-# 4,291/h rate that ran clean. #1303 (moving the check-runs walk to GraphQL) remains the real cost
-# fix; this is the conservative stopgap that keeps the 150-PR census internally budgeted.
+# 4,291/h rate that ran clean. The GraphQL path below is the cost fix; this legacy arithmetic is
+# retained as the conservative ceiling for a rollback or fallback tick.
 WORKER_PR_STATUS_LIMIT = 150
 WORKER_HEAD_PREFIX = "sparq-agent/"
 MERGEABLE_POLL_ATTEMPTS = 3
@@ -196,6 +196,14 @@ SAFE_SHA = re.compile(r"[0-9a-f]{40}")
 # Raising this without re-deriving that arithmetic trades a slow tick for a throttled one.
 # The PRIMARY limit is unaffected: overlapping reads does not change how many are issued.
 SNAPSHOT_CONCURRENCY = 8
+# GraphQL folds the REST PR-detail read and both gate-name check-run walks into one
+# repository query. Five aliases keeps each response below GitHub's measured resource ceiling
+# (a sparq PR has up to ~46 check suites) while turning 150 PRs into 30 round trips.
+# `rateLimit` in every response is authoritative for GraphQL's SEPARATE 5,000-point
+# bucket; preserving a reserve keeps later registry jobs able to diagnose a failed tick.
+GRAPHQL_PR_BATCH_SIZE = 5
+GRAPHQL_CHECK_RUNS_PER_SUITE_LIMIT = 10
+GRAPHQL_RATE_LIMIT_RESERVE = 100
 # Ceiling on a server-suggested `Retry-After` back-off. Overlapping reads is the way to
 # provoke a secondary rate limit, so the back-off must honour what GitHub asks for — but a
 # long suggestion must fail the read CLOSED inside the job's 15-minute timeout rather than
@@ -220,11 +228,10 @@ RATE_LIMIT_RESERVE = 100
 # ---------------------------------------------------------------------------------------------
 # CONDITIONAL (ETag) READS — issue #1207.
 #
-# The tick's request SET is not reducible without weakening completeness (the module docstring
-# above derives why: REST `check_name` takes one value, and REST cannot filter check runs by
-# conclusion). But most of those requests do not have to be BILLABLE. An authenticated
-# conditional request that answers `304 Not Modified` does not decrement the bucket, so the
-# lever is to stop PAYING for reads whose answer has not changed, without issuing fewer of them.
+# This store predates the GraphQL projection above. It still saves the red-only unfiltered legs
+# walk and protects a temporary fallback to the legacy REST reader, but the normal path no longer
+# issues the two filtered REST gate reads. An authenticated conditional request that answers
+# `304 Not Modified` does not decrement the core bucket.
 #
 # MEASURED 2026-07-29, and every number here is off a real response, not the documentation:
 #
@@ -809,6 +816,79 @@ def make_fetch(token, store=None):
     return fetch
 
 
+def make_graphql_fetch(token):
+    """Authenticated GraphQL reader with the REST reader's bounded retry policy.
+
+    GraphQL has a separate primary-rate-limit bucket. Every query this module emits asks
+    for ``rateLimit`` and this reader enforces its reserve from the response body rather
+    than consulting ``GET /rate_limit`` (which can report a healthy, unrelated bucket).
+    The operation is read-only, so replaying a transient response is safe.
+    """
+    endpoint = "https://api.github.com/graphql"
+
+    def fetch(query, variables):
+        body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+        for attempt in range(3):
+            request = Request(endpoint, data=body, method="POST", headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "reg4-plan-snapshot",
+                "X-GitHub-Api-Version": "2022-11-28",
+            })
+            try:
+                with urlopen(request, timeout=60) as response:
+                    payload = json.load(response)
+                if not isinstance(payload, dict):
+                    raise FetchError("GitHub GraphQL returned a non-object response")
+                data = payload.get("data")
+                rate = data.get("rateLimit") if isinstance(data, dict) else None
+                remaining = rate.get("remaining") if isinstance(rate, dict) else None
+                if (isinstance(remaining, int) and not isinstance(remaining, bool)
+                        and remaining <= GRAPHQL_RATE_LIMIT_RESERVE):
+                    reset = rate.get("resetAt") if isinstance(rate.get("resetAt"), str) else \
+                        "unknown"
+                    raise BudgetExhausted(
+                        "GitHub GraphQL request budget is down to the reserve — stopping this "
+                        f"snapshot before it spends the last of it (remaining={remaining}, "
+                        f"resets at {reset}, reserve {GRAPHQL_RATE_LIMIT_RESERVE}).")
+                errors = payload.get("errors")
+                if errors:
+                    if remaining == 0:
+                        raise BudgetExhausted(
+                            "GitHub GraphQL request budget is exhausted; the snapshot is "
+                            "stopping instead of retrying an empty bucket.")
+                    raise FetchError("GitHub GraphQL returned one or more errors")
+                if not isinstance(data, dict):
+                    raise FetchError("GitHub GraphQL response has no data object")
+                return data
+            except HTTPError as exc:
+                if exc.code == 403:
+                    headers = getattr(exc, "headers", None)
+                    kind = classify_403(headers, _error_body(exc))
+                    if kind == "budget":
+                        raise BudgetExhausted(
+                            "authenticated GitHub GraphQL read refused because its request "
+                            f"budget is exhausted ({_budget_detail(headers)}).") from exc
+                    if kind == "secondary" and attempt < 2:
+                        time.sleep(_retry_delay(exc, attempt))
+                        continue
+                    raise FetchError(
+                        f"authenticated GitHub GraphQL read failed (HTTP 403, {kind})") from exc
+                if RETRY_STATUS_POLICY.retries(exc.code) and attempt < 2:
+                    time.sleep(_retry_delay(exc, attempt))
+                    continue
+                raise FetchError(
+                    f"authenticated GitHub GraphQL read failed (HTTP {exc.code})") from exc
+            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+                if attempt < 2:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                raise FetchError("authenticated GitHub GraphQL read failed") from exc
+
+    return fetch
+
+
 def _response_etag(headers):
     """The `ETag` off a response, or None. Case-insensitive on purpose: urllib speaks HTTP/1.1,
     where GitHub sends `ETag`, while the same header arrives lower-cased over HTTP/2 — reading
@@ -1094,6 +1174,255 @@ def _pr_status_snapshot(fetch, claim, repo, pulls, concurrency=SNAPSHOT_CONCURRE
     return status_items, skips
 
 
+def _graphql_pr_query(count, claim):
+    """One bounded, variable-only query for ``count`` worker PRs.
+
+    The two check-run aliases deliberately live under EVERY check suite. GitHub's
+    ``Commit.checkSuites`` filter does not reliably match a check-run name, while
+    ``CheckSuite.checkRuns(filterBy: {checkName: ...})`` does. No repository or PR value
+    is interpolated into the document; only the registry-owned gate names are literals.
+    """
+    definitions = ["$owner: String!", "$name: String!"]
+    pulls = []
+    strict_name, draft_name = claim.CI_REPAIR_GATE_CHECKS
+    run_fields = "nodes { name status conclusion startedAt } pageInfo { hasNextPage } totalCount"
+    for index in range(count):
+        definitions.append(f"$n{index}: Int!")
+        pulls.append(f"""
+        p{index}: pullRequest(number: $n{index}) {{
+          number state isDraft mergeable headRefOid
+          autoMergeRequest {{ enabledAt }}
+          commits(last: 1) {{
+            nodes {{ commit {{
+              oid
+              checkSuites(first: 100) {{
+                pageInfo {{ hasNextPage }}
+                nodes {{
+                  strictGate: checkRuns(first: {GRAPHQL_CHECK_RUNS_PER_SUITE_LIMIT}, filterBy: {{checkName: {json.dumps(strict_name)}}}) {{ {run_fields} }}
+                  draftGate: checkRuns(first: {GRAPHQL_CHECK_RUNS_PER_SUITE_LIMIT}, filterBy: {{checkName: {json.dumps(draft_name)}}}) {{ {run_fields} }}
+                }}
+              }}
+            }} }}
+          }}
+        }}""")
+    return ("query(" + ", ".join(definitions) + ") {\n"
+            "  rateLimit { cost remaining resetAt }\n"
+            "  repository(owner: $owner, name: $name) {\n"
+            + "\n".join(pulls)
+            + "\n  }\n}")
+
+
+def _graphql_connection_runs(connection):
+    """Normalize one filtered GraphQL check-run connection to the REST record shape."""
+    if not isinstance(connection, dict):
+        raise SnapshotItemError("check-runs-malformed")
+    nodes = connection.get("nodes")
+    page_info = connection.get("pageInfo")
+    total = connection.get("totalCount")
+    if not isinstance(nodes, list) or not isinstance(page_info, dict):
+        raise SnapshotItemError("check-runs-malformed")
+    if page_info.get("hasNextPage") is True:
+        raise SnapshotItemError("check-runs-overflow")
+    if (not isinstance(total, int) or isinstance(total, bool) or total != len(nodes)):
+        raise SnapshotItemError("check-runs-malformed")
+    runs = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise SnapshotItemError("check-runs-malformed")
+        status = node.get("status")
+        conclusion = node.get("conclusion")
+        runs.append({
+            "name": node.get("name"),
+            "status": status.lower() if isinstance(status, str) else status,
+            "conclusion": conclusion.lower() if isinstance(conclusion, str) else conclusion,
+            "started_at": node.get("startedAt"),
+        })
+    return runs
+
+
+def _rest_detail_only_record(fetch, repo, number):
+    """Preserve the safety-critical detail fields when GraphQL gate data is unavailable."""
+    try:
+        detail = resolve_mergeable_detail(
+            fetch, f"https://api.github.com/repos/{repo}/pulls/{number}")
+    except FetchError as exc:
+        raise SnapshotItemError("pr-detail-read-failed") from exc
+    if not isinstance(detail, dict):
+        raise SnapshotItemError("pr-detail-malformed")
+    record = {
+        "head_sha": str((detail.get("head") or {}).get("sha", "")),
+        "mergeable": detail.get("mergeable"),
+        "draft": detail.get("draft"),
+        "check_runs": [],
+        "check_runs_degraded": "check-runs-read-failed",
+    }
+    if "auto_merge" in detail:
+        record["auto_merge"] = detail["auto_merge"]
+    return record
+
+
+def _graphql_pr_record(fetch, claim, repo, expected_number, node):
+    """Validate and normalize one PR alias from the batched GraphQL response."""
+    if (not isinstance(node, dict) or node.get("number") != expected_number
+            or node.get("state") != "OPEN" or not isinstance(node.get("isDraft"), bool)):
+        raise SnapshotItemError("pr-detail-malformed")
+    sha = node.get("headRefOid")
+    if not isinstance(sha, str) or not SAFE_SHA.fullmatch(sha):
+        raise SnapshotItemError("pr-detail-malformed")
+    mergeable_raw = node.get("mergeable")
+    mergeable = {"MERGEABLE": True, "CONFLICTING": False, "UNKNOWN": None}.get(
+        mergeable_raw, ...)
+    if mergeable is ...:
+        raise SnapshotItemError("pr-detail-malformed")
+    auto_merge_request = node.get("autoMergeRequest")
+    if auto_merge_request is None:
+        auto_merge = None
+    elif isinstance(auto_merge_request, dict):
+        auto_merge = {"enabled_at": auto_merge_request.get("enabledAt")}
+    else:
+        raise SnapshotItemError("pr-detail-malformed")
+    record = {
+        "head_sha": sha,
+        "mergeable": mergeable,
+        "draft": node["isDraft"],
+        "auto_merge": auto_merge,
+        "check_runs": [],
+    }
+
+    # GraphQL exposes the same asynchronous mergeability calculation as REST. Preserve
+    # the existing bounded re-poll for UNKNOWN so the needs-rebase lane does not silently
+    # lose precisely the conflicting PRs it exists to repair. The GraphQL detail remains
+    # usable if the poll itself fails; unresolved mergeability is already fail-closed.
+    if mergeable is None:
+        try:
+            refreshed = resolve_mergeable_detail(
+                fetch, f"https://api.github.com/repos/{repo}/pulls/{expected_number}")
+        except FetchError:
+            refreshed = None
+        if isinstance(refreshed, dict):
+            refreshed_sha = str((refreshed.get("head") or {}).get("sha", ""))
+            if refreshed_sha != sha:
+                fallback = {
+                    "head_sha": refreshed_sha,
+                    "mergeable": refreshed.get("mergeable"),
+                    "draft": refreshed.get("draft"),
+                    "check_runs": [],
+                    "check_runs_degraded": "check-runs-read-failed",
+                }
+                if "auto_merge" in refreshed:
+                    fallback["auto_merge"] = refreshed["auto_merge"]
+                return fallback
+            record["mergeable"] = refreshed.get("mergeable")
+            record["draft"] = refreshed.get("draft")
+            if "auto_merge" in refreshed:
+                record["auto_merge"] = refreshed["auto_merge"]
+
+    try:
+        commits = node.get("commits")
+        commit_nodes = commits.get("nodes") if isinstance(commits, dict) else None
+        if not isinstance(commit_nodes, list) or len(commit_nodes) != 1:
+            raise SnapshotItemError("check-runs-malformed")
+        commit = commit_nodes[0].get("commit") if isinstance(commit_nodes[0], dict) else None
+        if not isinstance(commit, dict) or commit.get("oid") != sha:
+            raise SnapshotItemError("check-runs-malformed")
+        suites = commit.get("checkSuites")
+        suite_nodes = suites.get("nodes") if isinstance(suites, dict) else None
+        suite_page = suites.get("pageInfo") if isinstance(suites, dict) else None
+        if not isinstance(suite_nodes, list) or not isinstance(suite_page, dict):
+            raise SnapshotItemError("check-runs-malformed")
+        if suite_page.get("hasNextPage") is True:
+            raise SnapshotItemError("check-runs-overflow")
+        check_runs = []
+        for suite in suite_nodes:
+            if not isinstance(suite, dict):
+                raise SnapshotItemError("check-runs-malformed")
+            check_runs += _graphql_connection_runs(suite.get("strictGate"))
+            check_runs += _graphql_connection_runs(suite.get("draftGate"))
+        if claim.repair_gate_conclusion(check_runs) == "failure":
+            # Failing leg names are prompt context only and require the unfiltered REST
+            # walk. Keep that expensive path red-only, as before.
+            check_runs += _fetch_check_runs(fetch, repo, sha)
+        record["check_runs"] = check_runs
+    except SnapshotItemError as exc:
+        record["check_runs"] = []
+        record["check_runs_degraded"] = exc.reason
+    return record
+
+
+def _graphql_pr_status_snapshot(graphql, fetch, claim, repo, pulls,
+                                concurrency=SNAPSHOT_CONCURRENCY):
+    """Batched GraphQL equivalent of ``_pr_status_snapshot``.
+
+    A failed batch falls back to REST DETAIL ONLY: this preserves disarm and conflict
+    safety without recreating the hundreds of check-run reads this path removes. Gate
+    admissions stand down explicitly until a later tick can read them.
+    """
+    worker_pulls = [
+        pull for pull in pulls
+        if isinstance(pull, dict) and pull.get("state") == "open"
+        and isinstance(pull.get("number"), int) and pull["number"] > 0
+        and str((pull.get("head") or {}).get("ref", "")).startswith(WORKER_HEAD_PREFIX)
+        and ((pull.get("head") or {}).get("repo") or {}).get("full_name") == repo
+    ]
+    if len(worker_pulls) > WORKER_PR_STATUS_LIMIT:
+        return {}, [{"pr_number": 0, "reason": "worker-pr-census-overflow"}]
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError as exc:
+        raise FetchError(f"invalid owner/repo target {repo!r}") from exc
+
+    status_items, skips = {}, []
+
+    def detail_fallback(pull):
+        number = pull["number"]
+        try:
+            return number, _rest_detail_only_record(fetch, repo, number), None
+        except SnapshotItemError as exc:
+            return number, None, exc.reason
+
+    for offset in range(0, len(worker_pulls), GRAPHQL_PR_BATCH_SIZE):
+        batch = worker_pulls[offset:offset + GRAPHQL_PR_BATCH_SIZE]
+        variables = {"owner": owner, "name": name}
+        variables.update({f"n{index}": pull["number"]
+                          for index, pull in enumerate(batch)})
+        try:
+            data = graphql(_graphql_pr_query(len(batch), claim), variables)
+            repository = data.get("repository") if isinstance(data, dict) else None
+            if not isinstance(repository, dict):
+                raise FetchError("GitHub GraphQL response has no repository object")
+        except FetchError as exc:
+            print("::warning::plan-snapshot: GraphQL PR-status batch failed; preserving "
+                  f"detail-only safety for {repo} PRs {batch[0]['number']}..{batch[-1]['number']} "
+                  f"and standing gate admissions down ({exc})")
+            # Fold in input order, matching the normal path and the existing REST snapshot.
+            results = _ordered_map(detail_fallback, batch, concurrency)
+            for number, record, reason in results:
+                if record is None:
+                    skips.append({"pr_number": number, "reason": reason})
+                else:
+                    status_items[str(number)] = record
+                    skips.append({"pr_number": number,
+                                  "reason": record["check_runs_degraded"]})
+            continue
+
+        for index, pull in enumerate(batch):
+            number = pull["number"]
+            node = repository.get(f"p{index}")
+            try:
+                # A null alias commonly means the PR disappeared after the listing. One
+                # detail read distinguishes that from a malformed GraphQL projection.
+                record = (_rest_detail_only_record(fetch, repo, number) if node is None
+                          else _graphql_pr_record(fetch, claim, repo, number, node))
+            except SnapshotItemError as exc:
+                skips.append({"pr_number": number, "reason": exc.reason})
+                continue
+            status_items[str(number)] = record
+            if "check_runs_degraded" in record:
+                skips.append({"pr_number": number,
+                              "reason": record["check_runs_degraded"]})
+    return status_items, skips
+
+
 def _reason_histogram(reasons):
     counts = {}
     for reason in reasons.values():
@@ -1165,7 +1494,8 @@ def inertness_attestation(claim, pulls, status_items):
     return {"items": items, "reasons": reasons}
 
 
-def snapshot_targets(fetch, claim, repos, out_dir, concurrency=SNAPSHOT_CONCURRENCY):
+def snapshot_targets(fetch, claim, repos, out_dir, concurrency=SNAPSHOT_CONCURRENCY,
+                     graphql=None):
     # Phase 1 — every repo-level listing is independent of every other, so the walks
     # overlap. Each walk is UNCHANGED: the same serial page-walk to a short page, the same
     # sweep-fatal 5000-entry ceiling, the same non-list-page rejection. A FetchError out of
@@ -1187,7 +1517,10 @@ def snapshot_targets(fetch, claim, repos, out_dir, concurrency=SNAPSHOT_CONCURRE
         # Phase 2 — per-PR status. Repos stay SEQUENTIAL here so `concurrency` is the exact
         # number of reads this process can ever have in flight (the secondary-rate-limit
         # budget above); the concurrency lives INSIDE _pr_status_snapshot.
-        status_items, skips = _pr_status_snapshot(fetch, claim, repo, pulls, concurrency)
+        status_items, skips = (
+            _graphql_pr_status_snapshot(graphql, fetch, claim, repo, pulls, concurrency)
+            if graphql is not None
+            else _pr_status_snapshot(fetch, claim, repo, pulls, concurrency))
         for skip in skips:
             print(f"SNAPSHOT skip {repo}#{skip['pr_number']}: {skip['reason']}")
         Path(out_dir, f"raw-prstatus-{index}.json").write_text(
@@ -2748,6 +3081,158 @@ def _self_test():
         assert inertness_attestation(claim, [row13], {13: detail})["items"]["13"] is False
         assert inertness_attestation(claim, [row13], {"13": detail})["items"]["13"] is False
 
+    def graphql_batches_detail_and_gates_without_weakening_degradation():
+        """The fast path removes REST fan-out while preserving every fail-closed tier.
+
+        One more than the batch bound must take two GraphQL requests; a red gate may use the
+        unfiltered REST legs walk. A failed GraphQL batch falls back to detail-only REST,
+        so disarm data survives while every gate-dependent admission stands down.
+        """
+        heads = {number: f"{number:040x}"
+                 for number in range(100, 101 + GRAPHQL_PR_BATCH_SIZE)}
+        worker_pulls = [worker_pull(number, sha) for number, sha in heads.items()]
+        graphql_calls, rest_calls = [], []
+
+        def connection(name, conclusion="SUCCESS"):
+            nodes = ([] if conclusion is None else [{
+                "name": name, "status": "COMPLETED", "conclusion": conclusion,
+                "startedAt": "2026-08-31T00:00:00Z",
+            }])
+            return {"nodes": nodes, "totalCount": len(nodes),
+                    "pageInfo": {"hasNextPage": False}}
+
+        def node(number, *, suite_overflow=False):
+            strict = connection(gate, "FAILURE" if number == 100 else "SUCCESS")
+            suite = {"strictGate": strict, "draftGate": connection(draft_gate, None)}
+            return {
+                "number": number, "state": "OPEN", "isDraft": True,
+                "mergeable": "MERGEABLE", "headRefOid": heads[number],
+                "autoMergeRequest": None,
+                "commits": {"nodes": [{"commit": {
+                    "oid": heads[number],
+                    "checkSuites": {"nodes": [suite],
+                                    "pageInfo": {"hasNextPage": suite_overflow}},
+                }}]},
+            }
+
+        def graphql(query, variables):
+            graphql_calls.append((query, dict(variables)))
+            numbers = [variables[f"n{index}"] for index in range(
+                len([key for key in variables if re.fullmatch(r"n\d+", key)]))]
+            return {"rateLimit": {"cost": len(numbers) * 2, "remaining": 4000,
+                                  "resetAt": "2026-08-31T01:00:00Z"},
+                    "repository": {f"p{index}": node(number)
+                                   for index, number in enumerate(numbers)}}
+
+        def rest(url):
+            rest_calls.append(url)
+            # Only the red PR's advisory failing-leg walk is allowed on the healthy path.
+            assert f"/commits/{heads[100]}/check-runs?" in url and "check_name=" not in url, url
+            return page([gate_run(conclusion="failure"),
+                         gate_run(conclusion="failure", name="leg-red")])
+
+        items, skips = _graphql_pr_status_snapshot(
+            graphql, rest, claim, repo, worker_pulls)
+        assert len(graphql_calls) == 2, len(graphql_calls)
+        assert [len([key for key in variables if re.fullmatch(r"n\d+", key)])
+                for _, variables in graphql_calls] == [GRAPHQL_PR_BATCH_SIZE, 1]
+        assert len(items) == GRAPHQL_PR_BATCH_SIZE + 1 and skips == [], (len(items), skips)
+        assert rest_calls == [f"https://api.github.com/repos/{repo}/commits/{heads[100]}"
+                              "/check-runs?per_page=100&page=1"], rest_calls
+        assert claim.pr_ci_status(items["100"])["failing_legs"] == ["leg-red"]
+        assert items["101"]["check_runs"][0]["status"] == "completed"
+        assert items["101"]["check_runs"][0]["conclusion"] == "success"
+        # The query is variable-only for target data and contains both exact gate filters.
+        query = graphql_calls[0][0]
+        last_alias = GRAPHQL_PR_BATCH_SIZE - 1
+        assert (f"$n{last_alias}: Int!" in query
+                and f"pullRequest(number: $n{last_alias})" in query)
+        assert f"checkName: {json.dumps(gate)}" in query
+        assert f"checkName: {json.dumps(draft_gate)}" in query
+
+        # A GraphQL outage spends one REST detail read per item, never the old gate fan-out.
+        fallback_calls = []
+
+        def dead_graphql(_query, _variables):
+            raise FetchError("unavailable")
+
+        def detail_only(url):
+            fallback_calls.append(url)
+            number = int(url.rsplit("/", 1)[1])
+            return {"head": {"sha": heads[number]}, "mergeable": True,
+                    "draft": True, "auto_merge": None}
+
+        fallback_items, fallback_skips = _graphql_pr_status_snapshot(
+            dead_graphql, detail_only, claim, repo, worker_pulls[:2])
+        assert sorted(fallback_items) == ["100", "101"]
+        assert fallback_skips == [
+            {"pr_number": 100, "reason": "check-runs-read-failed"},
+            {"pr_number": 101, "reason": "check-runs-read-failed"},
+        ]
+        assert all("/pulls/" in url and "/check-runs" not in url
+                   for url in fallback_calls), fallback_calls
+        assert all(claim.pr_ci_status(record)["check_runs_degraded"] is True
+                   for record in fallback_items.values())
+
+        # A connection beyond the explicit bound degrades only that PR after detail.
+        def overflowing_graphql(_query, _variables):
+            return {"repository": {"p0": node(100, suite_overflow=True)}}
+
+        overflow_items, overflow_skips = _graphql_pr_status_snapshot(
+            overflowing_graphql, lambda url: (_ for _ in ()).throw(
+                AssertionError(f"unexpected REST fallback {url}")),
+            claim, repo, worker_pulls[:1])
+        assert overflow_skips == [{"pr_number": 100, "reason": "check-runs-overflow"}]
+        assert overflow_items["100"]["head_sha"] == heads[100]
+        assert overflow_items["100"]["check_runs"] == []
+
+        # Exercise the real transport seam: POST + variables + bearer token, and the
+        # response-body rate-limit reserve from GraphQL's separate bucket.
+        class GraphQLResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        requests = []
+
+        def graphql_response(payload):
+            def answer(request, timeout):
+                requests.append((request, timeout))
+                return GraphQLResponse(json.dumps(payload).encode("utf-8"))
+            return answer
+
+        healthy_payload = {"data": {
+            "rateLimit": {"cost": 2, "remaining": 4998,
+                          "resetAt": "2026-08-31T01:00:00Z"},
+            "repository": {},
+        }}
+        with patch.object(sys.modules[__name__], "urlopen",
+                          graphql_response(healthy_payload)):
+            transported = make_graphql_fetch("secret")("query Q { viewer { login } }",
+                                                         {"n": 7})
+        request, timeout = requests.pop()
+        assert transported == healthy_payload["data"] and timeout == 60
+        assert request.get_method() == "POST"
+        assert request.get_header("Authorization") == "Bearer secret"
+        assert json.loads(request.data) == {
+            "query": "query Q { viewer { login } }", "variables": {"n": 7}}
+
+        reserve_payload = {"data": {
+            "rateLimit": {"cost": 2, "remaining": GRAPHQL_RATE_LIMIT_RESERVE,
+                          "resetAt": "2026-08-31T01:00:00Z"},
+            "repository": {},
+        }}
+        with patch.object(sys.modules[__name__], "urlopen",
+                          graphql_response(reserve_payload)):
+            try:
+                make_graphql_fetch("secret")("query Q { rateLimit { remaining } }", {})
+            except BudgetExhausted:
+                pass
+            else:
+                raise AssertionError("the GraphQL reserve must stop the sweep")
+
     # [sparq#4819 round 3] A GUARD THAT FIRES MUST SAY WHICH GUARD FIRED. This suite used to be a
     # flat call sequence, so any failure escaped as a bare traceback with NO verdict line at all —
     # `--self-test | grep -cE "self-test (PASSED|FAILED)"` returned 0. MEASURED on this file's
@@ -2802,6 +3287,7 @@ def _self_test():
 
     ok, rows = _run_checks((
         the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed,
+        graphql_batches_detail_and_gates_without_weakening_degradation,
         snapshot_parallel_output_is_identical_to_serial,
         per_pr_reads_actually_overlap,
         repo_listings_overlap_across_repos,
@@ -2911,7 +3397,8 @@ def main():
         fetch, make_download(token), os.environ.get("REGISTRY_REPO", ""),
         os.environ.get("REGISTRY_STORE_BRANCH", ""))
     try:
-        snapshot_targets(make_fetch(token, store), _load_claim(), repos, args.out_dir)
+        snapshot_targets(make_fetch(token, store), _load_claim(), repos, args.out_dir,
+                         graphql=make_graphql_fetch(token))
         # Only a COMPLETED sweep writes the store. A sweep that died half way has a `seen` set
         # covering only the reads it got to, and pruning to that would throw away live entries
         # for every PR it never reached — turning one failed tick into a cold cache for the
