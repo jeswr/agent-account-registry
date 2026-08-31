@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5775,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2ce64ed9644872ebbd359ccd9b469abd710b351c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The canonical wasm-pack version and all 18 workflow install sites remain consistently pinned. The scanner correctly handles cargo-install option ordering, recognized option values, both --version VALUE and --version=VALUE, action inputs, comments, and non-vacuity; its hermetic self-test and repository scan both pass. The added/updated tests exercise the real parsing and scan paths, and no correctness, soundness, test-validity, or security issue is present in the reviewed diff.",
+  "verdict": "approve"
+ }
+}
