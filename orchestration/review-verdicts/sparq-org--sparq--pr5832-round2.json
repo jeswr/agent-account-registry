@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5832,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "990e2b57ca27b09f594107d97ba8da25f6c6679a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only change remains correct and complete. The workflow comment and decision records consistently explain why the hermetic determinism gate remains separate from the browser-provisioned accessibility lane. The checked-in workflow confirms the distinct provisioning and gating identities, while the advisory-registry checker confirms that C3 recognizes no-timeout-gate.sh and requires an explicit waiver if such a gate is placed in an advisory job. No correctness, soundness, test-validity, or security issue is introduced.",
+  "verdict": "approve"
+ }
+}
