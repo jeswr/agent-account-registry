@@ -6631,6 +6631,16 @@ def provenance_workflow_seam_report():
         "timeout_minutes": job.get("timeout-minutes"),
         "retry_budget_seconds": provenance_retry_budget_seconds(),
         "step_has_gh_token": "GH_TOKEN" in ((step or {}).get("env") or {}),
+        # [SPARQ agent] [issue #2093] A failed-job rerun increments github.run_attempt without
+        # rerunning the successful worker/publisher. The PR therefore remains on the branch named
+        # by the WORKER'S preserved producing attempt. Pin the exact expression: using the
+        # recorder's attempt silently points reconciliation at a nonexistent sibling branch.
+        "head_branch_expr": ((step or {}).get("env") or {}).get("HEAD_BRANCH"),
+        # The audit stamp intentionally remains the CURRENT recorder attempt. worker-pr's
+        # volatile-field equality accepts `.1` -> `.2` for the same run while still rejecting a
+        # different run id, so branch identity and audit identity must not be collapsed.
+        "run_key_lines": [line.strip() for line in run.splitlines()
+                          if "--run-key" in line],
         # Registry #296: the terminal alert on BOTH failure paths this step can raise
         # (`_provenance_read` exhaustion, `_registry_put_file` exhaustion) is delivered only when
         # `_alert_route()` finds these names in the runner env. Reported as the EXACT binding of
@@ -8431,6 +8441,12 @@ def _self_test():
           (True, True))
     check("#677 YAML seam: the read is AUTHENTICATED (an unauthenticated read is a permanent "
           "401 that no retry can clear)", seam["step_has_gh_token"], True)
+    check("#2093 YAML seam: a recorder-only rerun reconciles the WORKER attempt's published "
+          "branch while recording the CURRENT rerun attempt in the audit stamp",
+          (seam["head_branch_expr"], seam["run_key_lines"]),
+          ("sparq-agent/issue-${{ inputs.issue_number }}-${{ github.run_id }}-"
+           "${{ needs.worker.outputs.outcome_attempt || github.run_attempt }}",
+           ['--run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \\']))
     check("#677 YAML seam: the retried read runs in the job that executes NO target code",
           (seam["job_needs_publish"], seam["job_permissions"]),
           # `issues: write` is the #296 grant: the ops-alert below upserts an issue in the
