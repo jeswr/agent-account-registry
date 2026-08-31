@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5871,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3b06f7a22d66e7b55e42daf269b92bb1c2c8eb88",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only correction remains accurate and complete. The referenced policy states that gui-mock-ipc currently gates because it has neither a registry declaration nor continue-on-error, and its rollback procedure requires adding a registry entry with owner_bead, promotion_criteria, and job_id plus enabling continue-on-error. The registry checker documents and tests C2's rejection of advisory-named jobs without a declaration. No correctness, soundness, security, or test-validity issue is introduced. Round 2 is materially unchanged from the already-clean round 1, so progress is stagnant.",
+  "verdict": "approve"
+ }
+}
