@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5798,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8080bf07c7a2c13d95f93c52ec4f695013e9cfb1",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior-round defect is still present in `executes_needle`: `text.startswith(needle)` does not require a shell-word boundary, and `needle in text` does not require an exact contiguous argv-word sequence. Thus `scripts/tests/test_sweeper.py.disabled --verbose` satisfies the direct-execution pin for `scripts/tests/test_sweeper.py`, while `python3 scripts/sweeper.py --self-test-disabled` satisfies the interpreter pin for `sweeper.py --self-test`. In both cases the precise pinned suite/option no longer executes, contradicting S1's stated guarantee. None of the added self-test cases covers either superstring mutation.",
+    "file": "scripts/check-workflow-step-guards.py",
+    "fix_hint": "Compare complete shell words rather than character substrings: require the needle's token sequence to equal the leading argv sequence for direct execution, or an exact contiguous argv subsequence for recognized interpreters. Add failing `check_tree` fixtures for a suffixed executable path and a suffixed `--self-test` option, plus controls confirming legitimate trailing arguments remain accepted.",
+    "severity": "major",
+    "title": "S1 still accepts command-name and option superstrings"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the round-4 major finding remains unchanged. `executes_needle` still uses prefix matching at command position and unrestricted substring matching for interpreter argv, so a different script or option with the pinned spelling as a prefix/superstring can satisfy S1. The self-test still lacks the requested suffixed-path and suffixed-option mutations. Consequently the checker can remain green after the exact declared guard invocation stops running.",
+  "verdict": "request_changes"
+ }
+}
