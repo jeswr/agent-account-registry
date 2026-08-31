@@ -350,6 +350,14 @@
    "wall_seconds": 457,
    "issue": 427,
    "why_no_diff": "blocked_on_decision"
+  },
+  {
+   "ts": 1788185072,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "success",
+   "run_id": "33400307058.1"
   }
  ]
 }
