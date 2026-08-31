@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2063,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "83df144a07f427e48c17b40dab78d97edb89e31f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 review confirms the prior approval. The generator derives `queue_dropped` exclusively from its own refusal log, publishes the zero census unconditionally, and keeps refused inputs distinct from accepted-row totals and display truncation. The page treats a positive integral refusal count as loss, renders full and partial loss clearly, and excludes affected snapshots from the queue-depth trend; absent, malformed, legacy, or collector-forged values do not fabricate or suppress generator-side loss. The executed page scenarios and generator checks independently cover empty, accepted, fully refused, partially refused, capped-warning, legacy, malformed, and forged-count cases with non-colliding expectations. I found no correctness, soundness, test-vacuity, security, or injection issue in the diff.",
+  "verdict": "approve"
+ }
+}
