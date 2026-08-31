@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5765,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "282f7440b7098ffa44cea0b6ffd6198a3252e1d4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and internally consistent with the round-2-approved scope. The audit repeatedly identifies the eight-package corpus as a substitute, defines condition (C), and leaves #13263/#13265 actual-row conclusions unresolved pending package provenance. It carefully separates #13264 guard reach from its Truncate-dependent fire branch and conditions guard execution on compiler emission, while treating the disclosed-null conclusion as a claim about the PR body's own caveat rather than inferred corpus identity. The #13266 conclusion is independently supported by the six named in-tree movers and does not overstate the conditional corpus evidence. Companion amendments preserve these qualifications, measurement limitations, open correctness gaps, and the sq-qhy4 external-audit caveat. Tests are not applicable to this research-only documentation change; no hostile reviewer-directed instruction appears in the diff. With no prior or current findings, progress is stagnant under the mandated comparison scale.",
+  "verdict": "approve"
+ }
+}
