@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-5] A DURABLE CREDENTIAL GAP ON ONE OWNER MUST NOT LOOK LIKE A GREEN TICK (issue #269).
+# [SPARQ agent] A DURABLE CREDENTIAL GAP ON ONE OWNER MUST NOT LOOK LIKE A GREEN TICK (issue #269).
 #
 # THE DEFECT THIS EXISTS FOR. The issue #168 fix made each per-owner target App-token mint in
 # groom-sweep.yml `continue-on-error`, and that is correct: policy enables targets under two distinct
@@ -155,14 +155,28 @@ class GroomMintAlertError(Exception):
     """A contract this script refuses to guess about."""
 
 
-def _alert_route(alert_repo, alert_token, registry_repo):
+def _repo_confirmed_private(repo, token):
+    proc = _gh(["api", f"repos/{repo}"], capture=True, token=token)
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
+
+
+def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
     """(repo, token) for the alert issue — locked decision 22c / issue #39, identical semantics and
     signature to scripts/dispatch-stall-alert.py's private copy: the private ALERT_REPO is the
     destination ONLY when ALERT_TOKEN can write there; a half-configured deployment (repo set,
     token missing) falls back to the registry repo under the ambient token instead of silently
     losing the alert."""
     if alert_repo and alert_token:
-        return alert_repo, alert_token
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
+        if not same_repo and check(alert_repo, alert_token):
+            return alert_repo, alert_token
     return registry_repo, None
 
 
@@ -725,7 +739,16 @@ def _self_test():
 
     # --- routing (mirrors the audited metrics/plan/groom/usage/dispatch-stall matrix) ----------
     chk("route: repo+token -> private + token",
-        _alert_route("org/private", "tok", "org/registry"), ("org/private", "tok"))
+        _alert_route("org/private", "tok", "org/registry", lambda r, t: True),
+        ("org/private", "tok"))
+    chk("route: public repo fails closed",
+        _alert_route("org/public", "tok", "org/registry", lambda r, t: False),
+        ("org/registry", None))
+    calls = []
+    chk("route: same repo is rejected case-insensitively without a lookup",
+        (_alert_route("ORG/REGISTRY", "tok", "org/registry",
+                      lambda r, t: calls.append(r) or True), calls),
+        (("org/registry", None), []))
     chk("route: repo but NO token -> registry fallback",
         _alert_route("org/private", "", "org/registry"), ("org/registry", None))
     chk("route: repo but None token -> registry fallback",
@@ -1309,6 +1332,8 @@ def _test_gh_flows(chk):
     def fake_run(cmd, capture_output=False, text=False, env=None, check=False):
         args = list(cmd[1:])
         issued.append((args, (env or {}).get("GH_TOKEN")))
+        if args[:2] == ["api", "repos/org/private"]:
+            return _Result(0, json.dumps({"private": True}))
         if args[:2] == ["issue", "list"]:
             return state["list"]
         return _Result(1 if tuple(args[:2]) in state["fail"] else 0, "")

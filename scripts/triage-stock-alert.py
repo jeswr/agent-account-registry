@@ -388,12 +388,26 @@ def _gh(args, capture=False, token=None, check=False):
     return result
 
 
-def _alert_route(alert_repo, alert_token, registry_repo):
+def _repo_confirmed_private(repo, token):
+    proc = _gh(["api", f"repos/{repo}"], capture=True, token=token)
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
+
+
+def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
     """(repo, token) for the alert issue — identical semantics to groom-alert/usage-alert: the
     private ALERT_REPO only when ALERT_TOKEN is present; otherwise the registry repo under the
     ambient token (token=None means "use the ambient GH_TOKEN")."""
     if alert_repo and alert_token:
-        return alert_repo, alert_token
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
+        if not same_repo and check(alert_repo, alert_token):
+            return alert_repo, alert_token
     return registry_repo, None
 
 
@@ -687,7 +701,7 @@ def _self_test():
 
     # ---- routing ------------------------------------------------------------------------------
     chk("private route when repo AND token are present",
-        _alert_route("o/p", "t", "o/r"), ("o/p", "t"))
+        _alert_route("o/p", "t", "o/r", lambda r, t: True), ("o/p", "t"))
     chk("half-configured private route falls back to the registry",
         _alert_route("o/p", "", "o/r"), ("o/r", None))
     chk("no private repo -> registry", _alert_route("", "t", "o/r"), ("o/r", None))
@@ -986,10 +1000,18 @@ def _test_alert_route_contract(chk):
         ([], True, False))
     # Behavioural statement of the contract the prose is now allowed to make. These literals appear
     # nowhere else in this harness, so a substituted value cannot collide with a fixture's.
-    chk("#1667: PRESENCE, not capability — a credential that obviously cannot write anything "
-        "still selects ALERT_REPO, exactly as a good one does",
-        _alert_route("org/priv-1667", "not-a-credential-1667", "org/reg-1667"),
+    chk("#1775: a positively verified private destination is selected",
+        _alert_route("org/priv-1667", "not-a-credential-1667", "org/reg-1667",
+                     lambda r, t: True),
         ("org/priv-1667", "not-a-credential-1667"))
+    chk("#1775: an unverified or public destination fails closed to the registry",
+        _alert_route("org/public-1775", "token-1775", "org/reg-1667", lambda r, t: False),
+        ("org/reg-1667", None))
+    calls = []
+    chk("#1775: same-repo is rejected case-insensitively without a lookup",
+        (_alert_route("ORG/REG-1667", "token-1775", "org/reg-1667",
+                      lambda r, t: calls.append(r) or True), calls),
+        (("org/reg-1667", None), []))
     chk("#1667: ... and an EMPTY ALERT_TOKEN never does (the half-configured fallback, which must "
         "not silently lose the alert)",
         _alert_route("org/priv-1667", "", "org/reg-1667"), ("org/reg-1667", None))

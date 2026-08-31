@@ -193,12 +193,26 @@ def _gh(args, capture=False, token=None, check=False):
     return result
 
 
-def _alert_route(alert_repo, alert_token, registry_repo):
+def _repo_confirmed_private(repo, token):
+    proc = _gh(["api", f"repos/{repo}"], capture=True, token=token)
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
+
+
+def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
     """(repo, token) — identical semantics to groom-alert/usage-alert/triage-stock-alert: the
     private ALERT_REPO only when ALERT_TOKEN is present; otherwise the registry repo under the
     ambient token."""
     if alert_repo and alert_token:
-        return alert_repo, alert_token
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
+        if not same_repo and check(alert_repo, alert_token):
+            return alert_repo, alert_token
     return registry_repo, None
 
 
@@ -601,10 +615,18 @@ def _test_alert_route_contract(chk):
         ([], True, False))
     # Behavioural statement of the contract the prose is now allowed to make. These literals appear
     # nowhere else in this harness, so a substituted value cannot collide with a fixture's.
-    chk("#1667: PRESENCE, not capability — a credential that obviously cannot write anything "
-        "still selects ALERT_REPO, exactly as a good one does",
-        _alert_route("org/priv-1667", "not-a-credential-1667", "org/reg-1667"),
+    chk("#1775: a positively verified private destination is selected",
+        _alert_route("org/priv-1667", "not-a-credential-1667", "org/reg-1667",
+                     lambda r, t: True),
         ("org/priv-1667", "not-a-credential-1667"))
+    chk("#1775: an unverified or public destination fails closed to the registry",
+        _alert_route("org/public-1775", "token-1775", "org/reg-1667", lambda r, t: False),
+        ("org/reg-1667", None))
+    calls = []
+    chk("#1775: same-repo is rejected case-insensitively without a lookup",
+        (_alert_route("ORG/REG-1667", "token-1775", "org/reg-1667",
+                      lambda r, t: calls.append(r) or True), calls),
+        (("org/reg-1667", None), []))
     chk("#1667: ... and an EMPTY ALERT_TOKEN never does (the half-configured fallback, which must "
         "not silently lose the alert)",
         _alert_route("org/priv-1667", "", "org/reg-1667"), ("org/reg-1667", None))
@@ -661,6 +683,8 @@ def _test_route_wiring(chk):
 
     def fake_run(cmd, capture_output=False, text=False, env=None):
         calls.append((list(cmd), dict(env or {})))
+        if cmd[1:3] == ["api", f"repos/{PRIVATE}"]:
+            return _Result(0, json.dumps({"private": True}))
         if cmd[1] == "api":
             return _Result(0, state["board"])
         if cmd[1:3] == ["issue", "list"]:
@@ -680,7 +704,10 @@ def _test_route_wiring(chk):
     def ambient():
         """The GH_TOKEN seen on the PR census read — the ONE call `main()` makes with `token=None`,
         whatever the harness ambient happens to be (unset locally, set in CI)."""
-        return routed("api")[1]
+        for cmd, env in calls:
+            if cmd[1] == "api" and "/pulls?" in cmd[2]:
+                return env.get("GH_TOKEN")
+        return None
 
     def run_once(alert_repo, alert_token, board=terminal_board, listing="[]"):
         calls.clear()
@@ -708,7 +735,8 @@ def _test_route_wiring(chk):
             # The route governs where the alert LANDS; it must not follow the census read, which is
             # a different repo under a different credential. Pinning both halves is what stops a
             # "just use `repo` everywhere" simplification from silently re-pointing the census.
-            api_cmd, api_env = next(((c, e) for c, e in calls if c[1] == "api"), (None, {}))
+            api_cmd, api_env = next(((c, e) for c, e in calls
+                                     if c[1] == "api" and "/pulls?" in c[2]), (None, {}))
             chk("#1773 wiring: ...while the PR census still reads the POLICY target, and never "
                 "borrows the routed credential to do it",
                 (api_cmd is not None and TARGET in api_cmd[2],

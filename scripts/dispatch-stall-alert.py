@@ -153,13 +153,27 @@ class DispatchStallError(Exception):
     """A contract this script refuses to guess about."""
 
 
-def _alert_route(alert_repo, alert_token, registry_repo):
+def _repo_confirmed_private(repo, token):
+    proc = _gh(["api", f"repos/{repo}"], capture=True, token=token)
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
+
+
+def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
     """(repo, token) for the alert issue — locked decision 22c / issue #39, identical semantics and
     signature to scripts/metrics-alert.py's private copy: the private ALERT_REPO is the destination
     ONLY when ALERT_TOKEN can write there; a half-configured deployment (repo set, token missing)
     falls back to the registry repo under the ambient token instead of silently losing the alert."""
     if alert_repo and alert_token:
-        return alert_repo, alert_token
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
+        if not same_repo and check(alert_repo, alert_token):
+            return alert_repo, alert_token
     return registry_repo, None
 
 
@@ -714,7 +728,16 @@ def _self_test():
 
     # --- routing (mirrors the audited metrics/plan/groom/usage-alert matrix) ------------------
     chk("route: repo+token -> private + token",
-        _alert_route("org/private", "tok", "org/registry"), ("org/private", "tok"))
+        _alert_route("org/private", "tok", "org/registry", lambda r, t: True),
+        ("org/private", "tok"))
+    chk("route: public repo fails closed",
+        _alert_route("org/public", "tok", "org/registry", lambda r, t: False),
+        ("org/registry", None))
+    calls = []
+    chk("route: same repo is rejected case-insensitively without a lookup",
+        (_alert_route("ORG/REGISTRY", "tok", "org/registry",
+                      lambda r, t: calls.append(r) or True), calls),
+        (("org/registry", None), []))
     chk("route: repo but NO token -> registry fallback",
         _alert_route("org/private", "", "org/registry"), ("org/registry", None))
     chk("route: no repo -> registry", _alert_route("", "tok", "org/registry"),
