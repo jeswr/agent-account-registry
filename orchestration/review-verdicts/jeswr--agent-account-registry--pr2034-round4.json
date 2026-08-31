@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2034,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "00048954417fd946777f7c37bab636273e9ed1ab",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_invokes_command` remains `token in line.split()`. Shell quotes are syntax removed before argv reaches Python, while `str.split()` preserves the quote characters. Thus `run: python3 scripts/account-usage.py \"--persist-limits\" usage.json` invokes persistence, but the reader sees `\"--persist-limits\"` and returns false; the same applies to single quotes. If a second workflow uses either ordinary spelling, `_workflows_invoking` omits it and `serialization_premise_errors` can still return empty. The new reader tests include comments, prose, suffixes, and unquoted tokens, but no quoted exact flag, so they do not detect the bypass.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Parse executable shell text with a shell-aware lexer so quotes are decoded before exact argv-token comparison, with explicit handling for the supported command separators and continuations. Add synthetic second-workflow tests using both double-quoted and single-quoted `--persist-limits`; assert each workflow is enumerated and `persist_limits` refuses before any `gh` call.",
+    "severity": "major",
+    "title": "Quoted persist flags still bypass workflow invocation discovery"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 major remains unchanged. `_invokes_command` still uses plain whitespace splitting, so shell-quoted spellings of `--persist-limits` are invisible even though the shell removes those quotes and passes the exact flag to Python. The added invocation-reader cases still exercise only unquoted flags. Consequently, a second workflow can invoke persistence with an ordinary quoted flag while `_workflows_invoking` omits it, allowing `serialization_premise_errors` to report that the single-writer premise holds. No new finding is needed, but the existing trust-plane bypass remains major.",
+  "verdict": "request_changes"
+ }
+}
