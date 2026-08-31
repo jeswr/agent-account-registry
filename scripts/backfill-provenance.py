@@ -1069,6 +1069,10 @@ _WF_SAMPLE = {
     "inputs.account": "acct07",
     "github.run_id": "1234567890",
     "github.run_attempt": "1",
+    # [SPARQ agent] [issue #2093] The provenance branch follows the worker attempt that actually
+    # published the PR. Keep the workflow replay able to render that exact expression; an unknown
+    # expression deliberately becomes the refusal sentinel below.
+    "needs.worker.outputs.outcome_attempt || github.run_attempt": "1",
     "github.token": "***",
     "secrets.PROVENANCE_SALT": "***",
     "needs.claim.outputs.account": "acct07",
