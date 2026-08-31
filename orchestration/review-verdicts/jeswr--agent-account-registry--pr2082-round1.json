@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 2082,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6b6a594b0937c95291dbebb8e1c3f4d60c38c5ad",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_workflow_crons` (cron_map.py:83-97) re-implements the `on:`-mapping lookup and `schedule[].cron` extraction that `workflow_triggers` + `m1_scope` still perform in ci-latency-alert.py (lines 394-425), and those are still live: the M1 census calls them at ci-latency-alert.py:927-928 on the same workflow files to obtain the same cron list.\n\nBefore this PR, `schedule_minute_map` called `m1_scope(workflow_triggers(text))`, so census and map shared ONE definition of \"which crons does this workflow declare\". After it there are two, and nothing pins them together. `m1_scope` legitimately needs the whole `on` mapping (it computes `cron_only` from `set(on) <= INVISIBLE_TRIGGERS`), so it cannot simply be deleted - which is exactly how the duplicate becomes permanent.\n\nThe drift fails OPEN. If either parser is later extended to accept a schedule form the other does not recognise (a bare-string schedule entry, an anchored/normalised cron, a differently-shaped `on:` block), `_workflow_crons` returns `[]` for that lane, `schedule_minute_map` skips it via the `if not crons: continue` branch, and the lane disappears from the map with no error. The deleted docstring stated the consequence precisely: \"A lane silently absent from this map reads to a collision check as a free minute.\" `cron_collisions` in regate-sweep.py:2721-2722 then reads green on a genuine collision.\n\nNo existing assertion catches this. regate-sweep.py:2717-2720 cross-checks only its OWN lane against its own parse, and the MIN_SCHEDULED_LANES floor (ci-latency-alert.py:2192, regate-sweep.py:2711-2716) only detects a map that lost ~all lanes, not one that lost a single lane. A one-lane divergence is invisible to both.\n\nThis is the #958 shape - one literal, N definitions, consumers blind to a repoint - which is the bug class this module's own docstring claims to close.",
+    "file": "scripts/cron_map.py",
+    "fix_hint": "Make cron_map the single owner of the trigger parse too. Move `workflow_triggers` into cron_map.py as a public function (raising CronMapError where it currently raises AlarmError), have `_workflow_crons` call it, and have ci-latency-alert.py import it alongside the other names and drop its private copy. `m1_scope` can stay in ci-latency-alert.py (it owns the M1-scope policy, including `cron_only` and INVISIBLE_TRIGGERS) as long as it is built on the imported `workflow_triggers` and the shared cron-list extraction rather than a parallel one.\n\nAlternatively, if the duplication is intentional as a two-independent-readings cross-check, make it an actual cross-check: add a self-test row asserting that for every workflow in the live tree, `sorted(m1_scope(workflow_triggers(text))[1]) == sorted(_workflow_crons(path))`, so a divergence reds by name instead of silently emptying a map entry.",
+    "severity": "major",
+    "title": "_workflow_crons forks workflow-trigger parsing: a second definition that fails open by dropping lanes"
+   },
+   {
+    "body": "ci-latency-alert.py:97-99 imports `_expand_field` from cron_map. The leading underscore marks it private to cron_map, yet it is now a load-bearing cross-module API: `expected_firings` calls it five times (lines 362-366) for the hour/dom/month/dow fields with lo/hi bounds that `cron_minutes` never uses.\n\nBecause the name advertises itself as private, a future change to cron_map's internals is free to alter or rename it without anyone expecting an external consumer to break - and the only signal would be an ImportError at ci-latency-alert.py's module top level, which now hard-fails the whole groom-sweep ci-latency job rather than just the expansion path.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Rename to a public `expand_field` in cron_map.py (it is part of the module's owned surface, not an implementation detail) and update the import. If the private name is kept deliberately, add a row to cron_map's `_self_test` asserting the symbol exists and is callable with explicit lo/hi bounds, so its cross-module contract is pinned where the owner lives - mirroring what regate-sweep.py:2556-2560 already does for schedule_minute_map and MIN_SCHEDULED_LANES.",
+    "severity": "minor",
+    "title": "Cross-module import of the private symbol _expand_field"
+   },
+   {
+    "body": "The moved functions lost the rationale the originals carried, in a repo whose defence against reintroducing these bugs is that the next author reads why.\n\n- `_expand_field`: the #1279 explanation that out-of-range is a REFUSAL not a FILTER, including the worked example (`3,13,23,33,43,53,60` previously coming back as six plausible minutes for a cron GitHub will never run), is now one line. The `if not out:` branch is still there but the note that it is provably unreachable under the current grammar and kept as a deliberate structural backstop is reduced to a five-word comment.\n- `cron_minutes`: the statement that hour/day/month restrictions are IGNORED **deliberately**, and that this is the fail-closed direction for \"is this minute already taken?\" (over-reporting costs an author one alternative; under-reporting hands them a collision), is gone. This is a real caller-visible semantic contract - a caller could reasonably assume `41 6 * * 1` does not hold :41.\n- `schedule_minute_map`: the both-directions fail-closed contract, and the concrete history of the stale hand-copied regate-sweep map, are gone.\n\nMitigating: the `weekly cron still holds its minute` self-test row does pin the cron_minutes contract as an executable assertion, which is stronger than prose.",
+    "file": "scripts/cron_map.py",
+    "fix_hint": "Carry the deleted docstring bodies across with the code. They are the record of why each refusal exists; a one-line summary invites the next author to \"simplify\" the out-of-range refusal back into a filter, which is the exact #1279 regression.",
+    "severity": "minor",
+    "title": "Extraction drops the documented fail-closed contracts from the moved docstrings"
+   },
+   {
+    "body": "`cron_map.py` is added after `ci-latency-alert.py` but before `compose-gate.py`, while the rest of the file is alphabetical ('compose-gate' sorts before 'cron_map'). Manifest validation in worker-live.sh only rejects an empty manifest and duplicate entries, so nothing reds on this - it is purely cosmetic, but it makes the next insertion point ambiguous.",
+    "file": "scripts/selftest-suite.txt",
+    "fix_hint": "Move the line one entry down, after `compose-gate.py`.",
+    "severity": "nit",
+    "title": "cron_map.py inserted out of alphabetical order"
+   },
+   {
+    "body": "The diff removes the trailing blank line after the final `groom-alert.py` invocation at the end of the file. This is unrelated to the cron_map extraction and adds diff noise to a workflow file that this PR otherwise only touches to add one sparse-checkout entry. Harmless to YAML parsing.",
+    "file": ".github/workflows/groom-sweep.yml",
+    "fix_hint": "Drop this hunk to keep the PR scoped to the extraction.",
+    "severity": "nit",
+    "title": "Unrelated trailing-blank-line deletion at end of file"
+   }
+  ],
+  "progress": null,
+  "summary": "A well-executed extraction of cron expansion into scripts/cron_map.py, but it closes one second-definition while opening another.\n\nVerified good: every consumer seam binds only to names cron_map actually exports (schedule_minute_map, cron_minutes, MIN_SCHEDULED_LANES, WORKFLOWS_DIR) - regate-sweep.py:2556-2560 and :2703-2716, dispatch-tick-floor.py:767-789. REQUIRED_FILES in both dispatch-tick-floor.py and regate-sweep.py derive from the repointed CRON_MINUTES_SCRIPT/CRON_MAP_SCRIPT constants, so the sparse-checkout seams stay self-consistent, and the three workflow sparse-checkout lists match them. groom-sweep.yml is the only lane that executes ci-latency-alert.py, and cron_map.py was correctly added to its checkout, so the new top-level `from cron_map import ...` resolves (script run => sys.path[0] is the scripts dir); nothing else path-loads ci-latency-alert.py, so the importlib consumers are unaffected. The AlarmError -> CronMapError catch site was updated. cron_map's _self_test is NOT vacuous: it pins the #1279 regression by hand-computed value (7-59/15 => {7,22,37,52}), asserts both polarities of the refusal probe, and covers malformed cron / malformed YAML / non-mapping / missing-tree fail-closed directions with distinct exception types.\n\nBlocking concern: cron_map._workflow_crons is a NEW private reimplementation of the workflow-trigger parsing that ci-latency-alert.workflow_triggers + m1_scope still perform at line 927-928 on the same files for the same cron list. Before this PR the map called m1_scope(workflow_triggers(...)) - ONE definition shared with the M1 census. No assertion pins the two to each other, and divergence fails OPEN in the direction the module's own deleted docstring warned about: a lane whose cron form only one parser recognises returns [], vanishes from the map, and reads to cron_collisions as a FREE minute. That is the exact #958 shape this module exists to remove.\n\nI could not execute the self-tests (Bash is rest\u2026 [truncated 95 chars]",
+  "verdict": "request_changes"
+ }
+}
