@@ -1074,27 +1074,27 @@ def _admitted_review_prs(
     return admitted
 
 
-def stale_worker_pr_reason(
+def aged_orphan_worker_pr(
     pull: dict[str, Any],
     bot_login: str,
     threshold_seconds: int,
     now: int,
     *,
     has_valid_provenance: bool,
-) -> str | None:
-    """Return why an old worker PR needs HUMAN attention, or None when it should remain untouched.
+) -> bool:
+    """True iff `pull` is a bot-authored worker PR, past the maintenance threshold, that NO
+    automated loop owns (no admissible registry provenance record).
 
-    Scope: this age sweep escalates ONLY a worker PR that NO automated loop owns — one with NO
-    VALID registry provenance record (missing, unreadable, or schema-invalid —
-    worker_pr_provenance_enumerable). A DRAFT orphan parks on ORPHAN_DRAFT_REASON; a NON-DRAFT
-    orphan parks only when it is ALSO wedged in a BAD_MERGE_STATE
-    (conflicting/dirty/behind/blocked/unstable/unknown). A PR with a VALID provenance record is
-    REVIEW-LOOP-OWNED and is NEVER escalated here, DRAFT OR NOT — see the ownership branch below.
-    Together: no orphan is ever silently stranded, and no pipeline-owned PR is ever parked out of
-    the loop that repairs it."""
+    [registry #1598] THE ONE DEFINITION of this age sweep's population, extracted so that its two
+    readers cannot drift apart (AGENTS.md: one definition, plus pointers).
+    `stale_worker_pr_reason` asks it which PRs it may escalate at all; `stranded_worker_pr` asks it
+    which of those the sweep then says NOTHING about. A second, hand-copied notion of "orphan" in
+    the census would be free to disagree with the hand-off about who is unowned, and a census that
+    measures a different population than the one a future park would act on is worse than none.
+    """
     updated = _epoch(pull.get("updated_at"), "pull request")
     if now - updated < threshold_seconds:
-        return None
+        return False
     head = pull.get("head", {}).get("ref", "")
     author = pull.get("user", {}).get("login", "")
     body = pull.get("body") or ""
@@ -1106,7 +1106,7 @@ def stale_worker_pr_reason(
         or not isinstance(body, str)
         or not body.lstrip().startswith(WORKER_PR_MARKER)
     ):
-        return None
+        return False
     # [FABLE-5] A worker PR with a VALID registry provenance record is REVIEW-LOOP-OWNED and is
     # never age-parked here (deadlock fix, live PRs jeswr/agent-account-registry#3472 / #3470).
     # Draft is the NORMAL pre-review pipeline state: dispatch-claim.enumerate_review_items picks
@@ -1134,7 +1134,34 @@ def stale_worker_pr_reason(
     # existence prevents is an INVISIBLE permanent hold — the exact state AGE_PARK_CAUSES calls
     # "strictly worse than a visible one". So ownership dominates the merge state in BOTH classes,
     # and escalating a review-loop-owned PR is left to the review reconciler that can see it.
-    if has_valid_provenance:
+    return not has_valid_provenance
+
+
+def stale_worker_pr_reason(
+    pull: dict[str, Any],
+    bot_login: str,
+    threshold_seconds: int,
+    now: int,
+    *,
+    has_valid_provenance: bool,
+) -> str | None:
+    """Return why an old worker PR needs HUMAN attention, or None when it should remain untouched.
+
+    Scope: this age sweep escalates ONLY a worker PR that NO automated loop owns — one with NO
+    VALID registry provenance record (missing, unreadable, or schema-invalid —
+    worker_pr_provenance_enumerable). That population is aged_orphan_worker_pr, which also carries
+    the ownership carve-out's rationale. A DRAFT orphan parks on ORPHAN_DRAFT_REASON; a NON-DRAFT
+    orphan parks only when it is ALSO wedged in a BAD_MERGE_STATE
+    (conflicting/dirty/behind/blocked/unstable/unknown). A PR with a VALID provenance record is
+    REVIEW-LOOP-OWNED and is NEVER escalated here, DRAFT OR NOT.
+
+    [registry #1598] THE NON-DRAFT ARM HAS NO CLOSURE GUARANTEE, DELIBERATELY AND FOR NOW. A
+    non-draft orphan whose `mergeable_state` is fine falls off the end of this function as None and
+    is handed off to nobody — see stranded_worker_pr, which measures exactly that residue so the
+    decision about whether to park it can be made on a counted population instead of a guess."""
+    if not aged_orphan_worker_pr(
+        pull, bot_login, threshold_seconds, now, has_valid_provenance=has_valid_provenance
+    ):
         return None
     if pull.get("draft") is True:
         # A DRAFT with NO VALID provenance record is a GENUINE ORPHAN owned by no automated
@@ -1159,6 +1186,47 @@ def stale_worker_pr_reason(
     if not isinstance(merge_state, str):
         raise GroomError("pull request merge state is malformed")
     return BAD_MERGE_STATES.get(merge_state)
+
+
+def stranded_worker_pr(
+    pull: dict[str, Any],
+    bot_login: str,
+    threshold_seconds: int,
+    now: int,
+    *,
+    has_valid_provenance: bool,
+) -> bool:
+    """[registry #1598] True iff this aged worker PR is owned by NO automated loop AND this sweep
+    produces NO hand-off reason for it — i.e. it is SILENTLY STRANDED, invisible in both directions.
+
+    Concretely that is the NON-DRAFT orphan whose `mergeable_state` is not one of
+    BAD_MERGE_STATES: `clean`, or any future state GitHub adds that this table does not name.
+    Nothing owns it — dispatch-claim.enumerate_review_items refuses it before any repair branch
+    because provenance_admission_error fails closed on a missing/unreadable/schema-invalid record,
+    and groom's issue-side orphan repair skips it because the open PR links its source issue — and
+    stale_worker_pr_reason returns None for it, so there is no park, no comment, and no census row
+    either. Being `clean` is not evidence of being owned; it is only evidence of not being wedged.
+    The DRAFT arm has no such residue (every draft orphan returns ORPHAN_DRAFT_REASON), which is
+    why the closure guarantee holds there and not here.
+
+    THIS IS A GAUGE, NOT A DISPOSITION. It writes nothing and parks nothing. The issue's suggested
+    remedy — extend the orphan hand-off to non-drafts regardless of merge state — is deliberately
+    NOT taken here: that is a mass park applied to a population nobody has counted, and #1598 asks
+    for the count first. Once the census line this feeds has run over real ticks, the park (a new
+    reason string, an AGE_PARK_CAUSES entry, and an `orphan-draft`-style recovery predicate keyed
+    on an admissible record appearing on the live ledger ref) can be argued from that number.
+
+    It is DERIVED from the two production functions rather than re-deriving orphan-hood, so it can
+    never measure a different population than the hand-off acts on: a change to either one moves
+    this count. It raises whatever stale_worker_pr_reason raises — a malformed merge state stays a
+    fail-closed refusal rather than becoming a quietly-uncounted row."""
+    if not aged_orphan_worker_pr(
+        pull, bot_login, threshold_seconds, now, has_valid_provenance=has_valid_provenance
+    ):
+        return False
+    return stale_worker_pr_reason(
+        pull, bot_login, threshold_seconds, now, has_valid_provenance=has_valid_provenance
+    ) is None
 
 
 # ---- the ONE diagnostic-masking contract (issue #644 defect 1, extended by issue #647) ----------
@@ -3653,6 +3721,10 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     pulls: dict[str, dict[int, dict[str, Any]]] = {}
     attempts: dict[tuple[str, int], int] = {}
     stale_prs: dict[tuple[str, int], str] = {}
+    # [registry #1598] The aged worker orphans this sweep has NO disposition for — non-drafts with
+    # no admissible provenance record whose merge state is not one BAD_MERGE_STATES names. Kept as
+    # the object list, not a bare counter, because the census names them (see the emission below).
+    stranded_prs: list[str] = []
     defuse_prs: dict[tuple[str, int], tuple[str, str]] = {}
     # Issue #647, THIRD instance of the same shape, found while closing the other two: the per-PR
     # DETAIL read below is an unwrapped per-object operation with reclaim downstream, so one PR
@@ -3778,13 +3850,18 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                     raise GroomError(
                         f"target pull request detail is malformed for {repo}#{number}"
                     )
+                # ONE provenance derivation, read by the hand-off decision and the [registry
+                # #1598] census alike. Deriving it twice would let the two disagree about who is
+                # unowned, which is the one thing the census must never do.
+                pr_owned = worker_pr_provenance_enumerable(
+                    repo, number, ledger_root=ledger_root)
                 reason = stale_worker_pr_reason(
-                    detail,
-                    bot_login,
-                    repo_limits.threshold_seconds,
-                    now,
-                    has_valid_provenance=worker_pr_provenance_enumerable(
-                        repo, number, ledger_root=ledger_root),
+                    detail, bot_login, repo_limits.threshold_seconds, now,
+                    has_valid_provenance=pr_owned,
+                )
+                pr_stranded = stranded_worker_pr(
+                    detail, bot_login, repo_limits.threshold_seconds, now,
+                    has_valid_provenance=pr_owned,
                 )
             except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #774)
                 # See _execute_age_unpark_actions' handler for the canonical rationale: a
@@ -3796,11 +3873,30 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             detect_completed += 1
             if reason:
                 stale_prs[(repo, number)] = reason
+            elif pr_stranded:
+                # [registry #1598] MEASURE, do not act. This PR is an aged worker orphan for which
+                # the sweep has no hand-off reason: no automated loop enumerates it and no park,
+                # comment or label is written for it, so until this line it left no trace anywhere.
+                # Naming it per-object is the point — a bare count tells an operator that a
+                # stranded PR exists but not which one, and the whole complaint in #1598 is that
+                # the object is unfindable.
+                stranded_prs.append(f"{repo}#{number}")
     # [#1303] The realised saving, per tick, from the tick's own counters — never a constant.
     print(
         f"SWEEP attempt-budget reads: {attempts_fetched} of {attempts_considered} open issues "
         f"needed a comments fetch, {attempts_considered - attempts_fetched} decided by the "
         "comment count already in the list payload (0 requests)"
+    )
+    # [registry #1598] Emitted UNCONDITIONALLY, zero row included, exactly like the #873
+    # `age_park_standing` gauge above it: this line's whole job is to answer "how many aged worker
+    # orphans is this sweep saying nothing about", and a gauge that appears only when it is
+    # non-zero trains its reader to read absence as health (AGENTS.md pre-flight item 8). A zero
+    # row here is the positive statement that the residue is empty on this tick.
+    print(
+        "CENSUS stranded worker PRs (aged, non-draft, no admissible provenance record, merge "
+        "state not one this sweep escalates — owned by no loop and handed off to nobody): "
+        f"{len(stranded_prs)}"
+        + (f" [{', '.join(sorted(stranded_prs))}]" if stranded_prs else "")
     )
     detect_outcome = PhaseOutcome(
         label="stale PR detection",
@@ -4393,6 +4489,10 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         # (AGENTS.md pre-flight item 8).
         f"age_park_standing={standing_count} "
         f"age_park_exit_unreachable={unreachable_count} "
+        # [registry #1598] Same unconditional-gauge contract as the two above, on the SUMMARY line
+        # an operator actually greps: the size of the population a future non-draft orphan park
+        # would act on, so that decision is argued from a measurement rather than an intuition.
+        f"stranded_prs={len(stranded_prs)} "
         f"age_unpark_deferred={len(unpark_outcome.deferred)} "
         f"detect_deferred={len(detect_outcome.deferred)} "
         f"snapshot_deferred={len(snapshot_outcome.deferred)} "
@@ -5143,6 +5243,132 @@ def _self_test() -> int:
         ],
         [None, None],
     )
+
+    # ---- [registry #1598] the SILENT-STRAND census: the residue the hand-off has no reason for --
+    # The check directly above proves a clean NON-DRAFT orphan returns None. That None is not a
+    # disposition: nothing enumerates the PR (dispatch-claim refuses a record-less pull before any
+    # repair branch), groom's issue-side orphan repair skips it (the open PR links its source
+    # issue), and no park, comment or census row was ever written for it. stranded_worker_pr is
+    # the gauge that makes exactly that population visible; it must be TRUE there and FALSE for
+    # every neighbouring case, or it is measuring something other than the strand.
+    _clean_orphan = {**old_pr, "mergeable_state": "clean"}
+    check(
+        "the CLEAN non-draft ORPHAN — the #1598 strand itself — is censused",
+        stranded_worker_pr(
+            _clean_orphan, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False
+        ),
+        True,
+    )
+    check(
+        # The REJECT side of the ownership gate, sharing every input with the row above except
+        # `has_valid_provenance`. Hard-code the census call site's provenance argument to False
+        # (or drop the gate from aged_orphan_worker_pr) and this reds while the row above stays
+        # green: a review-loop-owned PR is not stranded, it is simply waiting for its lane.
+        "a CLEAN non-draft PR the review loop OWNS is NOT stranded (ownership, not merge state, "
+        "is what the census measures)",
+        stranded_worker_pr(
+            _clean_orphan, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
+        ),
+        False,
+    )
+    check(
+        # The DRAFT arm's closure guarantee, restated as a census claim: every draft orphan
+        # already returns ORPHAN_DRAFT_REASON, so no draft can ever be part of this residue.
+        # Delete the `draft` branch of stale_worker_pr_reason and this flips to True.
+        "a DRAFT orphan is never stranded — the draft arm hands every one of them off",
+        stranded_worker_pr(
+            {**_clean_orphan, "draft": True},
+            "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False,
+        ),
+        False,
+    )
+    check(
+        # A PR still inside the maintenance threshold is not yet anything — not parked, not
+        # stranded. Delete the age guard and every freshly-opened clean worker PR is censused as
+        # stranded on the tick it is created, which would make the number meaningless.
+        "a FRESH clean orphan is not yet stranded (the age threshold gates the census too)",
+        stranded_worker_pr(
+            {**_clean_orphan,
+             "updated_at": datetime.fromtimestamp(now - 1, timezone.utc).isoformat()},
+            "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False,
+        ),
+        False,
+    )
+    check(
+        # The SHAPE gate. A human's clean PR has no provenance record either, and counting it
+        # would inflate the population a future park is argued from by the entire non-worker
+        # pull population.
+        "a non-worker (human-authored) clean PR is not stranded, record or no record",
+        [
+            stranded_worker_pr(
+                {**_clean_orphan, "user": {"login": "a-human"}},
+                "app[bot]", limits.threshold_seconds, now, has_valid_provenance=owned)
+            for owned in (False, True)
+        ],
+        [False, False],
+    )
+    # THE PARTITION, which is the whole claim #1598 makes: across the aged non-draft ORPHAN
+    # population, "has a hand-off reason" and "is stranded" are complementary — every such PR is
+    # in exactly one of them, and the strand is precisely the merge states BAD_MERGE_STATES does
+    # not name. The `clean` input is a LITERAL that appears in no table the code reads, so the
+    # row cannot be satisfied by a mutant that shrinks BAD_MERGE_STATES (AGENTS.md question (c)),
+    # and the expected list is written out by hand rather than derived from that table.
+    _partition = [
+        (_state,
+         stale_worker_pr_reason({**old_pr, "mergeable_state": _state}, "app[bot]",
+                                limits.threshold_seconds, now, has_valid_provenance=False)
+         is not None,
+         stranded_worker_pr({**old_pr, "mergeable_state": _state}, "app[bot]",
+                            limits.threshold_seconds, now, has_valid_provenance=False))
+        for _state in ("behind", "blocked", "clean", "dirty", "unknown", "unstable")
+    ]
+    check(
+        "every aged non-draft orphan is EITHER handed off OR censused as stranded, never both and "
+        "never neither — and `clean` is the one that is stranded",
+        _partition,
+        [("behind", True, False), ("blocked", True, False), ("clean", False, True),
+         ("dirty", True, False), ("unknown", True, False), ("unstable", True, False)],
+    )
+    # A malformed merge state must stay the fail-closed REFUSAL it is on the hand-off path rather
+    # than degrading into a quietly-uncounted census row: the census is derived from the same
+    # function, so it raises where that function raises. Swallow the exception in
+    # stranded_worker_pr and this reds.
+    _census_malformed_raised = False
+    try:
+        stranded_worker_pr(
+            {**old_pr, "draft": False, "mergeable_state": 7},
+            "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False,
+        )
+    except GroomError:
+        _census_malformed_raised = True
+    check(
+        "a malformed merge state fails closed in the census too (never a silent uncounted row)",
+        _census_malformed_raised,
+        True,
+    )
+    # aged_orphan_worker_pr is the SHARED population definition both readers key off. Asserted
+    # directly, in both directions, so the extraction cannot be hollowed out into a constant while
+    # its two callers happen to stay green on the fixtures above.
+    check(
+        "the shared orphan population: aged + worker-shaped + bot-authored + NO admissible record",
+        [
+            aged_orphan_worker_pr(_pr, "app[bot]", limits.threshold_seconds, now,
+                                  has_valid_provenance=_owned)
+            for _pr, _owned in (
+                (_clean_orphan, False),                                     # the population
+                (_clean_orphan, True),                                      # owned -> out
+                ({**_clean_orphan, "draft": True}, False),                  # drafts are in it too
+                ({**_clean_orphan, "user": {"login": "a-human"}}, False),   # not bot-authored
+                ({**_clean_orphan, "head": {"ref": "feature/x"}}, False),   # not a worker branch
+                ({**_clean_orphan, "body": "no marker"}, False),            # no agent self-ID
+                ({**_clean_orphan,
+                  "updated_at": datetime.fromtimestamp(now - 1, timezone.utc).isoformat()},
+                 False),                                                    # still fresh
+            )
+        ],
+        [True, False, True, False, False, False, False],
+    )
+
     check("worker branch links issue", linked_issue_numbers(old_pr), {7})
 
     # ---- issue #548: safely defuse stale terminally parked, ready-for-review PRs. ----
@@ -8623,6 +8849,67 @@ def _self_test() -> int:
                 "stale_prs=0" in raced_log,
             ),
             ([], [], True, True),
+        )
+
+        # (A1d) [registry #1598] THE SILENT-STRAND CENSUS, END TO END through the real run_sweep.
+        # This PR differs from (A1)'s parked one in ONE field — `mergeable_state` is `clean`, not
+        # `dirty` — and that one field is the whole defect: (A1) parks and comments, this one
+        # produced no park, no comment, no log line and no counter, so it was invisible to every
+        # automated loop AND to the operator at once. The census is what ends that, and it is
+        # asserted at the layer that decides it (AGENTS.md pre-flight item 11): the PR must still
+        # be written to by NOTHING, and must be NAMED on both the CENSUS line and the SUMMARY.
+        #
+        # The rendered text is pinned EXACTLY, tail included, not by substring-containing
+        # "CENSUS" (AGENTS.md pre-flight item 6): a mutant that emits the header and drops the
+        # count, or emits the count and drops the object list, satisfies a containment check while
+        # leaving the operator exactly as unable to find the PR as before.
+        stranded_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=({**_stale_worker_pr(47), "mergeable_state": "clean"},))
+        check(
+            "a CLEAN non-draft worker orphan is CENSUSED and NAMED — the sweep still writes "
+            "nothing to it and still parks nothing, but it is no longer silent about it",
+            (
+                terminal_sweep_env["writes"],
+                _comment_bodies(),
+                "handed off to nobody): 1 [owner/repo#47]" in stranded_log,
+                "stranded_prs=1" in stranded_log,
+                "stale_prs=0" in stranded_log,
+            ),
+            ([], [], True, True, True),
+        )
+        # (A1e) THE ZERO ROW, and the reason it is asserted separately. Item 3's second mutant —
+        # making an emission CONDITIONALLY inert rather than deleting it — is invisible to (A1d):
+        # wrapping the print in `if stranded_prs:` keeps every element above green and silences
+        # the gauge on exactly the quiet tick an operator interrogates it (AGENTS.md item 8). The
+        # run below is (A1d) with ONE thing changed — an admissible provenance record now exists in
+        # the checkout the sweep resolves records from — so it also kills a census that ignores
+        # ownership: hard-code the census call site's `has_valid_provenance` to False and this
+        # reds while (A1d) stays green.
+        stranded_provenance = json.dumps({
+            "pr_number": 47,
+            "head_sha_at_open": "1" * 40,
+            "impl_provider": "anthropic",
+            "impl_alias": "fable",
+            "impl_account_h": "ab" * 8,
+            "issue": 947,
+            "recorded_at_run": "29694084610.1",
+        })
+        with tempfile.TemporaryDirectory() as census_ledger_dir:
+            census_record = Path(census_ledger_dir) / PROVENANCE_DIR / "owner--repo--pr47.json"
+            census_record.parent.mkdir(parents=True)
+            census_record.write_text(stranded_provenance, encoding="utf-8")
+            owned_census_log, _e, _r = _sweep_with_refusals(
+                {}, pulls=({**_stale_worker_pr(47), "mergeable_state": "clean"},),
+                ledger_root=census_ledger_dir)
+        check(
+            "the census ZERO-SEALS: a review-loop-OWNED clean PR is not stranded, and the gauge "
+            "still emits its zero row on both surfaces rather than falling silent",
+            (
+                "handed off to nobody): 0" in owned_census_log,
+                "[owner/repo#47]" in owned_census_log,
+                "stranded_prs=0" in owned_census_log,
+            ),
+            (True, False, True),
         )
 
         # (A2) FAIL-CLOSED DEFAULT. A cause the taxonomy cannot name has no recovery predicate, so
