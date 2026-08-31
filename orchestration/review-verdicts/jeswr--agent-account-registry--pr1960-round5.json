@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1960,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8d57cce64f44dc9c6e2ed2cefb93123a1a1a927c",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The selector remains `started && /^[[:space:]]*path:[[:space:]]*target[[:space:]]*$/`, so it ignores `path: \"target\"` and `path: 'target'` even though YAML resolves both to the same checkout destination. A pinned unquoted decoy can be counted as the sole target checkout while the real model checkout uses a quoted target path and a moving or omitted ref. The extractor then returns the decoy's expected ref rather than `<ambiguous>`, leaving the marquee assertions green on an unbound model tree. This is materially the same trust-binding bypass reported in round 4, and none of the added mutants covers quoted scalar equivalence.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Parse the YAML value or normalize supported quoted and unquoted scalar spellings before comparing the destination, then fail closed unless exactly one checkout step semantically resolves to `target`. Add mutants with a correctly pinned unquoted decoy plus a real checkout using each of `path: \"target\"` and `path: 'target'` with a moving or absent ref; both must produce `<ambiguous>` or otherwise refuse.",
+    "severity": "major",
+    "title": "Quoted target paths still bypass checkout uniqueness"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 major finding remains unresolved. `_model_target_checkout_ref` still recognizes only the raw unquoted spelling `path: target`; YAML-equivalent quoted scalars remain invisible. A pinned unquoted decoy can therefore be counted as the unique target checkout while the actual model checkout uses `path: \"target\"` or `path: 'target'` with a moving or absent ref. The extensive new mutants do not exercise either quoted spelling, so the trust-binding claim remains bypassable. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
