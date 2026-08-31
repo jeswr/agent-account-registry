@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5700,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5f3c22009801db128065db087105bd3a47e7412d",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 confirms the change remains correct and complete. The evaluator reuses the existing added-crate and stub predicates, emits all three reactive rules independently per added public crate, expands crate-specific routing labels, and suppresses site/guide work only on checked-out-tree evidence for the same crate. The focused tests exercise the real evaluator across multi-crate emission, stub and nested-manifest exclusion, fail-closed evidence handling, dispatch labels, and deduplication; all 18 focused tests pass. No correctness, soundness, test-validity, or security defect was found.",
+  "verdict": "approve"
+ }
+}
