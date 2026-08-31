@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5722,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2f1505380a0d7a287560c15fcbb0d57466068b91",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, security, or test-validity defect. The content-based exemption remains restricted to the audited `.github/feature-matrix.d/` tree; all other `.github/**` YAML, including workflows with raw-text consumers, still fails closed to the full matrix. Revision/blob/parser/parse uncertainty also fails closed. Parsed-document comparison is type-tagged and order-aware where semantics require it, and the tests cover the real selection path, PyYAML comment and block-scalar behavior, behavior-changing edits, allowlist boundaries, consumer-audit drift, and a mutation check. The focused test classes pass in this checkout (28 tests, with 6 real-PyYAML cases skipped because the optional dependency is absent), while CI installs the hash-pinned dependency best-effort so absence affects precision only. Findings are materially unchanged from round 2: none remain.",
+  "verdict": "approve"
+ }
+}
