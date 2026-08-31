@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2072,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bde2a03fb662f6e6e1bc44289da8632d79f663f2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces the vulnerable raw-line substring check with a parsed, job-scoped equality check for the model-executing run job. It fails closed for malformed/non-mapping documents, missing jobs, a missing or renamed run job, a deleted gate, boolean false, weakened comparisons, and both internal and externally concatenated disjuncts. The live workflow is checked before the synthetic mutants, so anchor drift cannot conceal a broken production gate. The tests exercise hand-built parsed nodes, neighboring-job isolation, and an end-to-end mutation of real workflow text through the YAML parser; the existing acquired=false shell-body seam remains pinned. Factoring YAML loading into _workflow_document preserves the prior dependency and parse failure behavior. No security weakening, vacuous assertion, or diff-borne reviewer-directed injection was found.",
+  "verdict": "approve"
+ }
+}
