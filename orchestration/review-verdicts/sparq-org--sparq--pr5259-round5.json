@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5259,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c320ad0731f014f48da9d8d396f7dacd0b1c87b5",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "main invokes run_gate_once before save_state_file. Verdict paths inside evaluate_once/render_verdict emit the summary and diagnostics before run_gate_once returns; only afterward does main persist terminal_exit. A crash, eviction, or save failure after publication leaves the previous nonterminal carrier, so a retry may fetch a changed sibling set and publish the opposite verdict. The replay tests always persist successfully, and the atomic-save failure test demonstrates that a failed replacement intentionally preserves the old record, so neither test covers this ambiguous-publication interval.",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Separate decision computation from authoritative publication. Persist the state containing terminal_exit atomically before rendering/publishing that persisted decision, then replay the committed decision for output. Add a CLI/transport-path test that forces the terminal-state save to fail and retries against the opposite sibling set, proving that no opposite verdict can be published. If Phase 1 intentionally cannot provide this guarantee, remove claims that ambiguous transport retries are closed and document it explicitly as a Phase-2 obligation.",
+    "severity": "major",
+    "title": "Verdict is still published before its terminal state is durably committed"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4's major finding remains materially unchanged. main still calls run_gate_once first, allowing evaluate_once/render_verdict to publish the authoritative summary and diagnostics, and only afterward calls save_state_file. terminal_exit therefore protects duplicates only after that post-publication write succeeds. If the process is evicted or persistence fails in the interval, the old nonterminal carrier remains; a retry can observe a changed sibling set and publish the opposite verdict. The new replay tests cover successfully persisted terminal records, while the atomic-save test confirms failed writes preserve the previous record rather than closing this publication/commit gap. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
