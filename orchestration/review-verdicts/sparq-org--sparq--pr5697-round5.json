@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5697,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6aa6eacb8e177a9e3175b2619b3d8389b4221c75",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The final parenthetical still says this is \"the same anonymous-class output-vocabulary gap as WebOnt-I5.5-005\". That comparison remains unsupported by the taxonomy in this diff: New-Feature-SelfRestriction-002 reaches an in-profile anonymous hasSelf concept internally and fails when the realiser cannot emit a ClassAssertion to its restriction bnode, whereas WebOnt-I5.5-005 relies on owl:unionOf/list vocabulary outside EL and is skipped before the relevant concept is processed. Both conclusions may contain anonymous structure, but their blocking mechanisms are not the same.",
+    "file": "crates/sparq-conformance/tests/el_suite.rs",
+    "fix_hint": "Remove the final comparison to WebOnt-I5.5-005, or explicitly contrast the mechanisms: this hasSelf case is an in-profile anonymous-restriction reification/output gap, while WebOnt-I5.5-005 is blocked because owl:unionOf and its list structure are outside EL and skipped.",
+    "severity": "minor",
+    "title": "The hasSelf output gap is still incorrectly equated with WebOnt-I5.5-005"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4's documentation finding remains materially unchanged. The revised taxonomy correctly identifies anonymous-class output as a distinct output-vocabulary limitation, and the entry accurately explains that CRs3 now derives the hasSelf concept internally. However, the final parenthetical still calls this the same gap as WebOnt-I5.5-005, even though that case is blocked earlier by owl:unionOf/list vocabulary being outside EL and skipped. Because the same minor accuracy issue remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
