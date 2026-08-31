@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-31T15:31:27Z",
+  "generated_at": "2026-08-31T15:43:40Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -8,15 +8,15 @@
       "issues_closed_1h": 2,
       "issues_closed_24h": 7,
       "prs_open": 164,
-      "prs_draft": 134,
+      "prs_draft": 136,
       "prs_opened_1h": 1,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
       "prs_merged_24h": 4,
-      "review_changes_backlog": 11,
+      "review_changes_backlog": 12,
       "needs_user_parked": 16,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 8,
+      "review_lane_runs_1h": 7,
       "worker_attempts_1h": 1,
       "worker_success_rate_1h": 0.0,
       "pr_open_rate": 1.0,
@@ -24,10 +24,10 @@
       "net_pr_flow": 1.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 992,
+      "issues_open": 991,
       "issues_ready": 632,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 3,
+      "issues_closed_1h": 1,
+      "issues_closed_24h": 4,
       "prs_open": 49,
       "prs_draft": 34,
       "prs_opened_1h": 0,
@@ -60,12 +60,13 @@
     },
     {
       "target": "jeswr/agent-account-registry",
-      "classification": "ready-starved",
+      "classification": "review-lane-stalled",
       "fire": true,
-      "summary": "ready frontier 632 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=6 waits",
       "metrics": {
-        "issues_ready": 632,
-        "issues_closed_1h": 0
+        "review_changes_backlog": 6,
+        "review_lane_runs_1h": 1,
+        "prs_merged_1h": 0
       }
     }
   ]
