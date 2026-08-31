@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5856,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "19dfee42e6c94423154af83c7dcc624974c13e62",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`statements()` still splits `cargo test && echo passed` at `&&` without retaining that `cargo test` is a non-final AND-list command. `analyse_run_body()` therefore sees the test with `errexit_here == true` and reports nothing. Bash suppresses `-e` for such a command, so `cargo test && echo passed; echo done` becomes green when the test fails: the AND-list stops before `echo passed`, then `echo done` succeeds. The added `_STEP_D2_SAME_LINE_AND` only checks an explicit `set +e` transition and does not cover this prior-round counterexample.",
+    "file": "scripts/check-workflow-run-swallow.py",
+    "fix_hint": "Preserve AND/OR-list position and resulting-status propagation in the parsed representation. Flag a gate whose failure is consumed as a non-final conditional-list command when a later command can make the step succeed. Add a must-fire fixture for `cargo test && echo passed; echo done`; cover analogous `||` conditional-list use and shell condition contexts, or explicitly narrow the documented guarantee if those forms are intentionally unsupported.",
+    "severity": "major",
+    "title": "AND-list commands still bypass the swallow checker"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 major finding remains unresolved. The parser still splits `&&` and discards the AND-list context, so a gate command in a non-final AND-list position is analysed as if ordinary errexit applied. The new `set +e && gate` fixture exercises explicit errexit disabling, not Bash's implicit suppression of `-e` for commands used as AND/OR-list conditions. Consequently `cargo test && echo passed; echo done` can still finish successfully after a failed test without producing R1. Progress is stagnant because the same major correctness gap remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
