@@ -79,14 +79,6 @@
    "why_no_diff": "blocked_on_decision"
   },
   {
-   "ts": 1788235004,
-   "provider": "anthropic",
-   "account": "c0ac92ebee2c590e",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "33466039664.1"
-  },
-  {
    "ts": 1788235587,
    "provider": "anthropic",
    "account": "f79434c3ffba014f",
@@ -1742,6 +1734,14 @@
    "model_alias": "sol",
    "exit_class": "success",
    "run_id": "33523924239.1"
+  },
+  {
+   "ts": 1788275650,
+   "provider": "anthropic",
+   "account": "f79434c3ffba014f",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "33523440404.1"
   }
  ]
 }
