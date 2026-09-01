@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2155,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "52f5a1128270451f12111c9f463aa29c8f12bc3d",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`workflow_triggers` returns `{}` whenever the parsed `on:` value is not a mapping. That is safe for valid shorthand such as `on: push`, but it also collapses `on: schedule` and `on: [schedule]` to the identical unscheduled result. Those are malformed schedule declarations, yet `schedule_crons` never receives them and `schedule_minute_map` silently omits the lane. This preserves the prior round's trust-plane failure one layer earlier: unreadable schedule evidence becomes an apparently complete map. The self-test only asserts the permissive `on: push` case, so it cannot detect this scheduled variant.",
+    "file": "scripts/cron_map.py",
+    "fix_hint": "Parse valid scalar/list trigger shorthand without losing its event names. Continue treating scalar/list forms that contain only ordinary non-schedule events as unscheduled, but raise `CronMapError` when a non-mapping form contains `schedule`, because no cron list can be read from it. Add hermetic tests for both `on: schedule` and `on: [push, schedule]` proving `workflow_triggers` or `schedule_minute_map` refuses, while retaining positive tests for valid `on: push` and `on: [push, pull_request]` shorthand.",
+    "severity": "major",
+    "title": "Non-mapping scheduled triggers still disappear from the derived map"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 fixes the prior examples inside a mapping-valued `on:`: malformed schedule entries and non-list `schedule:` values now refuse, including mixed valid/malformed declarations. However, the same fail-open result remains at the immediately preceding parse boundary. `workflow_triggers` maps every non-mapping `on:` value to `{}`, including `on: schedule` and `on: [schedule]`; `schedule_crons` therefore never sees those malformed scheduled lanes, and `schedule_minute_map` omits them as if they were genuinely unscheduled. The new self-test explicitly blesses the scalar collapse using `on: push` without testing the security-relevant scheduled scalar/list variants. Because the prior major finding is only partially fixed and its core omission behavior remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
