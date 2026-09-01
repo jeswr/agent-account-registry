@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6084,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d9073236b9c822a4f38c82080a9b173df27b0bf2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The stale-run reaper is fail-closed and appropriately scoped. It requires both the merge_group event and a positively recognized queue ref, refuses incomplete or unreadable queue state, preserves current heads and grace-period runs, bounds cancellations, and re-reads both queue and run state before each mutation. The workflow uses default-branch policy code and job-level least privilege. The tests exercise the real mutation path with a stateful fake and cover active-current controls, empty/rebuilt queues, incomplete/null API responses, duplicate delivery, cancellation failures, dry-run behavior, and both queue/run TOCTOU changes. No correctness, soundness, security, or vacuous-test defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
