@@ -14,14 +14,6 @@
    "why_no_diff": "blocked_on_decision"
   },
   {
-   "ts": 1788185822,
-   "provider": "anthropic",
-   "account": "f79434c3ffba014f",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "33401106743.1"
-  },
-  {
    "ts": 1788186691,
    "provider": "anthropic",
    "account": "f79434c3ffba014f",
@@ -1642,6 +1634,14 @@
    "model_alias": "sol",
    "exit_class": "success",
    "run_id": "33470235516.1"
+  },
+  {
+   "ts": 1788237305,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "success",
+   "run_id": "33470262416.1"
   }
  ]
 }
