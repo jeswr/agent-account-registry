@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2097,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2883a460e8f44991b20a456d60c1fcf25d953df0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The duplicate-specific exception remains a GroomError subclass, so all existing fail-closed boundaries still catch it, while only `_consistent_snapshot` grants one diagnostic reread. The per-tick budget is shared across issue and pull listings for a repository, scoped independently per repository, and claimed before the settle/reread, so failed rereads consume the allowance and no permissive fallback is introduced. The production sweep publishes neither partial snapshot and retains leases when the reread remains inconsistent or otherwise fails. Tests exercise the real duplicate guards and both production call sites, distinguish recovery from persistent inconsistency, pin request counts, settle delegation, repository scoping, shared budgeting, lease retention, and unconditional zero-valued census output. I found no diff-supported correctness, soundness, security, injection, or test-validity defect.",
+  "verdict": "approve"
+ }
+}
