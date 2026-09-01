@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2140,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9ff3649a4a66782c4d444a8ef3fc212be4b9f175",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added executed-page case is sound and non-vacuous. It constructs a normalized flow document with all four metric sources absent, then verifies both that the Queue & flow card remains present with its surrounding queue, lease, and trend children in the expected order and that no obs-metric-grid child is attached. Deleting or inverting the childElementCount guard is detected, while the existing measured case continues to cover the positive branch. The fixture removals are strict, normalization produces an empty target queue consistently, and no trust-plane or security behavior is weakened.",
+  "verdict": "approve"
+ }
+}
