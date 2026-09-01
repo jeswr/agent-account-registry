@@ -12,7 +12,8 @@
 >
 > **Recommendation, in one line: do not build the breaker — and do not build the lock it breaks.**
 > The account-record write is already guarded, fail-closed, by a different and weaker-coupling
-> mechanism (§3). A lock ref is a *mutex*, and the leaked hold #1023 wants a breaker for is a
+> mechanism — which *detects* a clobber and fails loudly rather than preventing one, and the lock
+> would not close the gap that leaves (§3). A lock ref is a *mutex*, and the leaked hold #1023 wants a breaker for is a
 > failure mode the mutex **introduces**. The direction this repo has already adopted for exactly
 > this problem — `research/1051` §6, `research/389`, commit `eff35a82d` — uses a ref update **as
 > the compare-and-swap on the data**, which has no hold to leak (§4). If a lock is nevertheless
@@ -75,17 +76,27 @@ The count shapes are decided explicitly:
 - any other shape → a foreign edit may have landed *inside* the window and been replaced → **fail
   loudly**, without retrying (`:728-730`).
 
-So the property #1023 credits to the lock — "nothing is ever overwritten", loud and safe — is
-**already held**, by a mechanism that cannot leak because it holds nothing. A clobber is detected
-after the fact and surfaced (`WRITE_FAILURE_WARNING`, `persist_limits` returns 1) rather than
-prevented before the fact, and the replaced revision stays in the issue's edit history.
+That guarantee is **narrower than "nothing is ever overwritten"**, and the difference matters.
+`_persist_one` does not prevent an overwrite: `gh issue edit --body` replaces the whole body, so a
+foreign edit that lands inside the read→write window *is* replaced, and the count stamp reads that
+only afterwards. What the stamp buys is that the loss is never laundered into success — a suspected
+in-window clobber fails **loudly and without retry** (`:728-730`), `persist_limits` returns 1,
+`WRITE_FAILURE_WARNING` surfaces it as a red annotation, and the replaced revision stays recoverable
+from the issue's edit history. That is **detection, loud failure and recoverability — not
+prevention**. The mechanism's other property is structural: it cannot leak, because it holds nothing.
 
-Note also `_persist_one`'s own scope statement: automated writers *cannot reach the window* —
+So prevention *is* a gap here, and the honest question is a separate one: would the lock close it?
+`_persist_one`'s own scope statement says no. Automated writers **cannot reach the window** —
 `dispatch.yml` self-serializes (`registry-dispatcher`, `cancel-in-progress: false`) and
-`set-up-account` only creates catalog issues. The guard exists for **out-of-band manual edits**.
-That bounds what a lock could add: a lock between registry-owned writers serializes writers that
-are already serialized, and it cannot exclude a human editing the issue in the GitHub web UI at
-all. A lock ref is not a mutex over the resource; it is a mutex over one of several writers.
+`set-up-account` only creates catalog issues — so the guard exists for **out-of-band manual edits**,
+which is also the only writer class that reaches the window at all. A ref mutex is advisory: it
+excludes exactly those writers that consult it, and a human editing the issue in the GitHub web UI
+never reads `refs/acct-locks/<handle>`. The lock would therefore serialize writers already
+serialized by `cancel-in-progress: false` and leave the one writer that can actually clobber
+entirely unexcluded. It is not a mutex over the resource; it is a mutex over one of several writers.
+
+The recommendation in §4 therefore rests on the lock failing to supply the missing prevention — not
+on the existing guard being complete, which it is not (§8).
 
 ## 4. Why the adopted direction removes the lock rather than repairing it
 
@@ -217,9 +228,10 @@ existing one or (§4) needing no hold at all.
 
 ## 7. Decision
 
-1. **Do not implement #1023 as written.** Its subject does not exist (§2), the safety property it
-   attributes to that subject is already held by `_persist_one` (§3), and the failure it reports as
-   currently observable is not reachable by any code path.
+1. **Do not implement #1023 as written.** Its subject does not exist (§2), the lock would not close
+   the one gap `_persist_one` leaves open — the out-of-band manual edit no advisory mutex can
+   exclude (§3) — and the failure it reports as currently observable is not reachable by any code
+   path.
 2. **#1023 is blocked on #317, not on this record.** It cannot be built before the lock it breaks.
    It should be re-scoped or closed rather than retried; filed as a follow-up.
 3. **Prefer resolving #1051 §6 first.** If the `limits:` line moves to a CAS/immutable data-plane
