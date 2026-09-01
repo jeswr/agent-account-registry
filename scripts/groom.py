@@ -668,14 +668,14 @@ def attempts_fetch_needed(
     answer smaller, they are not known this early in the sweep, and an error in this predicate
     has to point at FETCHING, never at skipping.
 
-    [registry #1739] That declension STANDS, and the follow-through is decided in
-    `research/1739-groom-comments-fan-out-narrowing.md` rather than re-argued here. Its §5 is the
-    reason not to take the cheap version: the skip branch below records the BOUND, which is only
-    safe while it is provably UNDER the cap. Skipping on a cheaper SUPERSET of either set (e.g.
-    "has any non-dead lease", known before the fetch loop) records an OVER-count for an issue
-    with `>= max_attempts` comments, so an issue the lease loop then classifies dead reaches the
-    exhaustion guard with the suppression gone and is parked below its real budget. §6 and §7 name
-    the measurements that would have to exist before re-opening it; neither is in the tree today.
+    [registry #1739] That declension stands FOR NOW — see the INTERIM record
+    `research/1739-groom-comments-fan-out-narrowing.md` (#1739 stays open), not re-argued here.
+    Its §5 is the reason not to take the cheap version: the skip branch below records the BOUND,
+    which is only safe while it is provably UNDER the cap. Skipping on a cheaper SUPERSET of
+    either set (e.g. "has any non-dead lease", known before the fetch loop) records an OVER-count
+    for an issue with `>= max_attempts` comments, so an issue the lease loop then classifies dead
+    reaches the exhaustion guard with the suppression gone and is parked below its real budget.
+    §6/§7 name the measurements needed to settle it either way; neither is in the tree today.
     """
     if comment_count >= max_attempts:
         return True          # the exhaustion park is still reachable

@@ -1,18 +1,24 @@
 # Can groom's per-issue comments fan-out be narrowed further? (#1739 — the #1120 follow-through)
 
-> 🤖 **SPARQ agent** — decision record, 2026-09-01. Maintainer-review document.
+> 🤖 **SPARQ agent** — **INTERIM** decision record, 2026-09-01. Maintainer-review document.
 > **This record changes no behaviour.** #1739 asks for a DECISION whose stated input is live
 > measurement, and the measurement is not in the tree (§2). So this record does what
 > `research/1122-groom-http-cache-retention.md` did for #1088: it decides a **shape** and a
-> **rule**, not a diff, and states plainly what it is missing.
+> **rule**, not a diff, states plainly what it is missing, and leaves the issue OPEN for the part
+> it cannot decide.
 >
-> **Recommendation: the two narrowings STAY DECLINED — but NOT as a measured won't-fix.**
-> Recording "measured and rejected" for something nobody has measured is the one outcome #1120
-> was raised to prevent, so the declension here rests on the shipped-policy ceiling (§4) and the
-> fail-open in the cheap version (§5), and the measurement question is handed to a follow-up
-> issue rather than buried. §6 is the rule that settles it mechanically once the census exists;
-> §7 is the cheap, zero-risk counter that must come *before* any restructuring, because the
-> census #1120 specifies **cannot distinguish narrowable fan-out from irreducible fan-out**.
+> **This record does NOT discharge #1739.** #1739's actual question — *is the restructure worth
+> doing?* — is answerable only from the two censuses in §6 and §7, and neither exists in this
+> tree (§2). What is decided here is narrower, and holds without them: **hold both narrowings,
+> declined FOR NOW**, on the §5 fail-open (a refusal that stands on its own — the cheap version is
+> a wrong mutation at any traffic level) and on the **partial** ceiling in §4 (it bounds the
+> `live_by_issue` half by shipped policy and only estimates the `admitted` half from pre-#1303
+> notes). Recording "measured and rejected" for something nobody has measured is the one outcome
+> #1120 was raised to prevent — and closing the issue that asked for the measurement is the same
+> failure one level up. So **#1739 stays OPEN until §6's census line and §7's K/N counter have
+> both landed and been read** (§9.1). §6 is the rule that settles it mechanically once the census
+> exists; §7 is the cheap, zero-risk counter that must come *before* any restructuring, because
+> the census #1120 specifies **cannot distinguish narrowable fan-out from irreducible fan-out**.
 
 ## 1. What #1739 asks
 
@@ -92,6 +98,14 @@ narrowings cannot be the dominant term, and not enough to say whether they are w
 restructure**, because the comparison that matters is against the POST-#1303 fetch count, which
 is exactly what nothing has printed yet.
 
+**And this ceiling is PARTIAL — say so rather than lean on it.** Only the `live_by_issue` half is
+bounded by shipped policy (≤ 43, re-checkable in the tree today). The `admitted` half is bounded
+by nothing, and the figures above for it are historical, order-of-magnitude notes dated
+2026-07-27 — i.e. **before** #1303 changed which issues fetch at all. So §4 cannot answer whether
+the admitted subset is material post-#1303; that number is exactly §7's K. This is why the
+declension below rests primarily on §5, which does not depend on any count, and why §4 alone
+would not be grounds to close the question.
+
 ## 5. What re-opening this costs, and the constraint it must satisfy
 
 `attempts_fetch_needed`'s docstring records the reason #1303 declined: both sets "are not known
@@ -167,20 +181,26 @@ whatever P says.
   cheap-looking and structurally expensive.
 * It does not authorise consulting `live_by_issue`/`admitted` in `attempts_fetch_needed` on any
   approximation of those sets. §5 is a refusal, not a caution.
-* It does not claim to have MEASURED anything about the fan-out. #1739 is discharged as a
-  recorded declension plus a rule, not as a measured won't-fix; a won't-fix with no measurement
-  behind it reads, later, exactly like a measured rejection — and the whole complaint in #1120
-  was that the fan-out had never been measured. The measurement question outlives the issue that
-  asked it, so it is carried by the §7 follow-up rather than by #1739's open/closed state.
+* It does not claim to have MEASURED anything about the fan-out — and therefore it does not
+  discharge #1739. A won't-fix with no measurement behind it reads, later, exactly like a
+  measured rejection, and the whole complaint in #1120 was that the fan-out had never been
+  measured; closing #1739 on this record would reproduce that failure one level up, settling the
+  issue that asked for the measurement with a document whose own §2 says it has none. The
+  measurement question therefore stays attached to an OPEN issue (§9.1), not to prose here.
 * It does not decide anything about the OTHER users of the sweep's request budget. #1303's
   numerator is the comments fan-out alone; the ~150 non-comments requests in the 2026-07-29
   measurement are out of scope here.
 
 ## 9. Maintainer confirm-or-overrule
 
-1. **Declined on the §4 ceiling and the §5 fail-open — not on measurement**, and this record says
-   so in its own headline rather than letting a closed issue imply otherwise.
-2. **The §6 rule** settles it from ticks rather than from argument, including the won't-fix leg,
+1. **Do NOT close #1739 on this record — it is interim.** If the pull request carrying this record
+   auto-closes #1739, re-open it, or open a successor issue whose acceptance is exactly §6's
+   census line plus §7's K/N counter and link it from here. The measurement has to stay owned by
+   an open issue: a promise in a merged file is the carrier #1120 already demonstrated does not
+   survive.
+2. **Declined FOR NOW on the §5 fail-open and the partial §4 ceiling — not on measurement**, and
+   this record says so in its own headline rather than letting a closed issue imply otherwise.
+3. **The §6 rule** settles it from ticks rather than from argument, including the won't-fix leg,
    once the #1120 census is on `master` (§2: it is not).
-3. **The §7 counter comes before any restructure**, and the §5 constraints bind that restructure
+4. **The §7 counter comes before any restructure**, and the §5 constraints bind that restructure
    if it is ever taken.
