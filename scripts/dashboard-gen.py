@@ -1964,9 +1964,11 @@ def _obs_stat(drops, name, source, fields):
     describes the reader's contract for the drop line. Three cases, and the difference between the
     first two is the whole point:
 
-    * The collector did NOT send the field (absent, or an explicit null — #1557 settled that an
-      explicit null is "no value", not a shape mismatch): the field takes its `default` and nothing
-      is announced. A collector that has not shipped a field yet is the expected state.
+    * The collector did NOT send a field (absent, or an explicit null — #1557 settled that an
+      explicit null is "no value", not a shape mismatch): the field takes its `default`. If at
+      least one sibling parses, nothing is announced; if NO field parses, the whole statistic is
+      dropped and announced. A present-but-empty statistic measured nothing, so publishing all of
+      its defaults would fabricate a confident zero.
     * The collector SENT it and this build cannot read it: a producer/consumer mismatch. EVERY such
       field is announced through this seam's `_ObsDropLog`, and the WHOLE statistic publishes None
       so the panel stat HIDES. Dropping only the field would not be enough — the page reads each
@@ -1990,7 +1992,7 @@ def _obs_stat(drops, name, source, fields):
         drops.drop(f"observability flow stat `{name}` "
                    f"(the stat (type {type(source).__name__}) is not an object)")
         return None
-    published, readable = {}, True
+    published, readable, parsed = {}, True, False
     for field, reader, default, accepts in fields:
         raw = source.get(field)
         if raw is None:
@@ -2001,8 +2003,12 @@ def _obs_stat(drops, name, source, fields):
             drops.drop(f"observability flow stat `{name}` (field `{field}` "
                        f"(type {type(raw).__name__}) is not {accepts})")
             readable = False
+        else:
+            parsed = True
         published[field] = value
-    return published if readable else None
+    if readable and not parsed:
+        drops.drop(f"observability flow stat `{name}` (the stat has no parsed fields)")
+    return published if readable and parsed else None
 
 
 def _obs_flow(flow):
@@ -7168,10 +7174,19 @@ esac
           "collector that has not shipped a field yet is not a mismatch",
           obs_stat("parks_1h", {"needs_user": 4}),
           ({"needs_user": 4, "needs_orchestrator": 0}, []))
-    check("[#1880] an explicit null is 'no value' rather than a shape mismatch (the rule #1557 "
-          "settled for the cache key): a 24h window with no merges publishes its dashed "
-          "percentiles and the ZERO its sample count defaults to, with no warning",
+    for key in ("parks_1h", "review_rounds", "arm_to_merge_minutes_24h"):
+        check(f"[#1918] an EMPTY `{key}` stat measured nothing: hide it and announce the drop "
+              "instead of publishing a complete row made only from defaults",
+              obs_stat(key, {}),
+              (None, [_STAT_DROP.format(key, "the stat has no parsed fields")]))
+    check("[#1918] explicit nulls are still absent values, but a stat made ONLY of nulls has no "
+          "parsed field and cannot publish its sample-count default as a measurement",
           obs_stat("arm_to_merge_minutes_24h", {"p50": None, "p90": None, "samples": None}),
+          (None, [_STAT_DROP.format("arm_to_merge_minutes_24h",
+                                   "the stat has no parsed fields")]))
+    check("[#1918] null/unsent siblings keep their defaults once ONE field genuinely parses — a "
+          "quiet 24h sample count is a reading and still publishes silently",
+          obs_stat("arm_to_merge_minutes_24h", {"p50": None, "samples": 0}),
           ({"p50": None, "p90": None, "samples": 0}, []))
     # ...and the defaults are per FIELD, not one shared value: a park count nobody sent is 0 (the
     # panel reads counts through `obsNum(value, 0)` either way), while an unsent mean/max is None
