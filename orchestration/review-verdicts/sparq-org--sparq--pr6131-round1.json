@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6131,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c6b485247942a0e2e78ac2fb8e51d302da755ecb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`Allowlist.covers()` uses `files <= set(entry.files)` and `digests <= set(entry.digests)`. Thus one entry containing extra files or digests can suppress multiple unrelated findings, despite the script, JSON documentation, and AGENTS.md promising that entries name the exact files and exact block digests and exempt one repeat. Such an entry is also marked used after suppressing only one subset, so stale checking will not expose the unused breadth. This weakens the auditable escape hatch of a HARD gate.",
+    "file": "scripts/check-doc-duplication.py",
+    "fix_hint": "Require equality for both identities (`files == ...` and `digests == ...`), validate that `files` and `digests` are lists of non-empty strings, and add self-tests proving entries with an extra file or extra digest do not suppress a finding. If multi-group entries are intended, change the schema to enumerate each exact group separately rather than relying on supersets.",
+    "severity": "major",
+    "title": "Allowlist matching permits broad superset entries instead of exact identities"
+   },
+   {
+    "body": "Markers are attached after blocks below `WORD_FLOOR` have been discarded, via the first retained block whose start line is below the marker. A marker immediately followed by a short paragraph, heading, or code fragment therefore skips that content and exempts the next >=20-word block, potentially much later in the document. This contradicts the claimed narrow behavior of exempting the next content block and can silently hide an unrelated exact or near duplicate.",
+    "file": "scripts/check-doc-duplication.py",
+    "fix_hint": "Associate markers with the immediately following raw/normalised non-empty block before applying the word floor. If that block is below the comparison floor, consume the marker without exempting any later block (or report it as exempting non-comparable content). Add a fixture with a marker, a short intervening block, and a duplicated long block to prove the long block is still reported.",
+    "severity": "major",
+    "title": "Inline marker can exempt a later unrelated block"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposed duplication gate is thoughtfully scoped and extensively self-tested, but its two escape-hatch implementations are broader than the documented contract. The allowlist accepts supersets rather than exact file/digest identities, and an inline marker can skip intervening short content to exempt a later block. Because these behaviors can silently suppress real duplication in a HARD gate, they should be corrected and pinned with negative tests before approval.",
+  "verdict": "request_changes"
+ }
+}
