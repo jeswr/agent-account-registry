@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6155,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e24524d22cb735abd3bf84d5bb36ce46ac766b49",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`test_key_lanes_still_install_wasm_pack` requires the composite only in ci.yml, js.yml, and publish.yml. The PR converts 18 steps across nine workflows and repeatedly claims the test prevents any lane from quietly opting out, but removing the install from gui.yml, nightly-full-sweep.yml, pages.yml, release.yml, site-e2e-hero.yml, or site-visual.yml produces no direct jetli/cargo offender and leaves all three expected filenames present, so the suite passes. This makes the principal regression guard materially weaker than documented, especially for release/build lanes whose output is meant to use the canonical toolchain.",
+    "file": "scripts/tests/test_js_wasm_pack_install.py",
+    "fix_hint": "Encode the expected composite-install inventory (preferably workflow plus expected count, since several workflows have multiple jobs) and assert the observed inventory equals it. Add a synthetic/helper-level mutation test showing that deletion of an expected composite call is rejected. If some workflows are intentionally allowed to stop using wasm-pack, make that change an explicit update to the inventory rather than silently narrowing detection. Also match the local action path exactly rather than by substring while touching this detector.",
+    "severity": "major",
+    "title": "The anti-vacuity check allows most converted lanes to silently opt out"
+   }
+  ],
+  "progress": null,
+  "summary": "The central composite action is a reasonable way to unify the pin, but the inspection gate does not actually enforce its stated repo-wide guarantee. It only proves that three named workflows still contain a recognized composite step; any of the other converted build/release lanes can silently delete its wasm-pack install and the test remains green. Because preventing a lane from quietly opting out is an explicit load-bearing claim of this change, the guard is incomplete.",
+  "verdict": "request_changes"
+ }
+}
