@@ -23115,6 +23115,13 @@ def _escalation_call_site(source):
 #   - a nested `def`/`async def`/`lambda`, whose body runs when
 #     something CALLS it, not where it is written                -> `_SCOPE_BOUNDARIES`.
 #
+# LIVENESS IS PER-NODE AND THAT IS NOT ENOUGH. Deleting locally-dead nodes says each half of the
+# seam CAN run; it says nothing about whether ONE pass runs both, because these prunings neither
+# record nor compare the conditions a surviving node sits under. `if repo: targets = ...` with
+# `else: for target in targets: park(...)` leaves both halves live and shares no execution between
+# them — the `else:` arm dies evaluating a name only the `if:` arm ever bound. So the binding and
+# the loop are PAIRED before either is believed                 -> `_one_pass_order`.
+#
 # A class body is deliberately NOT a boundary: it EXECUTES IN PLACE at definition time, so a
 # statement written directly in one really does run. Its `def`s do not, and they are boundaries in
 # their own right — which is what keeps "call in a class-body METHOD" refused while "call in a
@@ -23132,6 +23139,13 @@ def _escalation_call_site(source):
 #   - a node made unreachable by an earlier `return`/`raise` is not seen at all.
 # A live-but-actually-dead node only makes the seam KEEP SCANNING a subtree, so the failure
 # direction of a mis-read is a refused seam, never a certified one.
+#
+# ...and the pairing is a floor in the OTHER direction: it refuses whatever it cannot prove, so a
+# real-but-unprovable path costs a refusal rather than a false certification. It does not know that
+# the binding SURVIVES to the loop (a later rebind is invisible), it does not reason across loop
+# iterations (a binding written after the loop but inside a surrounding one is refused, although
+# the next iteration would reach it), and any divergence into different FIELDS of one construct —
+# not just the arms of an `if` — refuses rather than case-splitting on which pairs stay ordered.
 _SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 # The comparisons that are pure value folds on two literals. `Is`/`IsNot` (identity of literals is
@@ -23249,6 +23263,45 @@ def _live_nodes(root):
         yield from _live_nodes(child)
 
 
+def _node_paths(root):
+    """`id(node)` -> the chain of `(field, index)` STEPS that walks from `root` down to that node.
+
+    Deliberately liveness-BLIND: it answers "where is this written", which is a fact about the
+    parse tree, while `_live_nodes` answers "can this run". Two chains sharing a prefix sit inside
+    exactly the same constructs up to the point they diverge, and the first differing step names
+    the ARM each one took — the only thing `_one_pass_order` needs."""
+    paths = {id(root): ()}
+    for parent in ast.walk(root):         # breadth-first, so a parent is always numbered first
+        base = paths[id(parent)]
+        for field, value in ast.iter_fields(parent):
+            if isinstance(value, list):
+                for index, child in enumerate(value):
+                    if isinstance(child, ast.AST):
+                        paths[id(child)] = base + ((field, index),)
+            elif isinstance(value, ast.AST):
+                paths[id(value)] = base + ((field, 0),)
+    return paths
+
+
+def _one_pass_order(binding_path, loop_path):
+    """[registry #1710] True when a single pass that reaches `loop_path` can ALREADY have run
+    `binding_path` — both chains as `_node_paths` numbers them, from the same enclosing function.
+
+    Node-at-a-time liveness cannot answer this: each half can be live under conditions that are
+    never both true, and certifying that pair is the same dead-code route as certifying a park
+    loop under `if False:`. Proven here only in the shape that needs no path conditions at all —
+    the two diverge inside ONE statement list, with the binding earlier in it — and refused
+    otherwise, so the undecidable directions cost a refusal."""
+    for step, other in zip(binding_path, loop_path):
+        if step == other:
+            continue              # same arm, same statement so far — keep descending
+        if step[0] != other[0]:
+            return False          # opposite ARMS of one construct: no pass takes both
+        return step[1] < other[1]  # one statement list: the binding must be written FIRST
+    return False                  # the loop CONTAINS the binding — and a `for` evaluates its
+                                  # iterable BEFORE its body, so this pass never saw the binding
+
+
 def _park_call_site(source):
     """[registry #822] STRUCTURAL proof that some PRODUCTION function iterates EVERY target
     `starvation_park_targets(...)` returned and parks EACH one. Returns that function's name,
@@ -23270,7 +23323,11 @@ def _park_call_site(source):
                                                        the `else:` of a constant-true guard,
                                                        inside `for _ in []:`, or inside an
                                                        uncalled nested `def`/method parks nothing
-                                                       while `ast.walk` still sees it.
+                                                       while `ast.walk` still sees it;
+      - a binding NOT CO-REACHABLE with the loop     -> two live halves that no single pass runs
+        (registry #1710)                                together — opposite arms of one `if`, or a
+                                                       binding written after (or inside) the loop
+                                                       it is supposed to feed.
 
     Every ACCEPTING scan therefore runs over `_live_nodes`, never `ast.walk`. The asymmetry with
     the slice probe is deliberate: a scan that REFUSES keeps raw `ast.walk`, so a `[:1]` hidden in
@@ -23280,7 +23337,7 @@ def _park_call_site(source):
     for func in _live_nodes(tree):
         if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
             continue
-        bound = set()
+        bound = []
         for node in _live_nodes(func):
             if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
                 continue
@@ -23288,17 +23345,21 @@ def _park_call_site(source):
                 continue
             if any(keyword.arg == "cap" for keyword in node.value.keywords):
                 continue                  # a call-site cap can silently restore the 1/tick defect
-            bound.update(target.id for target in node.targets
-                         if isinstance(target, ast.Name))
+            bound.extend((target.id, node) for target in node.targets
+                          if isinstance(target, ast.Name))
         if not bound:
             continue
+        paths = _node_paths(func)         # WHERE each half is written, so the two can be PAIRED
         for loop in _live_nodes(func):
             if not isinstance(loop, ast.For):
                 continue
             iter_names = {node.id for node in _live_nodes(loop.iter)
                           if isinstance(node, ast.Name)}
-            if not (iter_names & bound):
+            named = [node for name, node in bound if name in iter_names]
+            if not named:
                 continue                  # `for t in (targets if False else [])` iterates nothing
+            if not any(_one_pass_order(paths[id(node)], paths[id(loop)]) for node in named):
+                continue                  # both halves live, but never in the SAME pass
             if any(isinstance(node, ast.Slice) for node in ast.walk(loop.iter)):
                 continue                  # `targets[:1]` is the per-tick cap of 1, re-typed
             for stmt in _live_nodes(loop):
@@ -23350,10 +23411,12 @@ def _park_seam_arms(**swaps):
 
 
 # Each row is (what, expected verdict, arm, the BODY of `tick`). `arm` names WHY the row lands
-# where it does, and the two non-vacuity legs below read it: "live" and "shape" rows are decided
-# without any reachability reasoning, "1028" rows by the literal-only core, and "1710" rows ONLY by
-# the arms this issue added. The park call site is certified exactly when a pass through `tick`
-# reaches both the `for` over the assigned targets and the `park_starved_partition_holder` in it.
+# where it does, and the three non-vacuity legs below read it: "live" and "shape" rows are decided
+# without any reachability reasoning, "1028" rows by the literal-only core, "1710" rows ONLY by the
+# pruning arms this issue added, and "path" rows ONLY by its binding/loop pairing. The park call
+# site is certified only when ONE pass through `tick` can run the `starvation_park_targets` binding
+# and then reach both the `for` over it and the `park_starved_partition_holder` inside — "only
+# when", never "exactly when": every direction the floor cannot prove is refused, not certified.
 _PARK_SEAM_ROWS = (
     # ---- ACCEPTED: the shapes production legitimately writes ---------------------------------
     ("live loop", "tick", "live", """
@@ -23623,6 +23686,45 @@ _PARK_SEAM_ROWS = (
         for target in targets:
             park_starved_partition_holder(repo, target)
     """),
+    # ---- REFUSED on CO-REACHABILITY: both halves live, but never in the SAME pass -------------
+    # The pruning arms above are per-node: they delete what is LOCALLY dead and neither record nor
+    # compare the conditions a survivor sits under. Every row here keeps both halves live under
+    # them, so they are decided by the pairing alone — and each is the certification of code that
+    # parks nothing, which is the failure this issue is about, one conditional wider.
+    ("binding and loop in OPPOSITE arms of one `if`", None, "path", """
+        if repo:
+            targets = starvation_park_targets(items, starved, occupancy)
+        else:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # ...and the same shape STAGGERED, because the row above cannot kill the arm on its own.
+    # MEASURED: with the binding and the loop at the same index in their opposite arms, deleting
+    # the "different FIELD" test still refuses — the index comparison it falls through to reads
+    # `0 < 0`. Only a loop written LATER in its arm than the binding is in the other separates a
+    # checker that compares ARMS from one that merely compares positions.
+    ("opposite arms, loop written LATER in its arm", None, "path", """
+        if repo:
+            targets = starvation_park_targets(items, starved, occupancy)
+        else:
+            print(repo)
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # The binding runs AFTER the loop, so the pass that reaches the loop has not made it — this
+    # `for` is iterating something else entirely, and on the first tick it is not iterating at all.
+    ("binding written AFTER the loop", None, "path", """
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+        targets = starvation_park_targets(items, starved, occupancy)
+    """),
+    # ...and the same relationship one nesting level in. A `for` evaluates its ITERABLE before its
+    # body, so a binding in the body cannot be what the loop iterates on the pass that runs it.
+    ("binding INSIDE the loop it is meant to feed", None, "path", """
+        for target in targets:
+            targets = starvation_park_targets(items, starved, occupancy)
+            park_starved_partition_holder(repo, target)
+    """),
     # ---- REFUSED on SHAPE: the three #822 re-scalarisations, none of which had a fixture ------
     ("no loop at all — park(targets[0])", None, "shape", """
         targets = starvation_park_targets(items, starved, occupancy)
@@ -23651,13 +23753,15 @@ def _park_call_site_reachability_self_test():
     the exact 1-holder-per-tick defect #822 removed, or removes parking altogether, with the whole
     suite green.
 
-    NON-VACUITY IS MEASURED HERE, NOT ASSERTED. Every refusal is re-run twice with one arm of the
-    predicate swapped BACK to its pre-fix form, and each refusal it is responsible for must flip to
-    a certification. A row that refuses for an unrelated reason (a missing binding, say) therefore
-    cannot pose as coverage of the arm it is filed under.
+    NON-VACUITY IS MEASURED HERE, NOT ASSERTED. Every refusal is re-run three times, each with ONE
+    arm of the predicate swapped BACK to a form that shipped — `ast.walk`, the literal-only branch
+    test, and the pooled binding/loop match — and each refusal that arm is responsible for must
+    flip to a certification. A row that refuses for an unrelated reason (a missing binding, say)
+    therefore cannot pose as coverage of the arm it is filed under.
     """
     shipped = {name: globals()[name] for name in
-               ("_live_nodes", "_constant_test_truth", "_empty_literal_iterable")}
+               ("_live_nodes", "_constant_test_truth", "_empty_literal_iterable",
+                "_one_pass_order")}
 
     for what, expect, _arm, block in _PARK_SEAM_ROWS:
         verdict = _park_seam_verdict(block)
@@ -23667,10 +23771,10 @@ def _park_call_site_reachability_self_test():
             "reports the batch park as structurally proven while the partition is never released.")
 
     arms = Counter(arm for _w, _e, arm, _b in _PARK_SEAM_ROWS)
-    assert arms == {"live": 14, "1028": 12, "1710": 10, "shape": 3}, (
-        f"#1710 expected 14 live / 12 literal-core / 10 widened / 3 shape park-seam rows, got "
-        f"{dict(arms)} — a row was dropped from _PARK_SEAM_ROWS, which is how a refusal quietly "
-        "stops being tested")
+    assert arms == {"live": 14, "1028": 12, "1710": 10, "path": 4, "shape": 3}, (
+        f"#1710 expected 14 live / 12 literal-core / 10 widened / 4 co-reachability / 3 shape "
+        f"park-seam rows, got {dict(arms)} — a row was dropped from _PARK_SEAM_ROWS, which is how "
+        "a refusal quietly stops being tested")
 
     # ---- LEG 1: the pruning ITSELF is what refuses, not some incidental property -------------
     # `ast.walk` is the pre-fix checker exactly. Under it every reachability row must certify
@@ -23706,6 +23810,27 @@ def _park_call_site_reachability_self_test():
                     f"#1710 park-seam row [{what}] is filed as {arm!r}, which the widened arms "
                     f"must not decide, yet removing them changed its verdict to {verdict!r}")
 
+    # ---- LEG 3: the binding/loop PAIRING is load-bearing on its own --------------------------
+    # Legs 1 and 2 both leave the pairing untested: every row they decide has its binding on a path
+    # that really does reach its loop, so a checker that pooled every live binding in the function
+    # and matched it against every live loop — which is what this file shipped — passes both. This
+    # installs exactly that pooling ("any live binding pairs with any live loop") and requires the
+    # `path` rows, and only those, to go back to certified.
+    with _park_seam_arms(_one_pass_order=lambda binding_path, loop_path: True):
+        for what, expect, arm, block in _PARK_SEAM_ROWS:
+            verdict = _park_seam_verdict(block)
+            if arm == "path":
+                assert verdict is not None, (
+                    f"#1710 VACUOUS ROW [{what}]: it is refused even when ANY live binding is "
+                    "allowed to pair with ANY live loop, so it proves nothing about "
+                    "co-reachability — it is refused for some other reason and must be re-written "
+                    "or re-filed under the arm that actually decides it")
+            else:
+                assert verdict == expect, (
+                    f"#1710 park-seam row [{what}] is filed as {arm!r}, which the binding/loop "
+                    f"pairing must not decide, yet pooling the bindings changed its verdict to "
+                    f"{verdict!r} — the pairing is refusing a shape a single pass really reaches")
+
     for name, function in shipped.items():
         assert globals()[name] is function, (
             f"#1710 the {name} swap-back must be restored — a leaked stand-in would leave every "
@@ -23713,8 +23838,9 @@ def _park_call_site_reachability_self_test():
 
     print(f"  ok   #1710 park call-site seam decides REACHABILITY, not existence: "
           f"{arms['live']} live shapes certify while {arms['1028'] + arms['1710']} dead ones "
-          f"(incl. `False and _`, `0 == 1`, `for _ in []`) and {arms['shape']} re-scalarisations "
-          "are refused — each proved non-vacuous by swapping its own arm back")
+          f"(incl. `False and _`, `0 == 1`, `for _ in []`), {arms['path']} whose binding and loop "
+          f"never share a pass, and {arms['shape']} re-scalarisations are refused — each proved "
+          "non-vacuous by swapping its own arm back")
 
 
 def _starvation_park_batch_source():
