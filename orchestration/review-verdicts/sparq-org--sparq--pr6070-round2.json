@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6070,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3fbecd65f2d3f922c8d1be744d8c204d1cb749bb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 1 and 2 still label all three branches DROP-AS-ALREADY-LANDED and state that no code needs to be written, while sections 1 and 7 admit that `jeswr/solid-server-rs` was not inspected and that additional branch work is unknown. Local `git log -S` evidence establishes only that selected functionality entered this checkout with the import; it cannot establish full upstream branch ancestry or absence of an unported delta. The added caveat acknowledges the same evidence gap from round 1 without resolving it, leaving the primary triage verdict unsupported.",
+    "file": "research/lws-branch-port-triage.md",
+    "fix_hint": "Inspect each named upstream branch and compare its merge-base and full diff with upstream revision `1e555b10`, citing the relevant upstream commit IDs before retaining DROP. If the refs cannot be inspected, replace each final DROP verdict with HOLD/UNVERIFIED and state that only the named functionality\u2014not the complete branch delta\u2014has been verified in-tree.",
+    "severity": "major",
+    "title": "DROP verdicts still exceed the available evidence"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 adds a candid caveat that upstream was not inspected, but the central disposition remains DROP-AS-ALREADY-LANDED. That conclusion still does not follow from local symbol history: it proves named functionality was present at import, not that the three upstream branches were merged in full or contain no additional delta. The new section 7 explicitly leaves that delta unverifiable and delegates the decisive check to the maintainer, so the requested port-or-drop triage remains incomplete. Because the potentially omitted delta includes security-relevant DNS-verifier and existence-nondisclosure work, approval still requires upstream branch comparison or non-final HOLD/UNVERIFIED verdicts.",
+  "verdict": "request_changes"
+ }
+}
