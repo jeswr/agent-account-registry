@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5673,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9a8575ba63958b43e6948ebfe28610274f3779e9",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete on the supplied diff. All five measured-coincident workflow jobs use the shared cache key, docs-quality runs the focused inspection suite, and the closure model accounts for workspace feature activation, default and optional dependencies, forwarded dependency features, command-specific dev dependencies, and conservative target handling. The focused suite passes all 14 tests, including parser non-vacuity, real-manifest service-loopback/tokio activation, exclusion checks, CI wiring, and the overlap gate. No reviewer-directed instruction was detected in the diff. Because round 3 had zero findings and round 4 also has zero, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
