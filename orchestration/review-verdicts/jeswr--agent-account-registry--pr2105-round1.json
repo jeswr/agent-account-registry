@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2105,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "150b1db37cf9c1ff24798f9fe80550b0994ca107",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The no-change sample retention is correctly class-scoped, window-bounded, and subordinate to both absolute ceiling dimensions. Admission occurs only after the existing selection has been clamped, accounts for the existing ledger envelope and each added record's conservative serialized-size estimate, stops at the first non-fitting newest-first candidate, and cannot evict an already selected record. The self-tests are non-vacuous and cover the motivating shortfall, exact sample cap, class isolation, distribution evidence path, full-ceiling behavior, record and byte headroom, newest-first ordering, no size-based cherry-picking, and the zero-limit slice edge case. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
