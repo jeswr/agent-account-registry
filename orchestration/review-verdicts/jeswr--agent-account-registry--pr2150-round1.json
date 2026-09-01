@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2150,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "06ecda21dbf3cd68c95f882c827d97aadbc9a22e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly carries an unconditional pre-cap count through both canonical-ledger and legacy model-health normalization, renders the truncation disclosure before the empty-strip return, and clears it on re-render. The tests exercise the production payload seam, both cap directions, malformed controls, empty slices, stale-note removal, and the real HTML/JavaScript container binding with independent literal expectations. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
