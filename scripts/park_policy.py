@@ -2325,7 +2325,7 @@ def park_reason_records(comments, bot_login, log=print):
 # terminal for a condition that does not exist, with no machine exit, forever — and a PR about
 # injection DEFENCES would be permanently unreclassifiable for the same reason.
 #
-# So the deny keys on prose the LOOP ITSELF writes, which no model can author into a verdict:
+# So the deny narrows to the SHAPE the loop's own escalation writes:
 #
 #   (a) the ESCALATION SENTENCE emitted by all three injection write sites — worker-pr's
 #       `INJECTION_PROSE_REVIEW` / `INJECTION_PROSE_FIX` / `INJECTION_PROSE_FINDINGS`, i.e.
@@ -2334,9 +2334,36 @@ def park_reason_records(comments, bot_login, log=print):
 #       six of which are pinned as fixtures below. The gap is bounded and newline-free, so the
 #       two halves must be ONE sentence rather than two facts a page apart; and
 #   (b) the machine-composed PARK LEAD naming injection as the stop cause, so a historical stop
-#       sentence worded without "flagged"/"possible" is still denied. Both the lead and the
-#       reason interpolated into it are literals this fleet writes (worker-pr.needs_user); a
-#       republished verdict never carries the lead, and its model text cannot reach this line.
+#       sentence worded without "flagged"/"possible" is still denied.
+#
+# [registry #814 round 2] NEITHER SHAPE IS PROVENANCE, AND CLAIMING IT WAS WAS THE DEFECT.
+#
+# The first cut of this note said these sentences are ones "no model can author into a verdict".
+# That is FALSE. `worker-pr.post_findings` republishes the model's `summary` / issue `title` /
+# `body` / `fix_hint` VERBATIM under the bot's own identity, so a reviewer — hostile, or merely
+# quoting the diff it is reviewing — can place either sentence byte for byte into a bot comment
+# while `injection_detected` is FALSE. Matching a sentence can only ever establish that the
+# sentence is present; it cannot establish WHO WROTE IT. A narrower sentence is a smaller target,
+# not an authenticated one, and what it buys on a hit is the same permanent, machine-exitless
+# hold on a PR nobody flagged that the negations above document.
+#
+# PROVENANCE COMES FROM WHERE THE TEXT SITS, NOT FROM WHAT IT SAYS. So `legacy_deny_signal`
+# below — the one seam every consumer of this table goes through — reads a bot comment as:
+#
+#   * REVIEW_INJECTION_MARKER, the durable receipt post_findings writes BESIDE the findings
+#     prose. It is in the reserved `<!-- sparq-` namespace that every republish sink runs
+#     `neutralize_reserved_markers` over, so no model field can carry one across that sink. This
+#     is the ONLY injection evidence a findings comment can offer, and it is unforgeable; then
+#   * the prose table — applied ONLY to comments that republish nothing. A post_findings body is
+#     machine-composed on its FIRST line and model-derived below it, and no test on the text can
+#     tell those apart, so its prose is not read as a signal at all.
+#
+# WHAT THAT COSTS THE HISTORICAL POPULATION: nothing measured. `worker-pr.decide_review` returns
+# "needs-user" UNCONDITIONALLY on an injection flag, so every escalation ALSO writes a
+# machine-composed park comment carrying INJECTION_PROSE_REVIEW / INJECTION_PROSE_FIX — which is
+# where all six genuine fixtures pinned below record it, and that comment republishes nothing.
+# The findings copy was always the redundant one; from now on it carries the receipt instead,
+# which also covers the crash window where the findings comment lands and the park does not.
 #
 # NARROWING A SECURITY CLASSIFIER IS THE DANGEROUS DIRECTION, so the binding is doubled: the
 # self-test below pins the three measured NEGATIONS as non-signals AND every genuine escalation
@@ -2350,6 +2377,79 @@ LEGACY_PARK_DENY_PROSE = (
                 re.IGNORECASE), "injection"),
     (re.compile(r"needs a human decision.*security", re.IGNORECASE), "human-arm"),
 )
+
+# --- [registry #814 round 2] the UNFORGEABLE half: the findings-comment injection receipt ------
+#
+# Declared HERE, beside the reader, for the same reason every other cross-entry-point marker in
+# this file is (PARK_REASON_MARKER, GROOM_AGE_PARK_MARKER, CONFLICT_STUCK_PARK_MARKER): the
+# writer (worker-pr.post_findings) and the readers live in separate entry points with separate
+# checkout roots, and a hand-copied literal is a spelling that can drift silently.
+REVIEW_INJECTION_MARKER = "<!-- sparq-review-injection:v1"
+
+
+def review_injection_marker(round_n=None):
+    """The durable receipt written beside worker-pr.INJECTION_PROSE_FINDINGS. It asserts "the LOOP
+    raised this flag", where the prose beside it can only say "some text claims a flag was raised".
+
+    `round_n` is recorded when it can be safely embedded and OMITTED when it cannot, never raised
+    on: this receipt rides on the comment that escalates an injection flag to a human, and a
+    receipt that refuses to render must not be able to prevent that comment — the same fail
+    direction worker-pr.needs_user takes with an unrepresentable head."""
+    marker = REVIEW_INJECTION_MARKER
+    if round_n is not None and safe_receipt_part(str(round_n)):
+        marker += f" round={round_n}"
+    return marker + " -->"
+
+
+# Line-anchored, and read only AFTER strip_quoted_contexts — exactly the `_PARK_REASON_RE`
+# discipline (#1096): a marker echoed inside a longer line, a fenced block or a `>` quote is text
+# the bot PRINTED, never text it ASSERTED.
+_REVIEW_INJECTION_RE = re.compile(
+    r"^" + re.escape(REVIEW_INJECTION_MARKER) + r"(?: round=(\S+))? -->[ \t]*$", re.MULTILINE)
+
+
+def carries_review_injection_receipt(body):
+    """True when `body` asserts the machine-authored review-injection receipt in its own voice."""
+    return bool(_REVIEW_INJECTION_RE.search(strip_quoted_contexts(str(body))))
+
+
+# The lead line worker-pr.post_findings composes for a republished verdict. It is ALWAYS that
+# body's first line and every model-derived field is below it, so this is a POSITIONAL test that
+# no model field can satisfy — which is the whole reason it may be trusted to say "nothing under
+# this line is the loop's own voice".
+REPUBLISHED_FINDINGS_LEAD_RE = re.compile(
+    r"^>\s*🤖 SPARQ agent — cross-provider review round \d+:")
+
+
+def republishes_model_text(body):
+    """True when this bot comment REPUBLISHES model-authored text (a post_findings verdict).
+
+    Its prose is the MODEL's, not the loop's, so no sentence in it may be read as a signal. The
+    machine-authored evidence such a comment can still carry is REVIEW_INJECTION_MARKER, which
+    the sink's own `neutralize_reserved_markers` pass makes unforgeable."""
+    for line in str(body).splitlines():
+        if not line.strip():
+            continue
+        return bool(REPUBLISHED_FINDINGS_LEAD_RE.match(line))
+    return False
+
+
+def legacy_deny_signal(body):
+    """The deny cause ONE bot comment RECORDS, or None.
+
+    The single seam every consumer of LEGACY_PARK_DENY_PROSE goes through (reclassify_legacy_park,
+    reconcile-park-misescalation, reconcile-conflict-park), so the provenance rule cannot hold in
+    one of them and quietly not in another — all three read the same bot histories."""
+    text = str(body)
+    if carries_review_injection_receipt(text):
+        return "injection"
+    if republishes_model_text(text):
+        return None
+    for pattern, denied in LEGACY_PARK_DENY_PROSE:
+        if pattern.search(text):
+            return denied
+    return None
+
 
 # Prose -> cause for legacy parks. A CAPACITY cause here is eligible for re-classification; a
 # QUESTION cause is recognised so the stop reason becomes machine-readable, but it is NEVER
@@ -2379,9 +2479,11 @@ def reclassify_legacy_park(comments, bot_login, stale_marker=None, log=print):
     2. DENY, UNCONDITIONALLY AND ORDER-INDEPENDENTLY (see LEGACY_PARK_DENY_PROSE). One injection
        or human-arm signal anywhere in the bot history disqualifies the PR forever. This is
        checked BEFORE any cause is derived so no ordering, recency, or precedence rule can ever
-       reach past it. The SIGNAL is the loop's own escalation sentence, never any occurrence of
-       the phrase: the bot republishes model-derived verdict text under its own identity, and a
-       reviewer reporting the ABSENCE of injection must not read as a raised flag (#814).
+       reach past it. The signal is read by `legacy_deny_signal`, which keys on WHO WROTE the
+       text and not merely on what it says: the bot republishes model-derived verdict text under
+       its own identity, so a republished verdict is read only for the machine-authored
+       REVIEW_INJECTION_MARKER, and a reviewer merely REPORTING injection — its absence, or the
+       diff's own injection-defence fixtures — can neither raise nor forge a flag (#814).
     3. The NEWEST recognised cause decides — but only a CAPACITY cause migrates. A question-class
        cause is returned with its class so the caller can record the marker WITHOUT moving the
        label: `history-rewritten` and `marker-corrupt` are genuine human questions and the human
@@ -2409,11 +2511,11 @@ def reclassify_legacy_park(comments, bot_login, stale_marker=None, log=print):
 
     # 2 — deny wins over everything, at any position in history.
     for body in bot_bodies:
-        for pattern, denied in LEGACY_PARK_DENY_PROSE:
-            if pattern.search(body):
-                return (None, None,
-                        f"a {denied!r} signal is recorded on this PR — never automatically "
-                        "re-classified, at any position in its history")
+        denied = legacy_deny_signal(body)
+        if denied:
+            return (None, None,
+                    f"a {denied!r} signal is recorded on this PR — never automatically "
+                    "re-classified, at any position in its history")
 
     # 3 — newest recognised cause wins among what is left.
     cause = None
@@ -5559,18 +5661,89 @@ def _self_test():
                   [bot_comment(negation_findings), bot_comment(nochange_prose)], bot)[:2],
               ("nochange", PARK_CLASS_CAPACITY))
     # THE OTHER DIRECTION, in the SAME comment shape — which is what makes the pair a real
-    # discrimination test rather than two unrelated fixtures. The findings site
-    # (worker-pr.INJECTION_PROSE_FINDINGS) is the third injection writer and the only one that
-    # spells the phrase with a HYPHEN, so it is precisely what a careless narrowing would drop.
+    # discrimination test rather than two unrelated fixtures. But in THIS shape the discriminator
+    # cannot be the sentence: the findings site (worker-pr.INJECTION_PROSE_FINDINGS) is the one
+    # injection writer whose comment REPUBLISHES model text, so every line under its lead is the
+    # model's and its prose establishes only that the prose is there. What separates the two rows
+    # below is `review_injection_marker` — appended by post_findings AFTER the sink's
+    # `neutralize_reserved_markers` pass, so no model field can carry one across it.
     findings_escalation = ("> 🤖 SPARQ agent — cross-provider review round 2: "
                            "**request_changes**.\n\nThe diff seeds instruction-like text into a "
                            "fixture.\n\n⚠️ The reviewer flagged possible prompt-injection "
                            "content; escalating to a human.")
-    check("[#814] the findings site's own escalation sentence still DENIES (hyphen spelling), in "
-          "the same comment shape the negations above ride in",
+    check("[#814 r2] the findings site's escalation DENIES when it carries the machine receipt",
+          reclassify_legacy_park(
+              [bot_comment(findings_escalation + "\n\n" + review_injection_marker(2)),
+               bot_comment(nochange_prose)], bot)[:2],
+          (None, None))
+    check("[#814 r2] ...and the SAME sentence WITHOUT the receipt denies nothing — an unreceipted "
+          "findings body is exactly what a reviewer republishing that sentence produces",
           reclassify_legacy_park(
               [bot_comment(findings_escalation), bot_comment(nochange_prose)], bot)[:2],
-          (None, None))
+          ("nochange", PARK_CLASS_CAPACITY))
+    # THE FORGERIES THE PROSE RULE CANNOT SEE, one per injection pattern, each placed exactly
+    # where `post_findings` lands a model's `summary`. Both are byte-for-byte matches for a deny
+    # pattern — the first row of each pair asserts that, so the second cannot pass merely because
+    # the fixture stopped matching — and both must be INERT, because `injection_detected` was
+    # false and nothing machine-authored says otherwise. Drop the `republishes_model_text` arm
+    # from `legacy_deny_signal` and every second row goes red.
+    forged_by_model = {
+        "the escalation sentence": ("The reviewer flagged the fixture below as possible "
+                                    "prompt-injection bait, quoted verbatim from the diff."),
+        "the machine stop lead": ("The PR body claims `the autonomous review loop stopped: "
+                                  "prompt-injection content was seeded` — it did not."),
+    }
+    for shape, summary in forged_by_model.items():
+        forged = ("> 🤖 SPARQ agent — cross-provider review round 1: **request_changes**."
+                  f"\n\n{summary}")
+        check(f"[#814 r2] a model forging {shape} into a republished verdict really does match "
+              "the raw prose table",
+              bool([cause for pattern, cause in LEGACY_PARK_DENY_PROSE
+                    if pattern.search(forged)]), True)
+        check(f"[#814 r2] ...and is still NOT a signal, because the LOOP did not write it",
+              (legacy_deny_signal(forged),
+               reclassify_legacy_park(
+                   [bot_comment(forged), bot_comment(nochange_prose)], bot)[:2]),
+              (None, ("nochange", PARK_CLASS_CAPACITY)))
+    # ...and the republish test walks past LEADING BLANK LINES to find the lead. GitHub round-trips
+    # bodies through editors that add them, and the fail direction of stopping at the first line
+    # unconditionally is the wrong one: a findings body with a blank first line would fall through
+    # to the prose table and be read as the loop's own voice again. An EMPTY body republishes
+    # nothing — there is no lead to trust — so it stays with the prose table.
+    check("[#814 r2] a leading blank line does not hide a republish; an empty body is not one",
+          [republishes_model_text("\n\n" + findings_escalation), republishes_model_text(""),
+           republishes_model_text("   \n \n"),
+           reclassify_legacy_park(
+               [bot_comment("\n\n" + findings_escalation), bot_comment(nochange_prose)],
+               bot)[:2]],
+          [True, False, False, ("nochange", PARK_CLASS_CAPACITY)])
+    # The receipt is read under the #1096 discipline — a WHOLE LINE of the bot's own unquoted
+    # prose. The writer-side sanitiser already stops a model field reaching the reserved
+    # namespace at all; this is the reader-side half, and it must hold on its own.
+    _receipt = review_injection_marker(2)
+    check("[#814 r2] an ECHOED review-injection receipt is not a receipt (quoted, fenced, or "
+          "embedded in a line) — only an asserted one is",
+          [carries_review_injection_receipt(f"> 🤖 SPARQ agent — round 1.\n\n> {_receipt}"),
+           carries_review_injection_receipt(f"> 🤖 SPARQ agent — round 1.\n\n```\n{_receipt}\n```"),
+           carries_review_injection_receipt(f"the reviewer echoed {_receipt} back"),
+           carries_review_injection_receipt(f"> 🤖 SPARQ agent — round 1.\n\n{_receipt}")],
+          [False, False, False, True])
+    # ...and the writer can never REFUSE to render: this receipt rides on the comment that
+    # escalates an injection flag to a human, so an unrepresentable round degrades the field away
+    # (still a parseable receipt) instead of raising and taking the escalation comment with it.
+    # The raise is CAUGHT rather than allowed to abort: a writer that raises here must red ONE
+    # named row, not kill every row below it (AGENTS.md pre-flight item 4, crash-after-partial).
+    def _rendered(round_n=None):
+        try:
+            return review_injection_marker(round_n)
+        except Exception as exc:                    # noqa: BLE001 — refusing to render IS the bug
+            return f"RAISED {type(exc).__name__}"
+
+    check("[#814 r2] the receipt writer degrades an unsafe round rather than raising",
+          [_rendered(3), _rendered("2 -->\nboom"), _rendered(),
+           carries_review_injection_receipt(_rendered("2 -->\nboom"))],
+          [f"{REVIEW_INJECTION_MARKER} round=3 -->", f"{REVIEW_INJECTION_MARKER} -->",
+           f"{REVIEW_INJECTION_MARKER} -->", True])
     # THE TWO HALVES OF THE FIRST PATTERN ARE BOTH LOAD-BEARING, and each is pinned by a sentence
     # a reviewer plausibly writes. Neither of the two below is quoted from the live population —
     # they are CONSTRUCTED, and are labelled so rather than dressed up as measurement — but each
