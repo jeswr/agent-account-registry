@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5669,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d22fee5efac03187c6e37d04c90ee64ea2f1aefd",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security defect. The workflow gives coverage-engine-run and coverage-engine-merge the same rust-cache shared-key and removes the job-scoped key input, matching the intended cross-job namespace. The regression tests inspect the actual top-level job bodies and rust-cache steps, require a present and equal shared-key, and reject reintroduction of key; the targeted two-test class passes at the PR head. Findings remain unchanged from round 2, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
