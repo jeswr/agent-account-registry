@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2116,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2ca276c4fbe0c40a0e3b1f7e9d99d6e1c091d506",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The floor is 15 while the current scan sees 19 bindings. Deleting ALERT_REPO from the changed ratelimit alert step (or from as many as four live steps) leaves at least 15 canonical matches, `_divergent` remains empty, and the self-test passes. The raw regex can likewise overlook valid YAML spellings such as a quoted key or whitespace before the colon. Only the ci-latency step gets a parsed step-level assertion, so the second workflow change in this PR is not pinned at its actual consumer. This contradicts the test's `EVERY ALERT_REPO binding` claim and leaves the split-route regression reproducible with a green self-test.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Derive the complete set of live ALERT_REPO consumers independently from parsed workflow/job/step structure, assert the expected consumer identity or otherwise prove both scan directions, and exact-check each discovered consumer's value. At minimum, add a parsed step-level assertion for the ratelimit alert changed here; do not rely on a count floor to detect removal.",
+    "severity": "major",
+    "title": "Estate-wide binding check passes when a live binding disappears"
+   },
+   {
+    "body": "`\"secrets.ALERT_TOKEN\" in _token_expr` accepts non-working or unintended expressions such as `${{ secrets.ALERT_TOKEN_DROPPED }}` and `${{ secrets.ALERT_TOKEN || secrets.ALERT_TOKEN_DROPPED }}`. In the first case the private repository binding remains present but the credential resolves empty, so routing silently falls back to the public registry while the new assertion stays green. The check's prose says the token is read from the intended secret, but the predicate proves only that those characters occur somewhere.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Pin the parsed env value to the exact approved GitHub expression (and, if more than one approved form is intentional, compare against an explicit allowlist of exact expressions). Add a non-crashing misspelled-secret mutant demonstrating that the assertion turns red.",
+    "severity": "major",
+    "title": "ALERT_TOKEN assertion is a containment check at the YAML seam"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe workflow values themselves are corrected, but the new estate-wide regression guard is not sound: it can lose or overlook a live ALERT_REPO binding while all added checks remain green. The changed ratelimit binding therefore has no precise, non-vacuous test. The token assertion also uses containment at the YAML seam and accepts misspelled secret names. These are major test-validity gaps in privacy-routing controls.",
+  "verdict": "request_changes"
+ }
+}
