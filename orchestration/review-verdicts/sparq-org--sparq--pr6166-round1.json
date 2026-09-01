@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6166,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "720a6e06297fca1037774dd0a5dcd05f568e9c2b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "check_instrument() sums cache_writes but never rejects a nonzero value. That violates the load-bearing claim that measure trials are read-only and independent: if READ_ONLY is misspelled, unsupported, or otherwise ineffective, earlier concurrent/sequential trials can populate the namespace and bias later trials. The self-test hides this gap by giving every nominal treatment record cache_writes=260, so the supposedly valid ADOPT and DO-NOT-ADOPT cases explicitly demonstrate that a writing treatment still receives a verdict.",
+    "file": "scripts/sccache_ab_verdict.py",
+    "fix_hint": "Require treatment cache_writes == 0 before rendering either verdict and return INCONCLUSIVE otherwise. Change _rec()'s valid default to cache_writes=0 and add a mutation case with nonzero writes that must exit 2.",
+    "severity": "major",
+    "title": "Treatment cache writes do not make the experiment inconclusive"
+   },
+   {
+    "body": "--bar-seconds accepts any float without validation. A dispatch with 0 or a negative value can emit ADOPT for no improvement (or a regression), while NaN emits a confident DO-NOT-ADOPT because every comparison with NaN is false. This contradicts the documented policy that the 60-second bar cannot be lowered to fit a result and makes the workflow input a route to an invalid terminal verdict.",
+    "file": "scripts/sccache_ab_verdict.py",
+    "fix_hint": "Validate that the bar is finite and at least DEFAULT_BAR_SECONDS, failing without a verdict otherwise; alternatively remove the workflow input if rescoring below the precommitted threshold is not a supported operation. Add self-tests for zero, negative, below-default, NaN, and infinity.",
+    "severity": "major",
+    "title": "The precommitted 60-second adoption bar is not enforced"
+   }
+  ],
+  "progress": null,
+  "summary": "The harness is thoughtfully fail-closed for several failure modes, but it can still issue a confident verdict when the treatment trials wrote to the shared sccache namespace, invalidating the claimed independence of the five samples. The implementation also accepts arbitrary and non-finite adoption bars despite documenting 60 seconds as a precommitted policy threshold. Both defects affect the trustworthiness of the experiment's terminal verdict.",
+  "verdict": "request_changes"
+ }
+}
