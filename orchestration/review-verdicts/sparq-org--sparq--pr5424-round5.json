@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5424,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "66c7a4be70814bd841d4c5a55bf6724aa675c60b",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently prevents silent partial-population processing: bounded `gh pr list` consumers now fail closed on saturation, while issue-deduplication consumers use exhaustive REST pagination and exclude pull requests returned by the issues endpoint. The tests exercise the production call sites, include below-cap/absent-marker negative controls, model both capped and paginated CLI result shapes, and verify that PR bodies cannot create false deduplication. I found no correctness, soundness, test-validity, or security defect in the supplied diff.",
+  "verdict": "approve"
+ }
+}
