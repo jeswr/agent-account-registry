@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5872,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "36dbb74c7a4def7208e116cf4b11f934daafaf45",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`run_block_targets` splits every line on `&&`, `||`, `;`, and `|` and analyzes every fragment independently. It therefore credits `false && npm test` even though the test command is unreachable. It can also credit a line containing `npm test` inside a heredoc, where that text is input data rather than a command. This is a false green, not the documented fail-closed behavior, and a workflow can satisfy the new gate without executing the package tests.",
+    "file": "scripts/check-package-test-execution.py",
+    "fix_hint": "Use a parser/analysis that never treats conditionally unreachable branches or heredoc bodies as unconditional executed commands, or conservatively reject unsupported shell constructs and grant no coverage for that run block. Add negative tests proving `false && npm test` and heredoc-contained `npm test` do not produce a target, while retaining positive tests for supported command chains.",
+    "severity": "major",
+    "title": "Shell splitting credits unreachable or non-command `npm test` text"
+   },
+   {
+    "body": "The suite checks tokenization and directory attribution but never mutation-tests the core claim against syntactically present, non-executed `npm test` text. Consequently all 29 tests pass despite the false-positive paths in `run_block_targets`.",
+    "file": "scripts/tests/test_check_package_test_execution.py",
+    "fix_hint": "Add explicit negative fixtures for unreachable `&&` branches and heredoc/data content, and assert that `workflow_test_targets` does not attribute the package in either case.",
+    "severity": "minor",
+    "title": "Negative fixtures omit non-executing shell constructs"
+   }
+  ],
+  "progress": null,
+  "summary": "The guard and its current tests pass, but the shell scanner can grant coverage to commands that never execute. This contradicts the guard's fail-closed invariant and permits the exact false-green condition the change is intended to prevent. The test suite does not exercise shell control-flow or heredoc/data cases, so its negative fixtures do not protect the load-bearing attribution logic.",
+  "verdict": "request_changes"
+ }
+}
