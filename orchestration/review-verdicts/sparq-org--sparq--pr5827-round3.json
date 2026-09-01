@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5827,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f7502a746d09fab114459672bd284178c3ea45c2",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete. The two hermetic guards are preserved as the first executable checks after checkout in the gating gui-mock-ipc job, with no advisory-registry declaration, continue-on-error, job-level condition, or dependency that would weaken their blocking behavior. The updated policy and registry text consistently identify the new host job, while the live-registry test protects that gating job name from advisory declaration. The scripts still fail closed on their guarded invariants, and the existing C3 checker detects either gate-classified command if the host job is later declared advisory without an explicit waiver. No correctness, security, soundness, or test-validity defect is evident in the scoped change.",
+  "verdict": "approve"
+ }
+}
