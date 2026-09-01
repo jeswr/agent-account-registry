@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2168,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "985485401ea3c64534f6391c8c91939a7dfabd06",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 2, 6, 7, and 8 explicitly establish that neither the requested comments-fan-out/budget census nor the narrowable-share K/N census exists. Yet the headline recommends that both narrowings stay declined and section 8 says #1739 is discharged. The policy ceiling only bounds one subset and uses historical/order-of-magnitude notes; it does not answer whether the admitted-PR subset is material after #1303. The fail-open analysis rejects an approximate superset, but section 3 concedes that an exact narrowing is sound. Thus the evidence in this diff cannot decide whether the exact restructuring is worthwhile, which is the question #1739 asks after measurement. A prose promise of a future follow-up, with no identified durable owner or landed counter, can lose the required measurement while making the issue appear settled.",
+    "file": "research/1739-groom-comments-fan-out-narrowing.md",
+    "fix_hint": "Do not record #1739 as discharged or the narrowings as finally declined until the prerequisite measurement is available. Either land and collect the unconditional post-#1303 fan-out and narrowable-share censuses, then cite concrete ticks and decide from them, or make this an explicit interim/dependency record that keeps #1739 (or a specifically identified follow-up issue) open and removes the claim that the decision is complete.",
+    "severity": "major",
+    "title": "The decision closes the question before its stated measurement prerequisite exists"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is candid about the missing prerequisite, but it nevertheless presents #1739 as discharged and recommends that both narrowings remain declined. That is not a complete evidence-based decision on the question posed: the requested post-#1303 census is absent, the relevant narrowable share is also absent, and the document itself says those measurements are necessary to distinguish a worthwhile exact narrowing from a needless restructure. The code change only adds commentary and supplies no missing evidence or durable implementation of the proposed counter.",
+  "verdict": "request_changes"
+ }
+}
