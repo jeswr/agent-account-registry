@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2155,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "47e51084755a9ec606ddb0a6fc48596c5d0d9ea7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The extraction preserves the cron-expansion and derived-map behavior while moving their single ownership into scripts/cron_map.py. All three consumers are repointed consistently, their sparse-checkout inputs are updated, the new module is enrolled in the suite, and the watchdog retains its own error adapter and window-counting logic. The new self-test independently covers expansion boundaries, malformed inputs, YAML parsing, multi-cron union, missing/unparseable trees, live-tree anti-vacuity, suite enrollment, and the refusing entry point. I found no diff-supported correctness, soundness, test-validity, or security defect.",
+  "verdict": "approve"
+ }
+}
