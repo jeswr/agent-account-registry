@@ -1455,6 +1455,14 @@
    "wall_seconds": 134,
    "issue": 1333,
    "why_no_diff": "blocked_on_decision"
+  },
+  {
+   "ts": 1788225318,
+   "provider": "anthropic",
+   "account": "c0ac92ebee2c590e",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "33457240630.1"
   }
  ]
 }
