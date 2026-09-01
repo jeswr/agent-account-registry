@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2097,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2883a460e8f44991b20a456d60c1fcf25d953df0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The change narrowly distinguishes duplicate/self-contradictory listings from other snapshot failures, permits exactly one repository-scoped reread shared across issue and pull listings, and preserves the existing fail-closed repository deferral when the reread or any later snapshot operation fails. The reread budget is claimed before the extra listing, so failed rereads still consume it. Coverage added at both helper and full-sweep seams verifies recovery, persistent inconsistency, error scoping, per-repository and cross-listing bounds, both production call sites, settle-policy delegation, lease retention, and unconditional zero-valued census output. I found no diff-supported correctness, soundness, security, or test-validity defect.",
+  "verdict": "approve"
+ }
+}
