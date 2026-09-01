@@ -912,6 +912,33 @@ def _gh_json(args, label="ci-latency"):
         return None
 
 
+# =================================================================================
+# THE ROUTE'S OTHER HALF: THE YAML BINDING (#1776)
+# =================================================================================
+# `_alert_route` below decides the DESTINATION from ALERT_REPO/ALERT_TOKEN. It cannot decide
+# which values ever reach it — the workflow binding does, and no route row can see a binding.
+# This lane shipped `${{ secrets.ALERT_REPO }}` while every other ALERT_REPO binding in the
+# estate carried `|| vars.ALERT_REPO || ''`. Nothing red, and nothing detectable: an unset
+# SECRET renders empty exactly as the canonical form does, so the two are indistinguishable
+# until a deployment configures the route through a repository `vars.ALERT_REPO` — at which
+# point every other alert goes to the private destination and this one to the public registry.
+# A split-brain route surfaces during an incident, which is the worst time to discover it.
+#
+# ⚠️ EXACT match, never containment: `${{ secrets.ALERT_REPO }}`'s inner text is a SUBSTRING of
+# the canonical expression, so a containment check passes over precisely this regression.
+ALERT_REPO_BINDING = "${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}"
+
+# A FLOOR ON THE EVIDENCE, the same shape as MIN_SCHEDULED_LANES and for the same reason: a
+# uniformity assertion over an EMPTY scan is vacuously green, and a thin checkout or a pattern
+# that stopped matching is exactly how the scan goes empty. 19 bindings on master today; a
+# floor, not a copy, so retiring a lane does not red this.
+MIN_ALERT_REPO_BINDINGS = 15
+
+# Anchored to the start of a line so prose that mentions `ALERT_REPO:` inside a comment is not
+# read as a binding, and to the WHOLE name so `REGISTRY_ALERT_REPO:` is not swept in.
+ALERT_REPO_BINDING_RE = re.compile(r"^[ \t]*ALERT_REPO:[ \t]*(\S.*?)[ \t]*$", re.M)
+
+
 def _alert_route(alert_repo, alert_token, registry_repo):
     """(repo, token) for the alert issue — locked decision 22c / issue #39, identical
     semantics and signature to scripts/dispatch-stall-alert.py's private copy: the private
@@ -2327,6 +2354,27 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         chk("seam: every lane that claims a private cron minute HAS one — repointing any lane "
             f"in this directory onto a claimed minute reds here ({_violations})",
             _violations == [])
+        # --- THE ALERT ROUTE BINDING (#1776), across the WHOLE directory --------------
+        # See ALERT_REPO_BINDING for why a route row cannot see this and why an unset secret
+        # makes the divergence invisible. Scanned over every lane, not just this one, because
+        # the hazard is ASYMMETRY: one lane bound differently is a route that splits under a
+        # `vars`-configured deployment, and each lane's own self-test can only ever see its own
+        # binding. Raw text rather than a parse on purpose — this is the breadth oracle, and the
+        # YAML-parsed, step-level pin below is the precise one; neither subsumes the other.
+        _repo_bindings = []
+        for _p in sorted(_wf_dir.glob("*.yml")) + sorted(_wf_dir.glob("*.yaml")):
+            _repo_bindings += ALERT_REPO_BINDING_RE.findall(_p.read_text(encoding="utf-8"))
+        chk(f"seam: the ALERT_REPO scan clears the evidence floor of "
+            f"{MIN_ALERT_REPO_BINDINGS} bindings (saw {len(_repo_bindings)}) — a thin checkout "
+            "or a pattern that stopped matching yields none, and a uniformity check over an "
+            "empty scan is vacuously green",
+            len(_repo_bindings) >= MIN_ALERT_REPO_BINDINGS)
+        _divergent = sorted({b for b in _repo_bindings if b != ALERT_REPO_BINDING})
+        chk("seam: EVERY ALERT_REPO binding in this directory is the canonical expression — a "
+            "lane bound to `secrets.ALERT_REPO` alone cannot be configured through a repository "
+            "`vars.ALERT_REPO`, so that deployment routes the rest of the estate privately and "
+            f"this lane to the public registry ({_divergent})",
+            _divergent == [])
         wf = yaml.safe_load((root / GROOM_WORKFLOW).read_text())
         jobs = wf.get("jobs", {})
         chk("seam: groom-sweep.yml hosts a `ci-latency` job", "ci-latency" in jobs)
@@ -2376,6 +2424,22 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                        == "python3 registry/scripts/ci-latency-alert.py"]
         chk("seam: the ALERT step DOES carry continue-on-error (asymmetry is deliberate)",
             len(alert_steps) == 1 and alert_steps[0].get("continue-on-error") is True)
+        # ...and the route that step actually EXPORTS, pinned by exact expression. The estate
+        # scan above cannot see WHICH step a binding sits on: move ALERT_REPO onto the checkout
+        # or the self-test step and the estate stays perfectly uniform while the live detector
+        # resolves the registry fallback on every tick. That mutant dies here and nowhere else.
+        _alert_env = (alert_steps[0].get("env") or {}) if len(alert_steps) == 1 else {}
+        chk("seam: the ALERT step binds ALERT_REPO to the canonical expression EXACTLY "
+            f"(saw {_alert_env.get('ALERT_REPO')!r})",
+            _alert_env.get("ALERT_REPO") == ALERT_REPO_BINDING)
+        # THE TOKEN HAS NO `vars` FALLBACK, and must never grow one. Repository variables are
+        # not secrets: they are unmasked in logs and readable by anyone who can read settings,
+        # so a `vars.ALERT_TOKEN` would publish the private route's credential in order to make
+        # the private route work. This is the asymmetry that makes the repo binding above safe.
+        _token_expr = str(_alert_env.get("ALERT_TOKEN", ""))
+        chk(f"seam: ALERT_TOKEN is read from `secrets.` and NEVER from `vars.` (saw "
+            f"{_token_expr!r})",
+            "secrets.ALERT_TOKEN" in _token_expr and "vars." not in _token_expr)
         for step in job.get("steps", []):
             uses = step.get("uses")
             if uses:
