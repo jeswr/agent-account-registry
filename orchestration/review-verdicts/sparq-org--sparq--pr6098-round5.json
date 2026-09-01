@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6098,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "17dc28dd4e8a36180d80344b0276f8ba2b6606a1",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 5 finds no correctness, soundness, test-validity, or security defect. The change threads one QueryBudget through both variable-graph authorization resolution and engine application, aborts before mutation when authorization-time evaluation exhausts the budget, and re-materializes WAC/ACP state after a potentially partial apply whenever the authorized request could touch control data. The focused tests exercise the real PodStore and MCP tool paths: deterministic deadline and row-cap exhaustion, unchanged state on authorization-check failure, successful bounded updates, unlimited-budget compatibility, and the retained-ACL-prefix authorization invariant. The public API documentation and skills accurately describe the non-atomic apply contract, including the uncertainty around the failing operation itself. Progress is stagnant because round 4 already had no findings and this round likewise has none.",
+  "verdict": "approve"
+ }
+}
