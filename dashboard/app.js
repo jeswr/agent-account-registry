@@ -882,6 +882,13 @@ function obsLaneDefers(lanes) {
 // [#2008] `renderHealth` reaches this same helper for the model-health card's 20-pair strip: the
 // affordance is one function, not one per panel, so a capped array anywhere on the page states what
 // it hid by publishing its `<field>_total` and calling `obsTruncationNote`.
+// [#2009] `obsRenderTriggers` draws a per-FIRE `+7 more` instead of a card-level note — the
+// evidence cap is nested inside one alarm, and `showing 5 of 12 evidence links` under a stack of
+// alarms names none of them. It reaches this SAME predicate rather than re-deriving it, because two
+// copies of one guard make each copy individually unkillable (AGENTS.md pre-flight item 4): the
+// `Number.isInteger` rule below is written once and both affordances live or die with it. That is
+// why the parameter is a COUNT of what rendered, not the array — the trigger row's own render can
+// refuse a link the array still carries.
 //
 // The comparison is `total > shown` HERE rather than a flag from the generator, so nothing renders
 // on a healthy fleet whose array fit under its cap. An absent/unreadable total — a data.json
@@ -893,15 +900,15 @@ function obsLaneDefers(lanes) {
 // `showing 12 of 12.5 lanes` with a `0.5 more` title — a malformed value read as authoritative is
 // the same operator-facing lie the unreadable-total silence exists to prevent. Non-integral,
 // non-finite, non-numeric and negative totals are all "no truncation known".
-function obsTruncated(rows, total) {
+function obsTruncated(shown, total) {
   const collected = obsNum(total);
-  return Number.isInteger(collected) && collected > (Array.isArray(rows) ? rows.length : 0);
+  return Number.isInteger(collected) && collected > shown;
 }
 
 function obsTruncationNote(rows, total, noun) {
   const shown = Array.isArray(rows) ? rows.length : 0;
   const collected = obsNum(total);
-  if (!obsTruncated(rows, total)) return null;
+  if (!obsTruncated(shown, total)) return null;
   const note = node("p", "obs-truncated", `showing ${shown} of ${collected} ${noun}`);
   note.setAttribute("title",
     `${collected - shown} more ${noun} are in the collector snapshot than this panel displays`);
@@ -1003,13 +1010,26 @@ function obsRenderTriggers(fires, total) {
       meta.append(node("span", "obs-chip", `heal task ${fire.enqueued_task}`));
     }
     const links = Array.isArray(fire.evidence) ? fire.evidence : [];
+    let shown = 0;
     links.forEach((href, index) => {
       if (typeof href !== "string" || !href.startsWith("https://github.com/")) return;
       const anchor = node("a", "obs-evidence", `evidence ${index + 1}`);
       anchor.href = href;
       anchor.rel = "noopener";
       meta.append(anchor);
+      shown += 1;
     });
+    // [#2009] The generator publishes 5 links per fire out of however many it read, so an alarm
+    // with 12 pieces of evidence rendered exactly like one with 5. `shown` counts the anchors this
+    // row actually drew, not `links.length`: a hand-edited data.json can carry a link the pin above
+    // refuses, and `+N more` has to be honest about the links the READER can reach.
+    if (obsTruncated(shown, fire.evidence_total)) {
+      const hidden = obsNum(fire.evidence_total) - shown;
+      const more = node("span", "obs-evidence-more", `+${hidden} more`);
+      more.setAttribute("title", `${hidden} further evidence link${hidden === 1 ? " is" : "s are"}`
+        + " pinned to this fire in the collector snapshot than this row displays");
+      meta.append(more);
+    }
     row.append(meta);
     host.append(row);
   }

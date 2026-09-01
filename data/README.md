@@ -99,6 +99,15 @@ total is a whole NUMBER OF ROWS greater than the slice beside it — a missing, 
 fractional or already-satisfied total is "no truncation known" and draws nothing, so a document
 published before #1868 or edited by hand degrades to the old silence instead of a fabricated count.
 
+**Issue #2009 closed the one slice nested INSIDE a row**: a fire's `evidence` links are still cut at
+5, but the cut is now counted first — `trigger_fires[].evidence_total` is the number of links that
+survived the `https://github.com/` pin, published on every fire including the ones that hid nothing,
+and the page draws a per-FIRE `+7 more` beside the links rather than a card-level note (a
+`showing 5 of 12` above a stack of alarms names none of them). The 8-link cap on the READ is gone
+with it: it truncated the list before the pin ran, so a 9th link that was not a github.com URL was
+neither published nor counted by the drop diagnostic that exists to announce exactly that. `evidence`
+itself remains unbounded on the way in, like every other row array here.
+
 Validation is otherwise FAIL-CLOSED as before: an absent file hides the panel; a present document
 with the wrong `schema` fails the dashboard build LOUD; malformed rows inside a well-formed
 document are dropped (the model-health tolerance) — EXCEPT privacy violations, which are

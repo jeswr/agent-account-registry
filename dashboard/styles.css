@@ -212,6 +212,10 @@ td.degraded { color: var(--warn); }   /* [#1106] an unreadable dispatch history,
 .obs-trigger-summary { line-height: 1.4; }
 .obs-trigger-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: .74rem; }
 .obs-evidence { color: var(--accent-2); text-decoration: none; border-bottom: 1px dotted var(--accent-2); }
+/* Issue #2009: the per-FIRE half of the #1868 display-cap affordance — `+7 more` beside the five
+   evidence links a fire publishes, because the cap here is nested inside one alarm rather than
+   across a card, and `showing 5 of 12` above a stack of alarms names none of them. */
+.obs-evidence-more { color: var(--muted); font-variant-numeric: tabular-nums; }
 
 .obs-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .obs-card { padding: 20px; border-radius: var(--radius); border: 1px solid var(--line); background: linear-gradient(145deg, rgba(21, 30, 41, .96), rgba(15, 22, 30, .96)); box-shadow: 0 16px 45px rgba(0, 0, 0, .14); }
