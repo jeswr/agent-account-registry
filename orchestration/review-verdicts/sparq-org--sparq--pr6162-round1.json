@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6162,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7d31b9999aa333a5e0779bda9bcd2c46686d7b0f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new hermetic test correctly pins all three compiled head-ref regex copies to the declared canonical value, independently checks that the runtime patterns agree, scans source occurrences with anti-vacuity assertions, fixes the replication census, and verifies that CI invokes the suite. The test passes at the PR head, and the workflow wiring is consistent with the added file. No correctness, soundness, security, or test-validity defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
