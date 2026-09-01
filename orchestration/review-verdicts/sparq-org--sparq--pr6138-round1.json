@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6138,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b0a25464ad1dcc50f96006259632a621180778af",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently documents the coverage push-to-main exemption and adds a non-vacuous structural regression test. The frozen `needs` sets match the current workflow for all three demoted coverage jobs; additions of a conditional upstream job are detected directly, while new dot-syntax `needs.<job>.\u2026` references in job-level conditions are also rejected. This complements the existing behavioral event-envelope assertions and covers the load-bearing workflow shape described by the design. No correctness, soundness, security, or test-validity issue is evident in the diff. I could not execute the test locally because PyYAML is absent from the review environment, but the assertions and current workflow inputs were inspected directly.",
+  "verdict": "approve"
+ }
+}
