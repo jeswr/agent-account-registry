@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5835,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "47813e4b637915b9b698232fea9600bb34b79639",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The reason-bearing G1 exemption is applied consistently in the merge-time gate and periodic drift scanner, narrowly waives only benchmark and SKILL requirements, and remains fail-closed for an absent README or an empty directive reason. The tests exercise the real disk-reading predicates, exempt and non-exempt controls, README-mandatory behavior, and gate/scanner parity. The documentation accurately describes both escape hatches. No correctness, soundness, test-validity, or security issue is evident. Because round 3 had no findings and round 4 introduces none, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
