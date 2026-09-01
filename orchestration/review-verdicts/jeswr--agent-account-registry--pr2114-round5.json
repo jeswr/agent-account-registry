@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2114,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3f78961fa7a7fd159b22b9e45b47b1f7bd8c29cd",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior finding is not fixed. `if any(entry[0][0] in FLOW_WORDS for entry in lists)` checks only the first token of each `;`/`&`-delimited list. The later `commands.extend(split_on(list_tokens, \"&&\"))` can therefore record probes after a flow-control command later in that same list. For example, with PyYAML proven in a separate RUN, `RUN true && exit 0 && jq --version` is accepted: splitting records `[\"jq\", \"--version\"]`, but `exit 0` terminates the shell before jq and the build remains green. `exec true` provides the analogous bypass. The existing `deps-flow.Dockerfile` fixture uses `RUN set -eux; exit 0; jq --version`, where `exit` begins its semicolon-delimited list, so it passes without testing the vulnerable post-`&&` path.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Reject a RUN when a flow-control word begins any command produced after splitting every and-or list at `&&`, before recording probes from that RUN. Add non-vacuous fixtures with the other dependency genuinely proven and `RUN true && exit 0 && jq --version`, plus the analogous `exec true` form, asserting rejection and that jq is named.",
+    "severity": "major",
+    "title": "Flow control after && still permits unreachable probes"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 major remains unchanged. Flow-control rejection still checks only the first command of each semicolon/ampersand-delimited list, before splitting that list at `&&`. Consequently, a later `exit` or `exec` can make an accepted probe unreachable while the RUN succeeds. The sole flow fixture still puts `exit` at the beginning of its list and does not exercise the reported post-`&&` bypass. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
