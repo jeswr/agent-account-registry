@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6138,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b0a25464ad1dcc50f96006259632a621180778af",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. The documentation consistently records the coverage push-to-main exemption, and the structural regression test is non-vacuous: its frozen upstream sets exactly match the live workflow for all three coverage jobs, while its separate scan of job-level `needs.<job>...` references catches the other specified guard shape. This complements the existing behavioral event-envelope test and directly protects the load-bearing post-merge coverage path. No correctness, soundness, security, or test-validity issue is evident. The focused test could not execute in this environment because PyYAML is unavailable, but the test logic and current workflow inputs were inspected directly.",
+  "verdict": "approve"
+ }
+}
