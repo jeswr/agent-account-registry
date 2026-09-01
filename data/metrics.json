@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-01T20:31:05Z",
+  "generated_at": "2026-09-01T20:43:31Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -8,7 +8,7 @@
       "issues_closed_1h": 0,
       "issues_closed_24h": 4,
       "prs_open": 153,
-      "prs_draft": 121,
+      "prs_draft": 120,
       "prs_opened_1h": 1,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
@@ -24,10 +24,10 @@
       "net_pr_flow": 1.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 1018,
+      "issues_open": 1017,
       "issues_ready": 664,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 26,
+      "issues_closed_1h": 1,
+      "issues_closed_24h": 27,
       "prs_open": 47,
       "prs_draft": 33,
       "prs_opened_1h": 0,
@@ -48,21 +48,23 @@
   "alerts": [
     {
       "target": "sparq-org/sparq",
+      "classification": "backlog-growing",
+      "fire": true,
+      "summary": "open PRs 153 > 40 and net PR flow +1.0/hr (open 1.0 > close 0.0) sustained over 2 snapshots",
+      "metrics": {
+        "prs_open": 153,
+        "net_pr_flow": 1.0,
+        "pr_open_rate": 1.0,
+        "pr_close_rate": 0.0
+      }
+    },
+    {
+      "target": "sparq-org/sparq",
       "classification": "ready-starved",
       "fire": true,
       "summary": "ready frontier 274 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
       "metrics": {
         "issues_ready": 274,
-        "issues_closed_1h": 0
-      }
-    },
-    {
-      "target": "jeswr/agent-account-registry",
-      "classification": "ready-starved",
-      "fire": true,
-      "summary": "ready frontier 664 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
-      "metrics": {
-        "issues_ready": 664,
         "issues_closed_1h": 0
       }
     }
