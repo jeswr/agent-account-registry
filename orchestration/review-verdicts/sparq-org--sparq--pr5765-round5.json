@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5765,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "282f7440b7098ffa44cea0b6ffd6198a3252e1d4",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 still defines (C) as the PR corpus being the audited eight packages or a superset. Sections 4.2 and 5 then say that under (C) #13265's row is non-evidential because the patched arm is never reached, and section 4.3 similarly reasons about #13264's fire branch. If the actual corpus is a strict superset, an added package or probe may contain a radix decomposition or a qualifying mask/Truncate chain, so the audited-eight absence result does not establish that the actual row could not move. Saying elsewhere that the actual verdict is unresolved does not repair these explicitly conditional implications; the companion summary repeats them.",
+    "file": "research/noir-corpus-row-audit-13263-13266.md",
+    "fix_hint": "Replace (C) with an equality/complete-coverage condition for every absence or non-evidential inference: the actual corpus must equal the audited eight, or every additional member and dependency must also be audited for the construct. If retaining a separate superset condition, use it only for positive witness/reachability conclusions that survive adding members. Update the conditional table and companion amendments consistently.",
+    "severity": "major",
+    "title": "Superset condition still cannot support absence conclusions"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 logical defect remains. The revision now correctly says the direct audit describes only the documented eight and that the actual rows remain unresolved, but it still defines (C) as the actual corpus being those eight or any superset and repeatedly derives absence/non-evidential conclusions under (C). Those conclusions do not transfer to an unaudited superset: extra packages can reach or fire the changed paths. Because the same major inference error remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
