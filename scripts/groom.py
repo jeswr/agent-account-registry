@@ -2700,7 +2700,7 @@ def _execute_age_unpark_actions(
     registry_api: "GitHubAPI",
     registry_repo: str,
     bot_login: str,
-) -> tuple[PhaseOutcome, int, int, int]:
+) -> tuple[PhaseOutcome, int, int, int, int, int]:
     """Re-admit MACHINE age-parks whose own cause has provably recovered — the exit that makes the
     class split honest.
 
@@ -2753,7 +2753,9 @@ def _execute_age_unpark_actions(
         because the cause has NO PREDICATE AT ALL is this phase promising an exit it cannot
         deliver, and the two are the same log line ("age park stands") and the same label state.
         They are separated into two gauges — see `standing`/`unreachable` below — because only the
-        second one is a defect, and it is the one nothing else in the estate can see.
+        second one is a defect, and it is the one nothing else in the estate can see. Since
+        [registry #1664] the same population is ALSO censused per object and per cause, because
+        the candidate exits that could ever bound it are per-cause and a total cannot rank them.
 
     Every failure is PER-PR: one unreadable PR never stops the rest.
 
@@ -2777,12 +2779,12 @@ def _execute_age_unpark_actions(
     # never climbs toward AGE_UNPARK_MAX either. It is a gauge, not a decision — the sweep still
     # writes nothing here — but it has to be COUNTABLE, because "how big is the population that
     # only a cause can move" is the number any future bound has to be sized against.
-    standing = 0
-    # [registry #873] GAUGE (a SUBSET of `standing`): declined parks whose cause has no recovery
-    # predicate at all, so no tick can EVER grant them. Counted apart because it is the only part
-    # of the standing population whose permanence is PROVABLE without a clock, and because it
-    # falsifies a claim another checkout root makes about this sweep — see age_park_exit_reachable.
-    unreachable = 0
+    #
+    # [registry #1664] ...and the same argument, applied once more, is why this is a LIST of
+    # (pr, cause) rather than an `int`. Both #873 gauges below are DERIVED from it at the end of
+    # the phase, so the total, the unreachable subset and the named census cannot drift apart the
+    # way two independently-incremented counters can (AGENTS.md pre-flight item 4).
+    standing_parks: list[tuple[str, str]] = []
     deferrals: list[str] = []
     for repo, api in apis.items():
         for number, listed in sorted(pulls.get(repo, {}).items()):
@@ -3049,7 +3051,7 @@ def _execute_age_unpark_actions(
                         registry_api, registry_repo, repo, number),
                 )
                 if not recovered:
-                    standing += 1
+                    standing_parks.append((f"{repo}#{number}", owed["cause"]))
                     print(f"age park stands {repo}#{number} (cause={owed['cause']} "
                           f"gen={owed['gen']}): {why}")
                     # [registry #873] The park whose exit does not exist. Every other standing
@@ -3060,7 +3062,6 @@ def _execute_age_unpark_actions(
                     # own vocabulary gap is a decision this issue deliberately does not take, and
                     # a cause-shaped bound belongs in the class split, not in a log line.
                     if not age_park_exit_reachable(owed["cause"]):
-                        unreachable += 1
                         print(
                             f"ALERT PR {repo}#{number}: age park cause={owed['cause']} has NO "
                             "recovery predicate in this sweep, so no tick can ever re-admit it "
@@ -3119,6 +3120,52 @@ def _execute_age_unpark_actions(
             finally:
                 if not failed:
                     completed += 1
+    # [registry #873] The two gauges, DERIVED from the one record of the declined population
+    # above rather than incremented alongside it. `unreachable` is a SUBSET of `standing`:
+    # declined parks whose cause has no recovery predicate at all, so no tick can EVER grant
+    # them. It is reported apart because it is the only part of the standing population whose
+    # permanence is PROVABLE without a clock, and because it falsifies a claim another checkout
+    # root makes about this sweep — see age_park_exit_reachable.
+    standing = len(standing_parks)
+    unreachable = sum(
+        1 for _pr, cause in standing_parks if not age_park_exit_reachable(cause))
+    # [registry #1664] ...and the population itself, NAMED AND PARTITIONED BY CAUSE. #873 made
+    # this population countable; a total is not enough to argue the next step from, for two
+    # reasons. It cannot be turned back into the PRs a design record has to be tested against —
+    # exactly the correction [registry #1598] made for the stranded-orphan gauge, where a bare
+    # count told an operator that a stranded PR existed but not which one. And the candidate
+    # cause-shaped exits are PER CAUSE, not per population: an `orphan-draft` park would have to
+    # be escalated on the provenance record being provably UNMINTABLE for this PR, a `merge-*`
+    # park on something else entirely (its park receipt's `head` being unreachable on the
+    # remote), so "how big is it" cannot say which of those is worth designing while "which
+    # causes hold how many, and which of them are named by a receipt vocabulary this sweep no
+    # longer decides" can.
+    #
+    # This stays a GAUGE, on the same terms as the two it derives from: nothing here writes,
+    # escalates, or approaches a terminal. Escalating this population is human-owned
+    # (park_policy invariant 3) and each candidate observation is gated on its own design record;
+    # MEASURING it is the step that comes first, and this is that step.
+    #
+    # Emitted UNCONDITIONALLY, zero row included, for the reason the SUMMARY gauges are
+    # (AGENTS.md pre-flight item 8): a census that appears only when the population is non-empty
+    # trains its reader to read absence as health.
+    by_cause: dict[str, list[str]] = {}
+    for pr_ref, cause in standing_parks:
+        by_cause.setdefault(cause, []).append(pr_ref)
+    print(
+        "CENSUS machine age parks standing (declined this tick on their own cause — the "
+        "population no amount of elapsed time moves, which any cause-shaped exit must be sized "
+        f"against): {standing}"
+        + "".join(
+            f" | {cause}={len(refs)}"
+            # The subset #873 proves permanent, marked HERE too rather than left to be joined
+            # against the per-PR ALERT above: the whole point of a per-cause partition is that a
+            # reader can rank the causes without re-reading the tick's per-object log.
+            + ("" if age_park_exit_reachable(cause) else " NO-PREDICATE")
+            + f" [{', '.join(sorted(refs))}]"
+            for cause, refs in sorted(by_cause.items())
+        )
+    )
     return (
         PhaseOutcome(label="age park re-admission", changed=completed, attempted=attempted,
                      deferred=tuple(deferrals)),
@@ -9618,6 +9665,36 @@ def _self_test() -> int:
             ),
             (True, True, False, True),
         )
+        # [registry #1664] ...AND IT IS NAMED, AND PARTITIONED BY CAUSE. The gauge above answers
+        # "how many"; the census answers "which PR, held by which cause", which is the only form
+        # the question a cause-shaped exit has to be designed against can be asked in — the
+        # candidate observations differ per cause (`orphan-draft` would escalate on a provably
+        # unmintable provenance record, `merge-*` on an unreachable park head), so a total cannot
+        # rank them. Pinned as EXACT rendered text through the END OF THE LINE (AGENTS.md
+        # pre-flight item 6): a mutant that emits the header and drops the partition, or the
+        # partition and drops the object list, satisfies a bare `"CENSUS" in log` containment
+        # check while leaving the reader exactly where #873 left them.
+        check(
+            "[#1664] the declined population is CENSUSED per object and per cause on the same "
+            "tick the gauge counts it, and a DECIDABLE cause is NOT marked permanent there",
+            (
+                "must be sized against): 1 | merge-dirty=1 [owner/repo#34]\n" in stands_log,
+                "NO-PREDICATE" in stands_log,
+            ),
+            (True, False),
+        )
+        # [registry #1664] THE ZERO ROW, asserted separately because AGENTS.md item 3's second
+        # mutant is invisible to the check above: wrapping the census in `if standing_parks:`
+        # keeps every element there green and silences the line on exactly the quiet tick an
+        # operator interrogates it. `unpark_log` is a real sweep that re-admitted instead of
+        # declining, so the empty population is the true one — and the line-terminated form also
+        # kills a census that renders a partition for a population it just reported as empty.
+        check(
+            "[#1664] the per-cause census ZERO-SEALS: a tick with no standing park still emits "
+            "the row, with nothing named after the count",
+            ("must be sized against): 0\n" in unpark_log,),
+            (True,),
+        )
 
         # [registry #873] THE PARK WITH NO EXIT AT ALL, end to end through the REAL sweep. The
         # receipt on this PR carries a cause token no predicate decides — the shape a durable
@@ -9644,6 +9721,48 @@ def _self_test() -> int:
                 "age_park_exit_unreachable=1 " in unreachable_log,
             ),
             ([], True, True, True, True, True),
+        )
+        # [registry #1664] The census MARKS the undecidable cause in the partition itself, so a
+        # reader ranking causes never has to re-join the per-object ALERTs above to find out
+        # which rows are already provably permanent. Paired with the `NO-PREDICATE` ABSENCE
+        # pinned on `stands_log`, this drives the marker in BOTH directions: an unconditional
+        # marker reds there, a deleted one reds here.
+        check(
+            "[#1664] a cause with NO recovery predicate is named in the per-cause census AND "
+            "flagged permanent in it",
+            ("must be sized against): 1 | ci-red=1 NO-PREDICATE [owner/repo#43]\n"
+             in unreachable_log,),
+            (True,),
+        )
+        # [registry #1664] A MIXED tick — the only one that can prove the partition is real. Every
+        # scenario above stands exactly ONE park of ONE cause, so `len(refs)` is 1 in all of them
+        # and a census that emitted a hard-coded `=1`, kept every cause in a single bucket, or
+        # dropped the `sorted` would pass all of them unchanged (AGENTS.md pre-flight item 4,
+        # value-identical survivor). Three parks over two causes: the counts differ from each
+        # other AND from the total, the two causes differ in decidability, and the rendered order
+        # is the SORTED one rather than the encounter order (34, 43, 44).
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/34/comments": [_park_receipt_comment(1, 34)],
+            "/repos/owner/repo/issues/43/comments": [
+                _park_receipt_comment(1, 43, cause="ci-red")],
+            "/repos/owner/repo/issues/44/comments": [_park_receipt_comment(1, 44)],
+            **_bot_park_timeline(34), **_bot_park_timeline(43), **_bot_park_timeline(44)}
+        mixed_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(34, "dirty", ("review:parked",), fresh=True),
+                       _machine_parked_pr(43, "dirty", ("review:parked",), fresh=True),
+                       _machine_parked_pr(44, "dirty", ("review:parked",), fresh=True)))
+        check(
+            "[#1664] with THREE standing parks over TWO causes the census reports each cause's "
+            "own count, in sorted order, with only the undecidable one flagged — and the two "
+            "SUMMARY gauges stay consistent with it",
+            (
+                terminal_sweep_env["writes"],
+                "must be sized against): 3 | ci-red=1 NO-PREDICATE [owner/repo#43] | "
+                "merge-dirty=2 [owner/repo#34, owner/repo#44]\n" in mixed_log,
+                "age_park_standing=3 " in mixed_log,
+                "age_park_exit_unreachable=1 " in mixed_log,
+            ),
+            ([], True, True, True),
         )
         terminal_sweep_env["pages"] = {}
 
