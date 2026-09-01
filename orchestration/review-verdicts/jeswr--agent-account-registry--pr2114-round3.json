@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2114,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3f78961fa7a7fd159b22b9e45b47b1f7bd8c29cd",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The FLOW_WORDS rejection checks only `entry[0][0]`, the first token of each `;`/`&`-delimited list. It never checks commands produced later by `split_on(list_tokens, \"&&\")`. For example, with PyYAML genuinely proven in another RUN, `RUN true && exit 0 && jq --version` is accepted: the list is eligible because it starts with `true`, splitting records `[\"jq\", \"--version\"]`, but the shell exits successfully before jq and the image build remains green. `exec true` in the same position provides an equivalent bypass. The added `exit` fixture only exercises a flow word at the start of a list, so it does not catch this realistic mutation of the claimed reachability guarantee.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Reject a RUN when any command position that can transfer control is encountered, including commands after `&&`, before recording probes from it. Add a fixture with the other dependency genuinely proven and `RUN true && exit 0 && jq --version` (and preferably the analogous `exec true` form), asserting rejection and that jq is named.",
+    "severity": "major",
+    "title": "Control transfer after && still makes an unreachable probe count as proof"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 examples are now rejected, but the reachability model still accepts probes after a control-transfer word when that word is not the first command in its semicolon-delimited list. A successful `exit` or `exec` can therefore terminate the shell before the accepted probe while leaving the RUN green. This preserves the same major proof-vs-presence defect, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
