@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2116,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8b34e2e8684fa67784c9d4acb2a6131f779d1c60",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 closes the prior major finding. `ALERT_ROUTE_CONSUMERS` is now a complete, independently maintained identity inventory, and the live seam compares it for equality in both directions against the binding-derived consumer map. A whole-`env` deletion from any enrolled consumer therefore produces a named missing identity even though the floor, pairing, canonical-value, and token checks still pass. The hermetic tests exercise that exact non-crashing deletion shape, both drift directions, duplicate identities, parser failures, all supported binding levels, and exact token/repository expressions. The two workflow changes use the estate-canonical repository binding while retaining secret-only token bindings. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
