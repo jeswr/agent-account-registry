@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2147,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "93f340bcd5a35d88f125785e7ae949a83e9e271a",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_exits_to_enclosing_list` still returns true for a binding that is the sole statement in an `ast.If` arm or an `ast.For` body, because both node types remain in `_ESCAPABLE_NESTS` and there are no trailing statements to fail `_falls_through`. Consequently `if repo: targets = starvation_park_targets(...); for target in targets: park_starved_partition_holder(...)` is certified even when `repo` is false, and the analogous binding inside `for _ in items:` is certified even when `items` is empty. The added `binding NESTED in a live guard that returns` row exercises only an entered arm that cannot exit; it does not exercise the universal dominance requirement identified in round three. Leg 4's stand-in therefore cannot demonstrate detection of either prior counterexample.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Require proof that every path reaching the later statement list necessarily executes the nested binding; merely proving that a pass which entered an `if` arm or `for` body can exit it is insufficient. Add refused rows for a binding alone under a runtime `if` followed by the parking loop and for a binding inside a possibly-empty `for` followed by the loop, then add a non-vacuity mutation/stand-in that makes those exact rows certify while unrelated rows retain their verdicts.",
+    "severity": "major",
+    "title": "Escapable nests still do not prove that the binding dominates the loop"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-three dominance defect remains. The new flow checks reject a guarded binding only when a later statement in that entered arm fails to fall through, but `_ESCAPABLE_NESTS` still treats an ordinary `if` arm or possibly-empty `for` body as if every execution reaching the later parking loop must have entered it. Thus the two exact counterexamples requested last round still certify. This is materially the same major finding at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
