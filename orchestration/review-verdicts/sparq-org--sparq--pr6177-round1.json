@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6177,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c6c95e2fb3b243fb07b37984d6b40a6e4b96737f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Both `_NAME_RE` and `_KEY_RE` accept only the exact sequence prefix `- ` (`(?:- )?`). YAML permits additional separation spaces after a sequence dash, so a valid line such as `      -  name: Publish guard (#123)` is not matched and the truncated name passes the gate. The same limitation means a valid `-  run: |` header is not recognized as a block scalar, allowing embedded `name:` text in its body to be misclassified. The self-test covers only the single-space spelling, so it does not exercise this load-bearing lexical boundary.",
+    "file": "scripts/check-workflow-step-names.py",
+    "fix_hint": "Accept one or more YAML separation spaces after the dash in both regexes (for example, `(?:-[ \\t]+)?`, while retaining the existing indentation handling), and add self-tests proving that a multi-space `-  name: ... #123` is rejected and that a multi-space `-  run: |` body is skipped without swallowing the following sibling step.",
+    "severity": "major",
+    "title": "Valid sequence indentation bypasses the name-truncation gate"
+   }
+  ],
+  "progress": null,
+  "summary": "The intended lint catches the repository's current instances and its included self-tests pass, but the source scanner does not cover valid YAML sequence syntax with more than one space after the dash. That leaves a straightforward false-negative in the load-bearing gate and can also break block-scalar suppression, so the claim that it enforces the rule on every workflow name is not yet supported.",
+  "verdict": "request_changes"
+ }
+}
