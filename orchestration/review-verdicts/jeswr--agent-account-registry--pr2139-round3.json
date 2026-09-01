@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2139,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b35c524eafd97b00e2d083e4f2f08ef2acf8adda",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Line 987 builds `f\"repos/{registry_repo}/git/trees/{worker_pr.LEDGER_REF}?recursive=1\"`. The old read placed the ref in the query string; in path position, a value containing `?` or `#` can now rewrite the query \u2014 e.g. `REGISTRY_LEDGER_REF=\"ledger?recursive=0&x=\"` would drop recursion.\n\nStill a nit, unchanged from round 2: LEDGER_REF is operator-supplied workflow configuration (worker-pr.py:418), not untrusted input, and the outcome fails CLOSED anyway \u2014 a non-recursive tree lists only top-level entries, nothing starts with `orchestration/provenance/`, and the new presence guard raises. Noted only because scripts/pat-validity.py already quotes this same constant with `urllib.parse.quote(LEDGER_REF, safe='')`, so this line diverges from an established in-repo pattern.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Match pat-validity.py: `f\"repos/{registry_repo}/git/trees/{urllib.parse.quote(worker_pr.LEDGER_REF, safe='')}?recursive=1\"` (add the `urllib.parse` import if absent). The endpoint-wiring self-test pins the default `ledger`, which quotes to itself, so it stays green.",
+    "severity": "nit",
+    "title": "`worker_pr.LEDGER_REF` is interpolated into path position without URL quoting, diverging from pat-validity.py's house style"
+   },
+   {
+    "body": "Every fixture in the new block either yields a non-empty result or is expected to raise. Nothing asserts the third outcome the function must support: the provenance directory EXISTS on the ledger but holds no record for THIS repo (in production, a ledger carrying only `orchestration/provenance/README.md` plus other repos' records), which must return an empty set quietly.\n\nThe code is correct today \u2014 README.md satisfies `any(path.startswith(prefix))` and the loop matches nothing \u2014 and I confirmed `orchestration/provenance/README.md` is tracked, so the guard cannot mis-fire in steady state. But the property is unpinned: moving the guard after the loop as `if not numbers: raise` keeps the `{685}` check and the renamed-directory check both green while turning a genuinely-empty census into a fatal one. Since this raise is the fix for round-1 major #2, its boundary is worth one line.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Add one case asserting the quiet-empty outcome:\n\n    check(\"...and a present-but-empty provenance directory reads as 'nothing recorded'\",\n          recorded_pr_numbers(repo, \"reg/istry\", worker_pr,\n                              read_tree=lambda: {\"truncated\": False,\n                                                 \"tree\": [{\"path\": \"orchestration/provenance/README.md\",\n                                                           \"type\": \"blob\"}]}),\n          set())\n\nThis distinguishes \"the directory is gone\" (raise) from \"the directory is there and empty\" (set()) \u2014 exactly the pair the new guard exists to separate.",
+    "severity": "nit",
+    "title": "The legitimate \"directory present, zero records\" outcome returns set() but is not pinned, so the new presence guard could be tightened into a false fail-closed unnoticed"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 re-review of the same tree as round 2 (HEAD b35c524ea, one fix commit; no new work landed since). The change is correct, fail-closed, and its self-test is non-vacuous. I re-verified every mutation the round-2 approval rested on against the checkout rather than the diff text.\n\nCORRECTNESS. `recorded_pr_numbers` (scripts/mint-provenance.py:970-1005) now reads the whole ledger tree via `git/trees/{ref}?recursive=1` and slices names with `prefix = PROVENANCE_DIR + '/'` derived from the production builder (worker-pr.py:2673-2675, PROVENANCE_DIR='orchestration/provenance'). Three ordered guards separate \"could not tell\" from \"nothing recorded\": non-dict-or-truncated raises, non-list `tree` raises, and absent provenance directory raises. The caller at :914-916/:929 is inside `census`, which propagates MintError \u2014 an unreadable population hard-fails the census instead of being reported as empty. That is the correct direction for a trust-plane reader.\n\nThis strictly improves on the old read: `contents/{dir}` silently caps at 1000 entries with no truncation signal, so as the ledger grows the previous code would have started under-reporting recorded PRs (fail-OPEN, re-minting over existing records). The new read fails closed instead. Whole-tree truncation is a real but distant limit (7MB / ~100k entries; the tracked directory holds 34 records today), and it raises rather than lies when reached \u2014 observation, not a defect.\n\nTEST VALIDITY. Each new assertion reds on the mutation it exists for: drop the truncated clause -> \"no raise\" (:1834-1842); drop the isinstance-dict guard -> the `None` fixture raises AttributeError, uncaught, self-test crashes (:1843-1853); drop the list guard -> TypeError on `any()` over None (:1854-1862); drop the presence guard -> the renamed-directory case returns set() and hits the else branch (:1863-1874). The prefix decoys are genuine boundary cases: 'orchestration/provenance-archive/<stem>686.json' fails startswith bec\u2026 [truncated 982 chars]",
+  "verdict": "approve"
+ }
+}
