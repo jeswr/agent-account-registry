@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6105,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7785925dffb51243b88e193b6c952ca1b774b3f6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The CI target changes correctly add the lib test binary alongside the existing integration-test targets, so feature-gated in-module tests execute without weakening the conformance ratchets. The new structural check covers the five audited modules, resolves in-crate feature forwarding, excludes binary roots, and includes meaningful positive/negative non-vacuity tests. The QL stale-expectation comment update is consistent with the newly enforced lane. The structural test suite passes in the checkout; Rust compilation could not be independently repeated because cargo is unavailable in this environment.",
+  "verdict": "approve"
+ }
+}
