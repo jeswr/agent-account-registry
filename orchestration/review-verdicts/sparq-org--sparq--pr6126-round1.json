@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6126,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dadd1c5e41a00fff3a5030647aaa5143f5e15210",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new standalone totality mode reuses the production attribution function, enumerates the Git index without network or PR context, fails closed when enumeration is empty or unavailable, and reports unmapped tracked paths with a nonzero status. The unfiltered docs-quality workflow wiring addresses the trigger gap, while the structural tests pin invocation, unconditional execution, gating status, merge-group coverage, no-network behavior, and fail-closed/non-vacuous behavior. The CLI check succeeds over all 6423 tracked paths in the supplied checkout. The full Python test module could not be executed in this review environment because PyYAML is absent, but the workflow explicitly installs its hash-pinned PyYAML dependency before the test bucket; no correctness or security defect is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
