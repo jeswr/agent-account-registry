@@ -38,7 +38,9 @@
 #      is therefore never inferred: it must be ASSERTED by a durable expected-record manifest
 #      (`--expected-records`, {target: {window, records: [PR numbers]}}) that the maintainer
 #      derives from the authoritative enumeration of that target's worker PRs in an observation
-#      window, and VERIFIED here — every expected record must actually be present. Verification is
+#      window, and VERIFIED here — every expected record must actually be present, and the stated
+#      `window` must be a PR-number range that CONTAINS every record listed under it (a window the
+#      audit cannot check is a scope the reader is asked to take on trust). Verification is
 #      by FILENAME, so a filename must be worth trusting: each record's name is parsed exactly and
 #      must agree with the `pr_number` INSIDE it, or the audit refuses. Otherwise a record parked
 #      under another PR's name would witness a record that is really missing, and an incomplete
@@ -74,6 +76,9 @@ _FINGERPRINT_ALPHABET = frozenset("0123456789abcdef")
 RECORD_SUFFIX = ".json"
 RECORD_INFIX = "--pr"
 _DIGITS = frozenset("0123456789")
+# A manifest `window` is an INCLUSIVE PR-number range, `#<low>..#<high>` — see `window_bounds`.
+WINDOW_SEPARATOR = ".."
+WINDOW_NUMBER_PREFIX = "#"
 DEFAULT_POLICY = "policy/repos.toml"
 DEFAULT_PROVENANCE_DIR = "orchestration/provenance"
 # The env var holding the salt, when the operator opts in to mapping. Never read unless asked for,
@@ -230,6 +235,60 @@ def record_fingerprint(text, filename, number):
     return value
 
 
+def _window_number(text):
+    """One `#<N>` bound of a window, or None when `text` is not EXACTLY that — including when it is
+    the empty string, which is what a window carrying no `..` partitions into.
+
+    The same number grammar `record_number` reads out of a filename (positive, digits only, no zero
+    padding), because the two are compared to each other."""
+    if not text.startswith(WINDOW_NUMBER_PREFIX):
+        return None
+    digits = text[len(WINDOW_NUMBER_PREFIX):]
+    if not digits or set(digits) - _DIGITS or digits.startswith("0"):
+        return None
+    return int(digits)
+
+
+def window_bounds(window, target):
+    """The INCLUSIVE (low, high) PR numbers a manifest entry's `window` states.
+
+    A completeness claim is only as good as the scope it is made over, and `window` USED to be any
+    non-blank string: the report told the reader "all N expected record(s) present for window W"
+    while nothing had ever related W to the records beside it, so a manifest whose window said one
+    thing and whose records enumerated another was indistinguishable from a correct one (#1887).
+
+    A PR-NUMBER range is the one window shape this module can actually check. Dates cannot be: a
+    provenance record's filename carries only a PR number, so neither the corpus nor the manifest
+    holds a timestamp to check an instant against, and validating an ISO-8601 shape would only make
+    the unverified text better formatted. PR numbers are monotonic per repository, so `records` and
+    `window` are expressed in the SAME units and the containment below is a real check
+    (`research/1027-expected-record-manifest-generation.md` §5.3).
+
+    Exactly `#<low>..#<high>`, with no trailing prose: a window that carried free text would be
+    partly checked and partly not, which is the property this refuses to keep."""
+    if not isinstance(window, str):
+        raise AuditError(
+            f"expected-records entry for {target!r} states no observation `window` string (got "
+            f"{window!r}) — refusing to accept an unbounded completeness claim")
+    # A window carrying no `..` partitions into an empty high bound, which `_window_number` already
+    # rejects — so the separator is NOT tested a second time here. A duplicated guard makes each
+    # copy individually unkillable (AGENTS.md pre-flight 4), and one refusal is what a reader has to
+    # be able to trust.
+    low_text, _, high_text = window.partition(WINDOW_SEPARATOR)
+    low, high = _window_number(low_text), _window_number(high_text)
+    if low is None or high is None:
+        raise AuditError(
+            f"expected-records entry for {target!r} states window {window!r}, which is not a PR "
+            f"number range {WINDOW_NUMBER_PREFIX}<low>{WINDOW_SEPARATOR}{WINDOW_NUMBER_PREFIX}"
+            "<high> — refusing a completeness claim whose scope cannot be checked against the "
+            "records it is made over")
+    if low > high:
+        raise AuditError(
+            f"expected-records entry for {target!r} states window {window!r}, whose low bound is "
+            "above its high bound — refusing a window that contains nothing")
+    return low, high
+
+
 def expected_records(manifest_text, targets):
     """{target: {"window": str, "records": frozenset(filenames)}} from a completeness manifest.
 
@@ -242,7 +301,14 @@ def expected_records(manifest_text, targets):
 
     Record numbers, not filenames: a number is turned into a filename through `record_prefix` for
     the target it is declared under, so a manifest entry can never assert completeness using
-    another row's evidence."""
+    another row's evidence.
+
+    The `window` is checked against the `records` declared under it (`window_bounds`): every listed
+    PR number must lie inside the range the entry claims to be enumerating, so the scope the report
+    quotes is the scope the record list actually describes. This does not prove the enumeration is
+    COMPLETE for that window — nothing here can, since a manifest is exactly the assertion this
+    module cannot derive — but a manifest whose two halves describe different populations no longer
+    verifies as if they agreed."""
     try:
         document = json.loads(manifest_text)
     except (ValueError, TypeError) as exc:
@@ -259,10 +325,7 @@ def expected_records(manifest_text, targets):
         if not isinstance(entry, dict):
             raise AuditError(f"expected-records entry for {target!r} is not an object — refusing")
         window = entry.get("window")
-        if not isinstance(window, str) or not window.strip():
-            raise AuditError(
-                f"expected-records entry for {target!r} states no observation `window` — refusing "
-                "to accept an unbounded completeness claim")
+        low, high = window_bounds(window, target)
         numbers = entry.get("records")
         if not isinstance(numbers, list) or not numbers:
             raise AuditError(
@@ -273,6 +336,11 @@ def expected_records(manifest_text, targets):
                 raise AuditError(
                     f"expected-records entry for {target!r} lists record {number!r}, which is not "
                     "a positive PR number — refusing")
+            if not low <= number <= high:
+                raise AuditError(
+                    f"expected-records entry for {target!r} lists record #{number}, which lies "
+                    f"outside its own window {window!r} — refusing a manifest whose stated scope "
+                    "and whose record list describe different populations")
         if len(set(numbers)) != len(numbers):
             raise AuditError(
                 f"expected-records entry for {target!r} lists a duplicate PR number — refusing a "
@@ -491,8 +559,9 @@ def _record(handle, number):
                        "impl_account_h": _H[handle], "issue": 1, "recorded_at_run": "1.1"})
 
 
-def _manifest(rows, window="2026-07-01..2026-07-28"):
-    """A completeness manifest naming, per target, the PR numbers that MUST be present."""
+def _manifest(rows, window="#1..#9"):
+    """A completeness manifest naming, per target, the PR numbers that MUST be present. The default
+    window is the inclusive PR-number range every fixture record below falls inside."""
     return json.dumps({"targets": {target: {"window": window, "records": list(numbers)}
                                    for target, numbers in rows.items()}})
 
@@ -541,14 +610,37 @@ def _self_test():
             print(f"ok   {label}")
 
     def refuses(label, thunk):
+        """A refusal is an AuditError and nothing else. Any OTHER exception reds THIS row and lets
+        the suite continue: a traceback is not a refusal (it is an unhandled input reaching
+        production code), and letting it propagate would abort the run and leave every check below
+        unrun — a mutant that crashes here would otherwise be scored on a partial suite."""
+        nonlocal ok
         try:
             thunk()
         except AuditError:
             print(f"ok   {label}")
             return
-        nonlocal ok
+        except Exception as exc:               # noqa: BLE001 — a crash is a failure, not a refusal
+            ok = False
+            print(f"FAIL {label}: raised {type(exc).__name__} ({exc}) instead of refusing")
+            return
         ok = False
         print(f"FAIL {label}: no refusal")
+
+    def fixture(label, thunk):
+        """Build an input the checks BELOW depend on. A refusal here is a failure of this suite's
+        own premise, so it reds a named row and yields None rather than aborting: with None the
+        dependent rows go red too (an absent manifest proposes nothing), and every remaining check
+        is still measured."""
+        nonlocal ok
+        try:
+            built = thunk()
+        except AuditError as exc:
+            ok = False
+            print(f"FAIL {label}: the fixture itself refused ({exc})")
+            return None
+        print(f"ok   {label}")
+        return built
 
     grant_account = _load_sibling("grant-account.py", "registry_grant_account")
 
@@ -664,7 +756,9 @@ def _self_test():
             lambda: collect_evidence([("o--a--pr0x2.json", _record("acct01", 2))], ["o/a", "o/b"]))
     # The manifest states the corpus is EXACTLY these PRs for these windows, so — and only so —
     # absence becomes disuse. Every candidate-producing check below runs under this claim.
-    complete = expected_records(_manifest({"o/a": [1, 2], "o/b": [3]}), ["o/a", "o/b"])
+    complete = fixture("a correct manifest is ACCEPTED (every refusal below is a real distinction)",
+                       lambda: expected_records(_manifest({"o/a": [1, 2], "o/b": [3]}),
+                                                ["o/a", "o/b"]))
     scoped = audit(pools, evidence, foreign=foreign, salt=SALT, observed=observed,
                    expected=complete)
     check("a target's evidenced set is its OWN records only",
@@ -680,11 +774,10 @@ def _self_test():
 
     check("a complete corpus reports its verified bounds",
           scoped["targets"]["o/a"]["evidence_bounds"],
-          {"window": "2026-07-01..2026-07-28", "expected_records": 2, "missing_records": 0,
-           "complete": True})
+          {"window": "#1..#9", "expected_records": 2, "missing_records": 0, "complete": True})
     check("...and the window is surfaced to the reader of the text report",
-          "completeness: VERIFIED — all 2 expected record(s) present for window "
-          "2026-07-01..2026-07-28" in render(scoped), True)
+          "completeness: VERIFIED — all 2 expected record(s) present for window #1..#9"
+          in render(scoped), True)
 
     # -- FAIL CLOSED 1: no evidence for a row proposes NOTHING (not "revoke the whole pool").
     empty = audit(pools, {"o/a": collections.Counter(), "o/b": evidence["o/b"]}, salt=SALT,
@@ -712,7 +805,9 @@ def _self_test():
           in render(unbounded), True)
     # A manifest that expects a record the corpus does not hold is the partial-corpus case itself:
     # pr9 was written to the ledger branch and is not in this checkout.
-    gapped = expected_records(_manifest({"o/a": [1, 2, 9], "o/b": [3]}), ["o/a", "o/b"])
+    gapped = fixture("a manifest expecting a record this corpus lacks is still a VALID manifest",
+                     lambda: expected_records(_manifest({"o/a": [1, 2, 9], "o/b": [3]}),
+                                              ["o/a", "o/b"]))
     holey = audit(pools, evidence, foreign=foreign, salt=SALT, observed=observed, expected=gapped)
     check("a manifest with ONE expected record missing makes that row partial-evidence",
           holey["targets"]["o/a"]["status"], STATUS_PARTIAL)
@@ -721,11 +816,10 @@ def _self_test():
            holey["targets"]["o/b"]["revocation_candidates"]), ([], ["acct01", "acct02"]))
     check("...and the missing count and window are surfaced, not swallowed",
           holey["targets"]["o/a"]["evidence_bounds"],
-          {"window": "2026-07-01..2026-07-28", "expected_records": 3, "missing_records": 1,
-           "complete": False})
+          {"window": "#1..#9", "expected_records": 3, "missing_records": 1, "complete": False})
     check("...in the text report too",
-          "completeness: NOT verified — 1 of 3 record(s) expected for window "
-          "2026-07-01..2026-07-28 are absent" in render(holey), True)
+          "completeness: NOT verified — 1 of 3 record(s) expected for window #1..#9 are absent"
+          in render(holey), True)
     # A manifest is only a completeness signal if it is read exactly; every way of getting one
     # wrong refuses rather than licensing a revocation.
     refuses("a manifest that does not parse refuses",
@@ -740,6 +834,49 @@ def _self_test():
             lambda: expected_records(json.dumps({"targets": {"o/a": {"records": [1]}}}), ["o/a"]))
     refuses("a manifest entry with an empty window refuses",
             lambda: expected_records(_manifest({"o/a": [1]}, window="  "), ["o/a"]))
+    # -- THE WINDOW IS CHECKED AGAINST THE RECORDS IT IS MADE OVER (#1887). It used to be any
+    # non-blank string, while the report quoted it as the scope the completeness claim was made
+    # over: a manifest whose window said one thing and whose records enumerated another was
+    # indistinguishable from a correct one. Bounds and records are now in the SAME units.
+    check("a window is read as an INCLUSIVE PR-number range",
+          window_bounds("#3..#7", "o/a"), (3, 7))
+    inclusive = fixture("records ON both bounds and between them are ACCEPTED (the refusals below "
+                        "are real distinctions, not a window that rejects everything)",
+                        lambda: expected_records(_manifest({"o/a": [1, 4, 9]}, window="#1..#9"),
+                                                 ["o/a"]))
+    check("...and all three become expected records (the bounds are inclusive, not off by one)",
+          sorted(inclusive["o/a"]["records"]) if inclusive else None,
+          ["o--a--pr1.json", "o--a--pr4.json", "o--a--pr9.json"])
+    refuses("a manifest listing a record ABOVE its own window refuses",
+            lambda: expected_records(_manifest({"o/a": [1, 12]}, window="#1..#9"), ["o/a"]))
+    refuses("...and one BELOW its own window refuses too",
+            lambda: expected_records(_manifest({"o/a": [2, 5]}, window="#4..#9"), ["o/a"]))
+    refuses("a DATE window refuses: no record carries a timestamp, so it bounds nothing this "
+            "module can check",
+            lambda: expected_records(_manifest({"o/a": [1]}, window="2026-07-01..2026-07-28"),
+                                     ["o/a"]))
+    refuses("a window whose bounds carry no `#` refuses",
+            lambda: expected_records(_manifest({"o/a": [1]}, window="1..9"), ["o/a"]))
+    # MULTI-DIGIT on purpose. With a single-digit bound the `#` requirement and the slice that
+    # strips it mask each other — `"1"[1:]` is empty and refuses anyway — so dropping the prefix
+    # check alone survives the row above. `"12..99"` is where the two come apart: without the
+    # check it reads as the window #2..#9, silently narrowing the scope by ten PRs.
+    refuses("...including a multi-digit one, which without the `#` check would read as #2..#9",
+            lambda: window_bounds("12..99", "o/a"))
+    refuses("a window carrying trailing prose refuses (a partly-checked scope is unchecked)",
+            lambda: expected_records(_manifest({"o/a": [1]}, window="#1..#9 (July)"), ["o/a"]))
+    refuses("a window that names one bound and no range refuses",
+            lambda: window_bounds("#7", "o/a"))
+    refuses("a window with a third bound refuses rather than reading the first two",
+            lambda: window_bounds("#1..#4..#9", "o/a"))
+    refuses("a zero-padded window bound refuses, exactly as in a record name",
+            lambda: window_bounds("#01..#09", "o/a"))
+    refuses("a window bound that is not a positive PR number refuses",
+            lambda: window_bounds("#0..#9", "o/a"))
+    refuses("a window whose low bound is above its high bound refuses (it contains nothing)",
+            lambda: window_bounds("#9..#1", "o/a"))
+    refuses("a window that is not a string at all refuses",
+            lambda: window_bounds(20260701, "o/a"))
     refuses("a manifest entry expecting NO record refuses (it asserts nothing)",
             lambda: expected_records(_manifest({"o/a": []}), ["o/a"]))
     refuses("a manifest entry with a non-PR-number record refuses",
@@ -747,8 +884,10 @@ def _self_test():
     refuses("a manifest entry with a duplicate PR number refuses",
             lambda: expected_records(_manifest({"o/a": [1, 1]}), ["o/a"]))
     refuses("an empty manifest refuses", lambda: expected_records(_manifest({}), ["o/a"]))
+    filed = fixture("a two-target manifest is accepted",
+                    lambda: expected_records(_manifest({"o/a": [1, 2]}), ["o/a", "o/b"]))
     check("a manifest number becomes THIS target's record filename, never another row's",
-          sorted(expected_records(_manifest({"o/a": [1, 2]}), ["o/a", "o/b"])["o/a"]["records"]),
+          sorted(filed["o/a"]["records"]) if filed else None,
           ["o--a--pr1.json", "o--a--pr2.json"])
 
     # -- FAIL CLOSED 3: no salt => no candidate anywhere, on the SAME corpus that produces them.
@@ -773,9 +912,10 @@ def _self_test():
     # -- FAIL CLOSED 4: an evidenced account that no granted handle explains is surfaced.
     retired = {"o/a": collections.Counter({_H["acct01"]: 1, _H["acctzz"]: 3}),
                "o/b": collections.Counter()}
-    retired_report = audit(pools, retired, salt=SALT,
-                           observed={"o/a": {"o--a--pr1.json", "o--a--pr5.json"}},
-                           expected=expected_records(_manifest({"o/a": [1, 5]}), ["o/a", "o/b"]))
+    retired_report = audit(
+        pools, retired, salt=SALT, observed={"o/a": {"o--a--pr1.json", "o--a--pr5.json"}},
+        expected=fixture("a manifest whose records straddle its window bounds is ACCEPTED",
+                         lambda: expected_records(_manifest({"o/a": [1, 5]}), ["o/a", "o/b"])))
     row = retired_report["targets"]["o/a"]
     check("an unexplained (retired/foreign) account is counted", row["unexplained_accounts"], 1)
     check("...and does NOT mark any granted handle evidenced", row["evidenced"], ["acct01"])
@@ -811,12 +951,14 @@ def _self_test():
         manifest_path = root / "expected.json"
         manifest_path.write_text(_manifest({"o/a": [1, 2], "o/b": [3]}), encoding="utf-8")
         before = {path.name: path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
-        end_to_end = run(str(policy_path), str(prov), salt=SALT,
-                         expected_path=str(manifest_path))
+        end_to_end = fixture("the end-to-end run over real files completes",
+                             lambda: run(str(policy_path), str(prov), salt=SALT,
+                                         expected_path=str(manifest_path)))
         check("the end-to-end run reproduces the per-target scoping",
-              end_to_end["targets"]["o/a"]["revocation_candidates"], ["acct03"])
+              end_to_end["targets"]["o/a"]["revocation_candidates"] if end_to_end else None,
+              ["acct03"])
         check("a non-record file in the corpus directory is ignored",
-              end_to_end["foreign_records"], 1)
+              end_to_end["foreign_records"] if end_to_end else None, 1)
         check("the same end-to-end run WITHOUT a manifest proposes nothing (not vacuous)",
               [row["revocation_candidates"]
                for row in run(str(policy_path), str(prov), salt=SALT)["targets"].values()],
@@ -835,11 +977,11 @@ def _self_test():
                 lambda: run(str(policy_path), str(prov), salt=SALT,
                             expected_path=str(manifest_path)))
         misnamed.unlink()
-        check("...and the SAME run without that one file scopes normally (the refusal is not "
-              "vacuous)",
-              run(str(policy_path), str(prov), salt=SALT,
-                  expected_path=str(manifest_path))["targets"]["o/a"]["revocation_candidates"],
-              ["acct03"])
+        rerun = fixture("...and the SAME corpus without that one file is readable again",
+                        lambda: run(str(policy_path), str(prov), salt=SALT,
+                                    expected_path=str(manifest_path)))
+        check("...and it scopes normally (the refusal above is not vacuous)",
+              rerun["targets"]["o/a"]["revocation_candidates"] if rerun else None, ["acct03"])
 
         refuses("a missing provenance directory refuses",
                 lambda: run(str(policy_path), str(root / "nope"), salt=SALT))
@@ -927,8 +1069,10 @@ def main():
               "is ever proposed. The salt is never printed."))
     parser.add_argument(
         "--expected-records", default=None,
-        help=("path to the durable expected-record manifest that bounds the corpus "
-              '({"targets": {"<owner>/<repo>": {"window": "...", "records": [<PR number>, ...]}}}).'
+        help=('path to the durable expected-record manifest that bounds the corpus ({"targets": '
+              '{"<owner>/<repo>": {"window": "#<low>..#<high>", "records": [<PR number>, ...]}}}). '
+              "The window is an INCLUSIVE PR-number range and every listed record must lie inside "
+              "it: a window this tool cannot check would be a scope the reader takes on trust."
               " Without it, or with any expected record absent, the row is partial-evidence and no "
               "revocation candidate is proposed — a corpus not known to be complete cannot show "
               "disuse."))

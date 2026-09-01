@@ -188,6 +188,13 @@ it was derived from as prose inside the same string. Tightening the audit to ver
 to refuse a manifest older than some age, is a separate change (follow-up), and until it lands
 **"generated" buys review-ability, not verification**.
 
+> **Update (#1887): the range half of that has landed.** `window` must now be exactly
+> `#<low>..#<high>` and every number in `records` must lie inside it — so a generator must emit the
+> number range and **must not** append the derived date bounds to the same string (a window with
+> trailing prose is refused; put the derivation in a separate key). The line above about the table's
+> `window` row — *"shape only — nothing binds the window to the records"* — no longer describes the
+> code. **Freshness is still unchecked**: nothing refuses a manifest generated months ago.
+
 ### 5.4 Enumeration hygiene the repo already fixed once
 
 `scripts/metrics.py` is the prior art and its two rules transfer directly:

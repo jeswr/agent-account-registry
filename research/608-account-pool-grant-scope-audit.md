@@ -104,7 +104,13 @@ an audit and closes with this record rather than with a policy diff.
 
 For the maintainer, on a checkout that carries the `ledger` provenance records, with
 `expected.json` naming — per target — the observation window and every worker PR that window
-contains (`{"targets": {"sparq-org/sparq": {"window": "...", "records": [2434, 2439, ...]}}}`):
+contains
+(`{"targets": {"sparq-org/sparq": {"window": "#2434..#2542", "records": [2434, 2439, ...]}}}`):
+
+The `window` is an **inclusive PR-number range** and every number in `records` must lie inside it
+(#1887) — the audit refuses a manifest whose stated scope and whose record list describe different
+populations. A date range is not accepted: no provenance record carries a timestamp, so a date
+window would be text the reader is asked to take on trust.
 
 ```
 PROVENANCE_SALT=... python3 scripts/grant-scope-audit.py \
