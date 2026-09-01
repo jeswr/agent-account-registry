@@ -2456,8 +2456,13 @@ def _collect_defuse_prs(
             snapshot = _live_defuse_snapshot(
                 api, repo, number, detail, now, stale_seconds, bot_login
             )
-        except GroomError as exc:
-            print(f"ALERT PR {repo}#{number}: {exc} — defuse deferred")
+        except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #1650)
+            # See _execute_age_unpark_actions' handler for the canonical rationale. This loop's
+            # escape route is one hop longer than the sweep's own: a non-GroomError leaves this
+            # function, is missed by the per-repo snapshot try that calls it, and propagates out of
+            # run_sweep before _release_claims — so the whole tick's reclaim is lost to one PR's
+            # malformed latch payload.
+            print(f"ALERT PR {repo}#{number}: {_deferral_detail(exc)} — defuse deferred")
             continue
         if snapshot is not None:
             candidates[(repo, number)] = snapshot
@@ -3090,9 +3095,11 @@ def _execute_age_unpark_actions(
                 _drop_label()
                 unparked += 1
             except Exception as exc:  # noqa: BLE001 — see below; this PR defers, the sweep runs on
-                # THE CANONICAL STATEMENT OF THE PER-OBJECT FAILURE BOUNDARY (issues #647, #774).
-                # run_sweep's three sibling loops — stale-PR detection, issue status repair and
-                # stale-PR hand-off — cite this comment instead of restating it (AGENTS.md: one
+                # THE CANONICAL STATEMENT OF THE PER-OBJECT FAILURE BOUNDARY (issues #647, #774,
+                # #1650). Every sibling per-object handler in this module — stale-PR detection,
+                # issue status repair, stale-PR hand-off, the per-repo target snapshot, the
+                # attempt-budget read, both terminal-reap revalidation reads, and the two defuse
+                # handlers — cites this comment instead of restating it (AGENTS.md: one
                 # definition, plus pointers).
                 #
                 # A handler catches the BOUNDARY, never a failure CLASS. `except GroomError`
@@ -3173,8 +3180,13 @@ def _execute_defuse_actions(
                 if isinstance(pull, dict)
                 else None
             )
-        except GroomError as exc:
-            print(f"ALERT PR {action.repo}#{action.number}: {exc} — defuse deferred")
+        except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #1650)
+            # See _execute_age_unpark_actions' handler for the canonical rationale: a
+            # non-GroomError escaping here aborts the sweep before _release_claims. Nothing in the
+            # revalidation reads can raise RedraftUnavailable — only _redraft_pr does, below — so
+            # this handler needs no ordering carve-out; the MUTATION block does, and keeps one.
+            print(f"ALERT PR {action.repo}#{action.number}: {_deferral_detail(exc)} — "
+                  "defuse deferred")
             continue
         if snapshot != (action.head_sha, action.updated_at):
             print(
@@ -3194,6 +3206,10 @@ def _execute_defuse_actions(
         # The mutation pair sits INSIDE the same per-PR resilience block as the revalidation above
         # (issue #644 defect 2). RedraftUnavailable is caught FIRST — it is a subclass, and it is
         # the not-a-property-of-this-PR case, so it is recorded separately and reds the run.
+        # [#1650] That ordering is now LOAD-BEARING rather than merely tidy: the second handler
+        # catches the failure BOUNDARY, so moving it above this one would swallow a run-level
+        # RedraftUnavailable (no `gh`, no owner token) into a per-PR deferral and let precedence
+        # rule 3 report a green run for a phase that can never complete anything.
         try:
             _redraft_pr(action.repo, action.number, tokens.get(owner, ""))
             api.request(
@@ -3208,9 +3224,12 @@ def _execute_defuse_actions(
             )
             unavailable.append(f"{action.repo}#{action.number}: {exc}")
             continue
-        except GroomError as exc:
-            print(f"ALERT PR {action.repo}#{action.number}: {exc} — defuse deferred")
-            deferred.append(f"{action.repo}#{action.number}: {exc}")
+        except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #1650)
+            # See _execute_age_unpark_actions' handler for the canonical rationale: a
+            # non-GroomError escaping here aborts the sweep before _release_claims.
+            detail = _deferral_detail(exc)
+            print(f"ALERT PR {action.repo}#{action.number}: {detail} — defuse deferred")
+            deferred.append(f"{action.repo}#{action.number}: {detail}")
             continue
         print(f"WRITE defuse parked PR repo={action.repo} pr={action.number}")
         changed += 1
@@ -3874,13 +3893,19 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             repo_defuse = _collect_defuse_prs(
                 api, repo, repo_pulls, now, defuse_stale_seconds, bot_login
             )
-        except GroomError as exc:
+        except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #1650)
+            # See _execute_age_unpark_actions' handler for the canonical rationale: a
+            # non-GroomError escaping here aborts the sweep before _release_claims. This one is
+            # the WIDEST blast radius of them all — the try spans two listings AND
+            # _collect_defuse_prs, so a single malformed payload anywhere under it used to cost
+            # EVERY repo its reclaim, not just this one.
+            detail = _deferral_detail(exc)
             print(
-                f"ALERT repo {repo}: {exc} — target snapshot unreadable, so this repo's "
+                f"ALERT repo {repo}: {detail} — target snapshot unreadable, so this repo's "
                 "issue/PR grooming AND its lease releases defer this tick (every OTHER repo's "
                 "reclaim still runs)"
             )
-            snapshot_deferrals.append(f"{repo}: {exc}")
+            snapshot_deferrals.append(f"{repo}: {detail}")
             unreadable_repos.add(repo)
             continue
         snapshot_completed += 1
@@ -3917,12 +3942,15 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 # budget is spent.
                 try:
                     fetched = count_attempts(_comments(api, repo, number), bot_login)
-                except GroomError as exc:
+                except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #1650)
+                    # See _execute_age_unpark_actions' handler for the canonical rationale: a
+                    # non-GroomError escaping here aborts the sweep before _release_claims.
+                    detail = _deferral_detail(exc)
                     print(
-                        f"ALERT issue {repo}#{number}: {exc} — attempt-budget read deferred; "
+                        f"ALERT issue {repo}#{number}: {detail} — attempt-budget read deferred; "
                         "the issue is excluded from planning this tick"
                     )
-                    budget_deferrals.append(f"{repo}#{number}: {exc}")
+                    budget_deferrals.append(f"{repo}#{number}: {detail}")
                     unplannable_issues.add((repo, number))
                     continue
                 attempts[(repo, number)] = fetched
@@ -4096,20 +4124,24 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         for repo in sorted({parse_holder(lease["holder"]).repo for lease in candidate_leases}):
             try:
                 current_pulls[repo] = _pulls(groomable[repo], repo)
-            except GroomError as exc:
+            except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #1650)
+                # See _execute_age_unpark_actions' handler for the canonical rationale: a
+                # non-GroomError escaping here aborts the sweep before _release_claims — which
+                # this loop sits only a few statements ahead of.
+                detail = _deferral_detail(exc)
                 withdrawn = [
                     lease for lease in candidate_leases
                     if parse_holder(lease["holder"]).repo == repo
                 ]
                 print(
-                    f"ALERT repo {repo}: {exc} — fresh PR listing unreadable, so terminal reap "
+                    f"ALERT repo {repo}: {detail} — fresh PR listing unreadable, so terminal reap "
                     f"revalidation defers for {len(withdrawn)} claim(s); the leases are RETAINED "
                     "(an unread pull listing cannot prove the ABSENCE of a worker PR)"
                 )
                 for lease in withdrawn:
                     reap_attempted += 1
                     reap_deferrals.append(
-                        f"{repo}#{parse_holder(lease['holder']).issue}: {exc}"
+                        f"{repo}#{parse_holder(lease['holder']).issue}: {detail}"
                     )
                     unproven_claims.add(lease["claim_id"])
         if unproven_claims:
@@ -4124,13 +4156,17 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             reap_attempted += 1
             try:
                 issue = _fresh_issue(groomable[holder.repo], holder.repo, holder.issue)
-            except GroomError as exc:
+            except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #1650)
+                # See _execute_age_unpark_actions' handler for the canonical rationale: a
+                # non-GroomError escaping here aborts the sweep before _release_claims — which
+                # this loop sits only a few statements ahead of.
+                detail = _deferral_detail(exc)
                 print(
-                    f"ALERT lease claim={lease['claim_id'][:8]}: {exc} — terminal reap "
+                    f"ALERT lease claim={lease['claim_id'][:8]}: {detail} — terminal reap "
                     f"revalidation deferred for {holder.repo}#{holder.issue}; the lease is "
                     "RETAINED (an unread issue must never confirm a release)"
                 )
-                reap_deferrals.append(f"{holder.repo}#{holder.issue}: {exc}")
+                reap_deferrals.append(f"{holder.repo}#{holder.issue}: {detail}")
                 unproven_claims.add(lease["claim_id"])
                 continue
             reap_completed += 1
@@ -6110,6 +6146,29 @@ def _self_test() -> int:
             "unavailable for the whole run" in (no_token_reason or ""),
         ),
         (2, (), True, True),
+    )
+    # [#1650] THE HANDLER ORDER, now that the one behind it catches the failure BOUNDARY rather
+    # than a failure CLASS. RedraftUnavailable is a GroomError SUBCLASS and therefore also an
+    # Exception, so putting the broadened handler first would silently reclassify a RUN-level
+    # failure — no `gh`, no owner token — as one PR's per-object deferral, and precedence rule 3
+    # would then report a green run for a phase that can never complete anything. The routing is
+    # pinned by EXACT tuple, not by a count or a substring (AGENTS.md pre-flight item 6).
+    check(
+        "#1650: the broadened per-PR defuse handler must not SWALLOW RedraftUnavailable — the "
+        "run-level class keeps its own handler AHEAD of the boundary one, so a missing owner "
+        "token stays `unavailable` (systemic) and never becomes `deferred` (per-object). Swap "
+        "the two handlers and this reds",
+        (
+            no_token.deferred if no_token else "aborted",
+            no_token.unavailable if no_token else "aborted",
+            issubclass(RedraftUnavailable, GroomError),
+        ),
+        (
+            (),
+            ("owner/repo#21: target token is unavailable for parked PR owner/repo#21",
+             "owner/repo#22: target token is unavailable for parked PR owner/repo#22"),
+            True,
+        ),
     )
     gh_missing_api = _RedraftAPI()
     gh_missing, _aborted, _gh_drafted = _run_defuse(
@@ -8832,14 +8891,17 @@ def _self_test() -> int:
             }
 
         def _sweep_with_refusals(
-            refusals: dict[tuple[str, str], GroomError],
+            # [#1650] Every refusal map is typed `Exception`, not `GroomError`: the loops these
+            # scenarios drive defer on the failure BOUNDARY, so the fixture has to be able to
+            # refuse a read with a plain ValueError as readily as with GitHub's own envelope.
+            refusals: dict[tuple[str, str], Exception],
             *,
             pulls: tuple[dict[str, Any], ...] = (),
             issues: tuple[dict[str, Any], ...] = (),
             details: tuple[dict[str, Any], ...] | None = None,
             extra_gets: dict[str, Any] | None = None,
-            paginate_refusals: dict[str, GroomError] | None = None,
-            paginate_seq_refusals: dict[tuple[str, int], GroomError] | None = None,
+            paginate_refusals: dict[str, Exception] | None = None,
+            paginate_seq_refusals: dict[tuple[str, int], Exception] | None = None,
             paginate_seq_pages: dict[tuple[str, int], list[Any]] | None = None,
             leases: tuple[dict[str, Any], ...] | None = None,
             repos: tuple[str, ...] = ("owner/repo",),
@@ -10906,10 +10968,16 @@ def _self_test() -> int:
         # invisible to every boundary/continuation row above, whose refusals carry a short,
         # single-line, non-secret message. So the leak is driven END TO END through each call
         # site, one scenario per site, each asserted independently.
+        # ONE definition of the leaky failure, as an instance: #1650's sites are refused through
+        # the fixture's refusal MAPS (which hold an exception object) as well as through
+        # `side_effects` (which holds a raiser), and two copies of this literal would be two
+        # copies of one guard — AGENTS.md pre-flight item 4.
+        _leaky_failure = ValueError(
+            "malformed park receipt stamp\n(ghs_deferralleak87654321)\n" + "y" * 5000
+        )
+
         def _raise_leaky() -> None:
-            raise ValueError(
-                "malformed park receipt stamp\n(ghs_deferralleak87654321)\n" + "y" * 5000
-            )
+            raise _leaky_failure
 
         class _LeakyPages(dict):
             """The comments read the age-unpark loop makes, raising the leaky failure.
@@ -11383,6 +11451,327 @@ def _self_test() -> int:
             (reval_pull_reads, quiet_pull_reads),
             (2, 1),
         )
+
+        # ---- issue #1650: the OTHER FIVE per-object loops, refused with a NON-GroomError --------
+        # #774 broadened three handlers and deliberately left five with the identical shape still
+        # keyed on a failure CLASS. Every one of them sits upstream of, or in the same sweep as,
+        # `_release_claims`, so the exposure was #644/#647's head-of-line abort exactly: one
+        # object's plain ValueError/KeyError/TypeError cost EVERY repo its dead-lease reclaim for
+        # that tick. The injected failure is the SAME real `park_policy.parse_ts(None)` ValueError
+        # the #774 scenarios use, and its non-GroomError-ness is asserted up there — so a class
+        # that silently became a GroomError could not quietly turn these into a re-run of the
+        # already-covered #649 scenarios.
+        #
+        # These handlers NEST — the per-repo snapshot try spans `_collect_defuse_prs`, and a
+        # failure the inner handler catches never reaches the outer one at all. So "reclaim still
+        # ran" is NOT a sufficient assertion here: with the outer handler broadened, narrowing the
+        # inner one alone still leaves reclaim running, which is precisely the mutually-masking
+        # shape AGENTS.md pre-flight item 4 names. Every scenario below therefore also pins WHICH
+        # phase absorbed the failure, through the SUMMARY counters, so each handler is killable on
+        # its own.
+
+        # (5) THE PER-REPO TARGET SNAPSHOT. Widest blast radius of the five: its try spans both
+        # listings AND _collect_defuse_prs, and EVERY other repo's reclaim rode on it. Two targets,
+        # one of them refused, is the only fixture that can witness the head-of-line property.
+        vd_snap_log, vd_snap_error, vd_snap_releases = _sweep_with_refusals(
+            {},
+            repos=("owner/repo", "owner/other"),
+            leases=(repo_lease, other_lease),
+            paginate_refusals={_open_issues_path(): parse_ts_failure},
+        )
+        check(
+            "MUTATION #1650 (per-repo target snapshot): a NON-GroomError out of owner/repo's "
+            "issue listing defers only THAT repo — its lease is RETAINED, owner/other still "
+            "reclaims in the SAME tick, and the cause reaches the ALERT (narrow the handler back "
+            "to `except GroomError` and run_sweep ABORTS before _release_claims, releasing "
+            "NOTHING for EITHER repo)",
+            (
+                vd_snap_releases,
+                "ALERT repo owner/repo:" in vd_snap_log,
+                str(parse_ts_failure) in vd_snap_log,
+                "SKIP lease release claim=eeeeeeee: owner/repo's target snapshot was unreadable"
+                in vd_snap_log,
+                vd_snap_error,
+                "snapshot_deferred=1" in vd_snap_log,
+            ),
+            ([{"f" * 32}], True, True, True, "", True),
+        )
+
+        # (6) THE ATTEMPT-BUDGET READ. The refused issue must still leave PLANNING — a broadened
+        # handler that recorded a defaulted 0 instead would re-ready an exhausted issue — and the
+        # later issue must still be repaired while reclaim runs.
+        vd_budget_log, vd_budget_error, vd_budget_releases = _sweep_with_refusals(
+            {},
+            issues=(_commented_issue(41), _commented_issue(42)),
+            paginate_refusals={"/repos/owner/repo/issues/41/comments": parse_ts_failure},
+        )
+        check(
+            "MUTATION #1650 (attempt-budget read): a NON-GroomError out of ONE issue's comments "
+            "listing defers only THAT issue — it is EXCLUDED from planning (never planned from a "
+            "defaulted 0), #42 is still re-readied, reclaim still runs, and the phase counts the "
+            "deferral rather than swallowing it",
+            (
+                vd_budget_releases,
+                "ALERT issue owner/repo#41:" in vd_budget_log,
+                "attempt-budget read deferred" in vd_budget_log,
+                str(parse_ts_failure) in vd_budget_log,
+                "SKIP issue owner/repo#41: attempt budget unreadable" in vd_budget_log,
+                vd_budget_error,
+                "attempt_budget_deferred=1" in vd_budget_log,
+                "reset=1 " in vd_budget_log and "repair_deferred=0" in vd_budget_log,
+            ),
+            ([{"e" * 32}], True, True, True, True, "", True, True),
+        )
+
+        # (7) THE TERMINAL-REAP FRESH PULL LISTING — the SECOND read of a path whose FIRST read
+        # (the snapshot's) succeeded, so the snapshot try above cannot cover it. The
+        # `snapshot_deferred=0` element is the instrument validation AND the discriminator:
+        # without it a broadened snapshot handler would mask a narrowed one here.
+        vd_reval_log, vd_reval_error, vd_reval_releases = _sweep_with_refusals(
+            {},
+            repos=("owner/repo", "owner/other"),
+            leases=(repo_lease, other_lease),
+            paginate_seq_refusals={(_open_pulls_path(), 2): parse_ts_failure},
+        )
+        check(
+            "MUTATION #1650 (terminal reap — fresh PR listing): a NON-GroomError on the REAP "
+            "re-read withdraws only owner/repo's claims and RETAINS the lease, while owner/other "
+            "reclaims in the same tick and the snapshot phase reports clean",
+            (
+                vd_reval_releases,
+                "ALERT repo owner/repo:" in vd_reval_log,
+                "fresh PR listing unreadable" in vd_reval_log,
+                str(parse_ts_failure) in vd_reval_log,
+                vd_reval_error,
+                "reap_deferred=1" in vd_reval_log,
+                "snapshot_deferred=0" in vd_reval_log,
+            ),
+            ([{"f" * 32}], True, True, True, "", True, True),
+        )
+
+        # (8) THE TERMINAL-REAP PER-LEASE FRESH ISSUE. Record-and-continue fails OPEN here, so the
+        # broadened handler must keep the OPPOSITE degradation: withdraw the claim, RETAIN the
+        # lease, and never confirm a release on a read that never returned.
+        vd_reap_log, vd_reap_error, vd_reap_releases = _sweep_with_refusals(
+            {("GET", "/repos/owner/repo/issues/7"): parse_ts_failure},
+            leases=(repo_lease, reap_lease_8),
+        )
+        check(
+            "MUTATION #1650 (terminal reap — per-lease fresh issue): a NON-GroomError on ONE "
+            "claim's fresh issue read RETAINS that lease while the readable claim in the same "
+            "batch still reclaims — releasing BOTH (record-and-continue) or NEITHER (the abort) "
+            "reds this",
+            (
+                vd_reap_releases,
+                "ALERT lease claim=eeeeeeee:" in vd_reap_log,
+                "terminal reap revalidation deferred for owner/repo#7" in vd_reap_log,
+                "the lease is RETAINED" in vd_reap_log,
+                str(parse_ts_failure) in vd_reap_log,
+                vd_reap_error,
+                "reap_deferred=1" in vd_reap_log,
+            ),
+            ([{"d" * 32}], True, True, True, True, "", True),
+        )
+
+        # (9) + (10) THE DEFUSE PAIR. One stale, quiet, non-draft bot PR carrying the human-owned
+        # park label: a parked-PR defuse candidate, which is what puts BOTH defuse handlers on the
+        # sweep's path in a single fixture.
+        #
+        # A defuse candidate is the ONE sweep fixture that can reach `_redraft_pr`, which shells
+        # out to `gh`. So EVERY run below goes through `_sweep_defuse`, which stubs
+        # `subprocess.run`: an unstubbed run would make a real outbound `gh pr ready` call on any
+        # host that HAS a gh (the pr-gate runner does; this container does not), and the scenario
+        # would silently mean something different depending on where the suite ran.
+        class _DefuseRedraftOK:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _sweep_defuse(run_stub=None, **kwargs):
+            saved_run = subprocess.run
+            subprocess.run = run_stub or (lambda *_a, **_k: _DefuseRedraftOK())
+            try:
+                return _sweep_with_refusals(**kwargs)
+            finally:
+                subprocess.run = saved_run
+
+        def _defuse_candidate_pr(number: int) -> dict[str, Any]:
+            return {
+                "number": number,
+                "state": "open",
+                "draft": False,
+                "labels": [{"name": "needs:user"}],
+                "updated_at": datetime.fromtimestamp(
+                    now - DEFAULT_STALE_HOURS * 3600 - 600, timezone.utc
+                ).isoformat(),
+                "head": {"sha": f"{number:040x}", "ref": f"sparq-agent/issue-9{number}-fix"},
+                "user": {"login": "app[bot]", "type": "Bot"},
+                "body": "a worker PR",
+                "auto_merge": None,
+            }
+
+        # (9) `_collect_defuse_prs`' PER-PR HANDLER, one hop further from reclaim than the rest:
+        # its escape leaves the helper, is missed by the per-repo snapshot try that CALLS it, and
+        # aborts run_sweep. `snapshot_deferred=0` is the whole point of the check — with the
+        # snapshot handler broadened, a narrowed handler HERE still leaves reclaim running and
+        # would be invisible to a releases-only assertion (mutually-masking duplicates).
+        vd_collect_log, vd_collect_error, vd_collect_releases = _sweep_defuse(
+            refusals={},
+            pulls=(_defuse_candidate_pr(21),),
+            side_effects={("GET", "/repos/owner/repo/pulls/21", 1): _raise_parse_ts},
+        )
+        check(
+            "MUTATION #1650 (_collect_defuse_prs): a NON-GroomError out of ONE PR's latch read "
+            "defers only that PR's defuse — reclaim still runs and the repo's snapshot is NOT "
+            "dropped (narrow this handler and the whole repo defers; narrow the snapshot handler "
+            "too and the sweep aborts before _release_claims)",
+            (
+                vd_collect_releases,
+                "ALERT PR owner/repo#21:" in vd_collect_log,
+                "defuse deferred" in vd_collect_log,
+                str(parse_ts_failure) in vd_collect_log,
+                vd_collect_error,
+                "snapshot_deferred=0" in vd_collect_log,
+                "defused_prs=0" in vd_collect_log,
+            ),
+            ([{"e" * 32}], True, True, True, "", True, True),
+        )
+
+        # (10a) `_execute_defuse_actions`' REVALIDATION handler. Same PR, same failure, a LATER
+        # read: the candidate is collected cleanly and only its mutation-boundary re-read raises,
+        # so this scenario reaches a handler (9)'s cannot. `defused_prs=0` with a clean snapshot
+        # is what separates the two.
+        #
+        # INSTRUMENT VALIDATION FIRST. The ordinal below is a LITERAL, never derived from the code
+        # under test (AGENTS.md pre-flight item 2b), so it needs its own witness: a CLEAN sweep of
+        # this fixture reads that PR's detail exactly three times — `_collect_defuse_prs`, the
+        # stale-PR detection loop, and the defuse revalidation — so ordinal 3 is the LAST of them
+        # and is the read (10a) is named for. Add or drop a detail read anywhere in the sweep and
+        # this reds here rather than silently re-aiming (10a) at a different handler.
+        _sweep_defuse(refusals={}, pulls=(_defuse_candidate_pr(21),))
+        _DEFUSE_REVALIDATE_GET = 3
+        check(
+            "#1650 INSTRUMENT VALIDATION: the defuse revalidation is the LAST of the sweep's "
+            "three reads of a defuse candidate's PR detail, so injecting at that ordinal reaches "
+            "that handler and no other",
+            terminal_sweep_env["call_counts"].get(("GET", "/repos/owner/repo/pulls/21")),
+            _DEFUSE_REVALIDATE_GET,
+        )
+        vd_defuse_reval_log, vd_defuse_reval_error, vd_defuse_reval_releases = _sweep_defuse(
+            refusals={},
+            pulls=(_defuse_candidate_pr(21),),
+            side_effects={
+                ("GET", "/repos/owner/repo/pulls/21", _DEFUSE_REVALIDATE_GET): _raise_parse_ts},
+        )
+        check(
+            "MUTATION #1650 (_execute_defuse_actions revalidation): a NON-GroomError on the "
+            "defuse mutation-boundary re-read defers only that PR — reclaim still runs, the "
+            "repo's snapshot is clean, and nothing is redrafted",
+            (
+                vd_defuse_reval_releases,
+                "ALERT PR owner/repo#21:" in vd_defuse_reval_log,
+                "defuse deferred" in vd_defuse_reval_log,
+                str(parse_ts_failure) in vd_defuse_reval_log,
+                vd_defuse_reval_error,
+                "snapshot_deferred=0" in vd_defuse_reval_log,
+                "defused_prs=0" in vd_defuse_reval_log,
+            ),
+            ([{"e" * 32}], True, True, True, "", True, True),
+        )
+
+        # (10b) `_execute_defuse_actions`' MUTATION handler, the one that sits BEHIND the
+        # RedraftUnavailable carve-out. `subprocess.run` itself raises the non-GroomError, so the
+        # failure enters through `_redraft_pr` exactly as a malformed `gh` interaction would.
+        # Because this is the ONLY candidate, precedence rule 2 also applies: the broadened
+        # handler must RECORD the deferral, so the run exits NON-zero naming the phase — a
+        # broadened catch that merely swallowed would report a silent green here.
+        def _defuse_run_raises(*_args, **_kwargs):
+            _raise_parse_ts()
+
+        vd_defuse_log, vd_defuse_error, vd_defuse_releases = _sweep_defuse(
+            _defuse_run_raises, refusals={}, pulls=(_defuse_candidate_pr(21),)
+        )
+        check(
+            "MUTATION #1650 (_execute_defuse_actions mutation): a NON-GroomError out of the "
+            "redraft defers that PR instead of aborting — dead-lease reclaim STILL RUNS — and, "
+            "the phase having completed nothing, the run still exits NON-zero naming it (a "
+            "broadened handler must not buy SILENCE)",
+            (
+                vd_defuse_releases,
+                "ALERT PR owner/repo#21:" in vd_defuse_log,
+                "defuse deferred" in vd_defuse_log,
+                str(parse_ts_failure) in vd_defuse_log,
+                "defused_prs=0 defuse_deferred=1" in vd_defuse_log,
+                "every parked PR defuse failed (1 attempted, 0 completed)" in vd_defuse_error,
+                "owner/repo#21" in vd_defuse_error,
+            ),
+            ([{"e" * 32}], True, True, True, True, True, True),
+        )
+
+        # (11) THE MASKING CONTRACT, at EVERY ONE of the seven newly widened handlers. Same
+        # argument as #774's loop over its four: `_deferral_detail` is SHARED, so the residual
+        # defect is a WIRING one — put `str(exc)` back at ONE call site and the helper stays
+        # correct while THAT handler leaks arbitrary exception text into the operator log,
+        # invisible to every boundary/continuation row above (whose refusals all carry short,
+        # single-line, non-secret messages). So each call site is driven END TO END on its own.
+        # The expected line is a LITERAL — no term of it is read from `_TOKEN_SHAPE`,
+        # `GH_DETAIL_LIMIT` or the raiser (AGENTS.md pre-flight item 2b/2c).
+        def _defuse_redraft_leak() -> str:
+            return _sweep_defuse(
+                lambda *_a, **_k: _raise_leaky(),
+                refusals={}, pulls=(_defuse_candidate_pr(21),),
+            )[0]
+
+        for site, prefix, tail, run_leaky in (
+            ("per-repo target snapshot", "ALERT repo owner/repo:",
+             "target snapshot unreadable, so this repo's issue/PR grooming AND its lease "
+             "releases defer this tick (every OTHER repo's reclaim still runs)",
+             lambda: _sweep_with_refusals(
+                 {}, repos=("owner/repo", "owner/other"), leases=(repo_lease, other_lease),
+                 paginate_refusals={_open_issues_path(): _leaky_failure})[0]),
+            ("attempt-budget read", "ALERT issue owner/repo#41:",
+             "attempt-budget read deferred; the issue is excluded from planning this tick",
+             lambda: _sweep_with_refusals(
+                 {}, issues=(_commented_issue(41), _commented_issue(42)),
+                 paginate_refusals={
+                     "/repos/owner/repo/issues/41/comments": _leaky_failure})[0]),
+            ("terminal reap — fresh PR listing", "ALERT repo owner/repo:",
+             "fresh PR listing unreadable, so terminal reap revalidation defers for 1 claim(s); "
+             "the leases are RETAINED (an unread pull listing cannot prove the ABSENCE of a "
+             "worker PR)",
+             lambda: _sweep_with_refusals(
+                 {}, repos=("owner/repo", "owner/other"), leases=(repo_lease, other_lease),
+                 paginate_seq_refusals={(_open_pulls_path(), 2): _leaky_failure})[0]),
+            ("terminal reap — per-lease fresh issue", "ALERT lease claim=eeeeeeee:",
+             "terminal reap revalidation deferred for owner/repo#7; the lease is RETAINED (an "
+             "unread issue must never confirm a release)",
+             lambda: _sweep_with_refusals(
+                 {("GET", "/repos/owner/repo/issues/7"): _leaky_failure},
+                 leases=(repo_lease, reap_lease_8))[0]),
+            ("_collect_defuse_prs", "ALERT PR owner/repo#21:", "defuse deferred",
+             lambda: _sweep_defuse(
+                 refusals={}, pulls=(_defuse_candidate_pr(21),),
+                 side_effects={("GET", "/repos/owner/repo/pulls/21", 1): _raise_leaky})[0]),
+            ("_execute_defuse_actions revalidation", "ALERT PR owner/repo#21:", "defuse deferred",
+             lambda: _sweep_defuse(
+                 refusals={}, pulls=(_defuse_candidate_pr(21),),
+                 side_effects={("GET", "/repos/owner/repo/pulls/21", _DEFUSE_REVALIDATE_GET):
+                               _raise_leaky})[0]),
+            ("_execute_defuse_actions mutation", "ALERT PR owner/repo#21:", "defuse deferred",
+             _defuse_redraft_leak),
+        ):
+            leaky_log = run_leaky()
+            check(
+                f"#1650 ({site}): THIS handler's deferral goes through the masking contract — "
+                "credential SHAPE masked, collapsed to ONE line, truncated at the bound. Wire "
+                "this one call site back to `str(exc)`, leaving the shared helper untouched, and "
+                "the raw token, both newlines and all 5000 characters reach the operator log",
+                (
+                    "ghs_deferralleak87654321" in leaky_log,
+                    [line for line in leaky_log.splitlines() if line.startswith(prefix)],
+                ),
+                (False, [f"{prefix} {leaky_detail} — {tail}"]),
+            )
     finally:
         globals().update(terminal_sweep_saved)
 
