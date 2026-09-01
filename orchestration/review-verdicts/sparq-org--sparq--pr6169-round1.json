@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6169,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dafbc796f435b1af93df38a443fac3aad5678b55",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow change correctly replaces job-scoped rust-cache `key` inputs with one byte-identical `shared-key`, allowing the three coverage execution partitions and the merge job to reuse the same dependency cache while retaining the existing main-only save discipline. The structural test is non-vacuous: it locates each named job, requires exactly one rust-cache step, requires equal non-null shared keys, rejects a bare key, and is wired into docs-quality CI. The focused test suite passes, and the run/build-object paths use the same crate, feature set, target layout, and job-level RUSTFLAGS. No security, correctness, or completeness issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
