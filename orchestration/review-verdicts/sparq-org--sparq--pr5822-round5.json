@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5822,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e46a45e38a0005794ead10f504cc8eaa7dfaf179",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The design requires the evaluator to fire for every sibling workflow, yet PASS remains satisfied by runs from at least two distinct triggering workflows. A qualifying head may have more than two completed sibling workflows; events from any two then satisfy PASS even if another completed sibling never triggers the evaluator. The expanded FAIL definition does not repair this because the incomplete two-sibling observation is classified as PASS before or at the settle deadline. Stage 2 can therefore proceed without demonstrating the stated universal-routing invariant.",
+    "file": "research/ci-gate-slotless-aggregation.md",
+    "fix_hint": "For the qualifying head, mechanically derive the complete expected sibling set from the completed workflows used to qualify the observation, with deterministic documented exclusions. Require the observed distinct github.event.workflow_run.name set to cover that expected set before PASS. Declare FAIL after the settle window when any expected sibling is missing, and route that outcome to decision 4's checked-enumeration fallback.",
+    "severity": "major",
+    "title": "PASS still proves only two-sibling routing, not routing for every expected sibling"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4's major finding remains unresolved. The document still defines the required invariant as firing for every sibling workflow, but PASS still requires events from only two distinct triggering workflows. On a qualifying head with three or more completed siblings, two observed evaluator runs can produce PASS while another expected sibling never routes. Because stage 2 is blocked only on this insufficient PASS criterion, the required context could be enabled without evidence of universal routing. Progress is stagnant because the same major correctness gap remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
