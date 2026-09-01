@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5773,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b94b7cc1cf3f4eefa52e14b40d873542533052ca",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The shared floor constant is consumed by both the real crate-local runner and the central scoreboard, while an independent pinned-value test prevents silent lowering. The runner is non-vacuous: it traverses every manifest case through the real PodStore authorization/query path, rejects unknown expectation types, asserts each expected result, and enforces both full traversal and the shared minimum count. The scoreboard metadata and generated totals are consistent with the 15-case Editor's Draft query-semantics-only scope, generic test job, provenance pin, and legacy feature exclusion. No correctness, soundness, security, or test-validity issue is evident. Compared with round 3, there are still no findings, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
