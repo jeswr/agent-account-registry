@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2139,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b35c524eafd97b00e2d083e4f2f08ef2acf8adda",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Every new fixture either yields a non-empty result or is expected to raise. Nothing asserts the third outcome the function must support: the provenance directory EXISTS on the ledger but holds no record for this repo yet (in production, a fresh ledger carrying only `orchestration/provenance/README.md`), which must return an empty set quietly.\n\nToday the code is correct \u2014 the README satisfies `any(path.startswith(prefix))` and the loop matches nothing. But the property is unpinned: mutating the new guard from \"no entry under the directory\" to \"no matching record\" (e.g. moving it after the loop as `if not numbers: raise`) keeps the main `{685}` check green and keeps the renamed-directory check green, while turning a genuinely-empty ledger into a fatal census. Given this raise is brand new and is the fix for round-1 major #2, its boundary is worth one line.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Add one case asserting the quiet-empty outcome, e.g.:\n\n    check(\"...and a present-but-empty provenance directory reads as 'nothing recorded'\",\n          recorded_pr_numbers(repo, \"reg/istry\", worker_pr,\n                              read_tree=lambda: {\"truncated\": False,\n                                                 \"tree\": [{\"path\": \"orchestration/provenance/README.md\",\n                                                           \"type\": \"blob\"}]}),\n          set())\n\nThis distinguishes \"the directory is gone\" (raise) from \"the directory is there and empty\" (set()), which is exactly the pair the new guard exists to separate.",
+    "severity": "nit",
+    "title": "The legitimate \"directory present, zero records\" path returns set() but is not pinned, so the new presence guard could be tightened into a false fail-closed unnoticed"
+   },
+   {
+    "body": "The old read placed the ref in the query string (`contents/{directory}?ref={LEDGER_REF}`); the new one interpolates it as a path segment ahead of the query (`git/trees/{LEDGER_REF}?recursive=1`). `LEDGER_REF` is `os.environ.get(\"REGISTRY_LEDGER_REF\", \"ledger\")` (scripts/worker-pr.py:418) and is unquoted in both, but in path position a value containing `?` or `#` can now rewrite the query \u2014 e.g. `REGISTRY_LEDGER_REF=\"ledger?recursive=0&x=\"` would silently drop recursion.\n\nDeliberately filed as a nit, not higher: the value is operator-supplied workflow configuration rather than untrusted input, the unquoted pattern is pre-existing here, and the outcome now fails CLOSED anyway \u2014 a non-recursive tree lists only top-level entries, nothing starts with `orchestration/provenance/`, and the new presence guard raises. Noting it only because `scripts/pat-validity.py:659,669` already quotes this same constant with `urllib.parse.quote(LEDGER_REF, safe='')`, so the repo has a house style this line diverges from.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Match pat-validity.py: `f\"repos/{registry_repo}/git/trees/{urllib.parse.quote(worker_pr.LEDGER_REF, safe='')}?recursive=1\"` (the module already imports `urllib.parse` at pat-validity's call sites; add the import here if absent). The existing endpoint-wiring self-test pins the default `ledger`, which quotes to itself, so it stays green.",
+    "severity": "nit",
+    "title": "`worker_pr.LEDGER_REF` moved from query-string position to path-segment position without URL quoting"
+   }
+  ],
+  "progress": "improving",
+  "summary": "All five round-1 findings are addressed, and the two majors are fixed at the mechanism level rather than papered over.\n\n(1) MAJOR #1 (untested directory-scoping guard) is killed properly. `_listing` now carries three decoys whose basename matches this repo's stem but which must NOT count: `orchestration/provenance-archive/o--r--pr686.json` (sibling directory \u2014 note `startswith(\"orchestration/provenance/\")` is False because the next char is `-`, so this is a real prefix-boundary decoy, not a trivially-different one), a bare `o--r--pr686.json` at repo root, and `orchestration/provenance/sub/o--r--pr686.json` (in-directory but nested). Expectation stays `{685}`. Mutating `name = path[len(prefix):] if ... startswith(prefix)` to `path.rpartition('/')[2]` now yields `{685, 686}` and reds. The newly load-bearing line is no longer vacuous.\n\n(2) MAJOR #2 (false fail-closed docstring) is fixed by restoring the property rather than deleting the claim: the new `if not any(... path.startswith(prefix))` raise means a renamed/moved `PROVENANCE_DIR` reds instead of returning `set()`, so \"the layout moved\" and \"nothing is recorded\" are again distinct answers. Pinned non-vacuously by the `renamed/provenance/README.md` case (delete the guard and the `else` branch fires). Steady state stays quiet because the ledger branch is cut from master, which tracks `orchestration/provenance/README.md`.\n\n(3) MINOR #3: the `not isinstance(response, dict)` arm is now covered by `read_tree=lambda: None` (removing the arm raises AttributeError, not MintError -> red) and `{\"message\": \"Not Found\"}`.\n\n(4) MINOR #4: `type == \"blob\"` filter added, pinned by the `{path: .../pr687.json, type: \"tree\"}` fixture \u2014 drop the filter and the result becomes `{685, 687}`.\n\n(5) NIT #5: `prefix` hoisted above the loop.\n\nThe endpoint-wiring pin (`repos/reg/istry/git/trees/ledger?recursive=1`, `_gh_json` patched via module globals and restored in `finally`) survives. `truncated is not False` remain\u2026 [truncated 364 chars]",
+  "verdict": "approve"
+ }
+}
