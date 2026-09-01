@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6098,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8de9de1293832a71fc5190b1d351ea9d26fc96c3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`update_inner` applies the whole request with non-atomic `update_in_place_with_budget`, then rematerializes WAC/ACP only after that call succeeds. If operation 1 mutates an ACL/ACR or other rematerialization-triggering graph and operation 2 fails or trips the shared budget, operation 1 remains applied under the documented partial-apply contract, but control returns before `permit.rematerialize` is acted on. Subsequent authorization therefore consults an auth view inconsistent with the retained access-control graph. The new tests cover only single-operation failures and do not exercise this multi-operation security invariant.",
+    "file": "crates/sparq-solid/src/lib.rs",
+    "fix_hint": "Make partial apply and authorization-view maintenance consistent. Prefer an atomic update path if its durability tradeoff can be addressed; otherwise, on apply error detect whether any retained prefix may have changed authorization inputs and conservatively rematerialize the WAC/ACP view before returning. Add a multi-operation regression test whose first operation changes an ACL/ACR graph and whose later WHERE evaluation exhausts the budget, then assert both the retained-store contract and that subsequent authorization reflects the resulting graph state. Also describe operation K precisely: a failure in K normally retains successful operations before K, not necessarily K itself.",
+    "severity": "major",
+    "title": "Partial ACL updates can leave the authorization view stale after a later budget failure"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 corrects the two false public guarantees identified previously: the update path is now explicitly documented as non-atomic, and authorization-time budget exhaustion is accurately described as aborting before an allow/deny verdict. However, the chosen non-atomic path still has a security-relevant consistency hole: if an earlier operation changes an ACL/ACR graph and a later operation fails (including by exhausting the newly threaded budget), `update_inner` returns before rematerializing the authorization view. The graph can therefore retain the access-control mutation while authorization decisions continue using stale state. Because this is the unresolved consequence of the prior round's partial-apply concern, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
