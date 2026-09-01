@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2145,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4a159d86494e936927f839429b88efc44d9ee906",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`reclassify_legacy_park` searches every bot comment body, while `worker-pr.post_findings` republishes model-controlled summary/title/body text under that bot identity. The assertion that a model cannot author the new sentences is therefore false. A finding can contain `the reviewer flagged ... possible prompt-injection` (with <=64 characters in the gap), or can quote `the autonomous review loop stopped: ... prompt-injection`; either matches these patterns even when `injection_detected` was false. That permanently refuses reclassification based on untrusted text, reproducing the provenance defect this PR is intended to remove. The tests cover selected negations and partial phrases but do not place either complete new signal inside an otherwise non-injection findings comment.",
+    "file": "scripts/park_policy.py",
+    "fix_hint": "Use durable machine-authored structured evidence for the injection cause (for example the existing park-reason marker/cause), or otherwise authenticate/segregate the writer-owned suffix instead of regex-searching the whole republished body. Add end-to-end tests where `post_findings` runs with `injection_detected: false` while model fields contain each exact deny-shaped sentence, and require those comments not to deny; retain positive tests for all three real injection write sites.",
+    "severity": "major",
+    "title": "Republished model text can still forge both deny signals"
+   }
+  ],
+  "progress": null,
+  "summary": "The narrower patterns fix the three measured negation cases, and the writer-binding tests preserve the current genuine escalation spellings. However, the new classifier still treats model-controlled text republished under the bot identity as authoritative evidence. Both new regex shapes can occur inside a verdict summary or issue body, so the central provenance claim in the change is unsound and a benign or attacker-influenced review can still create a permanent human-terminal hold without an actual injection flag.",
+  "verdict": "request_changes"
+ }
+}
