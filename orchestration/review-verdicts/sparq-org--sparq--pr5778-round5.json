@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5778,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5cc2530c70522c5237034d1fab48e36804d6d39e",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "mergeNTriples unions independently returned N-Triples documents by exact line and explicitly assumes that the same blank-node label across runs identifies the same node. Blank-node labels are document/result scoped, however, and CONSTRUCT template blank nodes are fresh for each solution and execution. Two expansion runs can both serialize unrelated fresh nodes as (for example) _:b0; concatenating/deduplicating their lines then turns them into one node and may also discard a distinct triple whose serialized text happens to match. This makes the accumulated graph semantically incorrect.",
+    "file": "packages/sparq-client/src/graph-lens.ts",
+    "fix_hint": "Do not concatenate independently scoped blank-node labels unchanged. Establish an explicit identity policy: at minimum alpha-rename blank nodes with a unique namespace per result document before union so distinct generated nodes cannot collide; if persistent store blank nodes must merge across runs, obtain a stable engine-provided identity/skolemization rather than inferring identity from result-local labels. Add a test merging two documents that both use _:b0 for different structures and assert they remain distinct, plus coverage for the intended same-store-blank-node behavior.",
+    "severity": "major",
+    "title": "Merging independent CONSTRUCT documents can conflate distinct blank nodes"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 5 regresses from round 4's zero findings: the lens expansion merge treats blank-node labels from separate CONSTRUCT result documents as globally stable identifiers. RDF blank-node labels are scoped to their result/document, and CONSTRUCT template blank nodes may be freshly allocated on each execution, so exact-line union can silently conflate distinct nodes across start expansions or repeated clicks. The otherwise relevant form-gating, focus-binding, triple-term, and annotation tests do not exercise this cross-result identity invariant.",
+  "verdict": "request_changes"
+ }
+}
