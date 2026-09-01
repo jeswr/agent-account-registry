@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2171,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "31299207d89909bb1f6a53ef6888c1aeb90c76ac",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2 says the four quoted sentences are pinned in three self-tests, each quoting the live sentences verbatim. At the cited locations, `park_policy.py` includes three rows (#3901, #3661, and one #3554 sentence), while each reconciler includes only #3901. The table's second #3554 sentence (`No instruction-like prompt injection appears in the diff.`) is not present in any of those tests. Thus the classifier result is supported, but the stated regression-test coverage is not.",
+    "file": "research/870-negated-injection-human-terminal.md",
+    "fix_hint": "Narrow the sentence to identify exactly what is pinned: three negations in the park-policy self-test and #3901 through each reconciler seam. Do not claim the fourth sentence is directly pinned unless a behavior test actually includes it.",
+    "severity": "minor",
+    "title": "Self-test coverage is overstated"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe design record's substantive conclusion is supported by the checkout: the legacy deny patterns no longer match the quoted negations, republished findings are excluded by the shared provenance seam unless they carry the reserved receipt, and the Path A/Path B disposition boundaries are described fail-closed. The document also keeps live-PR facts explicitly unmeasured and makes no behavior change. One minor evidence-description overclaim remains: the three cited self-test regions do not each quote all of the live sentences; only the park-policy suite covers three of the four table rows, while each reconciler suite pins only #3901, and the second #3554 sentence is not present in any cited test. This does not undermine the measured classifier result or warrant blocking the research record, but the test-pinning claim should be narrowed.",
+  "verdict": "approve"
+ }
+}
