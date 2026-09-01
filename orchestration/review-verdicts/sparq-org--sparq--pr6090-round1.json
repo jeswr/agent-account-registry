@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6090,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "95ba39607a3653d730a0339de6bd4db3be269a12",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "resolve_one posts thread_reply first and then calls resolve. If the reply succeeds but resolveReviewThread fails or reports isResolved=false, the thread remains unresolved with a new github-actions reply. On the next tick parse_thread records two distinct authors, so classify returns other-participant and the sweeper never retries. This recreates the permanent merge blocker the change is intended to remove. In addition, thread_reply is worded as `Resolved by` before resolution has actually succeeded, leaving a false audit statement on failure. The self-test covers failed reply => no resolve and HTTP-200 unresolved => no PR receipt, but does not run a second sweep over the resulting replied-but-unresolved thread, so it misses the stranded state.",
+    "file": "scripts/orphan-thread-sweeper.py",
+    "fix_hint": "Make the partial failure recoverable and the audit text truthful. For example, recognize only this sweeper's own uniquely marked rationale reply as a retryable participant, retain/derive the original finding as the eligibility source, and word the pre-resolution reply as an attempted/pending resolution; then add an end-to-end test where reply succeeds, resolve fails, the next tick re-enumerates that thread including the sweeper reply, and resolution is retried successfully without allowing arbitrary second-party replies. Alternatively, implement a safe rollback of the rationale comment when resolution fails and test that rollback failure also fails closed without permanently stranding the thread.",
+    "severity": "major",
+    "title": "A resolve failure after replying permanently strands the thread"
+   }
+  ],
+  "progress": null,
+  "summary": "The eligibility logic is generally fail-closed and the wiring tests are substantial, but the reply-before-resolve sequence has an unhandled partial-failure state. If the rationale reply succeeds and resolveReviewThread then fails, the next run sees the workflow bot as a second participant and permanently refuses to retry the still-unresolved orphan. The posted reply also states that the thread was resolved even though it was not. The current failure test checks only the opposite ordering failure (reply fails), so it does not expose this real mutation boundary.",
+  "verdict": "request_changes"
+ }
+}
