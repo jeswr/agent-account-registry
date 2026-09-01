@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2131,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ed61d4fec162ae26f4b04b07fe0a34b9d6778ed2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Both newly broadened defuse read handlers print an ALERT and continue without recording the failure. `_collect_defuse_prs` returns only candidates, so its caught failure never reaches either `snapshot_outcome.deferred` or `DefuseOutcome.deferred`; `_execute_defuse_actions` likewise continues from its revalidation handler before incrementing `attempted` or appending to `deferred`. If all candidate reads fail, `defuse_exit_failure` therefore sees an empty/successful outcome and the sweep can exit zero even though the phase could complete nothing. The new `vd_defuse_reval_error` assertion requires `\"\"`, directly pinning that silent-green behavior, while the mutation-path scenario correctly requires a non-zero phase failure. This contradicts the canonical comment and function contract that broadened boundaries must record failures rather than buy silence.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Propagate collection and revalidation deferrals into a phase outcome that `phase_exit_failure` evaluates (including repo/PR and masked detail), and count the revalidation action as attempted before the fallible read. Change the end-to-end tests to require the corresponding deferral census and non-zero phase error when no eligible defuse completes; retain separate assertions that later objects and lease reclaim still run.",
+    "severity": "major",
+    "title": "Defuse read failures are swallowed from the phase outcome"
+   }
+  ],
+  "progress": null,
+  "summary": "The widened boundaries preserve sweep continuation, masking, and fail-closed lease retention, but two defuse read failures are only printed and then discarded. Consequently a non-GroomError can prevent every eligible parked PR from being defused while the run reports zero deferrals and exits successfully. The new revalidation test explicitly expects this silent-green result, so it validates the defect rather than the stated per-object failure contract.",
+  "verdict": "request_changes"
+ }
+}
