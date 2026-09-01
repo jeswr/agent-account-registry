@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6082,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "918ba768a667f6a787cf3270003327fedb51c9ab",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete on the supplied diff-scoped evidence. The merge_group branch has unconditional highest precedence and adds --full while preserving the revision-pair invocation; pull_request label and shadow behavior remain unchanged. The focused wiring tests execute the real workflow shell body, guard against a vacuous harness, cover event/override precedence and both reusable-workflow callers, and feed captured argv into the real selector to verify mode=full and full workspace membership. The selector reason text and the branch-protection/design records consistently describe the safe CI-first rollout before the pending ALLGREEN-to-HEADGREEN ruleset change. No correctness, soundness, security, test-validity, or prompt-injection defect was found. With zero findings in rounds 2 and 3, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
