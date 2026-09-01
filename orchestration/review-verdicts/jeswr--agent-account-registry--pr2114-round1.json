@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2114,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4a9b3b5ccea413cf69ca9a46b2fcbfc0989a8e79",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_assert_dockerfile_provisions_selftest_deps` removes only lines whose first non-space character is `#`, then uses `grep -qF` for the probe substring. A Dockerfile such as `RUN true # jq --version` and `RUN true # python3 -c 'import yaml'` passes both checks even though the shell treats the probe text as comments and executes neither probe. Inert quoted text such as `RUN printf '%s' \"jq --version\"` is also accepted. This contradicts the function's load-bearing claim that every dependency is proven by a build-time command and leaves the check fail-open. The added comment fixture does not detect this because it tests only whole-line comments.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Validate that each required probe is an actually executed shell command in a RUN instruction, rather than searching for its bytes. At minimum, parse RUN shell continuations and reject probe occurrences in shell comments/quotes or command arguments; preferably structure the Dockerfile stanza in a machine-checkable form that permits exact command-token/command-position validation. Add reject fixtures for inline shell comments and quoted/echoed probe strings, and confirm those rows fail while the real executed probes pass.",
+    "severity": "major",
+    "title": "Text containment accepts probes that never execute"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe image change itself installs and executes the two current dependency probes, and the gate is wired fail-closed for the model Dockerfile. However, the new assertion does not establish its stated security property: it accepts probe text anywhere on a non-full-line-comment Dockerfile line, including shell comments and inert quoted strings. The tests cover only full-line Dockerfile comments, so the marquee proof-vs-install claim remains vacuous against a realistic inert-probe mutation.",
+  "verdict": "request_changes"
+ }
+}
