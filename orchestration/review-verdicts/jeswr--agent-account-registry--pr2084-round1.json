@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2084,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "02fecdca7b60a96c6421a1ced67352d369829a0e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "data/README.md documents the #1557 rule (\"an optional group means omit it \u2014 a group supplied with nothing readable in it is not a group of zeros\"; publish only when at least one field parses, otherwise drop and name on stdout) explicitly for the `cache` group. After this change the three `flow` stats behave the same way, but the prose does not say so, so a collector author reading only the README could reasonably ship `parks_1h: {}` for a quiet hour and get a warning on every dashboard build. This is a nit rather than a defect because the README already states that the consumer-side contract IS `_normalize_observability()` and that collector authors should build against the code, not the prose.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Optionally add one sentence to the observability section of data/README.md noting that `flow.review_rounds` / `flow.parks_1h` / `flow.arm_to_merge_minutes_24h` follow the same rule as `cache`: omit an unmeasured stat, because a stat carrying no parseable field is dropped and named rather than published from its defaults.",
+    "severity": "nit",
+    "title": "Collector-facing prose in data/README.md states the \"at least one field parses\" rule only for `cache`, not for the flow stats"
+   },
+   {
+    "body": "AGENTS.md pre-flight item 11 wants the drop to be shown landing on the PAGE. The executed-page rows (7351-7365) cover a stat dropped because a field was unreadable; the new empty-stat path is not exercised through `dashboard/app.js`. This is genuinely low value here \u2014 both paths converge on the same `flow.<key> = None` the page already hides on, so a new page row would assert the same rendering through the same branch \u2014 but noting it since the seam's own convention is to deliver the drop into the panel.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "If you want the coverage, add `{}`-stat documents to the `documents` map fed to `_OBS_FLOW_STAT_PAGE_BODY` and assert the `Parked / 1h` metric is absent; otherwise leave as is and rely on the existing `unreadable` page row.",
+    "severity": "nit",
+    "title": "No executed-page row for the empty-stat drop (the existing page row covers only the unreadable-field path)"
+   }
+  ],
+  "progress": null,
+  "summary": "Correct, fail-closed-strengthening change to `_obs_stat` (scripts/dashboard-gen.py): a flow stat that is present but has NO field this build could parse now hides and announces `the stat has no parsed fields`, instead of publishing a full row synthesised from per-field defaults (the fabricated `0 user / 0 orch` / `0 samples / 24h` this seam exists to prevent). Verified against the checkout at head, not just the diff:\n\n* Logic: `parsed` flips on `value is not None` AFTER the reader, so a genuine measured zero (`{\"needs_user\": 0, \"needs_orchestrator\": 0}`, `{\"p50\": null, \"samples\": 0}`) still publishes SILENTLY \u2014 a census still emits its zero row (AGENTS.md pre-flight 8). Absent/explicit-null stat (`source is None`) is still a silent hide, so \"the collector has not landed\" is unchanged.\n* The `readable and not parsed` guard is load-bearing and mutation-covered: the pre-existing fractional-field rows (7246-7255) assert EXACTLY ONE drop line for inputs with an unreadable field and no parsed sibling, so an unconditional announcement reds them. Dropping `parsed` from the return reds the three new empty-stat rows; initialising `parsed = True` reds them too. Not vacuous.\n* Consistency: this makes the flow stats obey the same rule `data/README.md` already documents for the `cache` group after #1557 (\"a group supplied with nothing readable in it is not a group of zeros\"; publish only when at least one field parses, drop and NAME otherwise). The removed #1880 row is the behaviour being deliberately reversed, and its docstring bullet was updated with it.\n* Bounds/security: the new message is a static string plus this build's own stat name \u2014 no collector value reaches the build log, so the log-injection property holds. Per stat the seam still emits at most `len(fields)` drops (per-field drops and the no-parsed drop are mutually exclusive), so the `stat_drops` cap comment at 2156-2160 stays accurate and `OBS_DROP_WARN_MAX` is still unreachable. Tolerance un\u2026 [truncated 206 chars]",
+  "verdict": "approve"
+ }
+}
