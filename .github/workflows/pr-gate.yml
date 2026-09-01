@@ -49,6 +49,14 @@ on:
     # type nobody argued for is equally a change to what this required gate runs on.
     types: [opened, synchronize, reopened, ready_for_review, edited, converted_to_draft]
 
+# `contents: read` ONLY — and that is a REFUSAL, not an omission. #1353 step 3 proposed adding a
+# PR-time probe to this job (dispatch the touched workflow at the PR ref, assert
+# `jobs.total_count > 0`) to catch the ingestion-rejection class. It needs `actions: write` here,
+# and a fork `pull_request` gets a read-only token whatever this block says — so the probe cannot
+# run on a fork, which would make this REQUIRED check unsatisfiable for a class of PRs. Declined
+# with three further blockers in `research/1373-pr-time-workflow-dispatch-probe.md`; §5 there is the
+# acceptance bar for any future attempt, and §2.3 is why it is not narrowable to a smaller grant.
+# Detection ships instead, after the fact: `ci-latency-alert.py`'s M4 and `ingestion-alarm.yml`.
 permissions:
   contents: read
 
