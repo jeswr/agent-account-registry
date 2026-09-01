@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2178,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "52d0033f2141957d7b08e6740c3d1598c6af2684",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is correct and narrowly scoped. It documents the distinct entry-level `retriage self-test ENV-BLOCKED` terminal outcome and adds a non-vacuous negative classification check proving that this bare entry verdict is not mistaken for a harness fault. The existing positive rows separately prove that the `worker-live: ... ENV-BLOCKED` harness outcome remains classified as a fault, so the test covers both sides of the only distinguishing prefix and preserves fail-closed grading. No trust check, workflow permission, routing rule, or audit control is weakened.",
+  "verdict": "approve"
+ }
+}
