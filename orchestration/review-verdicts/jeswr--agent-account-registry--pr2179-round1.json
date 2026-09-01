@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2179,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3684bc4f1b0dfb4808125e525f1d69e1cf3f8b2b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_worker_pulls_for_issue` calls `api.paginate` on `matching-refs` and treats the resulting set as complete. The prefix can match an unbounded number of leftover/re-dispatched attempt refs; it is not an exact single-object lookup. If a matching ref is deleted while that listing is paged, later rows can shift across the cursor boundary just as they can in the repo-wide pull walk. The live PR's ref can therefore be absent from this result while the PR is simultaneously skipped by `_pulls`, causing the union to contain neither row and permitting the claim to be reaped. The comments' assertion that this read is not a population walk / cannot be page-skipped, and the stated request bound, are consequently false. The added tests use `_RefListingAPI`, which returns one preassembled list and cannot simulate pagination or a between-page mutation, so they do not detect this failure.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Use an evidence path whose completeness does not depend on enumerating a mutable set of matching refs (for example, derive and directly query a bounded set of authoritative candidate heads, or use a server-side query with a sound completeness argument). Add an end-to-end test that models more than one page and deletes a preceding ref between page reads, then prove the live worker PR still retains the lease. If no complete keyed witness is available, defer rather than treating an enumerated empty/partial ref set as proof of absence.",
+    "severity": "major",
+    "title": "The keyed witness still relies on a shiftable paginated ref listing"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new corroborating read is fail-closed on API errors and validates returned pull rows, but it does not establish the claimed independent absence proof: its first stage is itself a paginated population walk over every matching worker ref. With enough retained/re-dispatched refs, the same page-boundary deletion race can omit the ref carrying the live PR. The tests only exercise a single in-memory page and therefore do not cover the marquee race at this new evidence path.",
+  "verdict": "request_changes"
+ }
+}
