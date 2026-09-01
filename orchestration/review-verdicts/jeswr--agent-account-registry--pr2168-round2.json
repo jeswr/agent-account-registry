@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2168,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f5d61a60d79e688d7474410f0699141337e4fdc8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior major finding is resolved. The record now consistently identifies itself as interim, expressly says it does not discharge #1739, limits the current declension to \"for now,\" and requires the missing unconditional fan-out and K/N censuses to remain owned by #1739 or a specifically linked successor before a final measured decision. Its discussion of the current fetch predicate, bound substitution, live/admitted suppressions, and the hazard of using a drifting superset agrees with the referenced control flow. The scripts/groom.py change is commentary only and does not weaken or alter a trust check, workflow, test, or runtime path. No reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
