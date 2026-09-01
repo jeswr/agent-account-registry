@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6086,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5f3933ab2517244dab5b1ba45b4cacb5570e4232",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The reconciliation is fail-closed around marker authentication and duplicate issue claims, preserves unmapped and unparsable input, performs only one-way close synchronization, and writes atomically. The workflow keeps credentials scoped, rebuilds the derived snapshot from main, and avoids creating an uncheckable GITHUB_TOKEN-authored PR. The hermetic self-test exercises the load-bearing authentication, preservation, close, append, idempotence, serialization, and ambiguity paths and passes at the PR head. No correctness, soundness, test-validity, or security defect requiring changes was found.",
+  "verdict": "approve"
+ }
+}
