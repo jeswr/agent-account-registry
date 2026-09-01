@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 2139,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5efe3904e9f2288edf4a5aecbcfc7371a2b81a7e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The endpoint change widened the read from one directory to the entire registry repository tree. Previously the GitHub contents API guaranteed every entry was inside `orchestration/provenance/`; now that confinement lives entirely in the new line `name = path[len(prefix):] if isinstance(path, str) and path.startswith(prefix) else None`. Every fixture in `_listing` is already inside that directory (two provenance paths, `orchestration/provenance/README.md`, and `{\"path\": None}`), so the guard is never exercised against a path it must reject. Mutating the line to `name = path.rpartition('/')[2] if isinstance(path, str) else None` \u2014 which drops directory scoping entirely \u2014 still returns {685} for every assertion in this diff and leaves the self-test fully green. That is a vacuous test of the one line the endpoint switch made load-bearing. The realised failure is a false 'already recorded': any blob anywhere else in the registry repo whose basename matches `<owner>--<name>--pr<N>.json` (a backup/archive copy of the provenance dir, a fixture, an attachment path) would be counted, and census would report a genuinely unrecorded PR as recorded and suppress the mint it should have flagged. No such collision exists in today's layout (`verdict_path` and the round-claim paths carry `-round`/`--r` suffixes that fail `fullmatch`), so this is coverage of a live guard rather than a present-day bug \u2014 but the guard is exactly what stops the widened scope from mattering.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Add at least one decoy entry OUTSIDE the provenance directory whose basename would match, and assert it is excluded, e.g. append to `_listing`: `{\"path\": \"orchestration/provenance-archive/\" + worker_pr.provenance_path(repo, 686).rpartition(\"/\")[2]}` and `{\"path\": worker_pr.provenance_path(repo, 687).rpartition(\"/\")[2]}` (a bare basename at repo root). The existing expectation stays {685}; with the prefix guard removed the check goes red on {685, 686, 687}. Consider also asserting a nested path under the directory (`orchestration/provenance/sub/<basename>`) is excluded, and skipping non-blob entries via `entry.get(\"type\") == \"blob\"`.",
+    "severity": "major",
+    "title": "New directory-scoping guard is untested \u2014 the repo-wide tree read has no out-of-directory decoy, so removing `path.startswith(prefix)` keeps --self-test green"
+   },
+   {
+    "body": "The retained sentence \"a renamed layout reds this rather than silently matching nothing\" was true of the contents endpoint: `GET /contents/orchestration/provenance?ref=ledger` 404s when that directory does not exist at the derived path, `_run_gh(check=True)` exits non-zero and `_gh_json` raises MintError. Under `git/trees/{ref}?recursive=1` the request succeeds for any existing ref regardless of whether the directory exists; a renamed/moved `PROVENANCE_DIR` (or a ledger whose records live at the old path) now produces a well-formed, non-truncated tree with zero prefix matches and the function returns `set()`. That collapses \"the layout moved out from under me\" and \"nothing is recorded\" into the same answer \u2014 the same fail-open shape the rest of the docstring says this function exists to prevent, moved up one level from the file to the directory. Only the read-only census consumes this today, so the consequence is a mis-reported census rather than a duplicate write, but shipping a docstring that asserts a fail-closed property the code no longer has is worse than the behaviour: this repo's docstrings are the audit trail a later reviewer reasons from.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Either restore the signal \u2014 after building `numbers`, raise MintError when NO tree entry starts with `directory + \"/\"` (the ledger's provenance directory always carries at least a README, so this stays quiet in steady state and reds on a rename), and pin it with a self-test passing a tree containing only unrelated paths \u2014 or, if the bootstrap case (directory legitimately absent before the first record) must stay non-fatal, delete the now-false sentence and say plainly that a missing directory reads as 'nothing recorded' and only an unreadable/truncated tree raises.",
+    "severity": "major",
+    "title": "Docstring keeps the \"a renamed layout reds this\" fail-closed claim, but the tree endpoint returns an empty set for a missing/renamed provenance directory"
+   },
+   {
+    "body": "`if not isinstance(response, dict) or response.get(\"truncated\") is not False` guards two distinct failures, but only the `truncated: True` case is asserted. The non-dict case is reachable in production: `_gh_json` returns `json.loads(raw or \"null\")`, so an empty stdout yields `None`, and an error payload such as `{\"message\": \"Not Found\"}` takes the missing-`truncated` path \u2014 neither is pinned. The previously-deleted assertion covered the `{\"message\": \"Not Found\"}` shape explicitly; that coverage was dropped rather than ported.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Add two more cases mirroring the existing pattern: `read_tree=lambda: None` and `read_tree=lambda: {\"message\": \"Not Found\"}`, each asserting MintError with \"unreadable\" in `str(exc)`.",
+    "severity": "minor",
+    "title": "The `not isinstance(response, dict)` arm of the first raise has no test"
+   },
+   {
+    "body": "The recursive tree lists directories (`type: \"tree\"`) alongside blobs. A directory named `<owner>--<name>--pr<N>.json` inside the provenance directory would be counted as a recorded record. Unlikely, but the contents-listing version was at least restricted to a single directory's immediate children, and filtering on the type the API already gives you costs one condition.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Match only blobs: `if isinstance(entry, dict) and entry.get(\"type\") == \"blob\"` before extracting `path`, and add a `{\"path\": <a matching name>, \"type\": \"tree\"}` fixture asserting it is not counted.",
+    "severity": "minor",
+    "title": "Tree entries are matched without checking `type == \"blob\"`"
+   },
+   {
+    "body": "It is loop-invariant and the tree is now repo-wide (potentially tens of thousands of entries), so it belongs beside the `numbered` regex rather than inside the loop. Cosmetic only \u2014 no behavioural effect.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Hoist `prefix = directory + \"/\"` to just after the `numbered = re.compile(...)` line.",
+    "severity": "nit",
+    "title": "`prefix = directory + \"/\"` is recomputed on every tree entry"
+   }
+  ],
+  "progress": null,
+  "summary": "The motivation is right: `GET /repos/{r}/contents/{dir}` silently caps a directory listing at 1000 entries, so the old `recorded_pr_numbers` read could report a recorded PR as unrecorded once the ledger grew past that \u2014 a fail-open on exactly the read backfill's sol #217 flagged. Moving to `git/trees/{ref}?recursive=1` with a strict `truncated is not False` raise fixes that fail-open and fails closed on the new truncation limit, and the added self-test that patches module-global `_gh_json` and pins the exact URL (`repos/reg/istry/git/trees/ledger?recursive=1`) is a genuinely non-vacuous wiring assertion \u2014 a revert to the contents endpoint would go red. The truncated-raise and malformed-tree-raise cases are also pinned and non-vacuous. Two things block approval. (1) The read scope silently widened from ONE directory (scoped by the API) to the WHOLE registry repo; the only thing that now confines matches to the provenance directory is the new `path.startswith(prefix)` guard, and no fixture in `_listing` sits outside that directory, so deleting the guard (e.g. `name = path.rpartition('/')[2]`) still yields {685} and the self-test stays green. That is the exact newly-load-bearing line left unkilled. (2) The docstring's fail-closed claim \"a renamed layout reds this rather than silently matching nothing\" was kept verbatim but is no longer true: with the contents endpoint a missing/renamed provenance directory 404'd and raised; with the tree endpoint it returns a complete tree with zero matches and the function returns an empty set \u2014 i.e. \"the layout moved\" and \"nothing is recorded\" become the same answer again, for the directory rather than the file. Blast radius is bounded (only the read-only `census` consumes this; the mint write path still probes per-PR via `effective_record_body`), which is why these are major and not blockers, but both are one- or two-line fixes and the docstring is part of this repo's audit trail.",
+  "verdict": "request_changes"
+ }
+}
