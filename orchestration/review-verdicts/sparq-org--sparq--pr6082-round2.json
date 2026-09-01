@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6082,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "918ba768a667f6a787cf3270003327fedb51c9ab",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete on the supplied diff-scoped evidence. The merge_group branch has highest precedence and unconditionally adds --full while preserving the revision-pair invocation shape; pull_request label and shadow behavior remain unchanged. The wiring tests are non-vacuous: they execute the actual workflow shell body, assert event and precedence behavior, pass the captured argv into the real selector, and verify mode=full plus complete workspace membership. Caller coverage and the design/branch-protection documentation consistently describe the safe CI-first rollout and separately scoped queue reductions. No correctness, soundness, security, or test-validity defect was found. With zero findings in both rounds, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
