@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 2133,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2a99542d4f3324c6042bc9e110f47d98c6b8bcaa",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Re-verified this round. `obs-truncation-note` appears exactly once in the whole repo (app.js:1118) and dashboard/styles.css has no rule for it. Bare `.bad` is also unstyled: every `bad` rule is scoped \u2014 `.metric-value.bad` (:168), `.obs-metric-value.bad, td.bad` (:226), `.obs-reason-count.bad` (:237), `.badge.*` (:93-95) \u2014 and none matches a `<p>` inside `.obs-reasons`. So the unreadable-row warning inherits default body colour and default paragraph metrics rather than the `var(--bad)` emphasis the `bad` token clearly intends, and it does not even get the muted small-caption treatment its sibling `.obs-truncated` note (styles.css:240) gets.\n\nThe text is present and readable, so the operator-facing signal exists \u2014 that is why this is minor, not blocking \u2014 but the emphasis this change is about lands as a no-op. Nothing catches it: the new harness asserts only `queueText`/`queuePlotted`/`error`, never the className, even though the neighbouring #1879 page test at dashboard-gen.py:6612 deliberately asserts `[text, className]` pairs per cell for exactly this class of regression.",
+    "file": "dashboard/app.js",
+    "fix_hint": "Either add an `.obs-truncation-note` rule to dashboard/styles.css (mirror `.obs-truncated` at :240, plus `color: var(--bad)`), or reuse an already-styled class. Then extend `_OBS_QUEUE_LOSS_PAGE_BODY` to return the warning element's `className` alongside `queueText` and assert it literally, so a class that styles nothing cannot pass again.",
+    "severity": "minor",
+    "title": "The loss warning is emitted with class `obs-truncation-note bad`, which styles nothing \u2014 it renders as plain unstyled text, not red"
+   },
+   {
+    "body": "Re-verified. dashboard-gen.py:2033-2035 records the container failure (\"`flow.queue` (type dict) is not a list of rows\") as a SINGLE `_obs_drop_queue` call, so `drops.dropped == 1` and the page renders '1 queue row was unreadable'. That is precisely the producer bug the #982 comment at dashboard-gen.py:2027 calls out by name \u2014 `queue_stats()` keyed by integer classes is a dict, which loses every row before the loop starts \u2014 and it is the case this change's own comment (dashboard-gen.py:2187) describes as 'one whose entire input was unreadable'. In that state the page states a confident, specific count of 1 for a loss whose size is unknowable.\n\nIt still fails in the safe direction (the warning fires, and the trend refuses the sample because `queue_dropped !== 0`), so this is an accuracy defect rather than a silent hole. It is also untested: none of the three new scenarios exercises a non-list container.",
+    "file": "dashboard/app.js",
+    "fix_hint": "Either count the container refusal distinctly (a separate `queue_unreadable: true` flag, or a sentinel the page renders as 'the queue snapshot was unreadable' with no row count), or word the message so it does not assert a row count it cannot know. Add a fourth scenario with `flow.queue` set to a dict and assert the resulting sentence literally.",
+    "severity": "minor",
+    "title": "A non-list `flow.queue` container reports as exactly '1 queue row was unreadable' when the row count is actually unknown"
+   },
+   {
+    "body": "Re-verified. `obsTruncated` (app.js:883-885) deliberately uses `Number.isInteger` rather than `obsNum`, with a comment at :878-882 explaining that every one of these fields is a COUNT OF ROWS and that rendering `showing 12 of 12.5 lanes` off a tampered or future value 'is the same operator-facing lie the unreadable-total silence exists to prevent'. `queue_dropped` is also a count of rows, and app.js:1101 reads it with `obsNum`, which accepts any finite number (:827-829 \u2014 no string coercion, so only fractional/negative values get through). A hand-edited or future data.json carrying `queue_dropped: 2.5` renders '2.5 queue rows were unreadable' on the same card whose sibling note refuses to speak about a fractional total.\n\nThe trend side is unaffected (`=== 0` already rejects 2.5, correctly refusing the sample), and the generator only ever emits an int, so this is a tamper-path fidelity gap rather than a live bug \u2014 but the file's own existing self-tests carry a dedicated `fractional_page_doc` scenario (dashboard-gen.py:6850-6856) for exactly this shape on all six other count seams, and this seventh one is not added to it.",
+    "file": "dashboard/app.js",
+    "fix_hint": "Gate the warning on `Number.isInteger(queueDropped) && queueDropped > 0`, and add `queue_dropped` to `fractional_page_doc` / `hostile_page_doc` in scripts/dashboard-gen.py so a non-integral count is asserted to draw nothing.",
+    "severity": "minor",
+    "title": "`queue_dropped` is read with `obsNum`, not the `Number.isInteger` standard #1868 set for row counts 218 lines above"
+   },
+   {
+    "body": "Re-verified. data/README.md:88-100 documents the observability contract and explicitly enumerates the OUTPUT-side keys this generator adds beside each slice (`lanes_total`, ..., `flow.queue_total`, `flow.target_ci_queue_total` at :93-94, followed by 'These are OUTPUT-side keys: a collector neither sends them nor is read for them, and each is published on every build'). `queue_dropped` is a new key of exactly that kind \u2014 published on every build, ignored on input \u2014 and it is absent from that prose, so a collector author reading the documented shape sees a key in the published document that the contract does not mention.\n\nNot blocking: the README is explicit at :74-75 that the consumer-side contract IS `_normalize_observability`, self-tested with the golden fixture, which this PR does update at both equality checks (:6242, :7761). But the output-side-keys paragraph is the one place that enumerates precisely this category of key.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Add one sentence to the output-side-keys paragraph in data/README.md: `flow.queue_dropped` is the count of queue rows this build refused, published on every build (0 on the accept path), read by the page to distinguish an idle queue from a lost one and to refuse an incomplete depth sample.",
+    "severity": "minor",
+    "title": "`flow.queue_dropped` is a new key on the published public contract but data/README.md is not updated"
+   },
+   {
+    "body": "The new body (:6650-6677) is a near-line-for-line copy of `_OBS_LANE_WINDOW_PAGE_BODY`: the same fresh `new Function(source)` per scenario, the same `setImmediate` settle tick, the same five reset ids, the same try/catch, the same `card`/`spark` finders. It differs only in the card title and the extracted fields. The copy drops the load-bearing comment the original carries explaining that a FRESH page per scenario is required because `obsTrend` is module state that accumulates across renders, so one shared scope would carry one scenario's sparkline points into the next.\n\nThat rationale is what stops someone later collapsing this loop back onto the harness's shared `scope` (created at :2526 and now unused by this body), which would silently contaminate the queue trend across scenarios and weaken exactly the `queuePlotted` assertion this row exists to make.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Either carry the fresh-page rationale comment across into the new body, or factor the shared scaffold into one parameterised body (card title + extractor) used by both harnesses.",
+    "severity": "nit",
+    "title": "`_OBS_QUEUE_LOSS_PAGE_BODY` duplicates `_OBS_LANE_WINDOW_PAGE_BODY` almost verbatim, minus the comment explaining why"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2. The diff is byte-for-byte what round 1 reviewed (branch head is still the single commit 2a99542d4, tree clean) \u2014 nothing was changed in response to round 1's five findings, so progress is stagnant rather than improving. I re-derived every conclusion independently rather than inheriting them.\n\nThe change remains correct, sound and fail-closed. `_obs_flow` publishes `queue_dropped: drops.dropped` \u2014 an integer THIS build counted (`_ObsDropLog.dropped`, dashboard-gen.py:1925/1929), never a collector value, and the dict is built fresh so a collector cannot supply or spoof it; decision 22 is respected. `_obs_capped` does not touch `drops`, so the count is malformed-row loss only, not cap truncation, which is the right semantics beside `queue_total`. On the page, `obsRecordTrend` plots the depth sum only when `queueDropped === 0`, which refuses absent (pre-#1896 or flow-less), null, negative and fractional values \u2014 only an explicit measured zero plots. The warning branch and the trend branch are complementary and the `obsTruncationNote` path is untouched.\n\nTest validity holds in both directions. The golden fixture's `{'class': '9z'}` row is real loss evidence, so `queue_dropped: 1` in `obs_expected` is derived, not hand-set, and both golden checks (dashboard-gen.py:6242 and :7761) are exact dict equality. In the new page harness `{'class': 17}` is genuinely dropped at :2041 and `{'class': '2a', 'depth': 0}` genuinely survives at :2049 (0 is a valid `_obs_count`), so I traced the literal strings by hand against `obsFlowCard`/`obsSparkline` and the DOM shim and they match. Reverting the app.js hunk reds `dropped` (text null, plotted true); reverting the generator hunk reds it too; 'hide every empty sample' reds the `measured` control. A fresh `new Function` page per scenario keeps `obsTrend` module state from leaking. Existing #1868 notes are collected by EXACT className `obs-truncated`, so the new note cannot perturb them, and no other test a\u2026 [truncated 203 chars]",
+  "verdict": "approve"
+ }
+}
