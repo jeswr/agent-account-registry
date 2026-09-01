@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2147,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7170f04eab5e87433df155d1e1b1a80072370b40",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_one_pass_order` returns true as soon as the binding's index is lower than the loop's index in a shared statement list, without examining statements between them. `_live_nodes` likewise does not stop after `return` or `raise` (despite the comment claiming such nodes are not seen). Thus `targets = starvation_park_targets(...)` followed by `return`, then the parking `for`, is returned as `tick`; the same holds with an unconditional `raise` or a provably non-terminating `while True` between them. No execution reaches the loop, so this still violates the claimed one-pass structural proof. The four `path` rows cover opposite arms and relative placement only, leaving this acceptance untested.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make the pairing proof account for definite control-flow termination along the statement-list segment from the binding to the loop, failing closed when reachability cannot be proved. Add refused seam rows for an unconditional `return` and `raise` between binding and loop, and extend the non-vacuity leg with a stand-in that ignores this termination guard so those rows demonstrably flip.",
+    "severity": "major",
+    "title": "Statement order still certifies unreachable parking loops"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound two fixes the explicit opposite-branch example, but the structural proof still equates source order in one statement list with executable reachability. `_live_nodes` traverses siblings after unconditional control-flow termination, and `_one_pass_order` considers only the binding and loop paths, so it certifies batches that no execution can reach. The added path rows and swap test do not exercise this remaining form of the same co-reachability defect. The prior major finding therefore remains materially unresolved.",
+  "verdict": "request_changes"
+ }
+}
