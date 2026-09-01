@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6157,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9fde46ff2cf173993e6ab9fcd84b0a97ec621832",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In the S4 loop, the checker inspects only step['fields'].get('continue-on-error'). For a gate-classified step in a job that is not a declared seam, adding job-level `continue-on-error: true` swallows the command's failure but produces no offence. The advisory registry does not make such a job advisory merely because that key exists, so the required aggregator can still see a successful job. S2 catches this only for the three explicitly registered seams, leaving the claimed repo-wide protection bypassable everywhere else. The self-test likewise has no mutation for this case.",
+    "file": "scripts/check-step-seams.py",
+    "fix_hint": "During S4, when a job contains any gate-classified step, also reject a truthy job-level continue-on-error unless the job is declared advisory (using the same escape-hatch semantics). Add a mutation case that puts `continue-on-error: true` at job scope in the unregistered lints fixture and requires an offence, plus clean cases for a declared advisory job and literal false if that spelling is intentionally permitted.",
+    "severity": "major",
+    "title": "S4 misses job-level continue-on-error on unregistered gate jobs"
+   }
+  ],
+  "progress": null,
+  "summary": "The mutation suite and live check pass, and the declared-seam identity/body checks are substantive. However, the repo-wide swallow protection is incomplete: it detects truthy continue-on-error only on individual steps. A gate-classified command in any unregistered/unpinned job can still be silently neutralized by adding continue-on-error at job scope, leaving the job and aggregator green. This is the same failure mode the checker says it closes, and the implementation itself recognizes job-level swallowing for declared seams, so the repo-wide sweep should cover it too.",
+  "verdict": "request_changes"
+ }
+}
