@@ -27,14 +27,6 @@
    "why_no_diff": "other"
   },
   {
-   "ts": 1788201234,
-   "provider": "anthropic",
-   "account": "f79434c3ffba014f",
-   "model_alias": "opus5",
-   "exit_class": "unknown",
-   "run_id": "33422843974.1"
-  },
-  {
    "ts": 1788201797,
    "provider": "fleet",
    "account": "5f5b2dc3fb8e231b",
@@ -1655,6 +1647,14 @@
    "model_alias": "",
    "exit_class": "zero-dispatch",
    "run_id": "33479936820.1"
+  },
+  {
+   "ts": 1788246870,
+   "provider": "anthropic",
+   "account": "c0ac92ebee2c590e",
+   "model_alias": "opus5",
+   "exit_class": "unknown",
+   "run_id": "33476682276.1"
   }
  ]
 }
