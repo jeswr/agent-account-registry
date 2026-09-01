@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2134,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "265b4c2568aee9c2f452a73b576f2ec9d0211d88",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is documentation-only and accurately records why the proposed PR-time workflow-dispatch probe is unsafe and incomplete. The workflow comment preserves least privilege (`contents: read`) and does not alter execution. The design record distinguishes tree-verifiable evidence from platform claims requiring live confirmation, identifies production side effects, fork/permission and default-branch limitations, ambiguous outcomes, and the residual monitoring gap without claiming that the existing detectors close it. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
