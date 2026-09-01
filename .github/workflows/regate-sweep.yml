@@ -71,6 +71,7 @@ jobs:
             orchestration/gate-repairs.json
             scripts/selftest-suite.txt
             scripts/ci-latency-alert.py
+            scripts/yaml_dependency.py
             .github/workflows/regate-sweep.yml
             .github/workflows
 

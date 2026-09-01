@@ -99,6 +99,7 @@ SNAPSHOT_RELATIVE_PATH = "data/metrics.json"
 # class this unit exists to close.
 REQUIRED_FILES = (
     "scripts/metrics-alert.py",
+    "scripts/yaml_dependency.py",
     "scripts/metrics.py",
     ".github/workflows/metrics.yml",
     ".github/workflows/groom-sweep.yml",

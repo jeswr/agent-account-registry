@@ -334,6 +334,7 @@ CRON_MINUTES_SCRIPT = "scripts/ci-latency-alert.py"
 # this unit exists to close.
 REQUIRED_FILES = (
     "scripts/dispatch-tick-floor.py",
+    "scripts/yaml_dependency.py",
     CRON_MINUTES_SCRIPT,
     DISPATCH_WORKFLOW,
 )

@@ -6,6 +6,9 @@ failure shape here makes a bare container say what the dependency is for and how
 """
 
 import importlib
+import sys
+import tempfile
+from pathlib import Path
 
 
 class PyYAMLUnavailable(RuntimeError):
@@ -28,6 +31,22 @@ def require_yaml(role="workflow YAML", importer=importlib.import_module):
 
 def self_test():
     rows = []
+
+    previous_yaml = sys.modules.pop("yaml", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "yaml.py").write_text("sentinel = 'default-import-path'\n", encoding="utf-8")
+            sys.path.insert(0, tmp)
+            try:
+                default_result = require_yaml()
+            finally:
+                sys.path.pop(0)
+                sys.modules.pop("yaml", None)
+    finally:
+        if previous_yaml is not None:
+            sys.modules["yaml"] = previous_yaml
+    rows.append(("default importer loads the literal yaml module",
+                 getattr(default_result, "sentinel", None) == "default-import-path"))
 
     sentinel = object()
     rows.append(("available module is returned", require_yaml(importer=lambda name: sentinel)
@@ -66,6 +85,6 @@ def self_test():
 
 if __name__ == "__main__":
     import sys
-    if "--self-test" in sys.argv and sys.argv[1:] == ["--self-test"]:
+    if sys.argv[1:] == ["--self-test"]:
         raise SystemExit(self_test())
     raise SystemExit("usage: yaml_dependency.py --self-test")

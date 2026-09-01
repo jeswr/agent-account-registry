@@ -146,6 +146,7 @@ SUITE_MANIFEST = "scripts/selftest-suite.txt"
 # green. Anything _require()d must appear here, and the mismatch reds at pr-gate time.
 REQUIRED_FILES = (
     "scripts/groom-mint-alert.py",
+    "scripts/yaml_dependency.py",
     SUITE_MANIFEST,
     GROOM_WORKFLOW,
 )

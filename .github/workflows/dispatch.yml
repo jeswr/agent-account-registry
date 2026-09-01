@@ -109,6 +109,7 @@ jobs:
           sparse-checkout: |
             scripts/dispatch-tick-floor.py
             scripts/ci-latency-alert.py
+            scripts/yaml_dependency.py
             .github/workflows/dispatch.yml
           sparse-checkout-cone-mode: false
 

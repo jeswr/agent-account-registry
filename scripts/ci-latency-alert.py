@@ -94,12 +94,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-try:
-    from yaml_dependency import require_yaml
-    yaml = require_yaml("ci-latency workflow-seam checks")
-except RuntimeError as _exc:  # pragma: no cover - fail loud rather than skip M1
-    yaml = None
-    _YAML_IMPORT_ERROR = _exc
+def _load_workflow_yaml(require=None):
+    """Load PyYAML while preserving the detector's structured fail-closed error path."""
+    try:
+        if require is None:
+            from yaml_dependency import require_yaml
+            require = require_yaml
+        return require("ci-latency workflow-seam checks"), None
+    except (ImportError, RuntimeError) as exc:
+        return None, exc
+
+
+yaml, _YAML_IMPORT_ERROR = _load_workflow_yaml()
 
 ALERT_LABEL = "ops-alert"
 MARKER_PREFIX = "ci-latency-alert:v1"
@@ -110,6 +116,7 @@ MAINTAINER_HANDLE = os.environ.get("MAINTAINER_HANDLE", "jeswr")
 # YAML-seam assertions silently unreachable on the live path.
 REQUIRED_FILES = (
     "scripts/ci-latency-alert.py",
+    "scripts/yaml_dependency.py",
     ".github/workflows/groom-sweep.yml",
     # M3's floor is DERIVED from this file's `worker_timeout_minutes` (see EXEC_FLOOR_SECONDS).
     # Without it in the checkout the derivation assertion would be unreachable on the live
@@ -1487,6 +1494,21 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     def chk(name, condition):
         if not condition:
             failures.append(name)
+
+    def unavailable(error):
+        def refuse(_role):
+            raise error
+        try:
+            return _load_workflow_yaml(refuse)
+        except Exception as exc:
+            return "escaped", exc
+
+    missing_helper = unavailable(ModuleNotFoundError("missing helper", name="yaml_dependency"))
+    broken_yaml = unavailable(RuntimeError("broken PyYAML"))
+    chk("yaml loader converts a missing shared helper into the structured detector path",
+        missing_helper[0] is None and missing_helper[1].args == ("missing helper",))
+    chk("yaml loader converts a broken PyYAML install into the structured detector path",
+        broken_yaml[0] is None and broken_yaml[1].args == ("broken PyYAML",))
 
     NOW = dt.datetime(2026, 7, 28, 12, 0, tzinfo=dt.timezone.utc)
     H6 = NOW - dt.timedelta(hours=6)

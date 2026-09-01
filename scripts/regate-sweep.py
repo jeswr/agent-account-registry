@@ -208,6 +208,7 @@ CRON_MAP_SCRIPT = "scripts/ci-latency-alert.py"
 # YAML-seam assertions unreachable on the live path while still passing in pr-gate.
 REQUIRED_FILES = (
     "scripts/regate-sweep.py",
+    "scripts/yaml_dependency.py",
     REPAIRS_FILE,
     SUITE_MANIFEST,
     SWEEP_WORKFLOW,

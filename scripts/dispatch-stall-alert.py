@@ -143,6 +143,7 @@ HOST_JOB = "dispatch-stall"
 # YAML-seam assertions silently unreachable on the live path.
 REQUIRED_FILES = (
     "scripts/dispatch-stall-alert.py",
+    "scripts/yaml_dependency.py",
     "scripts/dispatch-tick-floor.py",
     DISPATCH_WORKFLOW,
     GROOM_WORKFLOW,
