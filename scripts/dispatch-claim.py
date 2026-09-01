@@ -23100,6 +23100,155 @@ def _escalation_call_site(source):
     return None
 
 
+# ---- [registry #1710] "THIS NODE RUNS", not "this node EXISTS" --------------------------------
+# `ast.walk` enumerates every node in a subtree, so an ancestry check built on it proves a call
+# EXISTS somewhere under the loop — never that a pass through the loop REACHES it. MEASURED on the
+# pre-#1710 tree, `_park_call_site` returned "dispatch" for a `dispatch()` whose park loop sat
+# under `if False:`, in the `else:` of a constant-true guard, inside an uncalled nested `def`, or
+# wrapped in `for _ in []:` — i.e. it certified the exact 1-holder-per-tick defect #822 removed as
+# structurally fixed, while every other assertion in this file stayed green.
+#
+# WHAT IS PROVEN DEAD HERE. Three arms, each deciding from the SOURCE ALONE or refusing:
+#   - a branch whose test is decidably constant                  -> `_constant_test_truth`;
+#   - the body of a `for`/`async for` over a literal that
+#     provably yields nothing (`[]`, `()`, `{}`, `""`)           -> `_empty_literal_iterable`;
+#   - a nested `def`/`async def`/`lambda`, whose body runs when
+#     something CALLS it, not where it is written                -> `_SCOPE_BOUNDARIES`.
+#
+# A class body is deliberately NOT a boundary: it EXECUTES IN PLACE at definition time, so a
+# statement written directly in one really does run. Its `def`s do not, and they are boundaries in
+# their own right — which is what keeps "call in a class-body METHOD" refused while "call in a
+# class body" stays accepted, instead of collapsing both into "anything nested".
+#
+# HONEST BOUNDARY, stated because the overclaim is the failure mode this repo keeps measuring.
+# This is a FLOOR, not a decision procedure, and every undecidable direction keeps the node LIVE:
+#   - `if x and False:` is always falsy, and is NOT pruned — `x` is still evaluated, and the shape
+#     is one refactor away from `if x and g():`, where it is not even falsy;
+#   - `if DEBUG:` with a module-level `DEBUG = False` is not pruned (no constant propagation);
+#   - `for _ in xs:` with an empty `xs` is not pruned (emptiness is a RUNTIME fact), and neither is
+#     `for _ in [*xs]:` / `{**m}`, whose unpacking can yield nothing;
+#   - `1 < "a"` raises at run time rather than deciding, so folding it would be a lie;
+#   - `is` / `in` are identity and container semantics, not value comparison, so they never fold;
+#   - a node made unreachable by an earlier `return`/`raise` is not seen at all.
+# A live-but-actually-dead node only makes the seam KEEP SCANNING a subtree, so the failure
+# direction of a mis-read is a refused seam, never a certified one.
+_SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+# The comparisons that are pure value folds on two literals. `Is`/`IsNot` (identity of literals is
+# an implementation detail) and `In`/`NotIn` (container protocol) are ABSENT on purpose: an op that
+# is not in this map is undecidable, which keeps the branch live.
+_CONSTANT_COMPARE_FOLDS = {
+    ast.Eq: lambda left, right: left == right,
+    ast.NotEq: lambda left, right: left != right,
+    ast.Lt: lambda left, right: left < right,
+    ast.LtE: lambda left, right: left <= right,
+    ast.Gt: lambda left, right: left > right,
+    ast.GtE: lambda left, right: left >= right,
+}
+
+
+def _literal_container_truth(node):
+    """The truth of a DISPLAY literal (`[]`, `()`, `{}`, `{1}`, `[a, b]`), else None.
+
+    Emptiness decides it and the elements never have to be evaluated — EXCEPT when an unpacking
+    is present (`[*xs]`, `{**m}`), where the length is a run-time fact and this refuses."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        if any(isinstance(elt, ast.Starred) for elt in node.elts):
+            return None
+        return bool(node.elts)
+    if isinstance(node, ast.Dict):
+        if any(key is None for key in node.keys):
+            return None                   # `{**mapping}` — the merge can be empty
+        return bool(node.keys)
+    return None
+
+
+def _constant_test_truth(test):
+    """The truth of a branch test that is decidable FROM THE SOURCE ALONE, else None.
+
+    [registry #1710] The literal-only form of this predicate (`ast.Constant`, or `not` of one) was
+    the whole of it, and the same vacuity survived one rewrite: `if False and x:` is an `ast.BoolOp`
+    and `if 0 == 1:` an `ast.Compare`, so both returned None and both kept a dead park loop live in
+    the seam's eyes. The two extra arms are SHORT-CIRCUIT-EXACT and LITERAL-ONLY respectively —
+    see the honest-boundary note above for what each still refuses."""
+    if isinstance(test, ast.Constant):
+        return bool(test.value)
+    container = _literal_container_truth(test)
+    if container is not None:
+        return container
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        inner = _constant_test_truth(test.operand)
+        return None if inner is None else not inner
+    if isinstance(test, ast.BoolOp):
+        # `and` is decided by the first FALSY operand, `or` by the first TRUTHY one — but only
+        # once every operand BEFORE it is decidable, because an undecidable operand is REACHED and
+        # nothing after it is known. So `False and _` folds and `_ and False` deliberately does not.
+        deciding = isinstance(test.op, ast.Or)
+        for value in test.values:
+            truth = _constant_test_truth(value)
+            if truth is None:
+                return None
+            if truth is deciding:
+                return deciding           # short-circuited here; the rest never runs
+        return not deciding               # every operand decided the other way
+    if isinstance(test, ast.Compare):
+        operands = [test.left] + list(test.comparators)
+        if not all(isinstance(operand, ast.Constant) for operand in operands):
+            return None
+        values = [operand.value for operand in operands]
+        for op, left, right in zip(test.ops, values, values[1:]):
+            fold = _CONSTANT_COMPARE_FOLDS.get(type(op))
+            if fold is None:
+                return None
+            try:
+                if not fold(left, right):
+                    return False          # a chained compare short-circuits on the first False
+            except TypeError:
+                return None               # `1 < "a"` RAISES rather than deciding
+        return True
+    return None
+
+
+def _empty_literal_iterable(node):
+    """[registry #1710] True when `node` is a literal a `for` provably iterates ZERO times, so the
+    loop BODY can never run — `for _ in []:` / `()` / `{}` / `""` wrapped around the park loop."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return not node.value
+    return _literal_container_truth(node) is False
+
+
+def _live_children(node):
+    """The direct children of `node` that a single pass through `node` can actually reach."""
+    dead = []
+    if isinstance(node, (ast.If, ast.IfExp, ast.While)):
+        truth = _constant_test_truth(node.test)
+        if truth is True:
+            dead = node.orelse    # `if True:` / `while True:` — the `else:` leg can never run
+        elif truth is False:
+            dead = node.body      # `if False:` / `while False:` — the body can never run
+        if not isinstance(dead, list):
+            dead = [dead]         # an IfExp's legs are single expressions, not statement bodies
+    elif isinstance(node, (ast.For, ast.AsyncFor)) and _empty_literal_iterable(node.iter):
+        dead = node.body          # ONLY the body: a `for`/`while` `else:` RUNS when the loop
+                                  # completes without `break`, so an empty loop reaches it.
+    dead = {id(leg) for leg in dead}
+    return [child for child in ast.iter_child_nodes(node) if id(child) not in dead]
+
+
+def _live_nodes(root):
+    """`root` plus every descendant a SINGLE pass through `root` reaches — `ast.walk` minus the
+    prunings described above.
+
+    A scope boundary is YIELDED but not descended into, so a caller scanning a module still finds
+    every function it defines while a call buried in an uncalled nested `def` stays invisible."""
+    yield root
+    for child in _live_children(root):
+        if isinstance(child, _SCOPE_BOUNDARIES):
+            yield child           # the `def` is defined HERE; its body runs wherever it is called
+            continue
+        yield from _live_nodes(child)
+
+
 def _park_call_site(source):
     """[registry #822] STRUCTURAL proof that some PRODUCTION function iterates EVERY target
     `starvation_park_targets(...)` returned and parks EACH one. Returns that function's name,
@@ -23115,15 +23264,24 @@ def _park_call_site(source):
       - `park_starved_partition_holder` outside it  -> at most one holder is ever written;
       - any SLICE in the loop's iterable            -> `[:1]` is the defect wearing a loop;
       - a `cap=` keyword at the call site           -> the bound must be the DERIVED constant,
-                                                       not a number retyped at the call site.
+                                                       not a number retyped at the call site;
+      - a DEAD or DEFERRED ancestor (registry #1710) -> a loop, or a park call, under `if False:`,
+                                                       under `if False and x:` / `if 0 == 1:`, in
+                                                       the `else:` of a constant-true guard,
+                                                       inside `for _ in []:`, or inside an
+                                                       uncalled nested `def`/method parks nothing
+                                                       while `ast.walk` still sees it.
+
+    Every ACCEPTING scan therefore runs over `_live_nodes`, never `ast.walk`. The asymmetry with
+    the slice probe is deliberate: a scan that REFUSES keeps raw `ast.walk`, so a `[:1]` hidden in
+    a dead leg refuses the seam too. Both directions err toward refusing.
     """
-    import ast
     tree = ast.parse(source)
-    for func in ast.walk(tree):
+    for func in _live_nodes(tree):
         if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
             continue
         bound = set()
-        for node in ast.walk(func):
+        for node in _live_nodes(func):
             if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
                 continue
             if getattr(node.value.func, "id", None) != "starvation_park_targets":
@@ -23134,21 +23292,429 @@ def _park_call_site(source):
                          if isinstance(target, ast.Name))
         if not bound:
             continue
-        for loop in ast.walk(func):
+        for loop in _live_nodes(func):
             if not isinstance(loop, ast.For):
                 continue
-            iter_names = {node.id for node in ast.walk(loop.iter)
+            iter_names = {node.id for node in _live_nodes(loop.iter)
                           if isinstance(node, ast.Name)}
             if not (iter_names & bound):
-                continue
+                continue                  # `for t in (targets if False else [])` iterates nothing
             if any(isinstance(node, ast.Slice) for node in ast.walk(loop.iter)):
                 continue                  # `targets[:1]` is the per-tick cap of 1, re-typed
-            for stmt in ast.walk(loop):
+            for stmt in _live_nodes(loop):
                 if (isinstance(stmt, ast.Call)
                         and getattr(stmt.func, "id", None)
                         == "park_starved_partition_holder"):
                     return func.name
     return None
+
+
+def _park_seam_verdict(block):
+    """`_park_call_site`'s verdict on a synthetic module whose only top-level function is `tick`.
+
+    Every refusal in that docstring is a trust check, and MEASURED with `trace --count --missing`
+    on the pre-#1710 tree three of them — the `cap=` arm, the slice arm and `return None` itself —
+    were NEVER-EXECUTED lines: the seam's only assertion was that the REAL source returns
+    "dispatch", which cannot tell a checker that decides ancestry from one that accepts anything.
+    This builds the shapes the production tree must never look like, so both directions are pinned.
+    """
+    return _park_call_site("def tick(repo, items, starved, occupancy):\n"
+                           + textwrap.indent(textwrap.dedent(block).strip("\n"), "    ") + "\n")
+
+
+def _literal_only_test_truth(test):
+    """The PRE-#1710 branch predicate, verbatim: an `ast.Constant`, or `not` of one, and nothing
+    else. Installed by the #1710 non-vacuity leg — under it, and only under it, every shape #1710
+    names must go back to being certified."""
+    if isinstance(test, ast.Constant):
+        return bool(test.value)
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        inner = _literal_only_test_truth(test.operand)
+        return None if inner is None else not inner
+    return None
+
+
+@contextlib.contextmanager
+def _park_seam_arms(**swaps):
+    """Install stand-in reachability arms for one non-vacuity leg, then restore them.
+
+    Swapped as MODULE GLOBALS because that is exactly how `_park_call_site` and `_live_children`
+    reach these helpers, so a leg measures the SHIPPED call graph rather than a re-implementation
+    of it — a mutant that stopped consulting an arm would leave the leg's expected flip unseen."""
+    saved = {name: globals()[name] for name in swaps}
+    globals().update(swaps)
+    try:
+        yield
+    finally:
+        globals().update(saved)
+
+
+# Each row is (what, expected verdict, arm, the BODY of `tick`). `arm` names WHY the row lands
+# where it does, and the two non-vacuity legs below read it: "live" and "shape" rows are decided
+# without any reachability reasoning, "1028" rows by the literal-only core, and "1710" rows ONLY by
+# the arms this issue added. The park call site is certified exactly when a pass through `tick`
+# reaches both the `for` over the assigned targets and the `park_starved_partition_holder` in it.
+_PARK_SEAM_ROWS = (
+    # ---- ACCEPTED: the shapes production legitimately writes ---------------------------------
+    ("live loop", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    # The real call sits under `elif park_starved_partition_holder(...)` inside a `try`, so a
+    # RUNTIME condition must stay accepted: only a DECIDABLE test is proven dead. Without this row,
+    # "refuse every conditional call" would pass every other row here.
+    ("runtime-conditional call", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            if repo:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("constant-true guard BODY", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if True:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # A class body EXECUTES IN PLACE, so this call really does run once per iteration. This row
+    # keeps the scope-boundary set honest: adding ast.ClassDef to _SCOPE_BOUNDARIES would collapse
+    # the predicate into "refuse anything nested", and reds HERE.
+    ("statement in a class body", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            class Receipt:
+                parked = park_starved_partition_holder(repo, target)
+    """),
+    # [#1710] THE HONEST BOUNDARY OF THE `and` ARM, and the row that stops the cheap fix "refuse
+    # every BoolOp". `x and False` is always falsy — but `x` IS evaluated, so the operand is
+    # reached, and one rename (`x and g()`) makes it not even falsy. It stays LIVE by design.
+    ("undecidable-first `and` — `if repo and False:`", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if repo and False:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # [#1710] ...and the same for Compare: a comparison against a NAME is a run-time fact.
+    ("runtime compare — `if repo == 'o/r':`", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if repo == "o/r":
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # [#1710] The two comparisons the fold REFUSES, which is where the over-prune risk lives.
+    # `is` is identity, not value (`0 is 1` is False here but `x is y` on equal literals is an
+    # interning detail), and `1 < "a"` RAISES rather than deciding — so neither may prune. Reds if
+    # `_CONSTANT_COMPARE_FOLDS` is widened to identity/containment ops, or if the `TypeError`
+    # guard starts answering `False` instead of "undecidable".
+    ("unfoldable compare op — `if 0 is 1:`", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if 0 is 1:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("comparison that RAISES — `if 1 < 'a':`", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if 1 < "a":
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # [#1710] The TRUE direction of the Compare fold, so an arm that folded every comparison to
+    # False (pruning live code) reds instead of passing every refuse row.
+    ("negated dead compare — `if not (0 == 1):`", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if not (0 == 1):
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # [#1710] ...and the same for the empty-iterable arm: a NON-empty literal really does iterate.
+    ("non-empty literal loop — `for _ in [1]:`", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for _ in [1]:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # [#1710] A `for`/`while` `else:` RUNS when the loop completes without `break`, so an empty or
+    # never-entered loop REACHES it. Pruning the whole statement instead of just its body would
+    # over-prune live production code, which is the direction a reachability predicate must never
+    # fail in — both rows red on `dead = node.body + node.orelse`.
+    ("`else:` of an empty `for`", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for _ in []:
+            pass
+        else:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("`else:` of `while False:`", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        while False:
+            pass
+        else:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # [#1710] An UNPACKING makes a display literal's length a run-time fact: `[*items]` is empty
+    # whenever `items` is, so this `else:` really can run. Reds if the Starred/`**` guard in
+    # `_literal_container_truth` is dropped — the one direction where a mis-read prunes LIVE
+    # production code out from under the seam instead of merely refusing it.
+    ("unpackable literal — `if [*items]:`", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if [*items]:
+            pass
+        else:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # The `**` half of that guard. MEASURED: with only the `[*items]` row above, deleting the
+    # dict guard SURVIVED the battery — two sibling guards need two rows, one each.
+    ("unpackable mapping — `if {**occupancy}:`", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if {**occupancy}:
+            pass
+        else:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # ---- REFUSED by the literal core: dead branches -------------------------------------------
+    ("loop under `if False:`", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if False:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call under `if False:`", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            if False:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("loop in the `else:` of `if True:`", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if True:
+            pass
+        else:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call under `while False:`", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            while False:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call under `if not True:`", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            if not True:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("targets ASSIGNED in a dead branch", None, "1028", """
+        if False:
+            targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    ("iterable is a dead conditional leg", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in (targets if False else []):
+            park_starved_partition_holder(repo, target)
+    """),
+    # ---- REFUSED by the scope boundary: the call is defined under the loop, never invoked -----
+    ("park call in a nested `def`", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            def _park_later():
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call in a nested `async def`", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            async def _park_later():
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call in an uncalled `lambda`", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            later = lambda: park_starved_partition_holder(repo, target)
+    """),
+    ("park call in a class-body METHOD", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            class Receipt:
+                def park(self):
+                    park_starved_partition_holder(repo, target)
+    """),
+    # The WHOLE batch — binding, loop and call — inside one uncalled helper. This is the row that
+    # makes the MODULE-level scan load-bearing: a nested `def` holding only the park call has no
+    # `targets =` binding of its own and would be refused for that unrelated reason, whereas under
+    # `ast.walk` this helper is certified as the call site under its OWN name.
+    ("the ENTIRE batch in an uncalled nested `def`", None, "1028", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        def _park_all():
+            inner = starvation_park_targets(items, starved, occupancy)
+            for target in inner:
+                park_starved_partition_holder(repo, target)
+    """),
+    # ---- REFUSED by the #1710 arms: the SAME vacuity, one rewrite away ------------------------
+    ("loop under `if False and repo:`", None, "1710", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if False and repo:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("loop under `if False or 0:`", None, "1710", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if False or 0:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call under `if 0 == 1:`", None, "1710", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            if 0 == 1:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("loop in the `else:` of `if 1 == 1:`", None, "1710", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if 1 == 1:
+            pass
+        else:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("park call under `if []:`", None, "1710", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            if []:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("loop wrapped in `for _ in []:`", None, "1710", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for _ in []:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    # Both directions of the mapping-literal truth, because one alone is survivable: with only the
+    # empty row, `return bool(node.keys)` -> `return False` still refuses it. MEASURED as a
+    # never-executed line before these two rows existed.
+    ("park call under `if {}:`", None, "1710", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            if {}:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("loop in the `else:` of `if {'a': 1}:`", None, "1710", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        if {"a": 1}:
+            pass
+        else:
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("loop wrapped in `for _ in '':`", None, "1710", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for _ in "":
+            for target in targets:
+                park_starved_partition_holder(repo, target)
+    """),
+    ("targets ASSIGNED inside `for _ in ():`", None, "1710", """
+        for _ in ():
+            targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    # ---- REFUSED on SHAPE: the three #822 re-scalarisations, none of which had a fixture ------
+    ("no loop at all — park(targets[0])", None, "shape", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        park_starved_partition_holder(repo, targets[0])
+    """),
+    ("sliced iterable — `targets[:1]`", None, "shape", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets[:1]:
+            park_starved_partition_holder(repo, target)
+    """),
+    ("call-site `cap=`", None, "shape", """
+        targets = starvation_park_targets(items, starved, occupancy, cap=1)
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+)
+
+
+def _park_call_site_reachability_self_test():
+    """[registry #1710] THE PARK SEAM DECIDES REACHABILITY, NOT EXISTENCE.
+
+    The seam's own assertion is that the REAL source returns "dispatch". That single assertion
+    cannot distinguish a checker that decides ancestry from one that certifies any call which
+    merely EXISTS — and `ast.walk` is the latter, so the same seam certified a park loop, or a
+    `park_starved_partition_holder` call, sitting in code that never runs. Each such shape restores
+    the exact 1-holder-per-tick defect #822 removed, or removes parking altogether, with the whole
+    suite green.
+
+    NON-VACUITY IS MEASURED HERE, NOT ASSERTED. Every refusal is re-run twice with one arm of the
+    predicate swapped BACK to its pre-fix form, and each refusal it is responsible for must flip to
+    a certification. A row that refuses for an unrelated reason (a missing binding, say) therefore
+    cannot pose as coverage of the arm it is filed under.
+    """
+    shipped = {name: globals()[name] for name in
+               ("_live_nodes", "_constant_test_truth", "_empty_literal_iterable")}
+
+    for what, expect, _arm, block in _PARK_SEAM_ROWS:
+        verdict = _park_seam_verdict(block)
+        assert verdict == expect, (
+            f"#1710 park call-site reachability [{what}]: expected {expect!r}, got {verdict!r}. A "
+            "seam that certifies a park call it cannot prove RUNS is worse than no seam: it "
+            "reports the batch park as structurally proven while the partition is never released.")
+
+    arms = Counter(arm for _w, _e, arm, _b in _PARK_SEAM_ROWS)
+    assert arms == {"live": 14, "1028": 12, "1710": 10, "shape": 3}, (
+        f"#1710 expected 14 live / 12 literal-core / 10 widened / 3 shape park-seam rows, got "
+        f"{dict(arms)} — a row was dropped from _PARK_SEAM_ROWS, which is how a refusal quietly "
+        "stops being tested")
+
+    # ---- LEG 1: the pruning ITSELF is what refuses, not some incidental property -------------
+    # `ast.walk` is the pre-fix checker exactly. Under it every reachability row must certify
+    # SOMETHING — "tick", or the uncalled helper's own name — while the shape rows and the live
+    # rows are untouched, because none of them is decided by reachability.
+    with _park_seam_arms(_live_nodes=ast.walk):
+        for what, expect, arm, block in _PARK_SEAM_ROWS:
+            verdict = _park_seam_verdict(block)
+            if arm in ("1028", "1710"):
+                assert verdict is not None, (
+                    f"#1710 VACUOUS ROW [{what}]: it is refused even by the pre-fix `ast.walk` "
+                    "checker, so it proves nothing about reachability — it is refused for some "
+                    "other reason and must be re-written or re-filed under `shape`")
+            else:
+                assert verdict == expect, (
+                    f"#1710 park-seam row [{what}] is filed as {arm!r} — decided WITHOUT "
+                    f"reachability — yet swapping the walk changed its verdict to {verdict!r}")
+
+    # ---- LEG 2: each WIDENED arm is load-bearing on its own ----------------------------------
+    # The literal-only core still prunes, so leg 1 alone would stay green if the BoolOp/Compare/
+    # empty-iterable arms were deleted: the `1028` rows would carry it. This installs exactly the
+    # pre-#1710 predicate and requires the `1710` rows — and ONLY those — to go back to certified.
+    with _park_seam_arms(_constant_test_truth=_literal_only_test_truth,
+                         _empty_literal_iterable=lambda node: False):
+        for what, expect, arm, block in _PARK_SEAM_ROWS:
+            verdict = _park_seam_verdict(block)
+            if arm == "1710":
+                assert verdict is not None, (
+                    f"#1710 VACUOUS ROW [{what}]: the literal-only predicate this issue was filed "
+                    "against already refuses it, so it does not exercise the widened arms")
+            else:
+                assert verdict == expect, (
+                    f"#1710 park-seam row [{what}] is filed as {arm!r}, which the widened arms "
+                    f"must not decide, yet removing them changed its verdict to {verdict!r}")
+
+    for name, function in shipped.items():
+        assert globals()[name] is function, (
+            f"#1710 the {name} swap-back must be restored — a leaked stand-in would leave every "
+            "later reachability check in this process measuring a predicate that never shipped")
+
+    print(f"  ok   #1710 park call-site seam decides REACHABILITY, not existence: "
+          f"{arms['live']} live shapes certify while {arms['1028'] + arms['1710']} dead ones "
+          f"(incl. `False and _`, `0 == 1`, `for _ in []`) and {arms['shape']} re-scalarisations "
+          "are refused — each proved non-vacuous by swapping its own arm back")
 
 
 def _starvation_park_batch_source():
@@ -24497,6 +25063,13 @@ def _starvation_sweep_self_test():
         f"— otherwise the 1-holder-per-tick defect is back at 10 min/holder (found {park_seam!r})")
     print("  ok   #822 park call-site seam (AST): the production tick PARKS EVERY selected "
           "holder — a re-scalarised call site, a `[:1]`, or a call-site cap= reds here")
+
+    # ---- [registry #1710] ...AND THE SEAM ITSELF, DECIDED ON REACHABILITY --------------------
+    # The assertion above is the seam's ONLY assertion and it runs on ONE input — the shipped
+    # source — so it cannot see a checker that certifies dead code. That is not hypothetical: it
+    # was `ast.walk`, and `trace --count --missing` put three of the four refusals it advertises
+    # on never-executed lines. The battery below is the other input.
+    _park_call_site_reachability_self_test()
 
     # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
     _starvation_park_batch_seam_self_test()
