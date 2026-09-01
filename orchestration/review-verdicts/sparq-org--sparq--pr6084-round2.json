@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6084,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d9073236b9c822a4f38c82080a9b173df27b0bf2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "queue_snapshot() treats the page as authoritative once hasNextPage is false, but for each node it conditionally adds headCommit.oid only when truthy. If GitHub returns a partial node with headCommit null, oid absent, or a malformed oid, the function still returns a complete QueueSnapshot with that current head omitted. decide_stale_run() then sees an older run for that current group as absent and returns CANCEL; the immediate revalidation repeats the same omission and permits the mutation. This contradicts the documented fail-closed invariant that incomplete queue state must refuse rather than resemble an empty/partial queue.",
+    "file": "scripts/merge-group-watchdog.py",
+    "fix_hint": "In queue_snapshot(), require every node's headCommit to be an object whose oid is a full 40-hex SHA (and reject malformed required entry structure with GhError) before constructing QueueSnapshot. Add a behavior test using a live run plus a queue node with null/missing/malformed headCommit and assert reap_stale_runs returns nonzero with no cancellation; include the same malformed response during revalidation to exercise the real mutation path.",
+    "severity": "major",
+    "title": "Malformed current queue entries can cause live runs to be cancelled"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The reap is not fully fail-closed when GraphQL returns a structurally complete page containing an entry with a missing or malformed headCommit. queue_snapshot() silently omits that entry's head from head_oids, so an unfinished run for the still-current group can be classified obsolete and cancelled. The tests cover absent pageInfo and null/truncated queues, but not incomplete entry objects. Round 1 reported no findings, so this newly identified major correctness/safety defect makes progress regressing.",
+  "verdict": "request_changes"
+ }
+}
