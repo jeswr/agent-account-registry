@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2126,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8a738de21f8d4e8474df13622416c9dfac76e247",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The design-only record is consistent with the checked-in trust-plane implementation and carefully distinguishes repository-verifiable history from live claims it could not re-measure. The described fail-closed ladder, positive machine-owned-label subset test, capacity-receipt and park-instance proofs, receiptless provenance proof, separate bounded void budget, census taxonomy, and legacy migration all match their referenced code. It changes no behavior or trust check, introduces no executable or workflow surface, and does not present unverified live observations as fresh evidence. One wording nuance is that a live `needs:user`/`review:needs-user` is normally reported as `human-hold` by gate 0 rather than `human-applied` as the first outcome-table row suggests; this does not alter the record's substantive terminal/ownership conclusion and is not material enough to block this documentation change.",
+  "verdict": "approve"
+ }
+}
