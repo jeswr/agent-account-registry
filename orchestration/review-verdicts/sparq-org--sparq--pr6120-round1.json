@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6120,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bf2d5556bf0722374bbd664b7d6d640bb4e02a87",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The untracked-crate check is correctly implemented by comparing the current on-disk scan against the recorded floor map, and it fails with actionable remediation. The committed floor data covers both directions (no missing or stale crates), and the hermetic tests exercise the real scan/check/seed paths, including the zero-test edge case, count and integration-directory regressions, monotonic seeding, and note preservation. The workflow invokes the new self-test. No correctness, soundness, security, or vacuity issue was found.",
+  "verdict": "approve"
+ }
+}
