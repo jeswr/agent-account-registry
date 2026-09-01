@@ -25,8 +25,9 @@ FAIL CLOSED, in both directions a caller can be misled by:
     reads to a collision check as "claims no minute" and to a rate invariant as "fires never",
     and both are vacuously green;
   * an out-of-range atom is a REFUSAL, not a filter (#1279) — see `_expand_field`;
-  * a missing/unparseable workflow tree RAISES (`CronMapError`) rather than returning a partial
-    map — a lane silently absent from the map reads as a FREE minute.
+  * a missing/unparseable workflow tree — or a `schedule:` declaration this module cannot read —
+    RAISES (`CronMapError`) rather than returning a partial map: a lane silently absent from the
+    map reads as a FREE minute, and so does a minute dropped from a lane that IS in it.
 
 Usage:
   cron_map.py --self-test          # the only standalone mode; this is an import-first helper
@@ -161,19 +162,37 @@ def workflow_triggers(text: str) -> dict:
 def schedule_crons(on: dict) -> list[str]:
     """-> the cron expressions this `on:` mapping declares, in declaration order.
 
-    [] for a lane that declares no schedule. A `schedule:` entry that is not a mapping, or whose
-    `cron` is not a string, is skipped HERE rather than raising: it is not a cron this repo can
-    read, and GitHub will not run it either — the callers that need "this lane declared something
-    unreadable" to be loud get that from `cron_minutes` refusing the expression itself.
+    [] for a lane that declares no schedule — the key ABSENT, or present carrying an explicitly
+    empty list. Every other shape RAISES `CronMapError`.
 
-    The per-entry filter is also what makes a `schedule:` that is not a LIST at all come back
-    empty: iterating a bare string yields characters and iterating a mapping yields keys, and
-    neither is a mapping carrying a string `cron`. A separate not-a-list guard above it was
-    tried and removed — it could not be killed by any input, because the filter already
-    answers every case it would have (AGENTS.md pre-flight item 4, equivalent survivor).
+    THE SKIP WAS THE HOLE. This used to filter out a `schedule:` entry that was not a mapping or
+    whose `cron` was not a string, and a `schedule:` that was not a list at all came back empty
+    for the same reason (iterating a bare string yields characters). Both readings hand back a
+    lane with no crons, which drops it from `schedule_minute_map` entirely — and a lane absent
+    from that map reads to a collision check as a FREE minute, the exact failure the rest of this
+    module refuses. The prose that justified the filter claimed the loudness came from
+    `cron_minutes` refusing the expression; it never could, because a filtered entry never
+    reaches `cron_minutes`. A lane declaring `- '4 * * * *'` (a bare string, `cron:` forgotten)
+    or `schedule: '4 * * * *'` is precisely the declaration a human needs told about.
+
+    An unreadable declaration is not the same as no declaration, and the split is which one can
+    hide a minute: a `schedule:` key holding something this reader cannot resolve may well claim
+    :04, so it refuses rather than answer "claims nothing" on the lane's behalf. An explicitly
+    empty list is the one readable way to say zero entries, and it hides nothing.
     """
-    return [entry["cron"] for entry in (on.get("schedule") or [])
-            if isinstance(entry, dict) and isinstance(entry.get("cron"), str)]
+    if "schedule" not in on:
+        return []
+    schedule = on["schedule"]
+    if not isinstance(schedule, list):
+        raise CronMapError(f"`schedule:` is not a list: {schedule!r}")
+    crons: list[str] = []
+    for entry in schedule:
+        if not isinstance(entry, dict):
+            raise CronMapError(f"`schedule:` entry is not a mapping: {entry!r}")
+        if not isinstance(entry.get("cron"), str):
+            raise CronMapError(f"`schedule:` entry carries no string `cron`: {entry!r}")
+        crons.append(entry["cron"])
+    return crons
 
 
 def schedule_minute_map(root) -> dict[str, set[int]]:
@@ -187,9 +206,11 @@ def schedule_minute_map(root) -> dict[str, set[int]]:
     names other lanes' minutes is a copy waiting to go stale.
 
     -> {".github/workflows/<name>.yml": {minutes}} for every workflow carrying a schedule.
-    FAIL CLOSED in both directions a caller could be misled by: a missing workflows directory
-    raises, and an unparseable cron raises rather than dropping the lane from the map. A lane
-    silently absent from this map reads to a collision check as a free minute.
+    FAIL CLOSED in every direction a caller could be misled by: a missing workflows directory
+    raises, an unparseable cron raises rather than dropping the lane from the map, and an
+    unreadable `schedule:` declaration raises (`schedule_crons`) rather than omitting the lane
+    or deriving a PARTIAL minute set for it. A lane silently absent from this map reads to a
+    collision check as a free minute, and so does a minute missing from a lane that is present.
     """
     wf_dir = Path(root) / WORKFLOWS_DIR
     if not wf_dir.is_dir():
@@ -308,14 +329,29 @@ def _self_test() -> int:  # noqa: C901 - a flat table of named assertions reads 
         == ["1 * * * *", "2 * * * *"])
     chk("schedule_crons returns [] for a lane with no schedule at all",
         schedule_crons({"push": None}) == [])
-    chk("schedule_crons returns [] for an EMPTY or null schedule key",
-        (schedule_crons({"schedule": None}), schedule_crons({"schedule": []})) == ([], []))
-    chk("schedule_crons skips a malformed schedule entry rather than crashing the whole map",
-        schedule_crons({"schedule": ["3 * * * *", {"cron": 7}, {"cron": "3 * * * *"}]})
-        == ["3 * * * *"])
-    chk("schedule_crons returns [] for a `schedule:` that is not a LIST at all — iterating a "
-        "bare string would hand the map one cron per CHARACTER",
-        schedule_crons({"schedule": "3 * * * *"}) == [])
+    chk("schedule_crons returns [] for an EXPLICITLY EMPTY schedule list — zero entries is a "
+        "readable declaration, and it hides no minute",
+        schedule_crons({"schedule": []}) == [])
+    # A SKIPPED entry is the free-minute lie one entry at a time, so every malformed shape is a
+    # refusal. Each row pairs the malformed input with the readable one it differs from by a
+    # single token, so a reader that refused everything would red on the rows above.
+    chk("schedule_crons REFUSES a schedule entry that is not a mapping — `- '3 * * * *'` with "
+        "`cron:` forgotten claims :03, and skipping it drops the lane from the derived map",
+        _raises(CronMapError, lambda: schedule_crons({"schedule": ["3 * * * *"]})))
+    chk("schedule_crons REFUSES an entry whose `cron` is not a string, and refuses the WHOLE "
+        "declaration rather than returning the readable entries beside it — a partial list "
+        "derives a partial minute set for a lane that is present in the map",
+        _raises(CronMapError, lambda: schedule_crons(
+            {"schedule": [{"cron": "3 * * * *"}, {"cron": 7}]})))
+    chk("schedule_crons REFUSES an entry carrying no `cron` key at all",
+        _raises(CronMapError, lambda: schedule_crons({"schedule": [{"crons": "3 * * * *"}]})))
+    chk("schedule_crons REFUSES a `schedule:` that is not a LIST — iterating a bare string "
+        "would hand the map one cron per CHARACTER, and answering [] hands it no minute at all "
+        "for a key that names :03",
+        (_raises(CronMapError, lambda: schedule_crons({"schedule": "3 * * * *"})),
+         _raises(CronMapError, lambda: schedule_crons({"schedule": {"cron": "3 * * * *"}})),
+         _raises(CronMapError, lambda: schedule_crons({"schedule": None})))
+        == (True, True, True))
 
     # --- schedule_minute_map on a HERMETIC tree. The live-tree rows below can only exercise the
     # POSITIVE direction (this repo has no malformed cron and no missing workflows directory),
@@ -336,6 +372,25 @@ def _self_test() -> int:  # noqa: C901 - a flat table of named assertions reads 
             "collision check a minute it cannot see is taken",
             _raises(CronError, lambda: schedule_minute_map(_tmp)))
         (_wf / "d.yml").unlink()
+        # THE DERIVED SIDE of the refusal above, which is where the damage would land: a lane
+        # whose schedule is ENTIRELY malformed would be omitted from the map (a free minute),
+        # and a lane with one readable entry beside a malformed one would be present with a
+        # PARTIAL minute set — the same lie, harder to see.
+        (_wf / "m1.yml").write_text("on:\n  schedule:\n    - '4 * * * *'\njobs: {}\n")
+        chk("schedule map: a lane whose schedule is ALL malformed RAISES rather than being "
+            "OMITTED — an absent lane reads to a collision check as a free minute",
+            _raises(CronMapError, lambda: schedule_minute_map(_tmp)))
+        (_wf / "m1.yml").unlink()
+        (_wf / "m2.yml").write_text("on:\n  schedule:\n    - cron: '9 * * * *'\n"
+                                    "    - cron: 7\njobs: {}\n")
+        chk("schedule map: a lane with one readable and one malformed entry RAISES rather than "
+            "mapping it to the PARTIAL minute set the readable entry alone derives",
+            _raises(CronMapError, lambda: schedule_minute_map(_tmp)))
+        (_wf / "m2.yml").unlink()
+        chk("...and the same tree derives cleanly again once those lanes are gone, so the two "
+            "rows above are killed by the malformed declaration and not by sticky state",
+            schedule_minute_map(_tmp) == {f"{WORKFLOWS_DIR}/a.yml": {4, 24, 44},
+                                          f"{WORKFLOWS_DIR}/b.yml": {0, 7, 15, 30, 45}})
         (_wf / "e.yml").write_text("on: [\njobs:\n")
         chk("schedule map: an UNPARSEABLE workflow RAISES too — the lane whose YAML broke is "
             "exactly the one whose minute nobody can see",

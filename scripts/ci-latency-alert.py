@@ -450,7 +450,14 @@ def m1_scope(on: dict) -> tuple[bool, list[str], bool]:
     # The cron LIST is cron_map's `schedule_crons` (#1280) — the same reading the derived
     # minute map is built from, so M1's population and the map can never disagree about which
     # lanes declare a schedule. What is M1's own is the SCOPE verdict and `cron_only`.
-    crons = cron_map.schedule_crons(on)
+    # Adapted the same way `workflow_triggers` above is, and for the same reason: a lane whose
+    # `schedule:` cron_map cannot read is a refusal, and unwrapped that refusal is a bare
+    # traceback rather than main's reported alarm path. It is NOT swallowed into "no crons",
+    # which would drop the lane out of M1's scope exactly when its schedule is unreadable.
+    try:
+        crons = cron_map.schedule_crons(on)
+    except cron_map.CronMapError as exc:
+        raise AlarmError(str(exc)) from exc
     cron_only = set(on) <= INVISIBLE_TRIGGERS
     return bool(crons), crons, cron_only
 
@@ -1908,6 +1915,19 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("...and that reading is the SAME one the derived minute map is built from, so M1's "
         "population and the map can never disagree about what a lane declares",
         m1_scope(_two_crons)[1] == cron_map.schedule_crons(_two_crons))
+    # cron_map REFUSES an unreadable `schedule:` (a bare-string entry, a non-string `cron`, a
+    # `schedule:` that is not a list) rather than skipping it. That refusal is a CronMapError,
+    # which `main`'s handler does not catch, so it is adapted here — and it must stay a
+    # refusal: read as "declares no crons" this lane would silently leave M1's scope at the
+    # moment its schedule became unreadable.
+    try:
+        m1_scope({"schedule": ["*/15 * * * *"]})
+        chk("M1 must not accept a lane whose `schedule:` cron_map cannot read", False)
+    except AlarmError:
+        pass
+    except Exception:
+        chk("an unreadable `schedule:` reaches M1 as AlarmError, so main reports it instead of "
+            "tracebacking the tick — cron_map's own error class escaping here is that bug", False)
 
     # --- M1 detection ---
     f, c = find_cron_deficits([_lane(fires=CAP, now=NOW)], NOW)
