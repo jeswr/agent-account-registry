@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2120,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a4a7b5e958a8492bfefdb4947d10b77d4ef33c98",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved. Section 2.2 now enumerates the full current production body-writer census (18 sites across 15 scripts), distinguishes label-only calls and self-test/prose matches, and supplies independent target-selection evidence for the 17 non-catalog sites. Section 5 correspondingly corrects the proposed invariant from an impossible three-writer allow-list to a target-aware review census that accounts for the pristine tree and explicitly requires a red demonstration when a nineteenth writer is introduced. The record also candidly limits what the census proves: current target separation is conventional rather than enforced, live labels were not checked, and the follow-up test remains implementation work. For this documentation-only decision record, those limitations are stated rather than laundered into stronger claims, and I found no remaining correctness, soundness, test-validity, or security issue that warrants blocking it.",
+  "verdict": "approve"
+ }
+}
