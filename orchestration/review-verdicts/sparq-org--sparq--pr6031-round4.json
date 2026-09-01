@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6031,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "79f915c8fe2a66123679985bee8ddd33d63f34be",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete for its explicitly limited in-process, honest-majority semi-honest simulation scope. The implementation independently seeds each party, completes the commitment barrier before sharing, verifies round- and party-bound openings, creates fresh degree-t Shamir sharings, sums all parties' shares pointwise, prevents commitment-counter wrap, rejects zero masks through the shared simulation predicate, refuses unsupported VSS, and keeps deployment fail-closed. The tests exercise the real construction path and its load-bearing invariants, including reconstruction and quorum consistency, inclusion of every party, independent randomness, commitment binding, share addressing, batching and round accounting, counter exhaustion, nonzero masks, and deployment refusal. The code, design record, capability matrix, and MPC skill consistently disclose that opening verification and zero rejection are simulation artefacts, malicious off-commitment sharing remains undetected, no malicious-tier or deployability property is established, and external review sq-qhy4 is pending. No reviewer-directed instruction appears in the diff. With no findings in round 3 and none newly identified, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
