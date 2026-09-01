@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2131,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fff23b276526287709991b9512a37274af59a67c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`phase_exit_failure` states that a deliberate skip is a completed object, but `_execute_defuse_actions` continues on `snapshot != (action.head_sha, action.updated_at)` without incrementing `changed` or any other completion count. That becomes observably wrong with this patch: if one candidate is recorded in `collection_deferrals` (or fails the pre-redraft revalidation) and another candidate revalidates cleanly but is skipped because its state changed, the outcome has `attempted > 0`, `deferred` non-empty, and `changed == 0`. Rule 2 then reports `every parked PR defuse failed`, although the second candidate was successfully and safely resolved as a no-op. The comment claiming that not counting a clean skip prevents this is only true when there are no other deferrals. This produces a false non-zero sweep for a mixed per-object failure/success case and contradicts the shared phase semantics.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Represent successful revalidation skips as completed phase work (without inflating the defused-PR mutation census), or separate completion accounting from `changed` so `phase_exit_failure` can distinguish completed no-ops from mutations. Add exact tests for both a collection deferral plus a revalidation skip and a revalidation-read deferral plus a different candidate's skip; both should remain per-object alerts rather than systemic failures.",
+    "severity": "major",
+    "title": "Deliberate defuse skips do not satisfy the phase completion accounting"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-two deferral propagation is present, but the widened accounting introduces a false systemic failure when a failed defuse read is accompanied by a candidate that revalidates to a deliberate skip. The shared phase contract explicitly treats such skips as completed work; `_execute_defuse_actions` does not record them, so the new seeded/read-failure attempts make rule 2 fire even though not every candidate failed. This interaction is not covered by the added tests, which pair deferrals only with a successful mutation. Because the prior round had no findings, this new major finding makes progress regressing.",
+  "verdict": "request_changes"
+ }
+}
