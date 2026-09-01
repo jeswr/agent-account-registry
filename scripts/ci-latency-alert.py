@@ -952,8 +952,9 @@ ALERT_TOKEN_BINDINGS = (
 # floor, not a copy, so retiring a lane does not red this.
 #
 # ⚠️ A FLOOR CANNOT SEE A DELETION and was never meant to: 19 consumers minus one still clears
-# 15, and the survivors are still uniform. Deletion is caught by identity — the pairing check
-# and ALERT_ROUTE_PINNED_CONSUMERS below — never by this number.
+# 15, and the survivors are still uniform. Deletion is caught by the ENROLLED CONSUMER SET
+# (ALERT_ROUTE_CONSUMERS below, compared for equality) — never by this number, and never by the
+# pairing check, which only ever judges consumers that are still in the map.
 MIN_ALERT_REPO_BINDINGS = 15
 
 # Anchored to the start of a line so prose that mentions `ALERT_REPO:` inside a comment is not
@@ -963,16 +964,73 @@ MIN_ALERT_REPO_BINDINGS = 15
 # `alert_route_consumers` is the primary reading; the seam requires the parse to cover this scan.
 ALERT_REPO_BINDING_RE = re.compile(r"^[ \t]*ALERT_REPO:[ \t]*(\S.*?)[ \t]*$", re.M)
 
-# The two alert steps #1776 repointed, pinned by STRUCTURAL IDENTITY (file::job::step) so that
-# deleting either binding reds by NAME. Both bind the route for a watchdog that alerts out of
-# this repository, and both were edited in the PR that added these checks — an assertion that
-# only its own lane's step satisfies leaves the other change unpinned at its actual consumer.
-# A subset check at the seam, not equality: a new consumer may appear without touching this file,
-# and the pairing + uniformity checks cover it the moment it does.
-ALERT_ROUTE_PINNED_CONSUMERS = (
+# EVERY live consumer of the alert route on master, by STRUCTURAL IDENTITY (file::job::step).
+# COMPLETE and compared for EQUALITY — this is the one oracle in this section that is not
+# derived from the bindings it watches.
+#
+# ⚠️ WHY A SUBSET WAS NOT ENOUGH (review round 2 of #1776's PR). Every other check here reads a
+# population DISCOVERED BY the binding: `alert_route_consumers` returns a step only because that
+# step binds ALERT_REPO or ALERT_TOKEN, and the raw line scan only sees surviving ALERT_REPO
+# lines. Delete a step's WHOLE `env` block and it stops being a consumer in both readings at
+# once — the floor still clears (19 minus one is still above 15), the pairing check has nothing
+# left to find unpaired, and the canonical/exact-token checks judge only the survivors. The step
+# then resolves the PUBLIC-registry fallback on every tick with the estate reading perfectly
+# clean. Pinning two identities made exactly two of the nineteen steps observable and left the
+# other seventeen deletable in silence; nothing short of the complete set closes that.
+#
+# EQUALITY, not containment, in BOTH directions. `unenrolled` is not bureaucracy: an unlisted
+# consumer inherits precisely the blindness above, so a new alert step is a failure HERE, on the
+# PR that adds it, rather than a silent gap discovered during an incident. Enrolling it is the
+# same edit that makes its own future deletion visible.
+#
+# ⚠️ Adding or renaming an alert step is therefore a TWO-FILE change, on purpose.
+# At this seam a rename is indistinguishable from a deletion (`_step_identity` explains why the
+# key must not be positional), and guessing between them is how the deletion ships.
+ALERT_ROUTE_CONSUMERS = (
+    f"{WORKFLOWS_DIR}/dispatch.yml::claim::claim",
+    f"{WORKFLOWS_DIR}/dispatch.yml::claim::usage-alert",
+    f"{WORKFLOWS_DIR}/dispatch.yml::plan-alert::"
+    "Alert maintainer that the dispatch PLAN job hard-failed",
+    f"{WORKFLOWS_DIR}/groom-core.yml::groom::"
+    "Decide + raise/close model-access health alerts",
+    f"{GROOM_WORKFLOW}::groom::Decide + raise/close model-access health alerts",
+    f"{GROOM_WORKFLOW}::metrics-stale::metrics-stale",
+    f"{GROOM_WORKFLOW}::dispatch-stall::dispatch-stall",
     f"{GROOM_WORKFLOW}::ci-latency::ci-latency",
     f"{GROOM_WORKFLOW}::ratelimit-budget::ratelimit-budget",
+    f"{GROOM_WORKFLOW}::mint-gap::mint-gap",
+    f"{GROOM_WORKFLOW}::groom-alert::"
+    "Alert maintainer that the scheduled GROOM job hard-failed",
+    f"{WORKFLOWS_DIR}/metrics.yml::metrics-alert::metrics-alert",
+    f"{WORKFLOWS_DIR}/pat-validity.yml::probe::"
+    "Probe PAT validity + upsert the rolling alert",
+    f"{WORKFLOWS_DIR}/review-fix.yml::outcome::"
+    "Record the target-identity refusal (terminal, counted, no round charged)",
+    f"{WORKFLOWS_DIR}/review-fix.yml::outcome::outcome",
+    f"{WORKFLOWS_DIR}/review-fix.yml::outcome::arm",
+    f"{WORKFLOWS_DIR}/review-fix.yml::outcome::"
+    "Apply the fix outcome (host-side markers, labels, escalation)",
+    f"{WORKFLOWS_DIR}/review-fix.yml::unresolvable::"
+    "Route the PR and its source issue to a human",
+    f"{WORKFLOWS_DIR}/worker.yml::provenance::provenance",
 )
+
+
+def alert_route_consumer_drift(consumers, enrolled=ALERT_ROUTE_CONSUMERS):
+    """(gone, unenrolled) — the two directions every binding-derived check is blind to (#1776).
+
+    `gone`: an enrolled consumer that is no longer in the live map at all — its `env` block was
+    deleted outright, or its job/step identity moved. No check that reads the map's VALUES can
+    see this, because the deleted consumer contributes no value to read.
+
+    `unenrolled`: a live consumer nobody wrote down, which is the same hole one PR later.
+
+    Pure and total: it compares two identity sets and never inspects a binding, so it stays
+    exactly as sound when every surviving binding is canonical — which is the state a
+    whole-block deletion leaves behind.
+    """
+    live = set(consumers)
+    return sorted(set(enrolled) - live), sorted(live - set(enrolled))
 
 
 def _step_identity(step: dict, index: int) -> str:
@@ -1003,7 +1061,10 @@ def alert_route_consumers(root) -> dict[str, dict]:
     is silent about the one that left. That is the #1776 regression running backwards: a live
     alert step with no ALERT_REPO resolves the public-registry fallback on every tick, while the
     estate reads perfectly clean. Keying by structure makes the consumer SET observable, so a
-    deletion is a MISSING KEY and a move to another step is a CHANGED key.
+    deletion is a MISSING KEY and a move to another step is a CHANGED key — observable, but only
+    against something written down independently: this map is DISCOVERED BY the bindings, so a
+    step that loses its whole `env` block simply stops appearing here. ALERT_ROUTE_CONSUMERS is
+    that independent record and `alert_route_consumer_drift` is the comparison.
 
     BOTH names, one map, because the pair is the invariant: a step exporting ALERT_TOKEN and no
     ALERT_REPO sends the private credential to the public registry, and one exporting ALERT_REPO
@@ -1789,17 +1850,42 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             _mutated.get("ALERT_TOKEN") is not None and "ALERT_REPO" in _mutated
             and _mutated["ALERT_REPO"] is None)
         # ...and the second kill, by identity: the whole env block goes, so the consumer no
-        # longer exists. Pairing cannot see this one (nothing is left to be unpaired); a pinned
-        # identity is the only thing that can.
+        # longer exists. This is the mutant that survived review round 1 anywhere outside the two
+        # then-pinned steps, so it is now run against EVERY estate check at once: the enrolled-set
+        # comparison is the only one that reds, and the rows below prove the others do not.
         (_awf / "alerts.yml").write_text(
             _dropped.replace("      - id: identified\n"
                              "        run: true\n"
                              "        env:\n"
                              "          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}\n",
                              "      - id: identified\n        run: true\n", 1))
+        _gone_tree = alert_route_consumers(_atmp)
         chk("alert route: a consumer whose env block is deleted OUTRIGHT leaves the map — "
-            "pairing is blind to it, so identity is pinned by name at the seam",
-            _key not in alert_route_consumers(_atmp))
+            "pairing is blind to it, so only an identity written down INDEPENDENTLY can see it",
+            _key not in _gone_tree)
+        # The three binding-derived verdicts on that same mutated tree, stated as facts rather
+        # than as prose: each one is GREEN, which is why the enrolled set has to be complete.
+        chk("alert route: ...and on that tree the PAIRING, canonical-value and exact-token "
+            "checks all pass — the deleted consumer contributes no value for them to judge",
+            [k for k, c in _gone_tree.items()
+             if c["ALERT_REPO"] is None or c["ALERT_TOKEN"] is None] == []
+            and [k for k, c in _gone_tree.items()
+                 if c["ALERT_REPO"] != _canonical] == []
+            and [k for k, c in _gone_tree.items()
+                 if c["ALERT_TOKEN"] not in ALERT_TOKEN_BINDINGS] == [])
+        # THE ORACLE THAT DOES RED, exercised exactly as the seam uses it: the enrolled identities
+        # here are the PRISTINE tree's own keys, so this is the estate-wide deletion mutant the
+        # finding describes, on a consumer that is not the lane this script runs in.
+        chk("alert route: drift against the enrolled set NAMES the vanished consumer, and names "
+            "nothing else, when its whole env block is deleted",
+            alert_route_consumer_drift(_gone_tree, sorted(_seen)) == ([_key], []))
+        chk("alert route: ...and reports NO drift on the pristine tree (an oracle that always "
+            "reports something is not an oracle)",
+            alert_route_consumer_drift(_seen, sorted(_seen)) == ([], []))
+        chk("alert route: a consumer that is LIVE but not enrolled is reported too — unlisted, "
+            "it inherits exactly the blindness above",
+            alert_route_consumer_drift(_seen, [k for k in sorted(_seen) if k != _key])
+            == ([], [_key]))
         (_awf / "collide.yml").write_text(
             "on:\n  push:\njobs:\n  watch:\n    steps:\n"
             "      - name: twin\n        run: true\n        env:\n"
@@ -1843,6 +1929,16 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         pass
     except Exception:
         chk("alert route: a missing workflows directory raised the wrong error", False)
+
+    # --- The enrolled record's own integrity. It is the ONE oracle here that is not derived from
+    # the tree, so nothing else can notice it decaying. ---
+    chk("alert route: ALERT_ROUTE_CONSUMERS lists each identity ONCE (a repeated entry shrinks "
+        f"the set the seam compares against) ({len(ALERT_ROUTE_CONSUMERS)} entries)",
+        len(set(ALERT_ROUTE_CONSUMERS)) == len(ALERT_ROUTE_CONSUMERS))
+    chk(f"alert route: the enrolled record clears the SAME evidence floor as the estate scan "
+        f"({len(ALERT_ROUTE_CONSUMERS)} enrolled, floor {MIN_ALERT_REPO_BINDINGS}) — thinning it "
+        "back toward a sample is exactly the review-round-2 defect",
+        len(set(ALERT_ROUTE_CONSUMERS)) >= MIN_ALERT_REPO_BINDINGS)
 
     # --- The approved binding allowlists, both directions. `in ALERT_TOKEN_BINDINGS` is an
     # EXACT membership test and the old check was `"secrets.ALERT_TOKEN" in expr`, which the
@@ -2680,11 +2776,14 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             "derivation that stopped matching yields none, and a uniformity check over an "
             "empty population is vacuously green",
             len(_consumers) >= MIN_ALERT_REPO_BINDINGS)
-        # THE PAIR IS THE INVARIANT, and it is what catches a DELETION anywhere in the estate:
-        # the floor above cannot (19 minus one still clears 15) and the uniformity check below
-        # cannot (it only judges the bindings that are still there). A step that exports the
-        # token and not the repo hands the private credential to the public registry; one that
-        # exports the repo and not the token cannot write to the private destination at all.
+        # THE PAIR IS THE INVARIANT, and it catches the HALF deletion — one of the two names
+        # dropped while the step stays a consumer. The floor above cannot (19 minus one still
+        # clears 15) and the uniformity check below cannot (it only judges bindings that are
+        # still there). A step that exports the token and not the repo hands the private
+        # credential to the public registry; one that exports the repo and not the token cannot
+        # write to the private destination at all.
+        # ⚠️ It is blind to the WHOLE-block deletion, which removes the consumer from this map
+        # entirely and leaves nothing to be unpaired — that one is the enrolled-set row below.
         _unpaired = sorted(k for k, c in _consumers.items()
                            if c["ALERT_REPO"] is None or c["ALERT_TOKEN"] is None)
         chk("seam: every alert-route consumer binds ALERT_REPO **and** ALERT_TOKEN — dropping "
@@ -2706,16 +2805,21 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             "reads `vars.` (a repository variable is unmasked in logs) and none resolves to an "
             f"empty credential through a misspelled secret ({_token_divergent})",
             _token_divergent == [])
-        # AND BY NAME, for the two alert steps this route was repointed for. Pairing is blind to
-        # a consumer whose whole `env` block goes (nothing is left to be unpaired) and the floor
-        # is blind to any single deletion, so the identity of the load-bearing consumers is
-        # pinned. Both changed steps are covered, not just the one this script runs in.
-        _missing_consumers = sorted(k for k in ALERT_ROUTE_PINNED_CONSUMERS
-                                    if k not in _consumers)
-        chk("seam: the alert steps #1776 repointed still EXIST as route consumers "
-            f"(missing: {_missing_consumers}) — deleting one leaves every survivor canonical, "
-            "the count above the floor, and that step alerting to the public registry",
-            _missing_consumers == [])
+        # AND BY NAME, for EVERY consumer in the estate — the only row here that is not derived
+        # from the bindings it watches. Every check above reads a population the binding itself
+        # produced, so a step that loses its whole `env` block leaves all of them green: it is
+        # not in the map to be unpaired, not in the map to be non-canonical, and the floor
+        # tolerates the missing row. It just alerts to the public registry from then on.
+        # BOTH directions in ONE comparison, deliberately: `== ([], [])` cannot be made
+        # half-inert at the call site, and each direction is killed on its own by the hermetic
+        # rows above, so making one of them vacuous means editing the helper into a red suite.
+        _drift = alert_route_consumer_drift(_consumers)
+        chk("seam: the live alert-route consumer set is EXACTLY the enrolled one "
+            f"(vanished: {_drift[0]}; unenrolled: {_drift[1]}) — a vanished identity is a step "
+            "whose route was deleted or renamed, and an unenrolled one is a consumer no check "
+            "here can see the deletion of. Enrol/retire it in ALERT_ROUTE_CONSUMERS in the same "
+            "PR that adds/removes the step",
+            _drift == ([], []))
         wf = yaml.safe_load((root / GROOM_WORKFLOW).read_text())
         jobs = wf.get("jobs", {})
         chk("seam: groom-sweep.yml hosts a `ci-latency` job", "ci-latency" in jobs)
