@@ -2051,8 +2051,15 @@ def _obs_flow(flow):
             _obs_drop_queue(drops, f"row `depth` (type {type(item.get('depth')).__name__}) is not "
                             "a non-negative integer")
             continue
+        raw_age = item.get("oldest_age_minutes")
+        age = _obs_minutes(raw_age)
+        if raw_age is not None and age is None:
+            _obs_drop_queue(
+                drops, f"row `oldest_age_minutes` (type {type(raw_age).__name__}) is not "
+                "a non-negative number of minutes")
+            continue
         queue.append({"class": queue_class, "depth": depth,
-                      "oldest_age_minutes": _obs_minutes(item.get("oldest_age_minutes"))})
+                      "oldest_age_minutes": age})
     drops.close()
     queue.sort(key=lambda row: row["class"])
 
@@ -6892,6 +6899,18 @@ esac
           obs_queue([{"class": "2a", "depth": 1}, {"class": "4", "depth": 9}]),
           ([{"class": "2a", "depth": 1, "oldest_age_minutes": None},
             {"class": "4", "depth": 9, "oldest_age_minutes": None}], []))
+    # [#1919] Age follows the same sent-vs-unreadable rule as its queue-row siblings. A collector
+    # that has not shipped the optional field stays silent; one that SENT an unreadable value
+    # loses the row loudly instead of publishing a depth-only row indistinguishable from absence.
+    check("[#1919] a SENT unreadable queue age drops the row LOUDLY instead of silently erasing "
+          "only the age",
+          obs_queue([{"class": "2a", "depth": 9, "oldest_age_minutes": "12m"}]),
+          ([], [_QUEUE_DROP.format(
+              "row `oldest_age_minutes` (type str) is not a non-negative number of minutes")]))
+    check("[#1919] an UNSENT queue age keeps the row and stays SILENT — absence is not a producer/"
+          "consumer mismatch",
+          obs_queue([{"class": "2a", "depth": 9}]),
+          ([{"class": "2a", "depth": 9, "oldest_age_minutes": None}], []))
     # One warning per drop REASON, each naming the field that failed — a single shared message
     # would leave a `depth` mismatch reading as a `class` mismatch. The non-object row is the
     # branch a `--self-test` line-coverage run showed had never executed at all (pre-flight 1).
