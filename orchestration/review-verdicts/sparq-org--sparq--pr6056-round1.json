@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 6056,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7998ac6fdf73094d22bfeec6eb2c0559d368c031",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`load` runs four independent queries sequentially and combines their results without locking/version validation. The store can change between calls, yielding class counts, hierarchy, relations, and literal ranges from different store states. Comparing only the captured quad count afterward does not prevent the mixed result and cannot detect same-size replacements. This contradicts the repeated ONE-snapshot claim and can make the views mutually inconsistent.",
+    "file": "gui/app/src/components/workbench/overview-tool.tsx",
+    "fix_hint": "Use an engine-supported immutable snapshot/transaction for all four queries. If unavailable, capture a monotonic store revision before and after the batch, discard/retry when it changes, and avoid claiming one snapshot unless that invariant is enforced. Add a test that mutates the store between aggregate calls and proves mixed results are never published.",
+    "severity": "major",
+    "title": "Sequential queries do not form the claimed single snapshot"
+   },
+   {
+    "body": "`sizeNode` enlarges every non-leaf circle to enclose its children (`Math.max(own, enclosing + padding)`), while the UI and README say every bubble's area is proportional to direct instances. A zero- or low-instance superclass can therefore become the largest filled bubble solely because of its descendants. The existing packing test explicitly verifies this enlargement but does not test the advertised quantitative encoding.",
+    "file": "gui/app/src/lib/dataset-overview.ts",
+    "fix_hint": "Separate hierarchy containment from the direct-count mark (for example, draw an enclosing group outline plus a distinct count-sized circle), or change the visualization and all user-facing claims so container area is not described as direct-count proportional. Add a test covering a low-count parent with high-count children and asserting the chosen semantics.",
+    "severity": "major",
+    "title": "Parent bubble area is not proportional to direct instance count"
+   },
+   {
+    "body": "The aggregate queries apply LIMIT 500/1000, but the models receive no truncation indicator or total count. `hiddenClasses` and `hiddenStatements` only measure the secondary chord top-N filtering inside the already-truncated relation rows. Consequently a result hitting a query limit can silently omit classes, hierarchy edges, relationships, and signatures while the comments and README claim truncated data is carried back in `hidden\u2026` fields and never presented as complete. Showing LIMIT inside a disclosure does not identify that truncation actually occurred or quantify what was omitted.",
+    "file": "gui/app/src/lib/dataset-overview.ts",
+    "fix_hint": "Fetch one extra row and expose an explicit 'at least N / query truncated' state, or run companion totals/count queries where exact omitted counts are promised. Surface truncation independently for each query and revise `hidden\u2026` wording so it only claims quantities that are actually known. Add boundary tests with more than each limit.",
+    "severity": "major",
+    "title": "Query LIMIT truncation is not measured or surfaced accurately"
+   }
+  ],
+  "progress": null,
+  "summary": "The overview has useful non-vacuous unit and browser coverage, but three load-bearing claims do not match the implementation: the four queries are not a single snapshot, hierarchy container circles do not preserve area proportionality, and LIMIT truncation is presented as though omitted data were fully accounted for. These can produce internally inconsistent or materially misleading visual summaries.",
+  "verdict": "request_changes"
+ }
+}
