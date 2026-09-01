@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6056,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e1aed807070219d495e9a09b32b02a440a9b7112",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "onSelectClass updates selection before validating the new IRI, but increments instanceRef only after instanceListQuery succeeds. If request A is in flight and the user selects an unsafe class B, B displays an error without invalidating A's ticket. When A resolves, it can overwrite that error with A's instance rows, which are then rendered under Instances of B. This is the same correctness race reported in round 4.",
+    "file": "gui/app/src/components/workbench/overview-tool.tsx",
+    "fix_hint": "Increment and capture instanceRef immediately upon entry to onSelectClass, before calling instanceListQuery, so every selection invalidates earlier work. Add a focused interleaving test that starts valid request A, selects unsafe class B, resolves A, and asserts that B's rejection error remains and A's rows are never displayed under B.",
+    "severity": "major",
+    "title": "Rejected class selection still does not cancel the previous drill-down request"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the round-4 drill-down race remains unchanged. onSelectClass still changes the selected class and validates its IRI before incrementing instanceRef. Therefore an earlier valid request retains the current ticket when a later unsafe class is selected, and its eventual response can replace the unsafe-class error with rows belonging to the earlier class. The added tests still exercise IRI rejection and parsing only; they do not cover this interleaving.",
+  "verdict": "request_changes"
+ }
+}
