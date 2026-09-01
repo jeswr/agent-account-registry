@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2145,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2211671e0ec0cb975c3c8e495a87e4db652ccdc3",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 preserves the round-2 provenance fix across all three consumers. Republished findings are recognized only by their machine-authored positional lead, their model-derived prose is excluded from legacy denial, and genuine findings-side injection escalation remains fail-closed through a line-anchored reserved-namespace receipt appended after neutralization. The writer-to-reader tests cover both genuine and forged deny-shaped findings, receipt removal, and quoted/fenced/embedded receipt rejection. I found no new or remaining diff-scoped correctness, soundness, test-validity, or security issue.",
+  "verdict": "approve"
+ }
+}
