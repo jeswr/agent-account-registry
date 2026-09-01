@@ -1793,6 +1793,50 @@ _assert_dockerfile_pinned() {
   return 0
 }
 
+# PURE (self-tested): [issue #1342] the MODEL SANDBOX must ship every dependency the offline suites
+# execute. AGENTS.md makes the AUTHOR responsible for keeping each touched script's `--self-test`
+# green and for running mutation experiments on its own diff, and both happen inside that container,
+# offline — so a sandbox missing jq/PyYAML does not merely redden a row, it makes the whole
+# pre-flight impossible and pushes the author towards a home-made stub on PATH.
+#
+# The expected value is DERIVED from `SELFTEST_ENV_REQUIREMENTS` — the same table the gate's #824
+# preflight probes — rather than restated here, so a dependency added there is demanded of the image
+# too (#958: two copies of one list make each individually unkillable). Each row must be PROVEN by a
+# build-time command in the Dockerfile, not merely apt-installed: an install line can silently stop
+# resolving to a working tool, and only the probe turns that into a red BUILD. Comment lines are not
+# proof — a dependency NAMED in prose and absent from the image is precisely the #1342 state.
+#
+# Fails closed on: an unreadable file, an unrecognised dependency kind, a table that reads empty
+# (which would otherwise "provision" everything vacuously). Names the first unproven dependency.
+_assert_dockerfile_provisions_selftest_deps() {
+  local file=$1 table=${2-$SELFTEST_ENV_REQUIREMENTS}
+  [[ -f "$file" ]] || { printf 'worker-live: container definition missing: %s\n' "$file" >&2; return 1; }
+  local body label kind probe pattern proof checked=0
+  body=$(grep -v '^[[:space:]]*#' "$file" || true)
+  while IFS='|' read -r label kind probe pattern; do
+    [[ -n "$label" ]] || continue
+    case "$kind" in
+      command) proof="$probe --version" ;;
+      pymodule) proof="python3 -c 'import $probe'" ;;
+      *) printf 'worker-live: unrecognised dependency kind %q for %s — refusing to call %s provisioned\n' \
+           "$kind" "$label" "$file" >&2
+         return 1 ;;
+    esac
+    grep -qF -- "$proof" <<< "$body" || {
+      printf 'worker-live: the model sandbox never proves %s at build time (expected the command `%s`) in %s\n' \
+        "$label" "$proof" "$file" >&2
+      return 1
+    }
+    checked=$((checked + 1))
+  done <<< "$table"
+  [[ "$checked" -gt 0 ]] || {
+    printf 'worker-live: no dependency rows to check against %s — refusing (an empty requirement table proves nothing)\n' \
+      "$file" >&2
+    return 1
+  }
+  return 0
+}
+
 # PURE (self-tested): [issue #524] every non-local `uses:` in a workflow must pin a FULL 40-hex
 # commit sha (docker refs: a 64-hex sha256 digest). This MIRRORS the assertion pr-gate.yml enforces
 # on the whole workflow tree (sol audit #221) — actionlint does not check pinning, so before this
@@ -2361,11 +2405,21 @@ registry_selftest_gate() {
 
   # 5) [issue #145] every touched container definition must keep its base images digest-pinned so a
   #    benign-labelled PR cannot silently weaken the model-isolation sandbox.
+  #    [issue #1342] and the MODEL SANDBOX specifically must keep proving the dependencies the
+  #    offline suites execute (SELFTEST_ENV_REQUIREMENTS) — an image that stops shipping them leaves
+  #    every later author unable to run the AGENTS.md pre-flight at all. Scoped to that one
+  #    definition on purpose: a future container built for something else owes nothing here.
+  #    (Keep the literal `self-test` out of this loop — _registry_gate_selftest_dispatch's exact
+  #    block pin selects blocks by that substring.)
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
     if [[ "$kind" == dockerfile ]]; then
       printf 'worker-live: base-image pin check %s\n' "$name"
       _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
+      if [[ "$name" == */worker-model.Dockerfile ]]; then
+        _assert_dockerfile_provisions_selftest_deps "$name" \
+          || die "model sandbox no longer proves a suite dependency at build time: $name (fail closed — #1342: an author cannot run the offline AGENTS.md pre-flight in a sandbox missing it)"
+      fi
       direct=$((direct + 1))
     fi
   done
@@ -5178,6 +5232,95 @@ PY
   chk "empty digest is REJECTED" \
     "$( _assert_dockerfile_pinned "$tmp/empty.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
     "unpinned"
+
+  # --- [issue #1342] the model sandbox must PROVE every SELFTEST_ENV_REQUIREMENTS dependency at
+  # build time, so the offline AGENTS.md pre-flight is runnable in the container the model actually
+  # gets. Directions, each aimed at one way this could go quietly vacuous: the REAL image passes;
+  # dropping EITHER dependency's probe is refused BY NAME (the point of #1342 is a named refusal,
+  # never a silent skip); a probe present only in a COMMENT is not proof; an unrecognised kind and
+  # an EMPTY table both refuse rather than "provision" everything. The fixture tables also keep the
+  # reject rows from deriving their input from the same constant the assertion reads (pre-flight
+  # item 2c) — a mutant that empties SELFTEST_ENV_REQUIREMENTS still reds the empty-table row. ---
+  local sandbox_df="$SCRIPT_DIR/../containers/worker-model.Dockerfile"
+  chk "the live model sandbox proves every offline suite dependency at build time" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$sandbox_df" >/dev/null 2>&1 \
+        && echo provisioned || echo missing)" "provisioned"
+  # Built with printf, never as a multi-line literal: a fixture row starting in column 1 would be
+  # rewritten by the ^-anchored sed the #1371 preflight fixtures run over this very file, which
+  # reds their own instrument-validation rows.
+  local dep_table
+  dep_table=$(printf '%s\n' 'jq|command|jq|x' 'PyYAML|pymodule|yaml|x')
+  { printf 'FROM scratch\nRUN set -eux; \\\n    apt-get install -y jq python3 python3-yaml; \\\n'
+    printf "    jq --version; \\\\\n    python3 -c 'import yaml'\n"
+  } > "$tmp/deps-ok.Dockerfile"
+  chk "a fixture image proving BOTH dependencies passes (accept side is not just the real tree)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-ok.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "provisioned"
+  { printf 'FROM scratch\nRUN set -eux; \\\n    apt-get install -y python3 python3-yaml; \\\n'
+    printf "    python3 -c 'import yaml'\n"
+  } > "$tmp/deps-nojq.Dockerfile"
+  chk "an image that stops proving jq is REJECTED (non-vacuous)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-nojq.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  chk "...and the refusal NAMES the dependency, so the author is not left guessing" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-nojq.Dockerfile" "$dep_table" 2>&1 \
+        >/dev/null | grep -c 'never proves jq at build time' || true)" "1"
+  printf 'FROM scratch\nRUN set -eux; \\\n    apt-get install -y jq; \\\n    jq --version\n' \
+    > "$tmp/deps-noyaml.Dockerfile"
+  chk "an image that stops proving PyYAML is REJECTED too (both rows are read, not just the first)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-noyaml.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  # THE MARQUEE CLAIM (pre-flight item 9): the assertion demands a PROOF, not an install line. An
+  # image that apt-installs all three and never runs them is the state where a package that stopped
+  # resolving to a working tool ships silently — a containment-style check on the package names
+  # alone would call this provisioned.
+  printf 'FROM scratch\nRUN apt-get install -y jq python3 python3-yaml\n' \
+    > "$tmp/deps-unproven.Dockerfile"
+  chk "an image that INSTALLS the dependencies but never PROVES them is REJECTED" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-unproven.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  { printf 'FROM scratch\n# jq --version\n'
+    printf "#     python3 -c 'import yaml'\n"
+  } > "$tmp/deps-comment.Dockerfile"
+  chk "a probe that appears only in a COMMENT is not proof (a dependency named in prose is the bug)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-comment.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  # The bogus row is preceded by a SATISFIED one on purpose: with the bogus row alone the refusal
+  # would also come from the empty-table floor below, and the two guards would mask each other
+  # (measured — a `continue` mutant on this arm survived the single-row form).
+  local dep_table_bogus
+  dep_table_bogus=$(printf '%s\n' 'jq|command|jq|x' 'Bogus|bogus-kind|jq|x')
+  chk "an UNRECOGNISED dependency kind refuses, it is never read as satisfied" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-ok.Dockerfile" "$dep_table_bogus" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  chk "...and that refusal NAMES the kind it did not recognise, so a typo'd row is diagnosable" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-ok.Dockerfile" "$dep_table_bogus" 2>&1 \
+        >/dev/null | grep -c 'unrecognised dependency kind bogus-kind' || true)" "1"
+  chk "an EMPTY requirement table refuses — nothing checked is not everything provisioned" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-ok.Dockerfile" '' \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  chk "an unreadable container definition refuses (fail closed)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-absent.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  # WIRING, on the PARSED gate body: the assertion above can be perfectly correct and never reached.
+  # It must be CALLED, must DIE rather than warn, and must stay scoped to the model sandbox.
+  local sandbox_gate_body
+  sandbox_gate_body=$(declare -f registry_selftest_gate)
+  chk "#1342 wiring: the touched-container lint calls the sandbox dependency assertion" \
+    "$(printf '%s\n' "$sandbox_gate_body" | grep -c '_assert_dockerfile_provisions_selftest_deps')" "1"
+  chk "#1342 wiring: an unprovisioned sandbox REFUSES the gate, it does not warn and continue" \
+    "$(printf '%s\n' "$sandbox_gate_body" | grep -c 'die "model sandbox no longer proves a suite dependency')" "1"
+  chk "#1342 wiring: the assertion is scoped to the model sandbox definition" \
+    "$(printf '%s\n' "$sandbox_gate_body" | grep -c '\*/worker-model.Dockerfile')" "1"
+  # ...and the scope test must MATCH what the classifier actually emits — a scoped check whose
+  # predicate never matches the real target name is a silent fail-OPEN, the "one layer short" shape.
+  # (The predicate's presence in the gate is pinned by the row above; this pins the composition.)
+  local sandbox_target
+  sandbox_target=$(printf 'containers/worker-model.Dockerfile\n' \
+    | _registry_selftest_targets "$FULL_SELFTEST_SUITE")
+  chk "#1342 wiring: the target the classifier EMITS for the sandbox satisfies that scope test" \
+    "$([[ "${sandbox_target#*:}" == */worker-model.Dockerfile ]] && echo matches \
+       || echo "MISSED(${sandbox_target:-<no target>})")" "matches"
 
   # --- [issue #524] the 40-hex `uses:` pin assertion, mirrored from pr-gate.yml (#221) into the
   # host-side touched-workflow lint. NON-VACUOUS in BOTH directions, and both directions matter for
