@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6174,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "437da37a41456033bde51bdc3d7ce8b37e08882c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "new_package() returns the first matching manifest, build_context() exposes one {package}, and each rule is evaluated only once. If a PR adds packages/a/package.json and packages/b/package.json, all three rules can create follow-ons only for a; b is silently ignored. This violates the rule's per-new-package purpose and can leave the second package untested and undocumented. The current tests use exactly one package and do not exercise this case.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Represent newly added package roots as a collection and evaluate/expand the new-package rules once per package, including publishability and dedup keys per package. Add a test that adds at least two manifests with different private states and asserts the complete per-package follow-on set.",
+    "severity": "major",
+    "title": "Only the first newly added npm package receives follow-ons"
+   },
+   {
+    "body": "unless_paths suppresses a rule when any changed path matches. Thus any edit to .github/workflows/js.yml suppresses CI follow-up even when it does not mention the new package; likewise any site/** or book/** edit suppresses advertising or guide work. Path presence does not establish that the follow-on was completed, so an unrelated edit can leave a new package uncovered while minting no issue. The tests encode this broad behavior rather than proving actual integration.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Use package-aware verification for each suppression (for example, confirm the package is actually enumerated in js.yml and represented in the canonical site/book locations), or do not suppress the reactive issue based solely on a touched path. Add negative tests where the relevant file/subtree is changed without referencing the new package and assert that the follow-on still fires.",
+    "severity": "major",
+    "title": "Unrelated path edits can suppress required package follow-ons"
+   }
+  ],
+  "progress": null,
+  "summary": "The new-package flow-on logic is not complete for valid PR shapes. It collapses all newly added npm packages to the first manifest, so a PR adding two packages produces follow-ons for only one. Its broad path-based suppressions also treat any edit in the relevant workflow/site/book subtree as proof that the new package was integrated, allowing unrelated edits to silence required follow-ons. The added tests cover only one package and only positive path-presence suppression, so neither failure is detected.",
+  "verdict": "request_changes"
+ }
+}
