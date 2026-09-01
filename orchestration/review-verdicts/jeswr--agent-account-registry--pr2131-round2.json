@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2131,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fff23b276526287709991b9512a37274af59a67c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-one major finding is resolved. Collection-time latch-read failures are now returned from `_collect_defuse_prs`, carried across `run_sweep`, and seeded into the single `DefuseOutcome` with matching attempted/deferral accounting. Pre-redraft revalidation failures are likewise counted and recorded before continuation. Consequently, when every defuse candidate fails in either read boundary, `phase_exit_failure` reports a non-zero systemic phase failure after reclaim work completes; when another candidate completes, the failure remains a per-object alert as designed. The added tests cover both boundaries end to end, assert exact outcome/error values, distinguish clean exclusions from unreadable candidates, preserve the `RedraftUnavailable` systemic carve-out, and exercise masking at each widened handler. No new correctness, soundness, test-validity, or security issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
