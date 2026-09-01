@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5856,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "19dfee42e6c94423154af83c7dcc624974c13e62",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`analyse_run_body` decides D2 solely from the tracked `set +/-e` state. In Bash, however, `-e` is ignored for commands used as `if`/`while`/`until` tests, commands negated with `!`, and non-final commands in `&&`/`||` lists. For example, a gating step containing `if cargo test; then echo passed; fi; echo done` finishes successfully when tests fail, but this checker sees `errexit_here == true`, no D1, and no D3, so it reports clean. Likewise, splitting at `&&` loses the fact that a non-final command is in an errexit-exempt AND-list. This contradicts the added AGENTS.md rule and workflow comments that the checker catches verifying commands whose failure is thrown away.",
+    "file": "scripts/check-workflow-run-swallow.py",
+    "fix_hint": "Model shell control contexts sufficiently to flag gate commands whose status cannot terminate the step, or use a real shell parser/AST and explicitly classify conditional tests, negation, and AND/OR-list positions. Add negative fixtures that prove `if cargo test; then ...; fi` followed by a successful command and `cargo test && echo passed; echo done` both RED. Also cover custom shells without `pipefail` if pipeline swallowing is within the claimed invariant. If the intended scope is only literal D1/D2/D3, narrow every public claim accordingly rather than saying the checker enforces the general run-body swallow rule.",
+    "severity": "major",
+    "title": "Errexit tracking misses failures suppressed by shell control-flow contexts"
+   }
+  ],
+  "progress": null,
+  "summary": "The checker is well structured for its three modeled patterns, but it does not enforce the broader invariant it claims: Bash suppresses `errexit` in several control-flow contexts even while the script's tracked `errexit` state remains enabled. A gate command used as an `if`/`while` condition, negated with `!`, or placed in a non-final AND/OR-list can fail without terminating the step; a later successful command then makes the step green. The implementation treats all such commands as protected by `-e` and emits no finding. The self-tests do not cover these shell semantics. This is a major correctness gap in a CI security/gating checker, so the PR should not be approved until those contexts are either detected or the stated scope is narrowed substantially and separately enforced.",
+  "verdict": "request_changes"
+ }
+}
