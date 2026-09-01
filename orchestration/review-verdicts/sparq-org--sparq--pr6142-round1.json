@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6142,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fd53cba36e669dc9442668f1f8cbb0ff64cf0f8f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly checks out the landed merge commit before inspecting manifests, reuses gate G1's exact new-crate detection and publish=false classification, fans out deterministically per added crate, expands per-crate labels before routing, and suppresses user-facing follow-ons for internal crates while retaining test follow-ons. Configuration errors for unsupported fan-out modes and unsafe crate-label usage fail loudly. The focused tests exercise multi-crate fan-out, nested-manifest rejection, public/internal behavior, label routing, dry-run output, and invalid configuration; the relevant test suite passes (48 tests). No correctness, soundness, security, or vacuous-test issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
