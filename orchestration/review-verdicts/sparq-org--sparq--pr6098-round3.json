@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6098,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d72c20f74171aa7fbbbe105be9d1b63fbeeef60e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The tool_update doc says a request failing on operation K leaves operations `1..K` applied. The engine's non-atomic contract does not guarantee that K completed: earlier operations are retained, while K itself may be partly applied or not applied. The new PodStore documentation in this same diff states that distinction correctly, so the MCP-facing documentation is inconsistent and can mislead callers about post-error state.",
+    "file": "crates/sparq-mcp/src/solid.rs",
+    "fix_hint": "Replace `leaves operations 1..K applied` with wording matching PodStore: operations before K remain applied; K itself is not guaranteed either to be fully applied or to have applied nothing; later operations do not run. The module-level wording `partially-applied prefix` can remain.",
+    "severity": "minor",
+    "title": "MCP update documentation still overstates what remains applied at operation K"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The round-2 security defect is fixed: update_inner now reconciles WAC/ACP after a partially applied error, and the new multi-operation regression test exercises the real retained-prefix path and verifies that a subsequent write is denied after an ACL revocation. One public MCP doc comment still states the partial-apply contract incorrectly by saying operations 1..K remain applied, even though operation K may be partly applied or not applied; the more precise PodStore documentation already says this correctly. Progress is improving because the prior major implementation/test gap is resolved and only this documentation inconsistency remains.",
+  "verdict": "request_changes"
+ }
+}
