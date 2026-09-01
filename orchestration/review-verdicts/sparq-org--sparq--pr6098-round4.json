@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6098,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6fe0e3879150debc028520659782379757959e86",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3's sole finding is resolved: the MCP update documentation now accurately distinguishes operations completed before failing operation K from K itself, which may be partly applied or not applied. The implementation consistently threads one QueryBudget through authorization-time variable-graph resolution and engine application, preserves fail-closed behavior on authorization-check exhaustion, and reconciles the WAC/ACP view after a potentially partial apply. The focused tests exercise the real MCP and PodStore paths, including deterministic deadline/row-cap failures, unchanged state when authorization resolution exhausts its budget, successful bounded updates, unlimited-budget compatibility, and the retained-ACL-prefix security invariant. No new correctness, soundness, test-validity, or security issue is evident in the diff. Progress is improving because the prior minor issue is gone and no findings remain.",
+  "verdict": "approve"
+ }
+}
