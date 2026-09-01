@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2128,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "47553c8e920d46d113523fe74ea3dbb5e4248153",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3 says the property attributed to the lock\u2014\"nothing is ever overwritten\"\u2014is already held by `_persist_one`. The implementation's own contract says the opposite: `gh issue edit --body` can replace a foreign edit that lands inside the read/write window, and the edit-count confirmation detects that loss only afterward. The record itself then says \"A clobber is detected after the fact\" and, in section 8, that `_persist_one` \"detects a clobber after it happens.\" Detection, a red annotation, and recoverability from edit history are valuable, but they are not prevention and do not establish the stated property. Because this assertion supports the recommendation that the lock adds no safety, the contradiction is material to the design decision rather than editorial wording.",
+    "file": "research/1023-acct-lock-age-breaker.md",
+    "fix_hint": "State the actual guarantee precisely: concurrent metadata loss is not silently reported as success; a suspected in-window clobber fails loudly and the prior revision remains recoverable. Remove the claim that nothing is overwritten or that the lock's preventive property is already held, then evaluate separately whether prevention is needed and whether a ref mutex would actually provide it against the relevant writers.",
+    "severity": "major",
+    "title": "The existing guard does not provide the claimed no-overwrite property"
+   }
+  ],
+  "progress": null,
+  "summary": "The record usefully establishes that the proposed lock is absent, but its central description of the existing write guard overstates the safety property. `_persist_one` detects a concurrent edit only after its unconditional whole-body write may already have replaced that edit; it does not ensure that nothing is ever overwritten. The record later acknowledges this, leaving its own argument internally contradictory. Correct that claim and reassess the conclusion using the narrower, accurate property (detect-and-report with edit-history recovery).",
+  "verdict": "request_changes"
+ }
+}
