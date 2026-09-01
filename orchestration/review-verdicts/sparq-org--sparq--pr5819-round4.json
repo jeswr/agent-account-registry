@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5819,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "11da5e941f923b923570995de6d95dfee4fdb14c",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The YAML seam class is skipped exactly when PyYAML is absent, while the separate, unskipped CI mandate fails clearly if the dependency disappears in CI. The policy tests cover present, absent-local, absent-CI, truthy, and falsy marker cases. The subprocess test exercises the real masked-import path and verifies a nonzero result, the dependency diagnostic, exactly one failure, and no safe_load/AttributeError cascade. No correctness, soundness, test-validity, or security issue is present in the diff.",
+  "verdict": "approve"
+ }
+}
