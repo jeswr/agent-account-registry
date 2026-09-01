@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2116,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8b34e2e8684fa67784c9d4acb2a6131f779d1c60",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 remains clean. The workflow bindings use the estate-canonical repository expression while keeping the token secret-only. The binding audit is fail-closed on missing or malformed workflow input, inventories consumers by stable structural identity, checks exact repository and token expressions, enforces repo/token pairing, and compares the live identity set in both directions against an independently maintained complete enrollment set. The hermetic tests exercise supported binding levels, quoted keys, half-bindings, whole-env deletion, both drift directions, duplicate identities, parser failures, and exact allowlist rejection without relying on crashing mutants. The live seam additionally pins the actual alert step, so moving a valid binding to the wrong step cannot satisfy the estate-wide checks. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
