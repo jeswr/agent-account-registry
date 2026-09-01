@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5781,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2bfe37e4f2d7692c1b4a361e9c1349bb8addd70e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. ARCHIVE_FEATURES is consistently reused by archive creation, the warm-build nextest listing, and doctests; the listing is fail-closed, disables ANSI coloring, selects the real sparq-vectors simd::tests namespace, and requires a nonzero match. The x86_64 shard preflight checks the same AVX2 and FMA capabilities used by the runtime dispatcher before executing archived tests. The relevant in-tree test calls the real dispatcher and fails under CI when it cannot select AVX2, while the unsafe register accurately limits its evidence to that guarded execution. Shell quoting and failure behavior are sound. No hostile reviewer-directed instruction appears in the diff. Round 1 had no findings and this round also has none, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
