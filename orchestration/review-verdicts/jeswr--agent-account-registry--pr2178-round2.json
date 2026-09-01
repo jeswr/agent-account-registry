@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2178,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "52d0033f2141957d7b08e6740c3d1598c6af2684",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and narrowly scoped. The added negative self-test directly exercises the only distinguishing condition: an entry-level `retriage self-test ENV-BLOCKED` output has no `worker-live: ` prefix and therefore must remain a delivered refusal rather than a harness fault. The existing loop independently pins the prefixed harness-level ENV-BLOCKED case as a fault, so both sides are non-vacuously covered and a broadened bare `ENV-BLOCKED` marker would fail the new row. This preserves fail-closed grading and does not weaken any trust check, routing rule, workflow permission, SHA binding, or audit control.",
+  "verdict": "approve"
+ }
+}
