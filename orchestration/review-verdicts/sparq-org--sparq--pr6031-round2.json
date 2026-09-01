@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6031,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "79f915c8fe2a66123679985bee8ddd33d63f34be",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete for its explicitly limited in-process, honest-majority semi-honest simulation scope. The implementation uses independently seeded per-party generators, commits all contributions before sharing, verifies openings against round- and party-bound commitments, creates fresh degree-t Shamir sharings, sums shares pointwise, refuses counter wrap and unsupported VSS, and keeps deployment fail-closed. The tests exercise the real construction path and its load-bearing invariants, including reconstruction/quorum consistency, inclusion of every party, phase binding, round accounting, counter exhaustion, nonzero rejection, and deployment refusal. The documentation consistently discloses that opening verification and the nonzero test are central simulation artefacts, off-commitment malicious sharing is undetected, no malicious-tier or deployability property is established, and external review sq-qhy4 remains pending. No hostile reviewer-directed instruction appears in the diff. No findings were present in round 1 and no new findings were identified, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
