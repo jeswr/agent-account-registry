@@ -59,6 +59,16 @@
    "model": "opus5",
    "issued_at": 1788228715,
    "expires_at": 1788235015
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "55dc16cd347f4158808bf7ab03987765",
+   "holder": "review:sparq-org/sparq#6061@dispatch-33461164009.1",
+   "package": "zk",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1788228730,
+   "expires_at": 1788232930
   }
  ]
 }
