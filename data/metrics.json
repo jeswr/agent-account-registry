@@ -1,14 +1,14 @@
 {
-  "generated_at": "2026-09-01T21:20:26Z",
+  "generated_at": "2026-09-01T21:29:38Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 2273,
-      "issues_ready": 281,
+      "issues_ready": 280,
       "issues_closed_1h": 0,
       "issues_closed_24h": 3,
       "prs_open": 153,
-      "prs_draft": 119,
+      "prs_draft": 124,
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
@@ -34,10 +34,10 @@
       "prs_closed_1h": 1,
       "prs_merged_1h": 0,
       "prs_merged_24h": 22,
-      "review_changes_backlog": 9,
+      "review_changes_backlog": 8,
       "needs_user_parked": 17,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 3,
+      "review_lane_runs_1h": 4,
       "worker_attempts_1h": 3,
       "worker_success_rate_1h": 0.3333,
       "pr_open_rate": 2.0,
@@ -50,9 +50,9 @@
       "target": "sparq-org/sparq",
       "classification": "ready-starved",
       "fire": true,
-      "summary": "ready frontier 281 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "ready frontier 280 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
       "metrics": {
-        "issues_ready": 281,
+        "issues_ready": 280,
         "issues_closed_1h": 0
       }
     },
@@ -66,6 +66,16 @@
         "net_pr_flow": 1.0,
         "pr_open_rate": 2.0,
         "pr_close_rate": 1.0
+      }
+    },
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "worker-failing",
+      "fire": true,
+      "summary": "worker success rate 33% < 50% floor over 2 snapshots (3 attempts this hour)",
+      "metrics": {
+        "worker_success_rate_1h": 0.3333,
+        "worker_attempts_1h": 3
       }
     }
   ]
