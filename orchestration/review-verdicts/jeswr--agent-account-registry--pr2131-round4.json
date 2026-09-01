@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2131,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fff23b276526287709991b9512a37274af59a67c",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`phase_exit_failure` says a deliberate skip is a completed object, yet `_execute_defuse_actions` still continues on `snapshot != (action.head_sha, action.updated_at)` without incrementing `changed` or any separate completion count. The patch seeds/increments `attempted` for collection and revalidation deferrals, so a tick with one such deferral plus another candidate that revalidates cleanly to a skip has `attempted > 0`, `deferred` non-empty, and `changed == 0`; rule 2 therefore falsely reports that every defuse failed even though the skipped candidate completed successfully as a safe no-op. The new tests exercise deferrals alongside a successful mutation, not alongside a clean skip, so they do not catch this mixed case.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Track completed no-ops separately from the defused-PR mutation census, or otherwise record a successful revalidation skip as completed phase work without inflating `defused_prs`. Add exact tests for both combinations requested previously: a collection deferral plus a different candidate's clean revalidation skip, and a revalidation-read deferral plus a different candidate's clean skip. Both should remain per-object alerts and must not produce a systemic phase failure.",
+    "severity": "major",
+    "title": "Deliberate defuse skips still do not satisfy phase completion accounting"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-three major remains. The new accounting records collection and revalidation failures, but it still does not count a clean revalidation skip as completed work. Consequently, a mixed tick containing one deferred candidate and one candidate safely revalidated away still satisfies `(attempted or deferred) and not changed` and is falsely reported as `every parked PR defuse failed`. The added tests cover deferral-only and deferral-plus-mutation cases, but not either mixed deferral-plus-skip case requested in round three. Because the same issue remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
