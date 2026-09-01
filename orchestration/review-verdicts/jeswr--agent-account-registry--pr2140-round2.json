@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2140,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9ff3649a4a66782c4d444a8ef3fc212be4b9f175",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The executed-page regression case remains sound and non-vacuous. It derives a well-formed normalized flow document with all four metric-producing sources removed, then independently establishes both sides of the intended behavior: the metric grid is absent, while the Queue & flow card and its expected queue, lease-utilization, and trend children remain present in render order. Deleting or inverting the childElementCount guard changes the observed child-class list, and losing or misidentifying the card also fails rather than satisfying the negative assertion. The existing measured case still exercises the positive branch. The strict fixture removals prevent source renames from silently weakening coverage, and no trust-plane or security control is changed. This round presents the same correct diff and no findings relative to the prior approved round, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
