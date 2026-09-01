@@ -23,12 +23,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "c65e4fb0f6454abfa9f589a26640305a",
-   "holder": "review:sparq-org/sparq#6070@dispatch-33455350809.1",
+   "holder": "review:sparq-org/sparq#6070@33456195628.1",
    "package": "sparq-lws-core",
    "role": "review",
    "model": "sol",
-   "issued_at": 1788223648,
-   "expires_at": 1788227848
+   "issued_at": 1788223685,
+   "expires_at": 1788227885
   },
   {
    "account": "dc2d751954080e13",
