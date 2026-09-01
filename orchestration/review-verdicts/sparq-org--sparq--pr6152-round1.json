@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 6152,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9287a24f255104d80d44805839c95b38b44ad099",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "entry_wall() returns max(median(duration_by_workflow)), but in general median(max(duration_by_entry)) != max(median(duration_by_workflow)). The fetched workflow runs are marginal observations and are not correlated by merge-group entry, so the implementation cannot derive an entry-wall distribution from them. Missing/skipped workflow runs make the mismatch worse. The report and JSON nevertheless label this value entry_wall_median and the research text says the tool re-derives the entry wall, creating a potentially misleading measurement.",
+    "file": "scripts/ci_mergegroup_poles.py",
+    "fix_hint": "Either correlate workflow runs belonging to the same merge-group entry (for example by head SHA/ref or another verified queue-entry identifier), compute each entry's maximum, then percentile those maxima; or rename this output to an honest value such as maximum_of_lane_medians and explicitly state that it is not the median entry wall. Add an asymmetric fixture where median(max) differs from max(median) so the real invariant is pinned.",
+    "severity": "major",
+    "title": "Entry-wall median is not the median queue-entry wall"
+   },
+   {
+    "body": "percentile() uses round(q * (n - 1)); Python round performs ties-to-even. This is not the standard nearest-rank estimator (ceil(q*n)-1), despite the docstring and report rationale calling it nearest-rank. For example, the median of two ordered samples always selects index 0 because round(0.5) is 0, while n=4 also selects index 2 because round(1.5) is 2. The estimator therefore changes its lower/upper selection due to parity rather than a stated percentile convention, which can alter rankings for thin samples.",
+    "file": "scripts/ci_mergegroup_poles.py",
+    "fix_hint": "Implement the documented estimator explicitly (typically max(0, ceil(q * n) - 1), with q bounds validated), or accurately document a deliberate alternative and implement it without banker's-rounding ambiguity. Replace the permissive test accepting either middle value with exact expected values for even sample sizes and boundary quantiles.",
+    "severity": "major",
+    "title": "Percentile implementation is not nearest-rank and has banker's-rounding artifacts"
+   },
+   {
+    "body": "fetch_jobs() requests per_page=100 but does not paginate. Matrix-heavy workflow runs can exceed that count, so --jobs may silently omit jobs while presenting the result as a workflow decomposition. This conflicts with the tool's fail-loud posture.",
+    "file": "scripts/ci_mergegroup_poles.py",
+    "fix_hint": "Paginate the jobs endpoint until a short page (with a bounded page cap and explicit failure on cap exhaustion), and add a mocked pagination test or factor pagination into a pure/testable helper.",
+    "severity": "minor",
+    "title": "Job listing silently truncates workflows above 100 jobs"
+   }
+  ],
+  "progress": null,
+  "summary": "The tool is well structured and its filters/reconciliation are meaningfully tested, but two central outputs are not sound as labelled. In particular, the reported queue-entry median is computed from unrelated per-workflow marginal medians rather than per-entry observations, and the purported nearest-rank percentile uses Python rounding rather than the nearest-rank definition. These can silently mis-rank poles, which is exactly the failure mode the change claims to prevent.",
+  "verdict": "request_changes"
+ }
+}
