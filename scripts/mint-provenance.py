@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-5] The MINTING half of the #657 orchestrator-PR review admission (design record
+# [SPARQ agent] The MINTING half of the #657 orchestrator-PR review admission (design record
 # research/657-orchestrator-provenance-minting.md; the admission half is #759 + #821).
 #
 # WHAT THIS IS FOR. `enumerate_review_items` admits a PR to the autonomous review lane only when
@@ -967,29 +967,38 @@ def census(repo, registry_repo, routing, enrolled_authors, *, impl_alias=DEFAULT
     return out
 
 
-def recorded_pr_numbers(repo, registry_repo, worker_pr, read_listing=None):
-    """The PR numbers that ALREADY hold a provenance record, from ONE ledger directory listing.
+def recorded_pr_numbers(repo, registry_repo, worker_pr, read_tree=None):
+    """The PR numbers that ALREADY hold a provenance record, from the complete ledger tree.
 
     Both the directory and the per-repo filename prefix are derived from the PRODUCTION path
     builder (`worker_pr.provenance_path`), never spelled out here — so a record for a DIFFERENT
     target repo in the same directory can never be counted as one of this repo's PRs, and a
     renamed layout reds this rather than silently matching nothing.
 
-    RAISES on an unreadable listing rather than returning an empty set: "no record exists" and
-    "I could not tell" must never be the same answer, which is the fail-open shape backfill's
-    sol #217 review found on this exact read."""
+    RAISES on an unreadable or truncated tree rather than returning an empty set: "no record
+    exists" and "I could not tell" must never be the same answer, which is the fail-open shape
+    backfill's sol #217 review found on this exact read."""
     template = worker_pr.provenance_path(repo, "")           # ".../<owner>--<name>--pr.json"
     directory, _, filename = template.rpartition("/")
     stem = filename[:-len(".json")] if filename.endswith(".json") else filename
     numbered = re.compile(rf"{re.escape(stem)}([1-9][0-9]*)\.json")
-    read_listing = read_listing or (lambda: _gh_json(
-        ["api", f"repos/{registry_repo}/contents/{directory}?ref={worker_pr.LEDGER_REF}"]))
-    listing = read_listing()
+    prefix = directory + "/"
+    read_tree = read_tree or (lambda: _gh_json(
+        ["api", f"repos/{registry_repo}/git/trees/{worker_pr.LEDGER_REF}?recursive=1"]))
+    response = read_tree()
+    if not isinstance(response, dict) or response.get("truncated") is not False:
+        raise MintError("the ledger tree was unreadable or truncated")
+    listing = response.get("tree")
     if not isinstance(listing, list):
-        raise MintError("the ledger provenance listing was not a directory listing")
+        raise MintError("the ledger tree did not contain a file listing")
+    if not any(isinstance(entry, dict) and isinstance(entry.get("path"), str)
+               and entry["path"].startswith(prefix) for entry in listing):
+        raise MintError("the ledger tree did not contain the provenance directory")
     numbers = set()
     for entry in listing:
-        name = entry.get("name") if isinstance(entry, dict) else None
+        path = (entry.get("path") if isinstance(entry, dict)
+                and entry.get("type") == "blob" else None)
+        name = path[len(prefix):] if isinstance(path, str) and path.startswith(prefix) else None
         match = numbered.fullmatch(name or "")
         if match:
             numbers.add(int(match.group(1)))
@@ -1800,19 +1809,68 @@ def _self_test():                                                       # noqa: 
           referenced_issue_numbers({"title": "fix(x): thing", "body": "closes #7"}), [7])
     # The recorded-PR reader is derived from the PRODUCTION path builder, so a record for ANOTHER
     # target repo sharing the directory can never be counted as one of this repo's PRs.
-    _listing = [{"name": worker_pr.provenance_path(repo, 685).rpartition("/")[2]},
-                {"name": worker_pr.provenance_path("other/repo", 999).rpartition("/")[2]},
-                {"name": "README.md"}, {"name": None}]
+    _basename = worker_pr.provenance_path(repo, 686).rpartition("/")[2]
+    _listing = [{"path": worker_pr.provenance_path(repo, 685), "type": "blob"},
+                {"path": worker_pr.provenance_path("other/repo", 999), "type": "blob"},
+                {"path": "orchestration/provenance/README.md", "type": "blob"},
+                {"path": "orchestration/provenance-archive/" + _basename, "type": "blob"},
+                {"path": _basename, "type": "blob"},
+                {"path": "orchestration/provenance/sub/" + _basename, "type": "blob"},
+                {"path": worker_pr.provenance_path(repo, 687), "type": "tree"},
+                {"path": None, "type": "blob"}]
     check("the recorded-PR reader counts THIS repo's records only",
-          recorded_pr_numbers(repo, "reg/istry", worker_pr, read_listing=lambda: _listing), {685})
+          recorded_pr_numbers(repo, "reg/istry", worker_pr,
+                              read_tree=lambda: {"tree": _listing, "truncated": False}), {685})
+    _tree_calls = []
+    _real_gh_json = globals()["_gh_json"]
+    globals()["_gh_json"] = lambda args: (_tree_calls.append(args)
+                                            or {"tree": _listing, "truncated": False})
+    try:
+        check("...and the production read uses the recursive Git Trees endpoint",
+              (recorded_pr_numbers(repo, "reg/istry", worker_pr), _tree_calls),
+              ({685}, [["api", "repos/reg/istry/git/trees/ledger?recursive=1"]]))
+    finally:
+        globals()["_gh_json"] = _real_gh_json
     try:
         recorded_pr_numbers(repo, "reg/istry", worker_pr,
-                            read_listing=lambda: {"message": "Not Found"})
+                            read_tree=lambda: {"tree": _listing, "truncated": True})
     except MintError as exc:
-        check("...and an unreadable listing RAISES rather than reading as 'nothing recorded'",
-              "directory listing" in str(exc), True)
+        check("...and a truncated tree RAISES rather than reading as 'nothing recorded'",
+              "truncated" in str(exc), True)
     else:
-        check("...and an unreadable listing RAISES rather than reading as 'nothing recorded'",
+        check("...and a truncated tree RAISES rather than reading as 'nothing recorded'",
+              "no raise", "MintError")
+    for description, unreadable in (("a null response", None),
+                                    ("an API error payload", {"message": "Not Found"})):
+        try:
+            recorded_pr_numbers(repo, "reg/istry", worker_pr,
+                                read_tree=lambda unreadable=unreadable: unreadable)
+        except MintError as exc:
+            check(f"...and {description} RAISES rather than reading as 'nothing recorded'",
+                  "unreadable" in str(exc), True)
+        else:
+            check(f"...and {description} RAISES rather than reading as 'nothing recorded'",
+                  "no raise", "MintError")
+    try:
+        recorded_pr_numbers(repo, "reg/istry", worker_pr,
+                            read_tree=lambda: {"truncated": False, "tree": None})
+    except MintError as exc:
+        check("...and an unreadable tree RAISES rather than reading as 'nothing recorded'",
+              "file listing" in str(exc), True)
+    else:
+        check("...and an unreadable tree RAISES rather than reading as 'nothing recorded'",
+              "no raise", "MintError")
+    try:
+        recorded_pr_numbers(
+            repo, "reg/istry", worker_pr,
+            read_tree=lambda: {"truncated": False,
+                               "tree": [{"path": "renamed/provenance/README.md",
+                                         "type": "blob"}]})
+    except MintError as exc:
+        check("...and a renamed provenance directory RAISES rather than matching nothing",
+              "provenance directory" in str(exc), True)
+    else:
+        check("...and a renamed provenance directory RAISES rather than matching nothing",
               "no raise", "MintError")
 
     # ---- the enrolment ordering constraint ----------------------------------------------------
