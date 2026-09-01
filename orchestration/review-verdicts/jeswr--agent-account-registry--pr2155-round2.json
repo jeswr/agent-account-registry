@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2155,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "47e51084755a9ec606ddb0a6fc48596c5d0d9ea7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "schedule_crons filters out any non-mapping entry or non-string cron and returns [] for a non-list schedule. Consequently schedule_minute_map skips an entirely malformed scheduled lane, or derives a partial minute set when one entry is valid and another malformed. That contradicts the module's fail-closed contract: the omitted declaration is precisely the evidence consumers need to know is unreadable. The comment claiming callers can get a refusal from cron_minutes is incorrect because filtered entries never reach cron_minutes. The self-tests at lines 313-318 explicitly require the unsafe skip/empty behavior, so they prevent detection rather than covering the failure mode.",
+    "file": "scripts/cron_map.py",
+    "fix_hint": "Make schedule_crons distinguish an absent schedule from a declared malformed schedule. Raise CronMapError (or another consistently handled refusal) when schedule is not a list, an entry is not a mapping, or cron is not a string; then add hermetic schedule_minute_map tests showing both an all-malformed lane and a mixed valid/malformed lane raise instead of producing an absent or partial map. Update the current permissive self-test rows accordingly.",
+    "severity": "major",
+    "title": "Malformed schedule declarations are silently omitted from the derived map"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The extraction introduces a fail-open parse boundary in the new shared trust-plane helper. Although the module promises that an unreadable cron/workflow cannot disappear from the derived map, schedule_crons silently filters malformed schedule entries and silently treats a non-list schedule as absent. schedule_minute_map therefore can return a plausible partial map (or omit the lane entirely) for a workflow GitHub will not run, allowing collision/rate assertions to go green on incomplete evidence. The self-test currently codifies this permissive behavior. This is a new major finding relative to round 1's clean approval, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
