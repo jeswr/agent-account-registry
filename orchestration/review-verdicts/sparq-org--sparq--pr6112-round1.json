@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6112,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "153c7d76a7a611590feae227c8ffa8ae3941ca44",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The dedicated sparq-lws-core coverage lane is wired consistently: it runs for full/untrusted selection and when the selected affected closure contains the exact crate name, remains skipped for unrelated selected closures, is incorporated into the aggregate coverage verdict, and is included in the demoted-lane failure filer. scripts/coverage.sh places the crate in PER_COMMIT_CRATES and the disjoint dedicated set, so the existing shard-partition guard continues to prove exactly-one placement. The focused wiring tests exercise the load-bearing selection behavior, exact-name matching, fail-open modes, event/draft guards, aggregation placement, and filer regex. The new floor and updated presence note agree on the default-feature measurement scope. No correctness, soundness, security, or vacuous-test defect is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
