@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6077,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e9d35fc96af2869d08b29cab7941f1c62e2691b5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`test_no_entry_is_reachable_from_a_pr_time_workflow` scans only `_WF_DIR.glob(\"*.yml\")`, and `local_calls` only matches an unquoted `uses: ./.github/workflows/...` value. GitHub Actions also accepts `.yaml` workflow files and quoted scalar values such as `uses: \"./.github/workflows/build-matrix.yml\"`. A PR-time workflow written in either valid form can call an entry in `_RELEASE_ONLY` without entering `reachable`, so this test remains green while the selector skips Rust jobs for a workflow that now participates in PR CI. That contradicts the stated fail-closed, machine-checked inertness obligation.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Enumerate both `*.yml` and `*.yaml` workflows and parse each workflow's jobs/`uses` values with a YAML-aware implementation, or make the stdlib parser explicitly support optional quoting and both extensions. Add regression fixtures/tests for a quoted local `uses` caller and a PR-triggered `.yaml` caller, each proving the allowlisted callee is detected.",
+    "severity": "major",
+    "title": "Reusable-workflow reachability proof misses valid GitHub Actions syntax"
+   }
+  ],
+  "progress": null,
+  "summary": "The current allowlisted workflows appear non-PR-triggered, but the load-bearing reachability test does not establish the durable inertness property claimed by the change. Its caller discovery recognizes only unquoted `uses:` values in `*.yml` files, although GitHub Actions permits quoted values and also supports `*.yaml` workflow files. A future PR-time caller using either valid form would leave an allowlisted reusable workflow classified release-only and could silently skip the Rust lanes it affects.",
+  "verdict": "request_changes"
+ }
+}
