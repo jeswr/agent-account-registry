@@ -20,7 +20,13 @@
 #   historical measured tick    = 613 requests at the old 100-PR census cap
 #       measured 2026-07-27 by the instrumented run recorded in scripts/plan-snapshot.py's module
 #       docstring (issue #721): 23 listings / 116 PR-detail / 474 check-runs.
-#   current cold-cache ceiling  = 23 + (5.9 * 150) = 908 requests at the live 150-PR cap
+#   post-#2099 core model       = 23 + (3.1 * 150) + (0.2 * 150) = 518 requests
+#       measured 2026-08-31: 433 red-only core pages across both live targets, including
+#       428 across 139 Sparq workers and 5 across 29 registry workers; 3.1 and 0.2 round both
+#       target-specific slopes upward and price BOTH targets at their independent 150-row caps.
+#   post-#2099 GraphQL ceiling = 300 workers * 2.5 points = 750 points/tick
+#       measured 2026-08-31: 168 workers, 182 requests / 364 points, zero skips. GraphQL has
+#       its own 5,000-point bucket and plan-snapshot enforces a 100-point response-body reserve.
 #   observed SAFE band          = 4-7 executed ticks/h, i.e. ~2,450-4,291 requests/h,
 #       sustained for the thirteen hours 04Z-17Z above with zero rate-limit failures.
 #   observed BREAKING rate      = 13 executed ticks/h, i.e. ~7,969 requests/h -> 403 at 18:26:17Z.
@@ -34,21 +40,20 @@
 #
 # The ceiling exists and is enforced in code, which is what makes this tractable:
 # plan-snapshot.WORKER_PR_STATUS_LIMIT caps per-PR status at 150 worker PRs and degrades the whole
-# repo to NO prstatus above it (`worker-pr-census-overflow`), so per-tick cost cannot grow past
-# 908 no matter how far the backlog runs. The 613-request run calibrates 5.9 per-PR reads at the
-# former 100-PR cap; extending that conservative model to the live cap prices the state a cold
-# cache can really reach. A backlog reduction only moves the real cost DOWN from that ceiling.
+# repo to NO prstatus above it (`worker-pr-census-overflow`). The post-#2099 model prices each of
+# the two enabled targets independently at that cap using its measured red-only REST slope; a
+# backlog reduction only moves the modeled cost down from that two-target ceiling.
 #
 # So the true ceiling lies somewhere in (4.3k, 8.0k] requests/hour. GitHub does not publish the
 # effective ceiling for this token in this configuration, and `GET /rate_limit` reports a DIFFERENT
 # bucket that reads healthy while every request 403s (issue #796) — so the floor is derived from
 # the OBSERVED band, never from a recalled documented constant.
 #
-#   floor F minutes  =>  at most 60/F executed ticks/h  =>  at most (60/F) * 908 requests/h
-#   F = 15  ->  4 ticks/h  ->  ~3,632 requests/h
+#   floor F minutes  =>  at most 60/F executed ticks/h
+#   F = 10  ->  6 ticks/h  ->  3,108 core requests/h and 4,500 GraphQL points/h
 #
 # which is (a) inside the 4-7 tick/h band that ran clean all day, (b) 46% of the rate that broke
-# it, and (c) exactly the rate the cron alone already schedules (`3,18,33,48`). That last
+# it, and (c) exactly the rate the cron alone schedules (`3,13,23,33,43,53`). That last
 # equality is the invariant worth stating: THE FLOOR MAKES THE DOORBELL STRUCTURALLY UNABLE TO
 # EXCEED THE SCHEDULE. _test_budget_arithmetic below asserts the multiplication, so the constant
 # cannot drift away from the reasoning that produced it.
@@ -206,7 +211,12 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------------------------
 # THE FLOOR. Derived in the header block above; NOT a tuning knob and deliberately NOT
 # env-overridable (a threshold readable from the workflow is a second place to get it wrong).
-MIN_TICK_INTERVAL_SECONDS = 15 * 60
+MIN_TICK_INTERVAL_SECONDS = 10 * 60
+
+# The CLAIM census now walks the live 150-PR board after PLAN. Production run 33444551254
+# exhausted the old 15-minute job bound before that walk completed; give the bounded job three
+# floor intervals while the workflow concurrency group coalesces later doorbells behind it.
+CLAIM_TIMEOUT_MINUTES = 30
 
 # The instrumented per-tick request count the arithmetic above is built on (issue #721), and the
 # linear model it calibrates. Splits from the same instrumented run: 23 listings (repo-level, does
@@ -217,16 +227,33 @@ SNAPSHOT_LISTING_REQUESTS = 23
 # this module is loaded in jobs that do not check out plan-snapshot.py; the self-test asserts the
 # two agree whenever that file IS present, so they cannot drift silently.
 WORKER_PR_STATUS_LIMIT = 150
-SNAPSHOT_REQUESTS_PER_WORKER_PR = 5.9   # 590 / 100 worker PRs, the cap the run was taken at
+SNAPSHOT_REQUESTS_PER_WORKER_PR = 3.1
+SECONDARY_TARGET_REQUESTS_PER_WORKER_PR = 0.2
+TARGET_REPOSITORY_COUNT = 2
 
 
-def requests_per_tick(worker_prs=WORKER_PR_STATUS_LIMIT):
+def requests_per_tick(worker_prs=WORKER_PR_STATUS_LIMIT,
+                      secondary_worker_prs=WORKER_PR_STATUS_LIMIT):
     """Authenticated requests one EXECUTED tick issues, as a function of the target's worker-PR
     count. Above WORKER_PR_STATUS_LIMIT the snapshot stops doing per-PR status entirely
     (`worker-pr-census-overflow`), so the cost does not keep climbing — it CLAMPS, and the clamp
     is what makes a floor derived from one measurement stay valid as the backlog moves."""
     counted = min(max(int(worker_prs), 0), WORKER_PR_STATUS_LIMIT)
-    return SNAPSHOT_LISTING_REQUESTS + SNAPSHOT_REQUESTS_PER_WORKER_PR * counted
+    secondary = min(max(int(secondary_worker_prs), 0), WORKER_PR_STATUS_LIMIT)
+    return (SNAPSHOT_LISTING_REQUESTS + SNAPSHOT_REQUESTS_PER_WORKER_PR * counted
+            + SECONDARY_TARGET_REQUESTS_PER_WORKER_PR * secondary)
+
+
+# GraphQL is a separate primary-rate-limit bucket. The live two-target census after #2099 read
+# 168 workers in 182 requests / 364 points; 2.5 points per worker rounds that 2.17-point slope
+# upward, and 300 workers covers both enabled targets at their independent 150-row caps. This is
+# an hourly proof, not a runtime gate: make_graphql_fetch enforces the
+# authoritative response-body reserve on every query.
+GRAPHQL_WORKER_PR_ALLOWANCE = TARGET_REPOSITORY_COUNT * WORKER_PR_STATUS_LIMIT
+GRAPHQL_POINTS_PER_WORKER_PR = 2.5
+GRAPHQL_POINTS_PER_TICK = round(GRAPHQL_WORKER_PR_ALLOWANCE * GRAPHQL_POINTS_PER_WORKER_PR)
+GRAPHQL_HOURLY_BUDGET = 5000
+GRAPHQL_RATE_LIMIT_RESERVE = 100
 
 
 # THE PRE-FLIGHT BUDGET RESERVE. Held back so a tick that IS admitted leaves enough behind for the
@@ -244,23 +271,25 @@ RATE_LIMIT_RESERVE = 100
 # off a real response is the only number the gate acts on.
 SHARED_HOURLY_BUDGET = 5000
 
-# [#1207] THIS IS NOW THE COLD-CACHE CEILING, and it stays the admission threshold on purpose.
+# [#1207/#2099] THIS IS THE CORE-BUCKET COLD-CACHE CEILING, and it stays the admission
+# threshold on purpose. Exact gate/detail reads have moved to GraphQL's separate bucket;
+# the remaining core fan-out is the red-only unfiltered repair-context walk.
 # plan-snapshot.py makes the per-PR check-runs reads CONDITIONAL against a cross-tick ETag store,
 # and measured against the live targets 213-222 of 222 of them answer 304 — which does not
-# decrement the bucket — so a warm tick now spends roughly 23 listings + 116 detail + ~19
-# billable check-runs reads, not the 908-request cold-cache ceiling.
+# decrement the bucket — so a warm two-target tick spends roughly 23 listings plus about 43
+# billable red-only pages at the measured 90% hit rate, not the 518-request cold ceiling.
 #
 # The floor is NOT lowered to that number. A cold store is a real state (first tick after a cache
 # eviction, a mass force-push, a restore that finds nothing) and in that state the tick really
-# can cost 908 at the live 150-PR cap. Admitting a tick at the warm price would let exactly the
-# cold tick through with
-# too little budget to finish — reopening the #819 exhaustion this file exists to prevent. An
+# can cost 518 with both live targets at the 150-PR cap. Admitting at the warm price would let the
+# cold tick through with too little budget to finish — reopening the #819 exhaustion this file
+# exists to prevent. An
 # error in a rate limiter must point at spending less, not more, so the gate keeps costing the
 # tick at its ceiling.
 #
 # The WIN is therefore not visible in this constant; it is visible in the number this gate reads.
-# Ticks that spend ~190-200 instead of 908 leave `x-ratelimit-remaining` high, so far more ticks
-# clear the same threshold. (That figure is the UNDER-LOAD one: the 304 rate is ~87-90% when the
+# Warm ticks leave `x-ratelimit-remaining` high, so the six-per-hour schedule remains affordable.
+# (The UNDER-LOAD 304 rate is ~87-90% when the
 # targets are busy, against 96-100% measured in a quieter window. The conservative number is the
 # one quoted, here and in the PR.) plan-snapshot.py prints the per-tick split ("SNAPSHOT conditional reads:
 # N of M ... billable") so the realised saving is auditable on every tick rather than assumed.
@@ -276,8 +305,8 @@ OBSERVED_BREAKING_REQUESTS_PER_HOUR = 13 * HISTORICAL_MEASURED_REQUESTS_PER_TICK
 # The artifact whose creation time IS the "this tick executed" record. Uploaded by the floor job
 # itself, immediately after it decides to proceed and before any target read happens.
 TICK_MARKER_ARTIFACT = "dispatch-tick"
-# One page is plenty: at the floor's own ceiling of 4/h with 1-day retention there are at most
-# ~96 of these, and the newest is always on the first page.
+# One page is plenty for finding the newest marker: at 6/h there can be 144 within retention,
+# but the API returns newest first and the newest is therefore always on the first page.
 ARTIFACT_PAGE_SIZE = 100
 
 DISPATCH_WORKFLOW = ".github/workflows/dispatch.yml"
@@ -883,7 +912,7 @@ def _test_cron_minute_expansion(chk):
     # ...and the shapes that kept the defect latent still expand exactly as they always did.
     chk("cron: an explicit minute LIST is unchanged (dispatch.yml's own cron — the one shape the "
         "live path exercises, and the reason the defect was latent)",
-        minutes("3,18,33,48 * * * *"), [3, 18, 33, 48])
+        minutes("3,13,23,33,43,53 * * * *"), [3, 13, 23, 33, 43, 53])
     chk("cron: a bare step from :00 is unchanged", minutes("*/10 * * * *"),
         [0, 10, 20, 30, 40, 50])
     chk("cron: a single fixed minute is a single minute", minutes("41 6 * * 1"), [41])
@@ -907,14 +936,14 @@ def _test_cron_minute_expansion(chk):
             "budget invariant vacuously)", _raised(lambda e=expr: minutes(e)), True)
     # THE PARTIALLY-invalid field, which the rows above cannot reach: they are all WHOLLY
     # unreadable, and an expander that merely DISCARDS what it cannot use refuses those anyway by
-    # running out of values. This one keeps four perfectly good minutes — dispatch's own schedule,
+    # running out of values. This one keeps six perfectly good minutes — dispatch's own schedule,
     # exactly — beside a minute the hour does not have, so a discarding expander answers
-    # `{3, 18, 33, 48}` and hands the budget row below the same shape it gets from the real cron.
-    # The row would go green on a workflow whose four claimed firings do not exist. :60
+    # `{3, 13, 23, 33, 43, 53}` and hands the budget row below the live cron's shape.
+    # The row would go green on a workflow whose six claimed firings do not exist. :60
     # is used by no valid expansion anywhere in this suite, so this cannot pass by collision.
     chk("cron: a minute list that is valid EXCEPT for one impossible atom RAISES — discarding "
-        "the :60 would answer with dispatch's own four minutes and confirm a schedule that never "
-        "fires", _raised(lambda: minutes("3,18,33,48,60 * * * *")), True)
+        "the :60 would answer with dispatch's own six minutes and confirm a schedule that never "
+        "fires", _raised(lambda: minutes("3,13,23,33,43,53,60 * * * *")), True)
     chk("cron: a range whose END runs past :59 RAISES rather than being truncated to :59",
         _raised(lambda: minutes("55-70 * * * *")), True)
     # The one-cron-per-workflow contract this file's own consumer depends on, in both directions.
@@ -954,20 +983,34 @@ def _test_budget_arithmetic(chk):
     floor and leave the justification standing."""
     ticks_per_hour = 3600 / MIN_TICK_INTERVAL_SECONDS
     ceiling = ticks_per_hour * COLD_CACHE_REQUESTS_PER_TICK
+    # [#2100] The post-GraphQL controls are a measured contract, not a cron tweak.
+    # Keep the target values explicit so the old 15-minute/908-request model cannot
+    # satisfy the new inequalities merely by changing both sides together.
+    chk("budget: the post-GraphQL cadence and core admission price are pinned",
+        (MIN_TICK_INTERVAL_SECONDS, COLD_CACHE_REQUESTS_PER_TICK), (10 * 60, 518))
+    graphql_cost = globals().get("GRAPHQL_POINTS_PER_TICK")
+    graphql_budget = globals().get("GRAPHQL_HOURLY_BUDGET")
+    graphql_reserve = globals().get("GRAPHQL_RATE_LIMIT_RESERVE")
+    chk("budget: six measured GraphQL ticks plus reserve fit the separate bucket",
+        (graphql_cost, graphql_budget, graphql_reserve,
+         isinstance(graphql_cost, int) and isinstance(graphql_budget, int)
+         and isinstance(graphql_reserve, int)
+         and ticks_per_hour * graphql_cost + graphql_reserve <= graphql_budget),
+        (750, 5000, 100, True))
     chk("budget: the #2078 live plan is pinned as cap/cold-cost/admission-threshold",
         (WORKER_PR_STATUS_LIMIT, COLD_CACHE_REQUESTS_PER_TICK, budget_floor()),
-        (150, 908, 1008))
+        (150, 518, 618))
     chk("budget: the historical evidence remains measured history, not retuned live controls",
         (HISTORICAL_MEASURED_REQUESTS_PER_TICK, OBSERVED_SAFE_REQUESTS_PER_HOUR,
          OBSERVED_BREAKING_REQUESTS_PER_HOUR),
         (613, 4291, 7969))
-    chk("budget: the floor admits at most 4 executed ticks/hour", ticks_per_hour, 4.0)
-    chk("budget: 4 ticks/h x 908 requests = 3632 requests/h", ceiling, 3632.0)
-    # The cost model, and the clamp that makes a floor derived from ONE measurement stay valid as
+    chk("budget: the floor admits at most 6 executed ticks/hour", ticks_per_hour, 6.0)
+    chk("budget: 6 ticks/h x 518 requests = 3108 requests/h", ceiling, 3108.0)
+    # The cost model, and the clamp that makes a floor derived from measurements stay valid as
     # the backlog moves. Without the clamp assertion, a growing backlog silently invalidates the
     # arithmetic above and a backlog spike becomes an outage trigger.
-    chk("budget: the cost model reproduces the 613-request instrumented observation at the old "
-        "100-PR cap", round(requests_per_tick(100)), HISTORICAL_MEASURED_REQUESTS_PER_TICK)
+    chk("budget: the post-GraphQL model rounds the 139-worker live census upward with its fixed "
+        "secondary-target slope", round(requests_per_tick(139, 29)), 460)
     chk("budget: the live 150-PR cap is priced at the conservative cold-cache ceiling",
         round(requests_per_tick(WORKER_PR_STATUS_LIMIT)), COLD_CACHE_REQUESTS_PER_TICK)
     chk("budget: per-tick cost is MONOTONE in the worker-PR count (a bigger backlog is a bigger "
@@ -984,9 +1027,17 @@ def _test_budget_arithmetic(chk):
     snapshot = os.path.join(_repo_root(), "scripts", "plan-snapshot.py")
     if os.path.isfile(snapshot):
         with open(snapshot, encoding="utf-8") as handle:
-            declared = re.search(r"^WORKER_PR_STATUS_LIMIT\s*=\s*(\d+)", handle.read(), re.M)
+            snapshot_source = handle.read()
+        declared = re.search(
+            r"^WORKER_PR_STATUS_LIMIT\s*=\s*(\d+)", snapshot_source, re.M)
         chk("budget: the clamp matches plan-snapshot.py's live WORKER_PR_STATUS_LIMIT",
             int(declared.group(1)) if declared else None, WORKER_PR_STATUS_LIMIT)
+        graphql_reserve = re.search(
+            r"^GRAPHQL_RATE_LIMIT_RESERVE\s*=\s*(\d+)", snapshot_source, re.M)
+        chk("budget: the hourly GraphQL proof holds back the same reserve the live reader "
+            "enforces from every response body",
+            int(graphql_reserve.group(1)) if graphql_reserve else None,
+            GRAPHQL_RATE_LIMIT_RESERVE)
     chk("budget: the ceiling is at or under the highest rate observed to run CLEAN "
         f"({OBSERVED_SAFE_REQUESTS_PER_HOUR}/h)", ceiling <= OBSERVED_SAFE_REQUESTS_PER_HOUR, True)
     chk("budget: the ceiling is at most half the rate that BROKE it "
@@ -994,6 +1045,14 @@ def _test_budget_arithmetic(chk):
         ceiling <= OBSERVED_BREAKING_REQUESTS_PER_HOUR / 2, True)
     # The invariant the header states in words: the doorbell cannot outpace the schedule.
     workflow = _load_workflow(DISPATCH_WORKFLOW)
+    try:
+        manifest = json.loads((workflow.get("env") or {}).get("DISPATCH_TARGET_REPOS", ""))
+    except (TypeError, json.JSONDecodeError):
+        manifest = None
+    chk("budget: the modeled target count matches dispatch.yml's live manifest",
+        (len(manifest) if isinstance(manifest, list) else None,
+         TARGET_REPOSITORY_COUNT, GRAPHQL_WORKER_PR_ALLOWANCE),
+        (2, 2, 2 * WORKER_PR_STATUS_LIMIT))
     # DERIVED by the shared expander (#1279), and REPORTED rather than raised: this function runs
     # second in the suite, so a raise here would abort the nine that follow it.
     scheduled, cron_error = _scheduled_minutes(workflow)
@@ -1016,8 +1075,8 @@ def _test_floor_predicate(chk):
     floor = MIN_TICK_INTERVAL_SECONDS
     chk("floor: a tick 3 min after the last executed tick HOLDS",
         decide(now - 3 * 60, now)[0], "hold")
-    chk("floor: a tick 16 min after the last executed tick RUNS",
-        decide(now - 16 * 60, now)[0], "run")
+    chk("floor: a tick 11 min after the last executed tick RUNS",
+        decide(now - 11 * 60, now)[0], "run")
     chk("floor: EXACTLY at the floor runs; one second inside it holds (the comparison is `<`, and "
         "an off-by-one here is either a stalled pipeline or an unbounded one)",
         (decide(now - floor, now)[0], decide(now - floor + 1, now)[0]), ("run", "hold"))
@@ -1060,7 +1119,7 @@ def _test_preflight_budget_predicate(chk):
     # this ONE repository, of which dispatch was 52. Every one of them spends from this bucket.
     chk("preflight: the wall-clock floor's own hourly ceiling is a MAJORITY of the whole SHARED "
         "bucket, so no constant can be safe — the other ~356 runs/h in this repository can empty "
-        "it inside a legal 4-tick hour, which is why the gate reads the LIVE remaining budget",
+        "it inside a legal 6-tick hour, which is why the gate reads the LIVE remaining budget",
         ((3600 // MIN_TICK_INTERVAL_SECONDS) * COLD_CACHE_REQUESTS_PER_TICK
          > SHARED_HOURLY_BUDGET // 2), True)
     chk("preflight: ... and the gate's threshold is a small fraction of that bucket, so the gate "
@@ -1279,10 +1338,10 @@ def _test_a_too_soon_tick_issues_no_snapshot_requests(chk):
         if tick() == "executed":
             executed += 1
         clock["now"] += 30
-    chk("regression: a doorbell ringing every 30 s for an hour executes at most 4 ticks",
-        executed <= 4, True)
-    chk("regression: ... i.e. at most 3632 snapshot requests in that hour",
-        snapshot_calls["n"] <= 3632, True)
+    chk("regression: a doorbell ringing every 30 s for an hour executes at most 6 ticks",
+        executed <= 6, True)
+    chk("regression: ... i.e. at most 3108 snapshot requests in that hour",
+        snapshot_calls["n"] <= 3108, True)
 
 
 def _test_live_path(chk):
@@ -1519,6 +1578,9 @@ def _test_workflow_seam(chk):
     # the gate.
     claim = _job(workflow, "claim")
     assert "secrets-guard" in _declared_needs(claim), "claim must need secrets-guard"
+    chk("seam[#2103]: CLAIM keeps the measured three-floor-interval timeout while later "
+        "doorbells coalesce behind the registry-dispatcher concurrency group",
+        claim.get("timeout-minutes"), CLAIM_TIMEOUT_MINUTES)
     chk("seam[#1208]: `claim` carries NO job-level `if:`, so a SKIPPED guard skips it via the "
         "implicit needs-must-succeed gate — gating the guard on the floor can only ever skip "
         "MORE, never admit more", claim.get("if"), None)

@@ -80,7 +80,7 @@ ALERT_LABEL = "ops-alert"
 STREAK_ALERT_TITLE = ("⚠️ The dispatch pipeline is STALLED — consecutive executed ticks are "
                       "failing and nothing is being dispatched")
 STREAK_ALERT_MARKER = "<!-- dispatch-stall-alert:v1 key=dispatch-failure-streak -->"
-# Three. At the #819 tick floor's ceiling of four executed ticks/hour this is ~45 minutes of a dead
+# Three. At the #2100 tick floor's ceiling of six executed ticks/hour this is ~30 minutes of a dead
 # pipeline. Preserve the established three-consecutive-failure evidence bar; the staleness window
 # below moves to 60 minutes so this signal remains strictly faster without paging on a transient
 # pair (asserted by _test_thresholds_agree_with_the_floor).
@@ -92,8 +92,8 @@ STALE_ALERT_TITLE = ("⚠️ The dispatch pipeline has not completed a PLAN — 
 STALE_ALERT_MARKER = "<!-- dispatch-stall-alert:v1 key=dispatch-plan-stale -->"
 # 60 minutes. NOT a tuning knob and deliberately NOT env-overridable (a threshold readable from the
 # workflow is a second place to get it wrong, and this alert is permitted to page a human). Sizing:
-# >= 4 dispatch cron periods (the cron is `3,18,33,48`, i.e. 15 min), and the host workflow
-# fires every 15 min so at least four deliveries land inside the window.
+# >= 6 dispatch cron periods (the cron is `3,13,23,33,43,53`, i.e. 10 min), and the host
+# watchdog still fires every 15 min so at least four deliveries land inside the window.
 # _test_threshold_vs_cadence asserts both, against the LIVE workflow files, so neither side can
 # drift silently.
 STALE_THRESHOLD_SECONDS = 60 * 60
@@ -103,8 +103,8 @@ RING_ALERT_TITLE = ("⚠️ The dispatcher is mostly administering itself — di
                     "tick is far above what the tick floor can ever admit")
 RING_ALERT_MARKER = "<!-- dispatch-stall-alert:v1 key=dispatch-ring-efficiency -->"
 # THE THRESHOLD, DERIVED — not chosen. The #819 floor admits at most
-# `3600 / MIN_TICK_INTERVAL_SECONDS` = 4 executed ticks/hour, and dispatch's cron fires exactly 4
-# times/hour (`3,18,33,48`). Those two numbers being EQUAL is the whole derivation: a
+# `3600 / MIN_TICK_INTERVAL_SECONDS` = 6 executed ticks/hour, and dispatch's cron fires exactly 6
+# times/hour (`3,13,23,33,43,53`). Those two numbers being EQUAL is the whole derivation: a
 # dispatcher rung only by its own schedule sits at a ratio of ~1.0, because every scheduled ring
 # lands on the floor boundary. `_test_ring_threshold_is_derived_from_the_floor` asserts that
 # equality against the LIVE floor constant and the LIVE cron, so a change to either side reds this
@@ -121,12 +121,12 @@ RING_ALERT_MARKER = "<!-- dispatch-stall-alert:v1 key=dispatch-ring-efficiency -
 # well under both measurements — asserted, in both directions, below.
 RING_RUNS_PER_EXECUTED_TICK_THRESHOLD = 3
 # Minimum concluded runs in the window before the ratio is allowed to mean anything. At the cron's
-# 4/hour this is three hours of evidence; preserving the 12-run sample avoids weakening the
-# evidence bar merely because the dispatcher is now scheduled less often. Below it a slow tick
+# 6/hour this is three hours of evidence; 18 concluded runs preserve that three-hour bar. Below
+# it a slow tick
 # can swing the ratio materially and the alarm would be reporting noise.
 # Under the sample the verdict is `unknown`, which `decide` reads as "do nothing" — it never pages
 # AND never closes a live alert.
-RING_MIN_RUNS = 12
+RING_MIN_RUNS = 18
 
 # The artifacts the halves key on. Both are written by dispatch.yml and by nothing else.
 TICK_MARKER_ARTIFACT = "dispatch-tick"          # an EXECUTED tick (uploaded before the snapshot)
@@ -904,21 +904,21 @@ def _test_ring_efficiency(chk):
                                    "created_at": stamp(ago)} for rid, conc, ago in rows]}
 
     horizon = now - 3 * 3600
-    # THE MEASURED SHAPE (#1326): 13 runs inside the window, 1 of which executed.
-    measured = runs([(1, "success", 600)] + [(n, "success", 600) for n in range(2, 14)])
-    chk("ring: the #1326 shape — 13 concluded runs, 1 executed",
-        ring_sample(measured, {1}, horizon), (13, 1))
+    # The #1326 shape resampled at the live three-hour minimum: many rings, one executed tick.
+    measured = runs([(1, "success", 600)] + [(n, "success", 600) for n in range(2, 19)])
+    chk("ring: the #1326 shape — 18 concluded runs, 1 executed",
+        ring_sample(measured, {1}, horizon), (18, 1))
     chk("ring: ... reads WASTEFUL", ring_verdict(*ring_sample(measured, {1}, horizon))[0],
         "wasteful")
     # A cron-only dispatcher: every run executed. This is the row that reds a mutant which always
     # returns 'wasteful', and the row that proves the recovery/close path is reachable.
-    healthy = runs([(n, "success", 600) for n in range(1, 14)])
+    healthy = runs([(n, "success", 600) for n in range(1, 19)])
     chk("ring: a dispatcher whose every run executed is OK at ratio 1.0",
-        ring_verdict(*ring_sample(healthy, set(range(1, 14)), horizon)), ("ok", 1.0))
+        ring_verdict(*ring_sample(healthy, set(range(1, 19)), horizon)), ("ok", 1.0))
     # THE BOUNDARY, both sides. Off-by-one here is either a page or a blind spot.
     chk("ring: exactly AT the threshold fires; one executed tick more does not "
         f"({RING_RUNS_PER_EXECUTED_TICK_THRESHOLD} vs just under it)",
-        (ring_verdict(12, 4)[0], ring_verdict(12, 5)[0]), ("wasteful", "ok"))
+        (ring_verdict(18, 6)[0], ring_verdict(18, 7)[0]), ("wasteful", "ok"))
     # EXCLUSIONS. Both can only shrink numerator and denominator together.
     older = runs([(1, "success", 600)] + [(n, "success", 4 * 3600) for n in range(2, 14)])
     chk("ring: runs OLDER than the horizon are excluded — their marker artifact may simply be off "
@@ -956,8 +956,8 @@ def _test_ring_efficiency(chk):
     chk("ring: every verdict that can reach the issue body carries its ratio (main()'s `or 0.0` "
         "fallback is unreachable on the posting path)",
         sorted({(state, ratio is None) for state, ratio in
-                (ring_verdict(13, 1), ring_verdict(12, 4), ring_verdict(12, 5),
-                 ring_verdict(13, 0), ring_verdict(3, 1))}),
+                (ring_verdict(18, 1), ring_verdict(18, 6), ring_verdict(18, 7),
+                 ring_verdict(18, 0), ring_verdict(3, 1))}),
         [("ok", False), ("unknown", True), ("wasteful", False)])
 
 
@@ -983,7 +983,7 @@ def _test_thresholds_agree_with_the_floor(chk):
     floor = _load_floor()
     streak_seconds = FAILURE_STREAK_THRESHOLD * floor.MIN_TICK_INTERVAL_SECONDS
     chk("thresholds: the failure streak is reachable strictly sooner than the staleness threshold",
-        (streak_seconds, streak_seconds < STALE_THRESHOLD_SECONDS), (2700, True))
+        (streak_seconds, streak_seconds < STALE_THRESHOLD_SECONDS), (1800, True))
 
 
 def _test_ring_threshold_is_derived_from_the_floor(chk):
@@ -997,7 +997,7 @@ def _test_ring_threshold_is_derived_from_the_floor(chk):
     cron_per_hour = 60 // _cron_period_minutes(_load_workflow(DISPATCH_WORKFLOW))
     chk("ring/floor: the schedule alone rings at EXACTLY the rate the floor can admit, which is "
         "what makes 1.0 the healthy ratio the threshold is a multiple of",
-        (ceiling_per_hour, cron_per_hour, ceiling_per_hour == cron_per_hour), (4, 4, True))
+        (ceiling_per_hour, cron_per_hour, ceiling_per_hour == cron_per_hour), (6, 6, True))
     chk("ring/floor: the threshold keeps real headroom over that structural ideal, and still fires "
         "well below both measured pathologies (8.2 in #1208, 13.5 in #1326) — a threshold set AT "
         "the measured pathology can never catch the drift toward it",
@@ -1005,16 +1005,16 @@ def _test_ring_threshold_is_derived_from_the_floor(chk):
          RING_RUNS_PER_EXECUTED_TICK_THRESHOLD < 8), (True, True))
     chk("ring/floor: the minimum sample spans at least three hours of the schedule, so one slow "
         "tick cannot swing the published ratio", RING_MIN_RUNS >= 3 * cron_per_hour, True)
-    chk("ring/floor: the conservative sample remains exactly 12 concluded runs",
-        RING_MIN_RUNS, 12)
+    chk("ring/floor: the conservative three-hour sample is exactly 18 concluded runs",
+        RING_MIN_RUNS, 18)
 
 
 def _test_threshold_vs_cadence(chk):
     """Both sides of the delivery contract, against the LIVE workflow files."""
     dispatch_period = _cron_period_minutes(_load_workflow(DISPATCH_WORKFLOW))
     groom_period = _cron_period_minutes(_load_workflow(GROOM_WORKFLOW))
-    chk("cadence: the staleness threshold is at least 4 dispatch cron periods",
-        (dispatch_period, STALE_THRESHOLD_SECONDS // 60 >= 4 * dispatch_period), (15, True))
+    chk("cadence: the staleness threshold is at least 6 dispatch cron periods",
+        (dispatch_period, STALE_THRESHOLD_SECONDS // 60 >= 6 * dispatch_period), (10, True))
     chk("cadence: the HOST workflow fires at least four times inside the threshold (a watchdog "
         "that runs less often than its own threshold cannot deliver on it)",
         (groom_period, 4 * groom_period <= STALE_THRESHOLD_SECONDS // 60), (15, True))
@@ -1069,12 +1069,12 @@ def _test_page_coverage(chk):
 def _test_gh_flows(chk):
     """The live path over a stubbed `gh`: the signal reads, and the alert flow for every half."""
     calls = []
-    # 101 executed; 102-113 are floor-held rings that concluded `success` and dispatched nothing —
+    # 101 executed; 102-118 are floor-held rings that concluded `success` and dispatched nothing —
     # the #1326 shape, and the shape in which (A) and (B) are the only signals that read healthy.
     _run_rows = ([{"id": 101, "run_number": 1, "conclusion": "failure",
                    "created_at": "2026-07-27T19:00:00Z"}]
                  + [{"id": rid, "run_number": rid, "conclusion": "success",
-                     "created_at": "2026-07-27T19:00:00Z"} for rid in range(102, 114)])
+                     "created_at": "2026-07-27T19:00:00Z"} for rid in range(102, 119)])
 
     def fake(args, label="dispatch-stall"):
         calls.append(args[-1])
@@ -1091,7 +1091,7 @@ def _test_gh_flows(chk):
     chk("live: it derives all three signals from them",
         (executed_ids, plan_epoch is not None, failure_streak(runs, executed_ids),
          ring_sample(runs, executed_ids, horizon)),
-        ({101}, True, 1, (13, 1)))
+        ({101}, True, 1, (18, 1)))
     chk("live: a REFUSED listing degrades to no signal rather than raising",
         read_signals("o/r", now=1_800_000_000, runner=lambda *a, **k: None),
         (set(), None, None, None))
@@ -1127,7 +1127,7 @@ def _test_gh_flows(chk):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-    chk("live: a 3-hour-old PLAN over 13 runs that produced ONE executed tick, with no open "
+    chk("live: a 3-hour-old PLAN over 18 runs that produced ONE executed tick, with no open "
         "alert, files exactly TWO issues (staleness + ring efficiency — the failure streak is 1 "
         "and stays quiet) and exits 0",
         (code, issued.count(["issue", "create"])), (0, 2))

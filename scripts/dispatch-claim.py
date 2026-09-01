@@ -2644,8 +2644,8 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
 #     `assemble-census`
 #     read `kept=0` on four consecutive executed ticks (20:12:40Z -> 20:47:36Z), every row deferred
 #     by `reason.global-reservation`, zero impl workers launched; it cleared at 21:07:30Z. Four
-#     holders at one park per tick was ~55 minutes of TOTAL dispatch outage. The live floor is now
-#     15 minutes; the historical incident remains the evidence for batching, while all current
+#     holders at one park per tick was ~55 minutes of TOTAL dispatch outage. The live floor is
+#     10 minutes; the historical incident remains the evidence for batching, while all current
 #     drain-time and headroom arithmetic below is derived from the live floor constants. Before #822
 #     ticks ran every ~7 minutes (briefly ~4), so the same cap was cheap. THE FLOOR IS CORRECT AND
 #     STAYS — it exists because exceeding ~6 ticks/h exhausted the request budget and took the
@@ -2681,17 +2681,17 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
 #       names elsewhere, which is a different set from the PARKED board.)
 #       These counts DRIFT — they moved within hours of being taken, and two read methods
 #       disagreed by one — so the exact numbers are not what the bound rests on. What it rests on
-#       is the margin to the 100/page boundary: at a cap of 12 the live spare affords NINE pages
-#       per holder (12 * (9 + 4) = 156 <= 164) before the budget binds, i.e. ~900 timeline events on
+#       is the margin to the 100/page boundary: at a cap of 12 the live spare affords TWELVE pages
+#       per holder (12 * (12 + 4) = 192 <= 197) before the budget binds, i.e. ~1,200 events on
 #       every holder at once.
-#   spare requests per tick     ~= 165
-#       the floor prices the live 150-PR cold-cache ceiling at 908 requests and admits 4 ticks/h:
-#       3,632/h against OBSERVED_SAFE_REQUESTS_PER_HOUR = 7*613 = 4,291/h, which ran clean for
-#       thirteen hours. Spare = 4,291 - 3,632 = 659/h = ~165 per tick at 4 ticks/h.
-#   12 parks * 5 requests       =  60  <=  165     (36% of the spare, 6.6% of a cold tick)
+#   spare requests per tick     ~= 197
+#       the post-#2099 floor prices both live targets at 518 core requests and admits 6 ticks/h:
+#       3,108/h against OBSERVED_SAFE_REQUESTS_PER_HOUR = 7*613 = 4,291/h.
+#       Spare = 4,291 - 3,108 = 1,183/h = ~197 per tick at 6 ticks/h.
+#   12 parks * 5 requests       =  60  <=  197     (30% of the spare, 11.6% of a cold tick)
 #
 # and 12 is 3x the largest starved board actually measured (4 holders, the window above), so the
-# measured case drains in ONE tick (15 min) rather than FOUR (60 min); the observed outage ran ~55
+# measured case drains in ONE tick (10 min) rather than FOUR (40 min); the observed outage ran ~55
 # min because that window also spans the tick that first measured it and the one that cleared it. A
 # board wider than the bound is paced onto later ticks exactly as before, loudly. _starvation_sweep_self_test asserts BOTH halves
 # of this arithmetic against dispatch-tick-floor.py's own constants, so neither the floor nor this
@@ -2753,7 +2753,7 @@ def starvation_park_targets(planned_items, deferred, occupancy, log=print,
 
     ALL of them, not one (registry #822 composition defect — see STARVATION_PARKS_PER_TICK_MAX).
     `busy` is a UNION, so the partition stays reserved while any holder holds it: parking one of N
-    frees nothing and the next tick — now 15 minutes away — re-measures the identical
+    frees nothing and the next tick — now 10 minutes away — re-measures the identical
     starvation. Under this function's own predicate (`planned_items` empty AND `deferred > 0`)
     there is no dispatch left to protect, so the batch cannot starve anything.
 
@@ -2897,9 +2897,9 @@ def format_unprovenanced_narrowed_census(repo, occupancy):
 #   * an ESCALATION is a WARNING, so OVER-acting is the expensive direction and 1/tick is right on
 #     its own terms — the harm it guards is a buried signal, not a starved lane.
 #
-# The tick cost is stated so nobody has to re-derive it: at the live 15-minute floor, N stuck
-# holders take N * 15 minutes for ALL of them to be NAMED in a run log. The measured population
-# was 3 (sparq-org/sparq #4360/#4509/#4528) = 45 minutes to enumerate. That is VISIBILITY latency
+# The tick cost is stated so nobody has to re-derive it: at the live 10-minute floor, N stuck
+# holders take N * 10 minutes for ALL of them to be NAMED in a run log. The measured population
+# was 3 (sparq-org/sparq #4360/#4509/#4528) = 30 minutes to enumerate. That is VISIBILITY latency
 # on a condition that is already permanent and already counted every tick under
 # `partition-starvation-unprovenanced`, not dispatch outage — which is why it is left at 1.
 STARVATION_ESCALATIONS_PER_TICK_MAX = 1
@@ -3099,31 +3099,92 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
     return dispatchable
 
 
+# [SPARQ agent] Registry #2107: CLAIM needs only issue identity + labels here. The former REST
+# list read returned every issue body and its nested metadata: on sparq's measured 2026-08-31
+# board that was 2,356
+# open issue/PR records, and the strict CLAIM step took 5m29 on the successful post-timeout run
+# (33448085955; the preceding 15-minute timeout died in this same pre-census region). GraphQL keeps
+# the SAME complete live open-issue population while projecting only the fields this predicate
+# consumes. `$endCursor` is the spelling `gh api graphql --paginate` advances automatically.
+LIVE_OPEN_ISSUE_LABELS_QUERY = """
+query($owner: String!, $name: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(states: OPEN, first: 100, after: $endCursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        labels(first: 100) {
+          pageInfo { hasNextPage }
+          nodes { name }
+        }
+      }
+    }
+  }
+}
+"""
+
+
 def _live_issue_labels(repo):
     """LIVE open-issue label map for the CLAIM-side busy revalidation — the same linkage
     input the PLAN partition read from its issue snapshot (round-2 P2 parity: the busy
     union and the enumerator must read the same source-issue hold/area state), re-read
-    from the list API at claim time. PR rows in the issues listing are skipped; a source
+    from GitHub at claim time. The GraphQL connection is issues-only (PR rows never enter),
+    and its field projection deliberately carries no bodies or unrelated metadata. A source
     issue absent from the map (closed in the window) reserves `__global__` inside
-    busy_packages_of_pulls exactly as at PLAN time. Malformed listings raise (the whole
-    repo's claim aborts loudly rather than revalidating against garbage)."""
-    pages = _gh_json(["api", "--paginate", "--slurp",
-                      f"repos/{repo}/issues?state=open&per_page=100"])
-    if not isinstance(pages, list):
+    busy_packages_of_pulls exactly as at PLAN time.
+
+    Fail closed on every incomplete or ambiguous shape: a truncated issue connection, a
+    label connection wider than its bound, malformed nodes, or a duplicate issue across pages
+    aborts this repo's claim instead of constructing a friendly partial map. The duplicate guard
+    matters because an issue moving in UPDATED_AT order during cursor pagination can otherwise
+    make whichever copy happened to arrive last silently authoritative."""
+    owner, name = repo.split("/", 1)
+    pages = _gh_json([
+        "api", "graphql", "--paginate", "--slurp",
+        "-f", "query=" + LIVE_OPEN_ISSUE_LABELS_QUERY,
+        "-F", "owner=" + owner, "-F", "name=" + name,
+    ])
+    if not isinstance(pages, list) or not pages:
         raise DispatchError("target issue listing is malformed")
+
     labels_map = {}
-    for page in pages:
-        if not isinstance(page, list):
+    for index, document in enumerate(pages):
+        try:
+            repository = document["data"]["repository"]
+            connection = repository["issues"]
+            page_info = connection["pageInfo"]
+            nodes = connection["nodes"]
+        except (KeyError, TypeError):
+            raise DispatchError("target issue listing page is malformed") from None
+        if (not isinstance(repository, dict) or not isinstance(connection, dict)
+                or not isinstance(page_info, dict) or not isinstance(nodes, list)):
             raise DispatchError("target issue listing page is malformed")
-        for issue in page:
-            if not isinstance(issue, dict) or "pull_request" in issue:
-                continue
+        has_next = page_info.get("hasNextPage")
+        if not isinstance(has_next, bool):
+            raise DispatchError("target issue listing pagination is malformed")
+        if (index < len(pages) - 1 and not has_next) or (index == len(pages) - 1 and has_next):
+            raise DispatchError("target issue listing pagination is incomplete")
+
+        for issue in nodes:
+            if not isinstance(issue, dict):
+                raise DispatchError("target issue listing entry is malformed")
             number = issue.get("number")
-            if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
-                continue
-            labels_map[number] = [
-                label.get("name") for label in (issue.get("labels") or [])
-                if isinstance(label, dict) and isinstance(label.get("name"), str)]
+            labels = issue.get("labels")
+            if (not isinstance(number, int) or isinstance(number, bool) or number <= 0
+                    or not isinstance(labels, dict)
+                    or not isinstance(labels.get("pageInfo"), dict)
+                    or not isinstance(labels.get("nodes"), list)):
+                raise DispatchError("target issue listing entry is malformed")
+            if labels["pageInfo"].get("hasNextPage") is not False:
+                raise DispatchError(f"target issue #{number} label listing is incomplete")
+            if number in labels_map:
+                raise DispatchError(f"target issue #{number} appears more than once")
+            names = []
+            for label in labels["nodes"]:
+                if not isinstance(label, dict) or not isinstance(label.get("name"), str):
+                    raise DispatchError(f"target issue #{number} label entry is malformed")
+                names.append(label["name"])
+            labels_map[number] = names
     return labels_map
 
 
@@ -3747,7 +3808,7 @@ def enrolment_enable_error(policy_doc, claim_admits, rf_admits, outcome_admits, 
 # that push rate is the quantity the congestion-collapse mode is a function of. The review lane's
 # 17 add reviewer ACCOUNT demand, not CI load, and that is bounded independently and EARLIER by
 # the account allocator, which returns no-slot and defers without mutating anything. At the
-# 15-minute cadence the fix half clears in ONE tick and the 17 in 4 — full drain within 60 minutes.
+# 10-minute cadence the fix half clears in ONE tick and the 17 in 4 — full drain within 40 minutes.
 DRAFT_TIER_BACKLOG_PER_TICK_MAX = 5
 _DRAFT_TIER_NEW = "_draft_tier_newly_reachable"   # private; stripped before the plan row is built
 
@@ -4118,8 +4179,8 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             # Measured on sparq-org/sparq#4847 (2026-07-28..29, under this code): review rounds 4,
             # 5 and 6 all returned `approve` on ONE unchanged head, with `nochange` fix rounds 3, 4
             # and 5 between them and three promote -> arm -> `gate-failed` -> disarm -> redraft
-            # cycles, ~10 minutes each under the then-live floor (the live counterfactual is now
-            # ~15 minutes each). The head's aggregator was a concluded FAILURE throughout.
+            # cycles, ~10 minutes each under the then-live floor (also ~10 minutes under the
+            # current #2100 floor). The head's aggregator was a concluded FAILURE throughout.
             #
             # So: a concluded-FAILURE aggregator on the live head selects the CI kind. This is the
             # SAME precedence GAP-B already applies one branch up ("conflict repair FIRST and alone
@@ -5392,6 +5453,83 @@ def _target_is_human_maintainer(repo, login):
     return _park_policy.probe_maintainer(repo, login, read_permission)
 
 
+def _cache_positive_maintainer_probes(probe):
+    """Reuse only positively proved maintainer identities within one PR decision.
+
+    One admission evaluates the same cached PR/issue timelines several times. Each park-policy
+    helper creates its own login cache, so without this wrapper the same collaborator permission is
+    re-read across those views even though they form one decision over one timeline snapshot.
+    Negative and failed probes are deliberately NOT cached. A transient failure must not be
+    amplified even within the decision, and a later successful proof must remain observable.
+    Exceptions propagate so each caller keeps its existing, operation-specific failure direction.
+
+    The caller MUST create a fresh wrapper for every PR. A repo-sweep cache would widen the
+    authorisation staleness window: permission revoked after PR A must be observed before a human
+    gesture on PR B can authorise re-admission (#2109).
+    """
+    confirmed = set()
+
+    def cached(login):
+        if login in confirmed:
+            return True
+        answer = probe(login)
+        if answer is True:
+            confirmed.add(login)
+            return True
+        return False
+
+    return cached
+
+
+def _cache_timeline_events_for_decision(fetch_events):
+    """Give one PR decision a single timeline view per repo/issue surface.
+
+    Park admission deliberately reasons over a PR and its source issue as one snapshot, but its
+    human-gesture, park-application, and budget helpers each request those same timelines. Cache a
+    successful read for the duration of one decision so those helpers cannot mix views or pay for
+    the same paginated target-API read repeatedly. Failures are not cached: every consumer keeps its
+    existing operation-specific failure direction and a later read may recover. Callers must create
+    a fresh wrapper for every PR, for the same staleness-bound reason as the maintainer cache.
+    """
+    events_by_surface = {}
+
+    def cached(repo, number):
+        key = (repo, number)
+        if key not in events_by_surface:
+            events = fetch_events(repo, number)
+            # park_policy deliberately turns malformed timeline rows into a conservative
+            # per-consumer result instead of raising out of the whole sweep. Validate the
+            # shared structural boundary HERE first: otherwise the first consumer can observe
+            # a malformed row, recover conservatively, and leave that failed read memoised for
+            # every later consumer in the same decision. Match park_policy._event_rows exactly:
+            # every label event needs a readable name, but only events for READMISSION_LABELS
+            # need a strict timestamp. Assignment stays strictly after validation, so a later
+            # read can recover just like an exception from fetch_events.
+            malformed = not isinstance(events, list)
+            if not malformed:
+                for event in events:
+                    if not isinstance(event, dict):
+                        malformed = True
+                        break
+                    kind = event.get("event")
+                    if kind in {"labeled", "unlabeled"}:
+                        label = event.get("label")
+                        name = label.get("name") if isinstance(label, dict) else None
+                        if (not isinstance(name, str)
+                                or (name in _park_policy.READMISSION_LABELS
+                                    and not _park_policy.valid_timestamp(
+                                        event.get("created_at")))):
+                            malformed = True
+                            break
+            if malformed:
+                raise DispatchError(
+                    f"target timeline for {repo}#{number} is structurally malformed")
+            events_by_surface[key] = events
+        return events_by_surface[key]
+
+    return cached
+
+
 def _read_model_health_window(model_health, registry_repo, now, api=None):
     """Read the task-decline evidence through model-health's authoritative validated reader.
 
@@ -5810,6 +5948,12 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
             # skip THIS PR (its park simply stands) and never abort the sweep — the whole tick's
             # claim runs under this call.
             labels = set(_labels(row))
+            # One timeline snapshot and one permission view per PR decision. Never hoist this out
+            # of the loop: a cross-PR cache could outlive a maintainer permission revocation and
+            # incorrectly authorise a later PR's human-gesture readmission (#2109).
+            is_human_maintainer = _cache_positive_maintainer_probes(
+                lambda login: _target_is_human_maintainer(repo, login))
+            cached_timeline = _cache_timeline_events_for_decision(timeline_fn)
             # `record` was read above the candidate filter (#835): the orchestrator waiver is a
             # function OF the record, so the record has to exist before the gates it can waive
             # are evaluated. ONE read per PR per tick — a second `provenance.get` here would be a
@@ -5836,9 +5980,8 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                         issue_hold_machine_owned=(
                             lambda issue, label:
                                 _park_policy.label_application_machine_owned(
-                                    repo, issue, label, timeline_fn,
-                                    is_human=lambda probe: _target_is_human_maintainer(
-                                        repo, probe),
+                                    repo, issue, label, cached_timeline,
+                                    is_human=is_human_maintainer,
                                     log=log)),
                         log=log):
                     migrated += 1
@@ -5902,19 +6045,9 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                         park_census, repo, number,
                         _park_policy.PARK_REFUSAL_FOREIGN_EPISODE, age_detail)
                     continue
-            # ONE timeline read per surface per PR: the admission consults the timelines several
-            # times (the human cutoff, the park applications, the ownership probe) and every read
-            # must see the SAME view anyway — a mid-decision change would mix two worlds.
-            timelines = {}
-
-            def cached_timeline(_repo, timeline_number, _cache=timelines):
-                if timeline_number not in _cache:
-                    _cache[timeline_number] = timeline_fn(_repo, timeline_number)
-                return _cache[timeline_number]
-
             action, evidence, detail = _park_policy.capacity_park_admission(
                 repo, number, issue_number, cached_timeline,
-                is_human=lambda probe_login: _target_is_human_maintainer(repo, probe_login),
+                is_human=is_human_maintainer,
                 consumed=worker_pr.park_generation_cutoffs(comments, bot_login),
                 auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                 auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
@@ -6072,8 +6205,8 @@ def _log_park_census(repo, census, log=print):
 # slowly than it was applied. That is the benign direction (a release is throughput coming back,
 # not an outage), and releases are driven by each PR's provenance record landing, which does not
 # arrive in a batch. An un-park deferred by this ceiling writes nothing and is retried next tick —
-# which is now a 15-minute unit (#822), so the drain of a full cohort is
-# ceil(N / AUTO_READMISSION_PER_TICK_MAX) * 15 minutes. Re-derive this if that ever binds.
+# which is now a 10-minute unit (#822/#2100), so the drain of a full cohort is
+# ceil(N / AUTO_READMISSION_PER_TICK_MAX) * 10 minutes. Re-derive this if that ever binds.
 STARVATION_UNPARKS_PER_TICK_MAX = AUTO_READMISSION_PER_TICK_MAX
 
 # The park cause this sweep owns. It is written into the park receipt and re-read before any
@@ -6864,6 +6997,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         finish_pending()
         number = item["pr_number"]
         lane = _review_item_lane(item["state"])
+        # Scope the proof snapshot to this PR. See _cache_positive_maintainer_probes: carrying it
+        # across items would turn a revoked permission into stale authorisation on a later PR.
+        is_human_maintainer = _cache_positive_maintainer_probes(
+            lambda login: _target_is_human_maintainer(repo, login))
+        cached_timeline = _cache_timeline_events_for_decision(_issue_timeline_events)
         lanes[lane]["planned"] += 1
         if lane == "fix":
             # Issue #460: count at the actual PLAN->CLAIM enumeration boundary, not just
@@ -6983,8 +7121,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # receipted decision.
                 park_action, _park_evidence, park_detail = \
                     _park_policy.capacity_park_admission(
-                        repo, number, issue_number, _issue_timeline_events,
-                        is_human=lambda login: _target_is_human_maintainer(repo, login),
+                        repo, number, issue_number, cached_timeline,
+                        is_human=is_human_maintainer,
                         consumed=park_receipts,
                         auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                         auto_marker_count=worker_pr.auto_readmission_marker_count(
@@ -7193,8 +7331,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 if readmission_cutoff is _UNPROBED:
                     readmission_cutoff = _park_policy.effective_readmission_cutoff(
                         _park_policy.readmission_cutoff(
-                            _repo, _number, _issue, _issue_timeline_events,
-                            is_human=lambda login: _target_is_human_maintainer(_repo, login)),
+                            _repo, _number, _issue, cached_timeline,
+                            is_human=is_human_maintainer),
                         worker_pr.auto_readmission_stamps(comments, bot_login))
                 return readmission_cutoff
 
@@ -7587,6 +7725,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # S=0 fails closed.  No static per-lane ceiling can strand an idle provider.
                 account_slot_bound=True,
                 return_reason=True,
+                # [#1480] A `review` run is READ-ONLY (review-fix.yml gates every commit/push
+                # site, including the push job, on `inputs.mode == 'fix'`), so two reviews on one
+                # crate cannot collide. `partition_available` is holder_prefix-scoped and the
+                # namespaces are disjoint ("review:" vs "fix:"), so this drops ONLY
+                # review-vs-review serialisation — no write lane ever consulted, or was consulted
+                # by, this predicate. `fix` keeps the package single-flight unchanged.
+                partition_scoped=(mode != "review"),
             )
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             defer_reasons["lease-error"] += 1
@@ -8457,7 +8602,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         # EVERY inert holder, not the lowest one (registry #822). `busy` is a union: the partition
         # is only released once the LAST holder is parked, so a per-tick cap of 1 multiplied by
         # #822's former 10-minute floor exposed a 4-holder board as ~55 minutes of total dispatch
-        # outage; the live 15-minute floor makes batching even more important. The loop is
+        # outage; the live 10-minute floor makes batching even more important. The loop is
         # per-holder-resilient — one failed park never costs the others.
         #
         # >>> starvation-park-batch — EXECUTED by _starvation_park_batch_seam_self_test against
@@ -10381,6 +10526,15 @@ def _self_test():
 
         def fake_gh_json(args):
             path = args[-1]
+            if (args[:2] == ["api", "graphql"]
+                    and any(value == "query=" + LIVE_OPEN_ISSUE_LABELS_QUERY
+                            for value in args)):
+                return [{"data": {"repository": {"issues": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [{"number": live_issue["number"],
+                               "labels": {"pageInfo": {"hasNextPage": False},
+                                          "nodes": live_issue["labels"]}}],
+                }}}}]
             if path == "repos/example/repo":
                 return {"default_branch": "main"}
             if path == "repos/example/repo/branches/main":
@@ -10389,8 +10543,6 @@ def _self_test():
                 return {"type": "file", "content": base64.b64encode(b"").decode()}
             if path == "repos/example/repo/pulls?state=open&per_page=100":
                 return [[]]
-            if path == "repos/example/repo/issues?state=open&per_page=100":
-                return [[live_issue]]
             if path == "repos/example/repo/issues/500":
                 return live_issue
             if path == "repos/example/repo/issues/500/comments?per_page=100":
@@ -15741,7 +15893,7 @@ def _self_test():
     # re-approves the identical tree. Measured on sparq-org/sparq#4847 (2026-07-28..29): review
     # rounds 4, 5 and 6 all `approve` on ONE unchanged head, `nochange` fix rounds 3, 4 and 5
     # between them, three arm -> `gate-failed` -> disarm -> redraft cycles ~10 minutes each under
-    # the then-live floor (the live counterfactual is now ~15 minutes each),
+    # the then-live floor (also ~10 minutes under the current #2100 floor),
     # and a concluded-red aggregator on the head the entire time.
     changes_red = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:changes"],
                        body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
@@ -20643,31 +20795,73 @@ agent = "impl"
         assert set(_claim_provenance_map(repo, legacy_root)) == {76}
         assert _claim_provenance_map(repo, str(Path(prov_tmp) / "absent")) == {}
 
-    # the live issue-label read: PR rows skipped, malformed listings fail LOUD
+    # [SPARQ agent] The live issue-label read is the production performance boundary: GraphQL
+    # projects ONLY number + label names, paginates the complete issues-only connection, and every
+    # incomplete/ambiguous response fails LOUD. This executes the real function and captures its
+    # exact gh argv; a helper-only test would leave the 2,356-record REST call site intact.
     prev_live_gh = globals()["_gh_json"]
     try:
-        globals()["_gh_json"] = lambda args: [[
-            {"number": 81, "labels": [{"name": "area:crate-b"}, {"name": "needs:user"}]},
-            {"number": 90, "labels": [{"name": "x"}], "pull_request": {}},
-            {"number": "bad", "labels": []},
-            {"number": 82, "labels": [{"name": 5}, "loose", {"name": "role:impl"}]},
-        ]]
+        def issue_node(number, labels, labels_have_next=False):
+            return {"number": number,
+                    "labels": {"pageInfo": {"hasNextPage": labels_have_next},
+                               "nodes": [{"name": label} for label in labels]}}
+
+        def issue_page(nodes, has_next=False, cursor=None):
+            return {"data": {"repository": {"issues": {
+                "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                "nodes": nodes,
+            }}}}
+
+        live_calls = []
+        good_pages = [
+            issue_page([issue_node(81, ["area:crate-b", "needs:user"])],
+                       has_next=True, cursor="page-2"),
+            issue_page([issue_node(82, ["role:impl"])], has_next=False),
+        ]
+        globals()["_gh_json"] = lambda args: live_calls.append(args) or good_pages
         assert _live_issue_labels(repo) == {81: ["area:crate-b", "needs:user"],
                                             82: ["role:impl"]}
-        globals()["_gh_json"] = lambda args: "garbage"
-        try:
-            _live_issue_labels(repo)
-        except DispatchError:
-            pass
-        else:
-            raise AssertionError("a malformed live issue listing must fail loud")
-        globals()["_gh_json"] = lambda args: ["garbage-page"]
-        try:
-            _live_issue_labels(repo)
-        except DispatchError:
-            pass
-        else:
-            raise AssertionError("a malformed live issue page must fail loud")
+        assert len(live_calls) == 1, live_calls
+        live_argv = live_calls[0]
+        assert live_argv[:4] == ["api", "graphql", "--paginate", "--slurp"], live_argv
+        query_fields = [value[len("query="):] for value in live_argv
+                        if isinstance(value, str) and value.startswith("query=")]
+        assert query_fields == [LIVE_OPEN_ISSUE_LABELS_QUERY], live_argv
+        query = query_fields[0]
+        assert ("issues(states: OPEN, first: 100, after: $endCursor)" in query
+                and "number" in query and "labels(first: 100)" in query
+                and "nodes { name }" in query and "body" not in query and "title" not in query
+                and "pullRequests" not in query), query
+        assert _gh_retry.graphql_read_reject(live_argv) is None, live_argv
+
+        malformed_live_pages = (
+            "garbage",
+            [],
+            ["garbage-page"],
+            [issue_page([], has_next=True, cursor="missing-page")],
+            [issue_page([issue_node(81, ["x"], labels_have_next=True)])],
+            [issue_page([issue_node(81, ["x"])]), issue_page([issue_node(81, ["y"])])],
+            [issue_page([{"number": 81, "labels": {"pageInfo": {"hasNextPage": False},
+                                                     "nodes": [{"name": 5}]}}])],
+        )
+        for malformed in malformed_live_pages:
+            globals()["_gh_json"] = lambda args, value=malformed: value
+            try:
+                _live_issue_labels(repo)
+            except DispatchError:
+                pass
+            else:
+                raise AssertionError(
+                    f"a malformed/incomplete live issue listing must fail loud: {malformed!r}")
+        dispatch_calls = [node for node in ast.walk(ast.parse(inspect.getsource(dispatch)))
+                          if isinstance(node, ast.Call)
+                          and isinstance(node.func, ast.Name)
+                          and node.func.id == "_live_issue_labels"]
+        assert len(dispatch_calls) == 1, (
+            "dispatch() must call the projected live issue reader exactly once per repository")
+        print("  ok   [claim throughput] the production live issue read is issues-only, "
+              "field-projected, retryable, completely paginated, and fails closed on every "
+              "malformed/truncated/duplicate shape")
         # round-3 finding 3: a malformed COMMENTS page could hide a durable receipt
         # (round/attempt/park-generation marker) — _pr_comments must RAISE, never drop it.
         good_comment = {"user": {"login": "b[bot]"}, "body": "x",
@@ -22333,6 +22527,155 @@ agent = "impl"
     finally:
         globals()["_run_gh_target_api"] = prev_target_api
 
+    # ---- [registry #2109] ONE PR-DECISION VIEW OF POSITIVELY PROVEN MAINTAINERS -------------
+    # False and failure must remain live probes, because memoising either would amplify a transient
+    # outage even within one decision and could miss a later successful proof. Production must
+    # create a fresh cache PER PR: a repo-sweep cache could outlive a permission revocation and
+    # authorise a human-gesture re-admission on a later PR.
+    maintainer_probe_calls = []
+
+    def changing_maintainer_probe(login):
+        maintainer_probe_calls.append(login)
+        attempts = maintainer_probe_calls.count(login)
+        if login == "confirmed":
+            return True
+        if login == "eventual":
+            return attempts >= 2
+        if login == "broken":
+            raise DispatchError("probe unavailable")
+        return False
+
+    cached_maintainer_probe = _cache_positive_maintainer_probes(changing_maintainer_probe)
+    assert [cached_maintainer_probe("confirmed") for _ in range(4)] == [True] * 4
+    assert maintainer_probe_calls.count("confirmed") == 1, maintainer_probe_calls
+    assert [cached_maintainer_probe("outsider") for _ in range(3)] == [False] * 3
+    assert maintainer_probe_calls.count("outsider") == 3, maintainer_probe_calls
+    assert cached_maintainer_probe("eventual") is False
+    assert cached_maintainer_probe("eventual") is True
+    assert cached_maintainer_probe("eventual") is True
+    assert maintainer_probe_calls.count("eventual") == 2, maintainer_probe_calls
+    for _ in range(2):
+        try:
+            cached_maintainer_probe("broken")
+            raise AssertionError("a probe exception must preserve the caller's failure path")
+        except DispatchError as exc:
+            assert str(exc) == "probe unavailable", exc
+    assert maintainer_probe_calls.count("broken") == 2, maintainer_probe_calls
+
+    timeline_probe_calls = []
+    timeline_payloads = {}
+
+    def changing_timeline_probe(probe_repo, number):
+        key = (probe_repo, number)
+        timeline_probe_calls.append(key)
+        if key == ("example/repo", 9) and timeline_probe_calls.count(key) == 1:
+            raise DispatchError("timeline unavailable")
+        if timeline_probe_calls.count(key) == 1:
+            if key == ("example/repo", 11):
+                return ["malformed-event"]
+            if key == ("example/repo", 12):
+                return [{"event": "labeled", "label": {},
+                         "created_at": "2026-08-31T00:00:00Z"}]
+            if key == ("example/repo", 13):
+                return [{"event": "unlabeled", "label": {"name": "review:parked"},
+                         "created_at": "not-a-timestamp"}]
+            if key == ("example/repo", 14):
+                return [{"event": "labeled", "label": {"name": "area:docs"},
+                         "created_at": "not-a-timestamp"}]
+        return timeline_payloads.setdefault(key, [{"surface": key}])
+
+    cached_timeline_probe = _cache_timeline_events_for_decision(changing_timeline_probe)
+    first_timeline = cached_timeline_probe("example/repo", 7)
+    assert cached_timeline_probe("example/repo", 7) is first_timeline
+    assert timeline_probe_calls.count(("example/repo", 7)) == 1, timeline_probe_calls
+    other_repo_timeline = cached_timeline_probe("other/repo", 7)
+    assert other_repo_timeline is not first_timeline
+    assert timeline_probe_calls.count(("other/repo", 7)) == 1, timeline_probe_calls
+    try:
+        cached_timeline_probe("example/repo", 9)
+        raise AssertionError("a timeline failure must preserve the caller's failure path")
+    except DispatchError as exc:
+        assert str(exc) == "timeline unavailable", exc
+    recovered_timeline = cached_timeline_probe("example/repo", 9)
+    assert cached_timeline_probe("example/repo", 9) is recovered_timeline
+    assert timeline_probe_calls.count(("example/repo", 9)) == 2, timeline_probe_calls
+    for malformed_number in (11, 12, 13):
+        try:
+            cached_timeline_probe("example/repo", malformed_number)
+            raise AssertionError("a malformed timeline must preserve the caller's failure path")
+        except DispatchError as exc:
+            assert "structurally malformed" in str(exc), exc
+        recovered_malformed_timeline = cached_timeline_probe(
+            "example/repo", malformed_number)
+        assert (cached_timeline_probe("example/repo", malformed_number)
+                is recovered_malformed_timeline)
+        assert timeline_probe_calls.count(("example/repo", malformed_number)) == 2, \
+            timeline_probe_calls
+    irrelevant_label_timeline = cached_timeline_probe("example/repo", 14)
+    assert irrelevant_label_timeline == [
+        {"event": "labeled", "label": {"name": "area:docs"},
+         "created_at": "not-a-timestamp"}]
+    assert cached_timeline_probe("example/repo", 14) is irrelevant_label_timeline
+    assert timeline_probe_calls.count(("example/repo", 14)) == 1, timeline_probe_calls
+
+    # The helper test above cannot prove production uses it or scopes it correctly. Parse both
+    # latency-dominant sweeps and require their migration/readmission and review/budget call sites to
+    # receive the SAME cached callable, created INSIDE the per-PR loop. This is exact AST wiring, not
+    # source containment: replacing one keyword with the old live lambda, leaving an unused cache,
+    # or hoisting the cache to repo scope makes this row red.
+    cache_source = ast.parse(Path(__file__).resolve().read_text(encoding="utf-8"))
+    for fn_name, expected_uses in (("_readmit_capacity_parks", 2),
+                                   ("_dispatch_review_items", 2)):
+        fn_node = next(node for node in ast.walk(cache_source)
+                       if isinstance(node, ast.FunctionDef) and node.name == fn_name)
+        parent_of = {child: parent for parent in ast.walk(fn_node)
+                     for child in ast.iter_child_nodes(parent)}
+        cache_assignments = [
+            node for node in ast.walk(fn_node) if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "is_human_maintainer"
+                    for target in node.targets)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "id", "") == "_cache_positive_maintainer_probes"
+        ]
+        uses = [
+            keyword.value for node in ast.walk(fn_node) if isinstance(node, ast.Call)
+            for keyword in node.keywords if keyword.arg == "is_human"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "is_human_maintainer"
+        ]
+        assert len(cache_assignments) == 1, (fn_name, len(cache_assignments))
+        cursor = cache_assignments[0]
+        enclosing_loops = []
+        while cursor in parent_of:
+            cursor = parent_of[cursor]
+            if isinstance(cursor, (ast.For, ast.While)):
+                enclosing_loops.append(cursor)
+        assert len(enclosing_loops) == 1, (fn_name, len(enclosing_loops))
+        assert len(uses) == expected_uses, (fn_name, len(uses), expected_uses)
+        timeline_assignments = [
+            node for node in ast.walk(fn_node) if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "cached_timeline"
+                    for target in node.targets)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "id", "") == "_cache_timeline_events_for_decision"
+        ]
+        timeline_uses = [
+            arg for node in ast.walk(fn_node) if isinstance(node, ast.Call)
+            for arg in node.args if isinstance(arg, ast.Name) and arg.id == "cached_timeline"
+        ]
+        assert len(timeline_assignments) == 1, (fn_name, len(timeline_assignments))
+        cursor = timeline_assignments[0]
+        enclosing_loops = []
+        while cursor in parent_of:
+            cursor = parent_of[cursor]
+            if isinstance(cursor, (ast.For, ast.While)):
+                enclosing_loops.append(cursor)
+        assert len(enclosing_loops) == 1, (fn_name, len(enclosing_loops))
+        assert len(timeline_uses) == expected_uses, (fn_name, len(timeline_uses), expected_uses)
+    print("  ok   [#2109] positive maintainer proofs and timeline reads collapse within one PR "
+          "decision; negative/failing reads stay live, and both production sweeps scope/use both "
+          "caches per PR")
+
     # deferred-retry lease filter: a live lease suppresses the retry, expiry re-admits it
     deferred_items = [{"number": 9, "deferred": True}, {"number": 7, "deferred": False}]
     live_impl = [{"holder": f"{repo}#9@run.1", "expires_at": now + 100}]
@@ -22879,8 +23222,8 @@ def _starvation_park_batch_seam_self_test():
     parked, counted = _run_starvation_park_batch(list(reversed(board)))
     assert parked == board, (
         f"ONE tick must park ALL {len(board)} inert `{GLOBAL_PACKAGE}` holders — the reservation "
-        f"is a union, so parking a subset frees nothing and the live 15-minute floor makes each "
-        f"un-parked holder another 15 minutes of TOTAL dispatch outage (parked {parked})")
+        f"is a union, so parking a subset frees nothing and the live 10-minute floor makes each "
+        f"un-parked holder another 10 minutes of TOTAL dispatch outage (parked {parked})")
     assert counted == len(board), counted
     print(f"  ok   #822 park batch (EXECUTED production source): {len(board)} inert holders -> "
           f"{len(parked)} label writes on ONE tick, and {counted} counted defer reason(s)")
@@ -23053,7 +23396,7 @@ def _starvation_sweep_self_test():
     #
     # `busy` is a UNION over occupants, so `__global__` stays reserved while ANY holder holds it:
     # parking 1 of N frees NOTHING and the lane is identically starved next tick — the live
-    # 15-minute floor makes each wasted tick a 15-minute unit. MEASURED on sparq-org/sparq
+    # 10-minute floor makes each wasted tick a 10-minute unit. MEASURED on sparq-org/sparq
     # 2026-07-27 under the former 10-minute floor: kept=0 on
     # four consecutive executed ticks 20:12:40Z->20:47:36Z, zero impl workers launched, ~55 min of
     # total dispatch outage. THIS IS THE ASSERTION THE PRE-FIX CODE REDS ON — it returned
@@ -23074,7 +23417,7 @@ def _starvation_sweep_self_test():
                           Path(__file__).resolve().parent / "dispatch-tick-floor.py")
     _drain_ticks = -(-MEASURED_STARVED_HOLDER_BOARD // STARVATION_PARKS_PER_TICK_MAX)
     _drain_minutes = _drain_ticks * _floor.MIN_TICK_INTERVAL_SECONDS // 60
-    assert _drain_ticks == 1 and _drain_minutes == 15, (
+    assert _drain_ticks == 1 and _drain_minutes == 10, (
         f"the widest MEASURED starved board ({MEASURED_STARVED_HOLDER_BOARD} holders) must drain "
         f"in ONE executed tick; at a cap of {STARVATION_PARKS_PER_TICK_MAX} it takes "
         f"{_drain_ticks} tick(s) = {_drain_minutes} min of TOTAL dispatch outage, because the "
@@ -23089,9 +23432,9 @@ def _starvation_sweep_self_test():
         "executed dispatch ticks 2026-07-27 20:12:40Z-20:47:36Z, assemble-census kept=0 with "
         "every row deferred by reason.global-reservation. Change it only with a new measurement, "
         "and re-derive STARVATION_PARKS_PER_TICK_MAX when you do")
-    assert (MEASURED_STARVED_HOLDER_BOARD * _floor.MIN_TICK_INTERVAL_SECONDS // 60) == 60, \
+    assert (MEASURED_STARVED_HOLDER_BOARD * _floor.MIN_TICK_INTERVAL_SECONDS // 60) == 40, \
         "the live SERIAL counterfactual is part of the batching justification: four holders x " \
-        "the live 15-minute floor. If either input moved, the justification moved with it"
+        "the live 10-minute floor. If either input moved, the justification moved with it"
     print(f"  ok   #822 drain time: the measured {MEASURED_STARVED_HOLDER_BOARD}-holder board "
           f"drains in {_drain_ticks} tick ({_drain_minutes} min), not "
           f"{MEASURED_STARVED_HOLDER_BOARD} ticks "
@@ -23155,16 +23498,16 @@ def _starvation_sweep_self_test():
     assert _floor.HISTORICAL_MEASURED_REQUESTS_PER_TICK == 613, (
         "the 613-request observation calibrates the cost model and the observed safe/breaking "
         "rates; preserve it as evidence rather than relabelling the 150-PR projection measured")
-    assert _floor.COLD_CACHE_REQUESTS_PER_TICK == 908, (
-        "the live 150-PR cold-cache ceiling is 23 + 5.9*150; understating it invents batch "
+    assert _floor.COLD_CACHE_REQUESTS_PER_TICK == 518, (
+        "the live two-target core model is 23 + 3.1*150 + 0.2*150; understating it invents batch "
         "headroom and reopens the request-budget outage")
     assert _floor.OBSERVED_SAFE_REQUESTS_PER_HOUR == 7 * 613, (
         "OBSERVED_SAFE_REQUESTS_PER_HOUR is an OBSERVATION — 7 executed ticks in the 10Z hour, "
         "ran clean; 13 (OBSERVED_BREAKING) did not. It sits only on the RIGHT of every `<=` that "
         "reads it, in BOTH files, so overstating it is invisible to all of them. This PR is what "
         "made a second file's bound lean on it, so it is pinned from the consumer")
-    assert _floor.MIN_TICK_INTERVAL_SECONDS == 15 * 60, (
-        "the #822 floor is what turns a per-TICK cap into a per-15-MINUTE cap; if it moves, every "
+    assert _floor.MIN_TICK_INTERVAL_SECONDS == 10 * 60, (
+        "the #822/#2100 floor turns a per-TICK cap into a per-10-MINUTE cap; if it moves, every "
         "drain time in this block and the bound they justify must be re-derived")
 
     # ...and the itemised timeline read is the one line item that is not a constant of the API: a
@@ -23351,6 +23694,43 @@ def _starvation_sweep_self_test():
                for node in _ast.walk(_pr_labels_kw.value)), \
         "pr_review_labels= must derive from the sweep's live `labels` read — a literal would make " \
         "the label-plan gate decide about a PR that does not exist"
+    # ---- [#1480] THE REVIEW PARTITION-SCOPE WIRING -------------------------------------------
+    # The allocator change is inert unless the review/fix dispatch call actually passes
+    # `partition_scoped`, and it is DANGEROUS if that value is a bare literal:
+    #   * `partition_scoped=True`  silently reverts the width fix while looking wired;
+    #   * `partition_scoped=False` drops package single-flight for the FIX lane too, which DOES
+    #     un-serialise concurrent writes to one crate — the failure research/1011 §9.2 is about.
+    # So the value must be EXACTLY `mode != "review"`. Merely requiring an expression that reads
+    # `mode` is insufficient: the inverted `mode == "review"` also reads it while applying the
+    # dangerous false value to the write lane.
+    _alloc_calls = [node for node in _ast.walk(_ast.parse(
+        Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, _ast.Call)
+        and isinstance(node.func, _ast.Attribute)
+        and node.func.attr == "claim"
+        and any(kw.arg == "holder_prefix" for kw in node.keywords)
+        and any(kw.arg == "return_reason" for kw in node.keywords)]
+    assert len(_alloc_calls) == 1, (
+        f"expected exactly ONE reasoned allocator.claim call site, found {len(_alloc_calls)} — "
+        "if the review/fix dispatch grew a second, this guard must cover BOTH or it protects the "
+        "one nobody edits")
+    _scope_kw = [kw for kw in _alloc_calls[0].keywords if kw.arg == "partition_scoped"]
+    assert _scope_kw, (
+        "the review/fix allocator.claim call must pass partition_scoped= — without it the review "
+        "lane keeps serialising read-only work behind a write-safety rule (#1480)")
+    _scope_value = _scope_kw[0].value
+    assert (isinstance(_scope_value, _ast.Compare)
+            and isinstance(_scope_value.left, _ast.Name)
+            and _scope_value.left.id == "mode"
+            and len(_scope_value.ops) == 1
+            and isinstance(_scope_value.ops[0], _ast.NotEq)
+            and len(_scope_value.comparators) == 1
+            and isinstance(_scope_value.comparators[0], _ast.Constant)
+            and _scope_value.comparators[0].value == "review"), (
+        'partition_scoped= must be exactly `(mode != "review")`: True silently reverts the '
+        'width fix, while False or the inverted `(mode == "review")` applies the false value to '
+        'the FIX lane and un-serialises concurrent writes to one crate (research/1011 §9.2)')
+
     # [review round 1, B3/M14] THE READ-ONLY GATE'S WIRING. The guard above matches only calls
     # carrying ALL of _void_kwargs, and the read-only CLAIM proof gate deliberately carries four of
     # the five (no `void_offered`) — so NOTHING referenced its wiring and deleting it passed the
@@ -24114,7 +24494,7 @@ def _starvation_sweep_self_test():
     assert park_seam == "dispatch", (
         "the production tick must ITERATE starvation_park_targets(...) and call "
         "park_starved_partition_holder for EACH target, un-sliced and without a call-site `cap=` "
-        f"— otherwise the 1-holder-per-tick defect is back at 15 min/holder (found {park_seam!r})")
+        f"— otherwise the 1-holder-per-tick defect is back at 10 min/holder (found {park_seam!r})")
     print("  ok   #822 park call-site seam (AST): the production tick PARKS EVERY selected "
           "holder — a re-scalarised call site, a `[:1]`, or a call-site cap= reds here")
 

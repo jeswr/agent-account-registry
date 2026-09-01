@@ -2079,10 +2079,15 @@ jobs:
           # 16-hex hash is stored; this job runs no target code, so the salt cannot leak to it.
           WORKER_IMPL_ACCOUNT: ${{ needs.claim.outputs.account }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
-          # DETERMINISTIC head branch — MUST match worker-live.sh's `branch=` construction. Built
-          # from trusted run identity (github.run_id/run_attempt are shared across every job in this
-          # run), never from the hostile worker job's pr_number output (issue #128).
-          HEAD_BRANCH: sparq-agent/issue-${{ inputs.issue_number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # [SPARQ agent] [issue #2093] DETERMINISTIC head branch — MUST match
+          # worker-live.sh's `branch=` construction. `outcome_attempt` is captured by the worker
+          # job that produced the publish bundle, so it stays on attempt 1 when ONLY this failed
+          # recorder job is rerun;
+          # a full rerun re-executes the worker and advances it normally. Using this recorder
+          # job's `github.run_attempt` here made a failed-job rerun look for a nonexistent `-2`
+          # branch after attempt 1 had already published `-1`. The value remains trusted runner
+          # output and is never taken from the hostile worker's pr_number output (issue #128).
+          HEAD_BRANCH: sparq-agent/issue-${{ inputs.issue_number }}-${{ github.run_id }}-${{ needs.worker.outputs.outcome_attempt || github.run_attempt }}
           # `<app-slug>[bot]` == the login the worker's `target` step verifies via /users/<slug>[bot].
           VERIFY_BOT_LOGIN: ${{ steps.app-token-recon.outputs.app-slug }}[bot]
           # Catalog-controlled account fields reach this contents:write + PROVENANCE_SALT job via

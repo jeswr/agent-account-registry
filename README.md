@@ -766,6 +766,18 @@ it left, and `dispatch-claim` reports the shortfall once per window load so an u
 is never mistaken for "the parks are not old enough yet". A live backoff is never evicted, by the
 cap or by the ceiling.
 
+**One class-scoped exception: the no-change evidence sample** (registry #743). Every rule above
+selects on recency alone, so `no_change` — about a fifth of the stream — could never accumulate the
+~100 declarations the #701 `why_no_diff` distribution on the dashboard is computed over: the early
+rows rotated out before the sample completed, and the measurement could not finish at any runtime.
+`prune` therefore also retains the newest `NO_CHANGE_SAMPLE_KEEP` (150) `no_change` records. It is
+still bounded above by the 48 h window, and it is admitted **after** the ceiling clamp into
+whatever headroom that clamp left, so it evicts nothing and can never be the reason the ceiling
+binds — which keeps the `::warning::` above meaning exactly what it meant. Retaining those rows
+longer also restores the sampling `_no_change_limit_view`, the decline ladder and
+`no_change_routing.retry_decision` were specified against; all three move in the deny direction and
+keep their own bounds.
+
 **The probe must PROVE its materialization** (same issue). `dispatch.yml`'s probe — the lane that
 spends real capacity — now applies the ledgergate the dashboard lane got in #219/#612: the ACCT_*
 materialization step carries **no** `continue-on-error`, the probe step **parses** the token subset

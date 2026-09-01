@@ -607,7 +607,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
-          ALERT_REPO: ${{ secrets.ALERT_REPO }}
+          # Privacy routing (locked decision 22c): the SAME binding every other ALERT_REPO in
+          # this estate uses (#1776). Reading only `secrets.ALERT_REPO` here looked equivalent —
+          # an unset secret renders empty too — but it silently excluded this lane from a
+          # deployment that configures the route through a repository `vars.ALERT_REPO`, sending
+          # every other alert to the private destination and this one to the public registry.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MAINTAINER_HANDLE: jeswr
@@ -689,7 +694,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
-          ALERT_REPO: ${{ secrets.ALERT_REPO }}
+          # Privacy routing (locked decision 22c): the estate-canonical binding (#1776) — see
+          # the identical note on the `ci-latency` alert step above.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MAINTAINER_HANDLE: jeswr

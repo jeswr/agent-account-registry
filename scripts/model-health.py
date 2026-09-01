@@ -134,6 +134,64 @@ RETENTION_CEILING_BYTES = 750_000
 # shaped and a validator-maximal record set.
 RECORD_BYTES_OVERHEAD = 32
 LEDGER_ENVELOPE_BYTES = 64
+
+# --- [SPARQ agent] NO-CHANGE EVIDENCE RETENTION (registry #743, from the #738 §7 M4 finding) ----
+#
+# THE DEFECT. Every retention rule above selects on RECENCY ALONE and is therefore CLASS-BLIND: the
+# count cap, the time floor and the ceiling all treat one `no_change` row and one fleet `success`
+# as interchangeable, so every class competes for one ring. `no_change` is only ~20% of the stream,
+# so at the volume measured in 2026-07 the retained window held at most ~40 of them — while the
+# measurement those rows exist FOR (the #701 `why_no_diff` distribution, published by
+# dashboard-gen's `_no_change_reason_census` across a SIX-row vocabulary) needs ~100 declarations
+# before its per-reason counts carry any signal. The earliest rows therefore rotated out before the
+# sample could complete, so the analysis could never finish accumulating no matter how long the
+# fleet ran — the census kept reporting a fresh few-hour `since` forever.
+#
+# THE RULE. On top of the class-blind selection, prune additionally retains the newest
+# NO_CHANGE_SAMPLE_KEEP `no_change` records. Class-scoped and count-bounded, so it widens exactly
+# the population that is under-sampled and nothing else: an ordinary failure record outside the
+# retention floor is still evicted by the count cap, unchanged.
+#
+# WHY A CLASS-SCOPED KEEP AND NOT A LARGER MAX_RECORDS — the other option #743 offers. MAX_RECORDS
+# is class-blind, so buying ~100 `no_change` rows through it means retaining ~5x that many rows of
+# every other class, and the ledger is rewritten WHOLE on every CAS append: ~500 extra records
+# re-PUT on each of ~60 appends/h, to widen a sample that is 20% of them. The class-scoped keep
+# costs at most NO_CHANGE_SAMPLE_KEEP records of one class. Nor is it a separate monotone store
+# (research/1828 §8 option B): a second ledger is a NEW CAS write on the dispatch hot path, which
+# has to be best-effort or a ledger blip blocks dispatch — and a best-effort store is lossy, so its
+# denominator is unaudited, which is the exact failure this measurement exists to remove.
+#
+# 150, NOT 100. The requirement is ~100 declarations across a 6-row vocabulary; the 50% headroom is
+# what stops a burst of one reason from starving the sample of the others before the distribution is
+# read. It is 7.5% of RETENTION_CEILING_RECORDS and ~65 KB at the validator-maximal 431 B record
+# width (~24 KB at the 161 B live mean), so it is small against both ceilings — and it is admitted
+# into their headroom anyway, so it cannot move either. At the measured ~11 no_change/h it reaches
+# back ~13 h, past the ~8 h the sample needs, and it is still bounded ABOVE by WINDOW_SECONDS — a
+# `no_change` row older than the 48 h window is dropped before any of this runs, so this is a wider
+# sample of the same window, never a longer-lived one.
+#
+# WHAT IT IS SUBORDINATE TO, deliberately. The sample is admitted LAST, into whatever headroom the
+# absolute ceiling has already left (`_admit_no_change_sample`), so it evicts nothing and can never
+# be the reason that ceiling binds. Both halves matter. The byte ceiling is a PHYSICAL bound — past
+# ~1 MB the contents API stops inlining `content`, every reader of this ledger fails and
+# account-usage fails OPEN — and losing sample rows only delays an analysis, so the sample yields.
+# And the ceiling's ::warning:: names a fleet record RATE, so a sample that could tip a
+# nearly-full ledger over the bound would make a measurement fabricate a capacity alarm.
+#
+# WHAT THIS CHANGES DOWNSTREAM — stated because retention feeds DECISIONS here, and #743 deferred
+# this change out of the #738 telemetry PR precisely so that would get its own review. Retaining a
+# `no_change` row longer makes it visible to three consumers that read the pruned window:
+# `_no_change_limit_view` below (an account with >= NO_CHANGE_LIMIT_MIN rows across
+# NO_CHANGE_LIMIT_MIN_ISSUES issues derives a limit, hence a reactive backoff), dispatch-claim's
+# decline ladder, and `no_change_routing.retry_decision`. All three move in the DENY direction — an
+# account is held OUT of dispatch, an issue is rerouted to decomposition instead of re-dispatched on
+# the tier that just produced nothing — and all three were specified against the 48 h window rather
+# than against the count cap (`no_change_routing`'s TERMINATION note reasons about WINDOW_HOURS and
+# calls the ledger 8x longer-lived than its own horizon). So this restores the sampling those rules
+# were written for; it does not widen them. Each stays bounded by its own exit: BACKOFF_CAP_SECONDS,
+# the machine-owned `status:parked` soft hold, and WINDOW_SECONDS respectively.
+NO_CHANGE_SAMPLE_KEEP = 150
+
 # Future-stamp guard (cross-provider review r2 finding 2): record stamps are write-time, but the
 # ledger is CAS-writable by every outcome job — a forged or clock-skewed stamp far in the FUTURE
 # would (a) never age out of the rolling window and (b) anchor account_backoffs' per-record clamp
@@ -599,6 +657,49 @@ def _apply_retention_ceiling(kept, selected, preserved, now):
     return survivors
 
 
+def _no_change_sample_indices(kept):
+    """Indices of the newest NO_CHANGE_SAMPLE_KEEP `no_change` records in the ts-sorted `kept`
+    (registry #743). The one CLASS-SCOPED retention rule in this module; see the
+    NO_CHANGE_SAMPLE_KEEP block for why the sample the #701 census is computed over cannot be
+    bought with a larger class-blind MAX_RECORDS.
+
+    Sliced with an explicit `max(0, ...)` start rather than `[-NO_CHANGE_SAMPLE_KEEP:]`: a keep of
+    0 would make the negative form `[-0:]`, i.e. the WHOLE list — an unbounded selection that reads
+    like a disabled one. This form degrades to the empty set at 0 or below, which is the direction a
+    retention bound must fail in."""
+    indices = [i for i, r in enumerate(kept) if r.get("exit_class") == CLASS_NO_CHANGE]
+    return set(indices[max(0, len(indices) - NO_CHANGE_SAMPLE_KEEP):])
+
+
+def _admit_no_change_sample(kept, selected):
+    """Add the newest `no_change` declarations that FIT in the headroom the absolute ceiling has
+    already left (registry #743). Runs AFTER _apply_retention_ceiling, on its output.
+
+    WHY AFTER, and not as another member of the union the ceiling clamps. Admitting into headroom
+    makes the subordination EXACT in both dimensions: the sample can never evict a record, and it
+    can never be the reason the ceiling binds. Unioned BEFORE the clamp it would be subordinate in
+    outcome — its rows are the oldest, so they are what the trim takes — but it could still push a
+    class-blind selection of 1990 over the 2000-record bound, and #699's ::warning:: would then fire
+    naming a fleet record RATE the fleet is not sustaining, and attribute an eviction to a retention
+    floor that did not cause it. A measurement must not fabricate a capacity alarm. This ordering
+    leaves that diagnostic meaning exactly what it meant before this change.
+
+    Admission is NEWEST-FIRST and STOPS at the first record that does not fit, rather than skipping
+    it to squeeze in smaller older ones: the admitted set is always a contiguous newest-first prefix
+    of the sample. Cherry-picking by size would silently bias the retained distribution toward
+    whichever reasons produce shorter records, which is a measurement defect, not a saving."""
+    survivors = set(selected)
+    total = _ledger_bytes([kept[i] for i in sorted(survivors)])
+    for i in sorted(_no_change_sample_indices(kept) - survivors, reverse=True):
+        size = _record_bytes(kept[i])
+        if (len(survivors) >= RETENTION_CEILING_RECORDS
+                or total + size > RETENTION_CEILING_BYTES):
+            break
+        survivors.add(i)
+        total += size
+    return survivors
+
+
 def prune(records, now):
     """Keep the rolling window: drop records older than WINDOW_SECONDS — or stamped more than
     FUTURE_SKEW_SECONDS ahead of `now` (an implausibly-future forgery would never age out) — then
@@ -630,13 +731,24 @@ def prune(records, now):
     auth-run tail even though its cooldown has long expired — that evidence is the ONLY thing keeping
     a dead probe-exempt account out of dispatch, so the cap must not be able to erase it.
 
-    BOUND CONTRACT (PR #85 finding 1, extended for #699): preserved records spend the MAX_RECORDS
-    budget first and the newest non-preserved records fill only the REMAINING budget, so the
-    count-cap arm is bounded by max(len(preserved), MAX_RECORDS) — never live-backoffs PLUS a full
-    200 of expired filler. The time floor adds the records inside RETENTION_FLOOR_SECONDS on top,
-    so the total is max(len(preserved), MAX_RECORDS, records-inside-the-floor), and the whole
-    result is then clamped by _apply_retention_ceiling to
-    max(len(preserved), RETENTION_CEILING_RECORDS) records / RETENTION_CEILING_BYTES bytes.
+    NO-CHANGE EVIDENCE SAMPLE (registry #743): the three rules above all select on RECENCY ALONE,
+    so the ~20%-of-stream `no_change` class could never accumulate the ~100 rows the #701
+    `why_no_diff` distribution is computed over. The newest NO_CHANGE_SAMPLE_KEEP `no_change`
+    records are therefore retained as well — a CLASS-SCOPED, count-bounded addition that widens
+    nothing else, admitted AFTER the ceiling clamp and only into its headroom. See the
+    NO_CHANGE_SAMPLE_KEEP block for the sizing, the rejected alternatives, and what retaining these
+    rows longer means for the consumers that read this window.
+
+    BOUND CONTRACT (PR #85 finding 1, extended for #699 and #743): preserved records spend the
+    MAX_RECORDS budget first and the newest non-preserved records fill only the REMAINING budget, so
+    the count-cap arm is bounded by max(len(preserved), MAX_RECORDS) — never live-backoffs PLUS a
+    full 200 of expired filler. The time floor adds the records inside RETENTION_FLOOR_SECONDS on
+    top, so that selection is max(len(preserved), MAX_RECORDS, records-inside-the-floor), and it is
+    then clamped by _apply_retention_ceiling to
+    max(len(preserved), RETENTION_CEILING_RECORDS) records / RETENTION_CEILING_BYTES bytes. The
+    no-change sample is then admitted into whatever headroom that clamp left and stops at the first
+    record that does not fit, so it moves neither bound: the final result obeys the SAME
+    max(len(preserved), RETENTION_CEILING_RECORDS) / RETENTION_CEILING_BYTES contract.
     When the live-backoff set alone exceeds MAX_RECORDS, correctness wins over the cap — a live
     backoff is never evicted, by the count cap OR by the ceiling — but NEVER silently: every
     expired/non-preserved record OUTSIDE the retention floor is evicted (inside it a record is
@@ -720,6 +832,11 @@ def prune(records, now):
     floor = {i for i, r in enumerate(kept) if r["ts"] >= floor_start}
     selected = _apply_retention_ceiling(
         kept, preserved | floor | set(newest), preserved, now)
+    # THE NO-CHANGE EVIDENCE SAMPLE (registry #743), admitted LAST and only into the headroom the
+    # absolute ceiling has already left, so it evicts nothing and can never be the reason that
+    # ceiling binds — a measurement must not trade an analysis for a reader, nor fabricate a
+    # capacity alarm. See _admit_no_change_sample.
+    selected = _admit_no_change_sample(kept, selected)
     return [kept[i] for i in sorted(selected)]
 
 
@@ -4492,6 +4609,176 @@ def _self_test():
          health_window_coverage_seconds([{"nope": 1}], h_now),
          sustained_health_coverage_shortfall([], h_now)["coverage_seconds"]),
         (0, 0, 0))
+
+    # ---- [registry #743] THE NO-CHANGE EVIDENCE SAMPLE (from the #738 §7 M4 finding) ----------
+    # THE DEFECT. Every retention rule above selects on RECENCY ALONE, so the `no_change` class —
+    # ~20% of the stream — could never accumulate the ~100 declarations the #701 why_no_diff
+    # distribution is computed over: the earliest rows rotated out before the sample completed.
+    # The stream below is that measured shape: 60 rec/h for 20 h with every 5th record a
+    # `no_change`, i.e. 1200 records of which 240 are the population under sampling, each carrying
+    # one of the FIVE producer-reachable reasons (index 0, `unspecified`, is producer-unreachable —
+    # dashboard-gen's census block says why — so a stored declaration is never it).
+    NC_TARGET = 100                # what the #743 analysis needs, stated INDEPENDENTLY of the code
+    nc_at = now + 24 * 3600
+    nc_stream = sorted(
+        (rec("anthropic", f"ncok{i % 3:02d}", SUCCESS, dt=24 * 3600 - i * 60, run=f"s{i}")
+         if i % 5 else
+         rec("openai", f"ncnd{i % 3:02d}", CLASS_NO_CHANGE, dt=24 * 3600 - i * 60, run=f"n{i}",
+             issue=3000 + i, why_no_diff=NO_CHANGE_REASONS[1 + (i // 5) % 5])
+         for i in range(1200)),
+        key=lambda r: r["ts"])
+    nc_sample_window, nc_sample_err = prune_loud(nc_stream, nc_at)
+    nc_kept = [r for r in nc_sample_window if r["exit_class"] == CLASS_NO_CHANGE]
+    # THE CONTROL, computed FIXTURE-SIDE from the rules that existed before this change (time floor
+    # UNION newest-MAX_RECORDS) so it cannot be an artifact of the code under test: on this stream
+    # they retain 85 declarations and the sample is structurally incompletable at any runtime.
+    nc_blind = {i for i, r in enumerate(nc_stream) if r["ts"] >= nc_at - RETENTION_FLOOR_SECONDS}
+    nc_blind |= set(range(len(nc_stream) - MAX_RECORDS, len(nc_stream)))
+    nc_blind_declarations = sum(1 for i in nc_blind
+                                if nc_stream[i]["exit_class"] == CLASS_NO_CHANGE)
+    chk("[#743] RED TEST: the class-blind rules alone leave the #701 sample short of the "
+        "population the analysis needs, on a stream that RAN LONG ENOUGH to supply it",
+        (nc_blind_declarations, nc_blind_declarations < NC_TARGET,
+         sum(1 for r in nc_stream if r["exit_class"] == CLASS_NO_CHANGE) > NC_TARGET),
+        (85, True, True))
+    chk("[#743] the class-scoped sample retains the newest keep-many declarations — the sample "
+        "now completes",
+        (len(nc_kept), len(nc_kept) >= NC_TARGET), (150, True))
+    chk("[#743] the keep is the stated 150, and it carries the 50% headroom over the ~100 the "
+        "analysis needs", (NO_CHANGE_SAMPLE_KEEP, NO_CHANGE_SAMPLE_KEEP >= NC_TARGET), (150, True))
+    # MARQUEE CLAIM, verified against the EVIDENCE PATH the census actually reads (AGENTS.md
+    # pre-flight item 9): not "more rows survived" but "the 5-way distribution is complete".
+    nc_dist = {reason: sum(1 for r in nc_kept if r.get("why_no_diff") == reason)
+               for reason in NO_CHANGE_REASONS}
+    chk("[#743] MARQUEE: the retained window carries a COMPLETE 5-way why_no_diff distribution "
+        "(every producer-reachable reason populated), which is the measurement #738 M4 could not "
+        "finish",
+        ([nc_dist[reason] for reason in NO_CHANGE_REASONS], sum(nc_dist.values()) >= NC_TARGET),
+        ([0, 30, 30, 30, 30, 30], True))
+    # THE CAP IS REAL — mutant "retain EVERY no_change" (240 rows here) goes red. The 150th-newest
+    # declaration is kept and the 151st is evicted; both are far outside the floor and the count
+    # cap, so neither survives for any other reason.
+    nc_runs = {r["run_id"] for r in nc_sample_window}
+    chk("[#743] the sample is BOUNDED: the 150th-newest declaration is retained, the 151st is not",
+        ("n745" in nc_runs, "n750" in nc_runs), (True, False))
+    # ...and it is CLASS-SCOPED, not a general widening of retention — mutant "select every record"
+    # goes red. `s746` is a SUCCESS one minute NEWER than the retained `n745` declaration and is
+    # still evicted, so the extra retention follows the class and nothing else.
+    chk("[#743] the sample widens ONE class: a newer non-no_change record at the same depth is "
+        "still evicted by the count cap",
+        ("s746" in nc_runs, "n745" in nc_runs), (False, True))
+    # BOUND CONTRACT: floor-count + the declarations the sample reaches back for, nothing else, and
+    # quietly — the ceiling diagnostic must keep its operational meaning.
+    nc_floor = sum(1 for r in nc_stream if r["ts"] >= nc_at - RETENTION_FLOOR_SECONDS)
+    chk("[#743] the widened window stays bounded by floor + keep, and stays SILENT",
+        (nc_floor, len(nc_sample_window), len(nc_sample_window) <= nc_floor + NO_CHANGE_SAMPLE_KEEP,
+         nc_sample_err),
+        (421, 486, True, ""))
+    # SUBORDINATION TO THE ABSOLUTE CEILING — a FULL ledger admits no sample at all, evicts nothing
+    # for it, and the live backoff that IS preserved still survives untouched.
+    nc_far = [rec("openai", "ncfar", CLASS_NO_CHANGE, dt=-(RETENTION_FLOOR_SECONDS + 3600 + i),
+                  run=f"f{i}", issue=4000 + i, why_no_diff="too_large") for i in range(200)]
+    nc_ceil_window, nc_ceil_err = prune_loud(hint_hit + nc_far + flood, now + 1000)
+    fah = account_hash("ncfar", salt)
+    chk("[#743] the sample YIELDS to the absolute ceiling: a measurement must never be what makes "
+        "the ledger unfetchable, while a LIVE backoff still is not evictable",
+        (len(nc_ceil_window),
+         sum(1 for r in nc_ceil_window if r["account"] == fah),
+         account_backoffs(nc_ceil_window, now + 1000).get(ah, {}).get("backoff_until"),
+         "RETENTION CEILING BINDING" in nc_ceil_err),
+        (RETENTION_CEILING_RECORDS, 0, now + BACKOFF_CAP_SECONDS, True))
+    # ...AND IT IS ADMITTED ONLY INTO HEADROOM, which is stronger than "the trim takes it first"
+    # and is why it is admitted AFTER the clamp. Unioned BEFORE the clamp, the RECORD-ceiling case
+    # below selects 1960 + 150 = 2110, so the ceiling would BIND: `prune` would print a
+    # ::warning:: naming a fleet rate the fleet is not sustaining and blame a retention floor that
+    # evicted nothing. Here it stays SILENT, fills the 40 records of real headroom, and stops.
+    hr_at = now + 30 * 3600
+    headroom_floor = [rec("anthropic", f"hrf{i:04d}", SUCCESS, dt=30 * 3600 - 3600 - i // 2,
+                          run=f"hf{i}") for i in range(1960)]
+    headroom_far = [rec("openai", "hrnc", CLASS_NO_CHANGE,
+                        dt=30 * 3600 - RETENTION_FLOOR_SECONDS - 600 - i * 30,
+                        run=f"hn{i}", issue=5000 + i, why_no_diff="other") for i in range(150)]
+    hr_window, hr_err = prune_loud(headroom_floor + headroom_far, hr_at)
+    # ...and the 40 it admits are the NEWEST 40 declarations (`hn0` is newest, `hn149` oldest), not
+    # whichever 40 the iteration happened to reach: a sample of the OLDEST rows would report a
+    # stale `since` and census a distribution the fleet has already moved on from.
+    chk("[#743] the sample is admitted ONLY into ceiling HEADROOM — it fills 40 records with the "
+        "NEWEST declarations and stops, silently, so it can never be the reason the #699 ceiling "
+        "diagnostic fires",
+        (len(hr_window),
+         sorted((r["run_id"] for r in hr_window if r["exit_class"] == CLASS_NO_CHANGE),
+                key=lambda run: int(run[2:])) == [f"hn{i}" for i in range(40)],
+         hr_err),
+        (RETENTION_CEILING_RECORDS, True, ""))
+    # The BYTE dimension of the same property, and it is independently load-bearing: on
+    # validator-maximal records the byte ceiling binds long before the record ceiling, so a sample
+    # admitted on the count bound alone would push the blob past the contents-API inline limit.
+    hb_far = [make_record("openai", account_hash("hbnc", salt), "m" * RECORD_FIELD_MAX_LEN,
+                          CLASS_NO_CHANGE, "9" * RECORD_FIELD_MAX_LEN,
+                          hr_at - RETENTION_FLOOR_SECONDS - 600 - i * 30,
+                          input_tokens=MAX_USAGE_TOKENS, output_tokens=MAX_USAGE_TOKENS,
+                          wall_seconds=MAX_WALL_SECONDS, issue=MAX_ISSUE_NUMBER,
+                          why_no_diff="other")
+              for i in range(150)]
+    # A class-blind selection of validator-maximal records sized to sit just under the BYTE ceiling
+    # with ~6 KB of room. Deliberately FEWER than RETENTION_CEILING_RECORDS rows (asserted), so the
+    # bound the sample has to respect here is unambiguously the byte one.
+    def hb_wide(dt):
+        # rate-limit, because make_record keeps `reset_hint` only for the backoff classes and that
+        # field is what makes the widest record the validator admits (the `widest` fixture above).
+        return rec("openai", "hbf", "rate-limit", dt=dt, model="m" * RECORD_FIELD_MAX_LEN,
+                   run="9" * RECORD_FIELD_MAX_LEN, reset="a" * RESET_HINT_MAX_LEN)
+    hb_count = ((RETENTION_CEILING_BYTES - 6000 - LEDGER_ENVELOPE_BYTES)
+                // _record_bytes(hb_wide(0)))
+    hb_floor = [hb_wide(30 * 3600 - 3600 - i // 2) for i in range(hb_count)]
+    hb_window, hb_err = prune_loud(hb_floor + hb_far, hr_at)
+    hb_admitted = sum(1 for r in hb_window if r["exit_class"] == CLASS_NO_CHANGE)
+    chk("[#743] ...and on the BYTE bound too: admission stops while the blob still fits, so the "
+        "ledger stays inline-fetchable and the sample never trades an analysis for every reader",
+        (hb_count < RETENTION_CEILING_RECORDS, len(hb_window) < RETENTION_CEILING_RECORDS,
+         _ledger_bytes(hb_window) <= RETENTION_CEILING_BYTES,
+         0 < hb_admitted < len(hb_far), hb_err),
+        (True, True, True, True, ""))
+    # THE STOP RULE, driven through the helper with the byte ceiling temporarily lowered: the
+    # property is only observable when the sample's records differ in SIZE, and at the real ceiling
+    # every fixture row above is the same width. Rows 0-2 are SHORT `already_done` declarations and
+    # are the OLDER ones; rows 3-5 are validator-maximal `too_large` ones and are newer. The
+    # headroom fits two maximal rows plus change. Skipping the row that does not fit — the obvious
+    # "waste no space" spelling — would admit the short older rows instead and publish a
+    # distribution skewed toward whichever reasons happen to produce short records, which is a
+    # measurement defect wearing the shape of an optimisation.
+    bias_hash = account_hash("bias", salt)
+    bias_kept = [make_record("openai", bias_hash, "f", CLASS_NO_CHANGE, "t", now + i,
+                             issue=9, why_no_diff="already_done") for i in range(3)]
+    bias_kept += [make_record("openai", bias_hash, "m" * RECORD_FIELD_MAX_LEN, CLASS_NO_CHANGE,
+                              "9" * RECORD_FIELD_MAX_LEN, now + 100 + i,
+                              input_tokens=MAX_USAGE_TOKENS, output_tokens=MAX_USAGE_TOKENS,
+                              wall_seconds=MAX_WALL_SECONDS, issue=MAX_ISSUE_NUMBER,
+                              why_no_diff="too_large") for i in range(3)]
+    _nc_bytes_saved = globals()["RETENTION_CEILING_BYTES"]
+    try:
+        globals()["RETENTION_CEILING_BYTES"] = (
+            LEDGER_ENVELOPE_BYTES + 2 * _record_bytes(bias_kept[5])
+            + _record_bytes(bias_kept[0]) + 10)
+        bias_admitted = _admit_no_change_sample(bias_kept, set())
+    finally:
+        globals()["RETENTION_CEILING_BYTES"] = _nc_bytes_saved
+    chk("[#743] admission is NEWEST-first and STOPS at the first row that does not fit — it never "
+        "skips that row to squeeze in smaller OLDER ones, which would bias the retained "
+        "why_no_diff distribution toward the reasons with short records",
+        (sorted(bias_admitted), sorted({bias_kept[i]["why_no_diff"] for i in bias_admitted})),
+        ([4, 5], ["too_large"]))
+    # A keep of 0 must select NOTHING. Pinned because the natural spelling
+    # `[-NO_CHANGE_SAMPLE_KEEP:]` selects the WHOLE list at 0 — an UNBOUNDED retention wearing the
+    # shape of a disabled one, and the one direction a retention bound must never fail in.
+    _nc_keep_saved = globals()["NO_CHANGE_SAMPLE_KEEP"]
+    try:
+        globals()["NO_CHANGE_SAMPLE_KEEP"] = 0
+        nc_zero_keep = _no_change_sample_indices(nc_stream)
+    finally:
+        globals()["NO_CHANGE_SAMPLE_KEEP"] = _nc_keep_saved
+    chk("[#743] a keep of 0 selects nothing (the negative-slice footgun would select everything)",
+        (nc_zero_keep, len(_no_change_sample_indices(nc_stream))), (set(), 150))
 
     # ---- validate_ledger fail-closes on a malformed/poisoned record (enforced at READ) -------
     # The same _validate_record contract as construction: a poisoned ledger (raw handle, unknown

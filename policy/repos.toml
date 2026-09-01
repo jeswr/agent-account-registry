@@ -94,7 +94,7 @@ routing = "orchestration/routing.toml"
 # from acctNN issues in ANY state, so keeping the records reserves those slot names permanently
 # and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
 # provenance records or salted fingerprints.
-account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
+account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07", "acct08"]
 max_concurrent = 40
 worker_timeout_minutes = 90
 gate_profile = "crate-scoped"

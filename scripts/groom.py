@@ -437,6 +437,20 @@ class GroomConflict(GroomError):
     """A retryable contents-API compare-and-swap conflict."""
 
 
+class GroomInconsistentSnapshot(GroomError):
+    """A target listing that CONTRADICTS ITSELF: one issue or pull number returned twice (#1624).
+
+    A SUBCLASS, never a sibling — every `except GroomError` in this file (the per-repo snapshot
+    try, the mutation-boundary re-reads, main's top-level handler) keeps failing closed on it
+    exactly as before. The only thing the narrower class buys is that ONE caller — the per-repo
+    snapshot phase, through `_consistent_snapshot` — can tell "the data disagrees with itself"
+    apart from "the payload was malformed" or "GitHub refused the read", and so can afford it one
+    clean re-read before deferring the repo's whole sweep. Widening that re-read to plain
+    GroomError would retry a permission refusal and a malformed page too, which is why the class
+    exists rather than a string match on the message.
+    """
+
+
 class RedraftUnavailable(GroomError):
     """A parked-PR redraft failure that is NOT a property of the pull request (issue #644).
 
@@ -1074,27 +1088,27 @@ def _admitted_review_prs(
     return admitted
 
 
-def stale_worker_pr_reason(
+def aged_orphan_worker_pr(
     pull: dict[str, Any],
     bot_login: str,
     threshold_seconds: int,
     now: int,
     *,
     has_valid_provenance: bool,
-) -> str | None:
-    """Return why an old worker PR needs HUMAN attention, or None when it should remain untouched.
+) -> bool:
+    """True iff `pull` is a bot-authored worker PR, past the maintenance threshold, that NO
+    automated loop owns (no admissible registry provenance record).
 
-    Scope: this age sweep escalates ONLY a worker PR that NO automated loop owns — one with NO
-    VALID registry provenance record (missing, unreadable, or schema-invalid —
-    worker_pr_provenance_enumerable). A DRAFT orphan parks on ORPHAN_DRAFT_REASON; a NON-DRAFT
-    orphan parks only when it is ALSO wedged in a BAD_MERGE_STATE
-    (conflicting/dirty/behind/blocked/unstable/unknown). A PR with a VALID provenance record is
-    REVIEW-LOOP-OWNED and is NEVER escalated here, DRAFT OR NOT — see the ownership branch below.
-    Together: no orphan is ever silently stranded, and no pipeline-owned PR is ever parked out of
-    the loop that repairs it."""
+    [registry #1598] THE ONE DEFINITION of this age sweep's population, extracted so that its two
+    readers cannot drift apart (AGENTS.md: one definition, plus pointers).
+    `stale_worker_pr_reason` asks it which PRs it may escalate at all; `stranded_worker_pr` asks it
+    which of those the sweep then says NOTHING about. A second, hand-copied notion of "orphan" in
+    the census would be free to disagree with the hand-off about who is unowned, and a census that
+    measures a different population than the one a future park would act on is worse than none.
+    """
     updated = _epoch(pull.get("updated_at"), "pull request")
     if now - updated < threshold_seconds:
-        return None
+        return False
     head = pull.get("head", {}).get("ref", "")
     author = pull.get("user", {}).get("login", "")
     body = pull.get("body") or ""
@@ -1106,7 +1120,7 @@ def stale_worker_pr_reason(
         or not isinstance(body, str)
         or not body.lstrip().startswith(WORKER_PR_MARKER)
     ):
-        return None
+        return False
     # [FABLE-5] A worker PR with a VALID registry provenance record is REVIEW-LOOP-OWNED and is
     # never age-parked here (deadlock fix, live PRs jeswr/agent-account-registry#3472 / #3470).
     # Draft is the NORMAL pre-review pipeline state: dispatch-claim.enumerate_review_items picks
@@ -1134,7 +1148,34 @@ def stale_worker_pr_reason(
     # existence prevents is an INVISIBLE permanent hold — the exact state AGE_PARK_CAUSES calls
     # "strictly worse than a visible one". So ownership dominates the merge state in BOTH classes,
     # and escalating a review-loop-owned PR is left to the review reconciler that can see it.
-    if has_valid_provenance:
+    return not has_valid_provenance
+
+
+def stale_worker_pr_reason(
+    pull: dict[str, Any],
+    bot_login: str,
+    threshold_seconds: int,
+    now: int,
+    *,
+    has_valid_provenance: bool,
+) -> str | None:
+    """Return why an old worker PR needs HUMAN attention, or None when it should remain untouched.
+
+    Scope: this age sweep escalates ONLY a worker PR that NO automated loop owns — one with NO
+    VALID registry provenance record (missing, unreadable, or schema-invalid —
+    worker_pr_provenance_enumerable). That population is aged_orphan_worker_pr, which also carries
+    the ownership carve-out's rationale. A DRAFT orphan parks on ORPHAN_DRAFT_REASON; a NON-DRAFT
+    orphan parks only when it is ALSO wedged in a BAD_MERGE_STATE
+    (conflicting/dirty/behind/blocked/unstable/unknown). A PR with a VALID provenance record is
+    REVIEW-LOOP-OWNED and is NEVER escalated here, DRAFT OR NOT.
+
+    [registry #1598] THE NON-DRAFT ARM HAS NO CLOSURE GUARANTEE, DELIBERATELY AND FOR NOW. A
+    non-draft orphan whose `mergeable_state` is fine falls off the end of this function as None and
+    is handed off to nobody — see stranded_worker_pr, which measures exactly that residue so the
+    decision about whether to park it can be made on a counted population instead of a guess."""
+    if not aged_orphan_worker_pr(
+        pull, bot_login, threshold_seconds, now, has_valid_provenance=has_valid_provenance
+    ):
         return None
     if pull.get("draft") is True:
         # A DRAFT with NO VALID provenance record is a GENUINE ORPHAN owned by no automated
@@ -1159,6 +1200,47 @@ def stale_worker_pr_reason(
     if not isinstance(merge_state, str):
         raise GroomError("pull request merge state is malformed")
     return BAD_MERGE_STATES.get(merge_state)
+
+
+def stranded_worker_pr(
+    pull: dict[str, Any],
+    bot_login: str,
+    threshold_seconds: int,
+    now: int,
+    *,
+    has_valid_provenance: bool,
+) -> bool:
+    """[registry #1598] True iff this aged worker PR is owned by NO automated loop AND this sweep
+    produces NO hand-off reason for it — i.e. it is SILENTLY STRANDED, invisible in both directions.
+
+    Concretely that is the NON-DRAFT orphan whose `mergeable_state` is not one of
+    BAD_MERGE_STATES: `clean`, or any future state GitHub adds that this table does not name.
+    Nothing owns it — dispatch-claim.enumerate_review_items refuses it before any repair branch
+    because provenance_admission_error fails closed on a missing/unreadable/schema-invalid record,
+    and groom's issue-side orphan repair skips it because the open PR links its source issue — and
+    stale_worker_pr_reason returns None for it, so there is no park, no comment, and no census row
+    either. Being `clean` is not evidence of being owned; it is only evidence of not being wedged.
+    The DRAFT arm has no such residue (every draft orphan returns ORPHAN_DRAFT_REASON), which is
+    why the closure guarantee holds there and not here.
+
+    THIS IS A GAUGE, NOT A DISPOSITION. It writes nothing and parks nothing. The issue's suggested
+    remedy — extend the orphan hand-off to non-drafts regardless of merge state — is deliberately
+    NOT taken here: that is a mass park applied to a population nobody has counted, and #1598 asks
+    for the count first. Once the census line this feeds has run over real ticks, the park (a new
+    reason string, an AGE_PARK_CAUSES entry, and an `orphan-draft`-style recovery predicate keyed
+    on an admissible record appearing on the live ledger ref) can be argued from that number.
+
+    It is DERIVED from the two production functions rather than re-deriving orphan-hood, so it can
+    never measure a different population than the hand-off acts on: a change to either one moves
+    this count. It raises whatever stale_worker_pr_reason raises — a malformed merge state stays a
+    fail-closed refusal rather than becoming a quietly-uncounted row."""
+    if not aged_orphan_worker_pr(
+        pull, bot_login, threshold_seconds, now, has_valid_provenance=has_valid_provenance
+    ):
+        return False
+    return stale_worker_pr_reason(
+        pull, bot_login, threshold_seconds, now, has_valid_provenance=has_valid_provenance
+    ) is None
 
 
 # ---- the ONE diagnostic-masking contract (issue #644 defect 1, extended by issue #647) ----------
@@ -2100,7 +2182,9 @@ def _issues(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
                 f"target issue comment count is malformed for {repo}#{number}"
             )
         if number in result:
-            raise GroomError(f"target issue snapshot contains duplicates for {repo}")
+            raise GroomInconsistentSnapshot(
+                f"target issue snapshot contains duplicates for {repo}"
+            )
         result[number] = item
     return result
 
@@ -2116,11 +2200,87 @@ def _pulls(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
         _epoch(pull.get("updated_at"), f"target pull request {repo}#{number}")
         linked_issue_numbers(pull)
         if number in result:
-            raise GroomError(
+            raise GroomInconsistentSnapshot(
                 f"target pull request snapshot contains duplicates for {repo}"
             )
         result[number] = pull
     return result
+
+
+# [#1624] ONE clean re-read before an inconsistent snapshot costs a repo its whole sweep cycle.
+#
+# Deliberately left out of #678 (its proposal 3) because it adds a retry shape to a trust-surface
+# reader. What changed is what a duplicate MEANS: under STABLE_LISTING_ORDER a concurrently created
+# row lands past the cursor and can no longer duplicate an already-read one, so the refusal is no
+# longer "we lost a race" but "this listing disagrees with itself". That is exactly the case a
+# second read is DIAGNOSTIC for — it separates a residual race from genuine inconsistency — and the
+# thing it buys back is a whole ~20-minute cycle of dead-lease reclaim, stuck-issue repair and
+# stale-PR hand-off for that repo.
+#
+# Three properties, each with its own killer in the self-test:
+#
+#   * SCOPED to the inconsistency class. A malformed payload, a refused read, a truncated walk are
+#     NOT re-read: they are not self-contradiction, and retrying a permission refusal buys nothing
+#     but a second 403. That is what `GroomInconsistentSnapshot` is for.
+#   * FAIL-CLOSED on the second answer. A re-read that is ALSO inconsistent propagates unchanged,
+#     so the repo defers exactly as it did before this existed. There is no third attempt and no
+#     "collapse the duplicate and carry on" — groom mutates labels and state off this snapshot.
+#   * BOUNDED at ONE extra listing per repo per tick, shared across the issue AND pull listings.
+#     A persistently inconsistent repo therefore cannot double the sweep's request budget: the
+#     first contradiction spends the repo's token, every later one in the same tick fails closed
+#     immediately. The token is spent when the re-read is ISSUED, not when it succeeds.
+class _SnapshotRereadBudget:
+    """Per-tick allowance of ONE extra target listing per repo (issue #1624)."""
+
+    def __init__(self) -> None:
+        self._spent: set[str] = set()
+
+    def claim(self, repo: str) -> bool:
+        """Reserve `repo`'s single re-read, or False if this tick already spent it."""
+        if repo in self._spent:
+            return False
+        self._spent.add(repo)
+        return True
+
+    def __len__(self) -> int:
+        return len(self._spent)
+
+
+def _snapshot_settle(attempt: int = 1, **injection: Any) -> None:
+    """Wait once for a self-contradictory listing to settle, before the single re-read.
+
+    Delegates to the SHARED `ledger_retry` CONTENTION schedule (full-jitter, 0.5s ceiling at
+    attempt 1) — the same policy the ledger CAS writers wait on — and deliberately NOT to
+    gh_retry's 2s->30s THROTTLE schedule: nothing here was rate-limited, so the seconds-to-a-minute
+    wait a burst limiter needs would only lengthen every sweep. Delegating rather than
+    re-implementing is the point (AGENTS.md: no new hand-rolled retry/sleep loops); the self-test
+    pins the delegation so a re-inlined `time.sleep` reds.
+    """
+    _ledger_retry.sleep_backoff(attempt, **injection)
+
+
+def _consistent_snapshot(
+    read: Callable[[], Any], repo: str, budget: _SnapshotRereadBudget
+) -> Any:
+    """`read()`'s snapshot, allowing ONE re-read per repo per tick on self-contradiction (#1624)."""
+    try:
+        return read()
+    except GroomInconsistentSnapshot as first:
+        if not budget.claim(repo):
+            raise
+        print(
+            f"NOTE repo {repo}: {first} — re-reading this listing ONCE (issue #1624); a re-read "
+            "that is also inconsistent defers this repo's whole sweep"
+        )
+        _snapshot_settle()
+        # No handler here: a second contradiction — or any other failure of the re-read — is the
+        # caller's per-repo deferral, unchanged from before this existed.
+        result = read()
+        print(
+            f"NOTE repo {repo}: the re-read came back consistent — this repo's sweep continues "
+            "(the first listing was a residual race, not inconsistent data)"
+        )
+        return result
 
 
 def _comments(api: GitHubAPI, repo: str, number: int) -> list[dict[str, Any]]:
@@ -3653,6 +3813,10 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     pulls: dict[str, dict[int, dict[str, Any]]] = {}
     attempts: dict[tuple[str, int], int] = {}
     stale_prs: dict[tuple[str, int], str] = {}
+    # [registry #1598] The aged worker orphans this sweep has NO disposition for — non-drafts with
+    # no admissible provenance record whose merge state is not one BAD_MERGE_STATES names. Kept as
+    # the object list, not a bare counter, because the census names them (see the emission below).
+    stranded_prs: list[str] = []
     defuse_prs: dict[tuple[str, int], tuple[str, str]] = {}
     # Issue #647, THIRD instance of the same shape, found while closing the other two: the per-PR
     # DETAIL read below is an unwrapped per-object operation with reclaim downstream, so one PR
@@ -3687,6 +3851,9 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     snapshot_attempted = 0
     snapshot_completed = 0
     snapshot_deferrals: list[str] = []
+    # [#1624] The tick's re-read allowance: ONE extra listing per repo, shared by that repo's issue
+    # and pull reads, so a persistently inconsistent repo cannot double the sweep's request budget.
+    reread_budget = _SnapshotRereadBudget()
     # The per-tick audit of the #1303 saving. Printed rather than assumed, for the same reason
     # plan-snapshot prints its conditional-read split: a request-budget win that is not visible
     # in the log of the tick that took it cannot be told apart from a quiet hour.
@@ -3696,8 +3863,14 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         repo_limits = limits[repo]
         snapshot_attempted += 1
         try:
-            repo_issues = _issues(api, repo)
-            repo_pulls = _pulls(api, repo)
+            # [#1624] Both listings go through the same per-repo re-read allowance: a snapshot
+            # that contradicts itself gets one clean re-read before this repo's sweep defers.
+            repo_issues = _consistent_snapshot(
+                lambda: _issues(api, repo), repo, reread_budget
+            )
+            repo_pulls = _consistent_snapshot(
+                lambda: _pulls(api, repo), repo, reread_budget
+            )
             repo_defuse = _collect_defuse_prs(
                 api, repo, repo_pulls, now, defuse_stale_seconds, bot_login
             )
@@ -3778,13 +3951,18 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                     raise GroomError(
                         f"target pull request detail is malformed for {repo}#{number}"
                     )
+                # ONE provenance derivation, read by the hand-off decision and the [registry
+                # #1598] census alike. Deriving it twice would let the two disagree about who is
+                # unowned, which is the one thing the census must never do.
+                pr_owned = worker_pr_provenance_enumerable(
+                    repo, number, ledger_root=ledger_root)
                 reason = stale_worker_pr_reason(
-                    detail,
-                    bot_login,
-                    repo_limits.threshold_seconds,
-                    now,
-                    has_valid_provenance=worker_pr_provenance_enumerable(
-                        repo, number, ledger_root=ledger_root),
+                    detail, bot_login, repo_limits.threshold_seconds, now,
+                    has_valid_provenance=pr_owned,
+                )
+                pr_stranded = stranded_worker_pr(
+                    detail, bot_login, repo_limits.threshold_seconds, now,
+                    has_valid_provenance=pr_owned,
                 )
             except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #774)
                 # See _execute_age_unpark_actions' handler for the canonical rationale: a
@@ -3796,11 +3974,30 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             detect_completed += 1
             if reason:
                 stale_prs[(repo, number)] = reason
+            elif pr_stranded:
+                # [registry #1598] MEASURE, do not act. This PR is an aged worker orphan for which
+                # the sweep has no hand-off reason: no automated loop enumerates it and no park,
+                # comment or label is written for it, so until this line it left no trace anywhere.
+                # Naming it per-object is the point — a bare count tells an operator that a
+                # stranded PR exists but not which one, and the whole complaint in #1598 is that
+                # the object is unfindable.
+                stranded_prs.append(f"{repo}#{number}")
     # [#1303] The realised saving, per tick, from the tick's own counters — never a constant.
     print(
         f"SWEEP attempt-budget reads: {attempts_fetched} of {attempts_considered} open issues "
         f"needed a comments fetch, {attempts_considered - attempts_fetched} decided by the "
         "comment count already in the list payload (0 requests)"
+    )
+    # [registry #1598] Emitted UNCONDITIONALLY, zero row included, exactly like the #873
+    # `age_park_standing` gauge above it: this line's whole job is to answer "how many aged worker
+    # orphans is this sweep saying nothing about", and a gauge that appears only when it is
+    # non-zero trains its reader to read absence as health (AGENTS.md pre-flight item 8). A zero
+    # row here is the positive statement that the residue is empty on this tick.
+    print(
+        "CENSUS stranded worker PRs (aged, non-draft, no admissible provenance record, merge "
+        "state not one this sweep escalates — owned by no loop and handed off to nobody): "
+        f"{len(stranded_prs)}"
+        + (f" [{', '.join(sorted(stranded_prs))}]" if stranded_prs else "")
     )
     detect_outcome = PhaseOutcome(
         label="stale PR detection",
@@ -4393,9 +4590,19 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         # (AGENTS.md pre-flight item 8).
         f"age_park_standing={standing_count} "
         f"age_park_exit_unreachable={unreachable_count} "
+        # [registry #1598] Same unconditional-gauge contract as the two above, on the SUMMARY line
+        # an operator actually greps: the size of the population a future non-draft orphan park
+        # would act on, so that decision is argued from a measurement rather than an intuition.
+        f"stranded_prs={len(stranded_prs)} "
         f"age_unpark_deferred={len(unpark_outcome.deferred)} "
         f"detect_deferred={len(detect_outcome.deferred)} "
         f"snapshot_deferred={len(snapshot_outcome.deferred)} "
+        # [#1624] The extra listings this tick spent re-reading a self-contradictory snapshot,
+        # emitted UNCONDITIONALLY including the zero row (AGENTS.md pre-flight item 8): this is a
+        # REQUEST-BUDGET gauge, and one that only appears when it is non-zero cannot be told apart
+        # from a quiet tick — which is precisely the reading needed to notice a repo that pays for
+        # a re-read on every single sweep.
+        f"snapshot_rereads={len(reread_budget)} "
         f"attempt_budget_deferred={len(budget_outcome.deferred)} "
         f"reap_deferred={len(reap_outcome.deferred)}"
     )
@@ -4687,6 +4894,157 @@ def _self_test() -> int:
         _snapshot_refusal([_race_pull(9), {**_race_pull(9), "body": "Fixes #4"}], _pulls),
         "target pull request snapshot contains duplicates for owner/repo",
     )
+    # Both refusals above are raised — and caught here — as GroomError, so the narrowing to
+    # GroomInconsistentSnapshot (#1624) is pinned by the checks that already exist: make it a
+    # sibling of GroomError rather than a subclass and every one of them reds, because the
+    # `except GroomError` in `_snapshot_refusal` (and in the sweep's per-repo try) stops catching
+    # it and the refusal escapes as `raised GroomInconsistentSnapshot`. The class is asserted by
+    # NAME below, where the re-read decision actually turns on it.
+
+    # ---- #1624: ONE clean re-read before an inconsistent snapshot costs a whole sweep cycle -----
+    #
+    # The guard above stays exactly as strict; what changes is the PRICE of a contradiction —
+    # one extra listing to diagnose it, instead of a ~20-minute cycle of dead-lease reclaim,
+    # stuck-issue repair and stale-PR hand-off for that repo. Everything asserted here is counted
+    # in LISTINGS ACTUALLY ISSUED, because "bounded to one extra read" is a claim about requests.
+    class _ScriptedRead:
+        """A snapshot read serving scripted answers in order, counting the listings it issued.
+
+        An Exception answer is RAISED, so a scenario can say `inconsistent, then clean` or
+        `inconsistent twice` without standing up a fixture GitHub. A call past the end of the
+        script returns a loud sentinel rather than another scripted value: an implementation that
+        read a THIRD time must not be able to satisfy an assertion by accident."""
+
+        def __init__(self, *answers: Any) -> None:
+            self.answers = answers
+            self.calls = 0
+
+        def __call__(self) -> Any:
+            self.calls += 1
+            if self.calls > len(self.answers):
+                return "UNSCRIPTED EXTRA LISTING"
+            answer = self.answers[self.calls - 1]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    def _reread(
+        reader: Any, budget: Any, repo: str = "owner/repo"
+    ) -> tuple[Any, int, str]:
+        """(outcome, listings issued, operator log) for one `_consistent_snapshot` call.
+
+        TOTAL: any exception is reported as a VALUE, so a mutant that makes the reader blow up
+        cannot abort the suite and score itself a kill (AGENTS.md item 4)."""
+        captured = io.StringIO()
+        saved_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            outcome: Any = _consistent_snapshot(reader, repo, budget)
+        except Exception as exc:  # noqa: BLE001
+            outcome = f"{type(exc).__name__}: {exc}"
+        finally:
+            sys.stdout = saved_stdout
+        return outcome, reader.calls, captured.getvalue()
+
+    _ISSUE_DUP = "target issue snapshot contains duplicates for owner/repo"
+    _PULL_DUP = "target pull request snapshot contains duplicates for owner/repo"
+    settle_calls: list[int] = []
+    _real_settle = globals()["_snapshot_settle"]
+    globals()["_snapshot_settle"] = lambda attempt=1, **_kw: settle_calls.append(attempt)
+    try:
+        recover_budget = _SnapshotRereadBudget()
+        recovered = _reread(
+            _ScriptedRead(GroomInconsistentSnapshot(_ISSUE_DUP), {7: "clean"}), recover_budget
+        )
+        check(
+            "[#1624] a self-contradictory snapshot is RE-READ once, and a clean re-read is "
+            "ACCEPTED — the repo's whole sweep cycle is saved. Exactly TWO listings, one settle, "
+            "and the operator sees both the re-read and its outcome",
+            (recovered[0], recovered[1], len(recover_budget), settle_calls,
+             "re-reading this listing ONCE" in recovered[2],
+             "came back consistent" in recovered[2]),
+            ({7: "clean"}, 2, 1, [1], True, True),
+        )
+        settle_calls.clear()
+        closed_budget = _SnapshotRereadBudget()
+        still_bad = _reread(
+            _ScriptedRead(GroomInconsistentSnapshot(_ISSUE_DUP),
+                          GroomInconsistentSnapshot(_ISSUE_DUP)),
+            closed_budget,
+        )
+        check(
+            "[#1624] FAIL CLOSED: a re-read that is ALSO inconsistent still REFUSES — the repo "
+            "defers exactly as it did before the re-read existed, the refusal keeps its class and "
+            "message, and there is NO third listing. Swallowing the second refusal (returning the "
+            "duplicated view, or collapsing it) reds here and nowhere else",
+            (still_bad[0], still_bad[1], len(closed_budget)),
+            (f"GroomInconsistentSnapshot: {_ISSUE_DUP}", 2, 1),
+        )
+        settle_calls.clear()
+        shared_budget = _SnapshotRereadBudget()
+        issue_leg = _reread(
+            _ScriptedRead(GroomInconsistentSnapshot(_ISSUE_DUP), {}), shared_budget
+        )
+        pull_leg = _reread(
+            _ScriptedRead(GroomInconsistentSnapshot(_PULL_DUP), {}), shared_budget
+        )
+        check(
+            "[#1624] BOUNDED at ONE extra listing per repo PER TICK, SHARED by the issue and pull "
+            "reads: the issue listing recovers, and the pull listing's contradiction in the same "
+            "tick fails closed on its FIRST read with no settle. A per-CALL allowance makes the "
+            "second leg 2 listings and reds",
+            (issue_leg[1], pull_leg[1], pull_leg[0], len(shared_budget), settle_calls),
+            (2, 1, f"GroomInconsistentSnapshot: {_PULL_DUP}", 1, [1]),
+        )
+        settle_calls.clear()
+        other_leg = _reread(
+            _ScriptedRead(GroomInconsistentSnapshot(_ISSUE_DUP), {}), shared_budget,
+            "owner/other",
+        )
+        check(
+            "[#1624] and the allowance is PER REPO, not per tick: a DIFFERENT repo on the same "
+            "budget still gets its own re-read, so one noisy target cannot starve the others "
+            "(a tick-global token makes this 1 listing and reds)",
+            (other_leg[1], len(shared_budget), settle_calls),
+            (2, 2, [1]),
+        )
+        settle_calls.clear()
+        scope_budget = _SnapshotRereadBudget()
+        malformed = _reread(
+            _ScriptedRead(GroomError("target issue snapshot is malformed for owner/repo"), {}),
+            scope_budget,
+        )
+        check(
+            "[#1624] SCOPED to self-contradiction: a malformed page, a refused read, a truncated "
+            "walk — every other GroomError — is NOT re-read, spends no budget and sleeps not at "
+            "all. Widening the except to GroomError would retry a permission refusal into a "
+            "second 403 and reds here",
+            (malformed[0], malformed[1], len(scope_budget), settle_calls),
+            ("GroomError: target issue snapshot is malformed for owner/repo", 1, 0, []),
+        )
+        # The SETTLE itself: shared policy, not a hand-rolled sleep, and the CONTENTION schedule
+        # rather than the throttle one. Both legs call the REAL `_snapshot_settle` (the global is
+        # stubbed above for the scenarios), so neither can be satisfied by the stub.
+        delegated: list[int] = []
+        _real_ledger_sleep = _ledger_retry.sleep_backoff
+        _ledger_retry.sleep_backoff = lambda attempt, *_a, **_kw: delegated.append(attempt)
+        try:
+            _real_settle()
+        finally:
+            _ledger_retry.sleep_backoff = _real_ledger_sleep
+        observed: list[float] = []
+        _real_settle(1, sleeper=observed.append, draw=lambda _lo, hi: hi)
+        check(
+            "[#1624] the settle DELEGATES to ledger_retry's shared CONTENTION schedule — "
+            "re-inlining a `time.sleep(random.uniform(...))` here reds the first leg (AGENTS.md: "
+            "no new hand-rolled retry/sleep loops), and its 0.5s ceiling is strictly under "
+            "gh_retry's 2s+ THROTTLE schedule, which is for a rate limiter and not for a listing "
+            "that disagreed with itself",
+            (delegated, observed, observed[0] < _gh_retry.backoff_ceiling(1)),
+            ([1], [0.5], True),
+        )
+    finally:
+        globals()["_snapshot_settle"] = _real_settle
 
     # ---- YAML seam: WORKER_RUN_NAME vs the title worker.yml actually renders (issue #1130) ----
     # A regex over a string another file produces drifts silently the moment that file changes:
@@ -5143,6 +5501,132 @@ def _self_test() -> int:
         ],
         [None, None],
     )
+
+    # ---- [registry #1598] the SILENT-STRAND census: the residue the hand-off has no reason for --
+    # The check directly above proves a clean NON-DRAFT orphan returns None. That None is not a
+    # disposition: nothing enumerates the PR (dispatch-claim refuses a record-less pull before any
+    # repair branch), groom's issue-side orphan repair skips it (the open PR links its source
+    # issue), and no park, comment or census row was ever written for it. stranded_worker_pr is
+    # the gauge that makes exactly that population visible; it must be TRUE there and FALSE for
+    # every neighbouring case, or it is measuring something other than the strand.
+    _clean_orphan = {**old_pr, "mergeable_state": "clean"}
+    check(
+        "the CLEAN non-draft ORPHAN — the #1598 strand itself — is censused",
+        stranded_worker_pr(
+            _clean_orphan, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False
+        ),
+        True,
+    )
+    check(
+        # The REJECT side of the ownership gate, sharing every input with the row above except
+        # `has_valid_provenance`. Hard-code the census call site's provenance argument to False
+        # (or drop the gate from aged_orphan_worker_pr) and this reds while the row above stays
+        # green: a review-loop-owned PR is not stranded, it is simply waiting for its lane.
+        "a CLEAN non-draft PR the review loop OWNS is NOT stranded (ownership, not merge state, "
+        "is what the census measures)",
+        stranded_worker_pr(
+            _clean_orphan, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
+        ),
+        False,
+    )
+    check(
+        # The DRAFT arm's closure guarantee, restated as a census claim: every draft orphan
+        # already returns ORPHAN_DRAFT_REASON, so no draft can ever be part of this residue.
+        # Delete the `draft` branch of stale_worker_pr_reason and this flips to True.
+        "a DRAFT orphan is never stranded — the draft arm hands every one of them off",
+        stranded_worker_pr(
+            {**_clean_orphan, "draft": True},
+            "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False,
+        ),
+        False,
+    )
+    check(
+        # A PR still inside the maintenance threshold is not yet anything — not parked, not
+        # stranded. Delete the age guard and every freshly-opened clean worker PR is censused as
+        # stranded on the tick it is created, which would make the number meaningless.
+        "a FRESH clean orphan is not yet stranded (the age threshold gates the census too)",
+        stranded_worker_pr(
+            {**_clean_orphan,
+             "updated_at": datetime.fromtimestamp(now - 1, timezone.utc).isoformat()},
+            "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False,
+        ),
+        False,
+    )
+    check(
+        # The SHAPE gate. A human's clean PR has no provenance record either, and counting it
+        # would inflate the population a future park is argued from by the entire non-worker
+        # pull population.
+        "a non-worker (human-authored) clean PR is not stranded, record or no record",
+        [
+            stranded_worker_pr(
+                {**_clean_orphan, "user": {"login": "a-human"}},
+                "app[bot]", limits.threshold_seconds, now, has_valid_provenance=owned)
+            for owned in (False, True)
+        ],
+        [False, False],
+    )
+    # THE PARTITION, which is the whole claim #1598 makes: across the aged non-draft ORPHAN
+    # population, "has a hand-off reason" and "is stranded" are complementary — every such PR is
+    # in exactly one of them, and the strand is precisely the merge states BAD_MERGE_STATES does
+    # not name. The `clean` input is a LITERAL that appears in no table the code reads, so the
+    # row cannot be satisfied by a mutant that shrinks BAD_MERGE_STATES (AGENTS.md question (c)),
+    # and the expected list is written out by hand rather than derived from that table.
+    _partition = [
+        (_state,
+         stale_worker_pr_reason({**old_pr, "mergeable_state": _state}, "app[bot]",
+                                limits.threshold_seconds, now, has_valid_provenance=False)
+         is not None,
+         stranded_worker_pr({**old_pr, "mergeable_state": _state}, "app[bot]",
+                            limits.threshold_seconds, now, has_valid_provenance=False))
+        for _state in ("behind", "blocked", "clean", "dirty", "unknown", "unstable")
+    ]
+    check(
+        "every aged non-draft orphan is EITHER handed off OR censused as stranded, never both and "
+        "never neither — and `clean` is the one that is stranded",
+        _partition,
+        [("behind", True, False), ("blocked", True, False), ("clean", False, True),
+         ("dirty", True, False), ("unknown", True, False), ("unstable", True, False)],
+    )
+    # A malformed merge state must stay the fail-closed REFUSAL it is on the hand-off path rather
+    # than degrading into a quietly-uncounted census row: the census is derived from the same
+    # function, so it raises where that function raises. Swallow the exception in
+    # stranded_worker_pr and this reds.
+    _census_malformed_raised = False
+    try:
+        stranded_worker_pr(
+            {**old_pr, "draft": False, "mergeable_state": 7},
+            "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False,
+        )
+    except GroomError:
+        _census_malformed_raised = True
+    check(
+        "a malformed merge state fails closed in the census too (never a silent uncounted row)",
+        _census_malformed_raised,
+        True,
+    )
+    # aged_orphan_worker_pr is the SHARED population definition both readers key off. Asserted
+    # directly, in both directions, so the extraction cannot be hollowed out into a constant while
+    # its two callers happen to stay green on the fixtures above.
+    check(
+        "the shared orphan population: aged + worker-shaped + bot-authored + NO admissible record",
+        [
+            aged_orphan_worker_pr(_pr, "app[bot]", limits.threshold_seconds, now,
+                                  has_valid_provenance=_owned)
+            for _pr, _owned in (
+                (_clean_orphan, False),                                     # the population
+                (_clean_orphan, True),                                      # owned -> out
+                ({**_clean_orphan, "draft": True}, False),                  # drafts are in it too
+                ({**_clean_orphan, "user": {"login": "a-human"}}, False),   # not bot-authored
+                ({**_clean_orphan, "head": {"ref": "feature/x"}}, False),   # not a worker branch
+                ({**_clean_orphan, "body": "no marker"}, False),            # no agent self-ID
+                ({**_clean_orphan,
+                  "updated_at": datetime.fromtimestamp(now - 1, timezone.utc).isoformat()},
+                 False),                                                    # still fresh
+            )
+        ],
+        [True, False, True, False, False, False, False],
+    )
+
     check("worker branch links issue", linked_issue_numbers(old_pr), {7})
 
     # ---- issue #548: safely defuse stale terminally parked, ready-for-review PRs. ----
@@ -7924,6 +8408,14 @@ def _self_test() -> int:
             sequenced = terminal_sweep_env.get("paginate_seq_failures", {}).get((path, nth))
             if sequenced is not None:
                 raise sequenced
+            # [#1624] A call-sequenced PAGE, the response-side twin of the refusal above. The
+            # defect under test is a listing whose CONTENT contradicts itself and then does not
+            # (or does again) on the very next read; only a per-(path, Nth) payload can express
+            # that, and driving it through the SHIPPED `_issues`/`_pulls` guards is what makes the
+            # scenario about the real refusal rather than about an exception the fixture invented.
+            sequenced_page = terminal_sweep_env.get("paginate_seq_pages", {}).get((path, nth))
+            if sequenced_page is not None:
+                return list(sequenced_page)
             if path == _open_issues_path():
                 return terminal_sweep_env["planned_issues"]
             if path == _open_pulls_path():
@@ -8348,6 +8840,7 @@ def _self_test() -> int:
             extra_gets: dict[str, Any] | None = None,
             paginate_refusals: dict[str, GroomError] | None = None,
             paginate_seq_refusals: dict[tuple[str, int], GroomError] | None = None,
+            paginate_seq_pages: dict[tuple[str, int], list[Any]] | None = None,
             leases: tuple[dict[str, Any], ...] | None = None,
             repos: tuple[str, ...] = ("owner/repo",),
             ledger_root: str = "",
@@ -8359,7 +8852,10 @@ def _self_test() -> int:
             revalidated AWAY inside the hand-off loop (the deliberate-skip case). `paginate_refusals`
             refuses a LISTING (issue #649's snapshot and comments reads), `paginate_seq_refusals`
             refuses the Nth call to one listing path (the terminal-reap re-read, which is the SECOND
-            read of `/pulls?state=open`), `repos`/`leases` widen the fixture to a second target so a
+            read of `/pulls?state=open`), `paginate_seq_pages` serves a chosen PAYLOAD on the Nth
+            call to one listing path (issue #1624's self-contradictory snapshot, which must be able
+            to differ between the first read and the re-read), `repos`/`leases` widen the fixture
+            to a second target so a
             head-of-line claim about ONE repo can be witnessed. `ledger_root` points run_sweep at a
             provenance checkout, so a PR can be given a VALID record; `side_effects` fires a
             callable on the Nth (method, path) request, so the world can CHANGE mid-sweep — the two
@@ -8392,6 +8888,7 @@ def _self_test() -> int:
                 http_failures=dict(refusals),
                 paginate_failures=dict(paginate_refusals or {}),
                 paginate_seq_failures=dict(paginate_seq_refusals or {}),
+                paginate_seq_pages=dict(paginate_seq_pages or {}),
             )
             terminal_sweep_releases.clear()
             saved_limits = globals()["load_limits"]
@@ -8418,7 +8915,8 @@ def _self_test() -> int:
                 globals()["load_limits"] = saved_limits
                 terminal_sweep_env.update(
                     pulls=[], gets={}, http_failures={}, planned_issues=[], fresh_issues={},
-                    paginate_failures={}, paginate_seq_failures={}, side_effects={},
+                    paginate_failures={}, paginate_seq_failures={}, paginate_seq_pages={},
+                    side_effects={},
                 )
             return log.getvalue(), error, [set(claims) for claims in terminal_sweep_releases]
 
@@ -8623,6 +9121,67 @@ def _self_test() -> int:
                 "stale_prs=0" in raced_log,
             ),
             ([], [], True, True),
+        )
+
+        # (A1d) [registry #1598] THE SILENT-STRAND CENSUS, END TO END through the real run_sweep.
+        # This PR differs from (A1)'s parked one in ONE field — `mergeable_state` is `clean`, not
+        # `dirty` — and that one field is the whole defect: (A1) parks and comments, this one
+        # produced no park, no comment, no log line and no counter, so it was invisible to every
+        # automated loop AND to the operator at once. The census is what ends that, and it is
+        # asserted at the layer that decides it (AGENTS.md pre-flight item 11): the PR must still
+        # be written to by NOTHING, and must be NAMED on both the CENSUS line and the SUMMARY.
+        #
+        # The rendered text is pinned EXACTLY, tail included, not by substring-containing
+        # "CENSUS" (AGENTS.md pre-flight item 6): a mutant that emits the header and drops the
+        # count, or emits the count and drops the object list, satisfies a containment check while
+        # leaving the operator exactly as unable to find the PR as before.
+        stranded_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=({**_stale_worker_pr(47), "mergeable_state": "clean"},))
+        check(
+            "a CLEAN non-draft worker orphan is CENSUSED and NAMED — the sweep still writes "
+            "nothing to it and still parks nothing, but it is no longer silent about it",
+            (
+                terminal_sweep_env["writes"],
+                _comment_bodies(),
+                "handed off to nobody): 1 [owner/repo#47]" in stranded_log,
+                "stranded_prs=1" in stranded_log,
+                "stale_prs=0" in stranded_log,
+            ),
+            ([], [], True, True, True),
+        )
+        # (A1e) THE ZERO ROW, and the reason it is asserted separately. Item 3's second mutant —
+        # making an emission CONDITIONALLY inert rather than deleting it — is invisible to (A1d):
+        # wrapping the print in `if stranded_prs:` keeps every element above green and silences
+        # the gauge on exactly the quiet tick an operator interrogates it (AGENTS.md item 8). The
+        # run below is (A1d) with ONE thing changed — an admissible provenance record now exists in
+        # the checkout the sweep resolves records from — so it also kills a census that ignores
+        # ownership: hard-code the census call site's `has_valid_provenance` to False and this
+        # reds while (A1d) stays green.
+        stranded_provenance = json.dumps({
+            "pr_number": 47,
+            "head_sha_at_open": "1" * 40,
+            "impl_provider": "anthropic",
+            "impl_alias": "fable",
+            "impl_account_h": "ab" * 8,
+            "issue": 947,
+            "recorded_at_run": "29694084610.1",
+        })
+        with tempfile.TemporaryDirectory() as census_ledger_dir:
+            census_record = Path(census_ledger_dir) / PROVENANCE_DIR / "owner--repo--pr47.json"
+            census_record.parent.mkdir(parents=True)
+            census_record.write_text(stranded_provenance, encoding="utf-8")
+            owned_census_log, _e, _r = _sweep_with_refusals(
+                {}, pulls=({**_stale_worker_pr(47), "mergeable_state": "clean"},),
+                ledger_root=census_ledger_dir)
+        check(
+            "the census ZERO-SEALS: a review-loop-OWNED clean PR is not stranded, and the gauge "
+            "still emits its zero row on both surfaces rather than falling silent",
+            (
+                "handed off to nobody): 0" in owned_census_log,
+                "[owner/repo#47]" in owned_census_log,
+                "stranded_prs=0" in owned_census_log,
+            ),
+            (True, False, True),
         )
 
         # (A2) FAIL-CLOSED DEFAULT. A cause the taxonomy cannot name has no recovery predicate, so
@@ -10533,6 +11092,167 @@ def _self_test() -> int:
             ),
             ([set()], True, True, True),
         )
+
+        # (2b) [#1624] THE ONE CLEAN RE-READ, driven through the REAL sweep. Everything below is
+        # counted in LISTINGS THE FIXTURE ACTUALLY SERVED, and every refusal is raised by the
+        # SHIPPED `_issues`/`_pulls` duplicate guard off a self-contradictory payload — never by a
+        # GroomError the fixture wrote, which could not tell the re-read apart from any other
+        # deferral. The settle is stubbed to a counter so the suite neither sleeps nor depends on
+        # a clock; the schedule it delegates to is pinned separately, up in the unit checks.
+        dup_issue_page = [dict(parked_issue), dict(parked_issue)]
+        dup_pull_page = [
+            {"number": 91, "body": "",
+             "updated_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat()},
+        ] * 2
+        sweep_settles: list[int] = []
+        saved_sweep_settle = globals()["_snapshot_settle"]
+        globals()["_snapshot_settle"] = lambda attempt=1, **_kw: sweep_settles.append(attempt)
+        try:
+
+            def _issue_reads(repo: str) -> int:
+                return sum(
+                    1 for path in terminal_sweep_env["paginated"]
+                    if path == _open_issues_path(repo)
+                )
+
+            recover_log, recover_error, recover_releases = _sweep_with_refusals(
+                {},
+                repos=("owner/repo", "owner/other"),
+                leases=(repo_lease, other_lease),
+                paginate_seq_pages={
+                    (_open_issues_path(target), 1): dup_issue_page
+                    for target in ("owner/repo", "owner/other")},
+            )
+            check(
+                "MUTATION [#1624] (2b — recovering re-read): a target issue listing that "
+                "contradicts itself is re-read ONCE, comes back clean, and that repo's ENTIRE "
+                "sweep continues — both repos reclaim in the SAME tick instead of losing a "
+                "~20-minute cycle of reclaim, repair and hand-off. Deleting the re-read defers "
+                "both repos and releases NOTHING; the allowance is PER REPO, so a tick-global "
+                "token defers the second one and reds this too",
+                (
+                    recover_releases,
+                    recover_error,
+                    "snapshot_deferred=0" in recover_log,
+                    "snapshot_rereads=2" in recover_log,
+                    (_issue_reads("owner/repo"), _issue_reads("owner/other")),
+                    sweep_settles,
+                ),
+                ([{"e" * 32, "f" * 32}], "", True, True, (2, 2), [1, 1]),
+            )
+            sweep_settles.clear()
+            hard_log, hard_error, hard_releases = _sweep_with_refusals(
+                {},
+                repos=("owner/repo", "owner/other"),
+                leases=(repo_lease, other_lease),
+                paginate_seq_pages={
+                    (_open_issues_path(), ordinal): dup_issue_page for ordinal in (1, 2)},
+            )
+            check(
+                "MUTATION [#1624] (2b — the re-read is ALSO inconsistent): the sweep STILL FAILS "
+                "CLOSED. owner/repo's snapshot is refused with its own cause, its lease is "
+                "RETAINED (an inconsistent view must never release a claim, and must never be "
+                "collapsed into a usable one), owner/other reclaims in the same tick — and the "
+                "walk stops at exactly TWO listings, so a persistently inconsistent repo cannot "
+                "spin. Retrying until clean, or accepting the second duplicate, reds here",
+                (
+                    hard_releases,
+                    "ALERT repo owner/repo:" in hard_log,
+                    "target issue snapshot contains duplicates for owner/repo" in hard_log,
+                    "SKIP lease release claim=eeeeeeee: owner/repo's target snapshot was "
+                    "unreadable" in hard_log,
+                    hard_error,
+                    "snapshot_deferred=1" in hard_log,
+                    "snapshot_rereads=1" in hard_log,
+                    _issue_reads("owner/repo"),
+                    sweep_settles,
+                ),
+                ([{"f" * 32}], True, True, True, "", True, True, 2, [1]),
+            )
+            sweep_settles.clear()
+            budget_log, budget_error, budget_releases = _sweep_with_refusals(
+                {},
+                repos=("owner/repo", "owner/other"),
+                leases=(repo_lease, other_lease),
+                paginate_seq_pages={
+                    (_open_issues_path(), 1): dup_issue_page,
+                    (_open_pulls_path(), 1): dup_pull_page},
+            )
+            budget_pull_reads = sum(
+                1 for path in terminal_sweep_env["paginated"] if path == _open_pulls_path()
+            )
+            check(
+                "MUTATION [#1624] (2b — REQUEST BUDGET): the allowance is ONE extra listing per "
+                "repo per tick, SHARED by that repo's issue and pull reads. The issue listing "
+                "recovers and spends owner/repo's token; the pull listing then contradicts itself "
+                "in the SAME tick and defers on its FIRST read, with no second settle. A "
+                "per-LISTING allowance re-reads the pulls too (2 reads, rereads=2) and reds this — "
+                "that is the shape that lets a persistently inconsistent repo double the sweep's "
+                "request budget",
+                (
+                    budget_releases,
+                    "target pull request snapshot contains duplicates for owner/repo" in budget_log,
+                    budget_error,
+                    "snapshot_deferred=1" in budget_log,
+                    "snapshot_rereads=1" in budget_log,
+                    (_issue_reads("owner/repo"), budget_pull_reads),
+                    sweep_settles,
+                ),
+                ([{"f" * 32}], True, "", True, True, (2, 1), [1]),
+            )
+            sweep_settles.clear()
+            pull_recover_log, pull_recover_error, pull_recover_releases = _sweep_with_refusals(
+                {},
+                repos=("owner/repo", "owner/other"),
+                leases=(repo_lease, other_lease),
+                paginate_seq_pages={(_open_pulls_path(), 1): dup_pull_page},
+            )
+            pull_recover_reads = sum(
+                1 for path in terminal_sweep_env["paginated"] if path == _open_pulls_path()
+            )
+            check(
+                "MUTATION [#1624] (2b — the PULL listing recovers on ITS OWN): the ordering is "
+                "wired at BOTH snapshot reads, so this is what kills the pulls call site by "
+                "itself — unwiring it while leaving the issue read wrapped leaves every other "
+                "check in this file GREEN (measured; AGENTS.md item 4, mutually-masking "
+                "duplicates). A self-contradictory PR listing is re-read once, comes back clean, "
+                "and the repo sweeps: no deferral, one re-read, and the snapshot's THREE pull "
+                "reads against the two a clean reaping tick issues",
+                (
+                    pull_recover_releases,
+                    pull_recover_error,
+                    "snapshot_deferred=0" in pull_recover_log,
+                    "snapshot_rereads=1" in pull_recover_log,
+                    pull_recover_reads,
+                    sweep_settles,
+                ),
+                ([{"e" * 32, "f" * 32}], "", True, True, 3, [1]),
+            )
+            sweep_settles.clear()
+            quiet_log, _quiet_error, _quiet_releases = _sweep_with_refusals(
+                {}, repos=("owner/repo", "owner/other"), leases=(repo_lease, other_lease),
+            )
+            quiet_pull_reads = sum(
+                1 for path in terminal_sweep_env["paginated"] if path == _open_pulls_path()
+            )
+            check(
+                "[#1624] INSTRUMENT VALIDATION + the ZERO ROW: a tick whose snapshots are "
+                "consistent spends NO extra listing and NO settle, and still emits the gauge "
+                "(AGENTS.md item 8 — a counter that only appears when non-zero trains its reader "
+                "to read absence as health). Without this pair the checks above would pass "
+                "against a sweep that simply re-reads every listing twice — the same reaping "
+                "tick issues ONE issue listing per repo and TWO pull listings, not three",
+                (
+                    "snapshot_rereads=0" in quiet_log,
+                    (_issue_reads("owner/repo"), _issue_reads("owner/other")),
+                    quiet_pull_reads,
+                    sweep_settles,
+                ),
+                (True, (1, 1), 2, []),
+            )
+        finally:
+            globals()["_snapshot_settle"] = saved_sweep_settle
+            sweep_settles.clear()
 
         # (3) THE TERMINAL-REAP RE-READ (#509's mutation boundary). Here record-and-continue fails
         # OPEN — an unread issue stays ABSENT from `fresh_reap_issues`, which `_terminal_non_pr_claims`

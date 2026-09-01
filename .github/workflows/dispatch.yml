@@ -2,7 +2,7 @@
 # code with no secrets in its environment; CLAIM treats the PLAN artifact as hostile data before
 # any mutation.
 #
-# The four-per-hour cron below is the SINGLE scheduler for the issue drain AND the cross-provider
+# The six-per-hour cron below is the SINGLE scheduler for the issue drain AND the cross-provider
 # review/fix loop: every review -> fix -> re-review -> arm transition is a durable-marker state
 # the sweep re-derives each tick, so the loop's LIVENESS depends on this cron. It was enabled
 # after the REG-4 pilot canary passed end-to-end (issues #2407–#2416 flowed through workers;
@@ -25,7 +25,7 @@ on:
     # schedules are throttled less aggressively, and the off-peak offset (:03 not :00) avoids
     # the top-of-minute stampede. The cron is now the BACKSTOP; the doorbell below is the
     # primary liveness signal.
-    - cron: '3,18,33,48 * * * *'
+    - cron: '3,13,23,33,43,53 * * * *'
   # NOTE: this workflow_run trigger is effectively DEAD for pipeline-initiated runs — worker
   # and review-fix runs are started via the repo GITHUB_TOKEN, and GitHub suppresses
   # workflow-triggering events from GITHUB_TOKEN-initiated runs (measured 2026-07-17: zero
@@ -64,11 +64,12 @@ jobs:
   #
   # Budget arithmetic (measured; the full derivation and the numbers it rests on are in
   # scripts/dispatch-tick-floor.py's header, and its self-test asserts the multiplication):
-  #   the 150-PR cold-cache ceiling is 23 + 5.9*150 = 908 requests/executed tick;
-  #   4 ticks/h therefore caps dispatch at ~3,632 requests/h, below the historical 4,291/h
-  #   observed-safe rate (7 x the measured 613-request tick) and less than half the 7,969/h
-  #   breaking rate. The floor makes the DOORBELL STRUCTURALLY UNABLE TO EXCEED THE SCHEDULE
-  #   above (`3,18,33,48` is 4/h).
+  #   after #2099, the core cold-cache model is 23 listings + 3.1*150 dominant-target
+  #   red-only pages + 0.2*150 secondary-target pages = 518 requests/tick; 6 ticks/h is
+  #   3,108 core requests/h, below the historical 4,291/h observed-safe rate. The separate
+  #   GraphQL model prices both 150-row caps at 750 points/tick: 4,500/h plus its 100-point
+  #   reserve remains inside 5,000/h.
+  #   The floor makes the doorbell unable to exceed the six-ring schedule above.
   #
   # A tick that arrives inside the floor exits as a CLEAN NO-OP: `proceed=false`, exit 0, `plan`
   # and (transitively) `claim` skipped, one API request issued in total. It deliberately does not
@@ -286,7 +287,7 @@ jobs:
           # fails, and its per-tick "SNAPSHOT conditional reads: N of M ... billable" line reports
           # the realised hit rate, which goes to zero on the very next tick.
           if-no-files-found: warn
-          # One tick is 15 minutes; a day is ample, and it bounds what accumulates.
+          # One tick is 10 minutes; a day is ample, and it bounds what accumulates.
           retention-days: 1
 
       # Extract the policy-controlled trusted-bot allowlist (issue #111) from the registry policy
@@ -1628,7 +1629,12 @@ jobs:
     name: CLAIM (validate, lease, launch)
     needs: [plan, secrets-guard]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # [SPARQ agent] #2103: the live 150-PR board exhausted the former 15-minute bound in
+    # run 33444551254 while the claim census was still processing. Keep this bounded, but allow
+    # three ten-minute floor intervals; the registry-dispatcher concurrency group serialises the
+    # job and coalesces later doorbells, so a longer live census cannot create overlapping ticks.
+    # scripts/dispatch-tick-floor.py pins this YAML seam to the measured bound.
+    timeout-minutes: 30
     # SECRET-EXFIL GUARD (issue #101). This job holds the App private key, every repository secret
     # (toJSON(secrets)), the per-account ACCT*_TOKEN credentials, the alert token, and a write
     # GITHUB_TOKEN. Because `workflow_dispatch` (top of file) accepts an arbitrary ref and GitHub
@@ -2234,7 +2240,7 @@ jobs:
   # the JOB itself is cancelled (its own `timeout-minutes`, or a run-level cancel), and CLAIM hosts
   # the CAS lease claim, the worker launch AND the `always()` per-tick telemetry recorder (#756).
   # Measured on run 30245515435: PLAN success, then CLAIM cancelled at exactly 1200 s
-  # (timeout-minutes 15 + GitHub's 5-minute post-cancel grace); the CAS-claim step never finished
+  # (the then-current timeout-minutes 15 + GitHub's 5-minute post-cancel grace); the CAS-claim step never finished
   # and the telemetry step never ran. The run-level conclusion was `cancelled` — identical to the
   # 116/117 cancellations in that window that were FREE concurrency coalescing with zero started
   # jobs, so no run-conclusion aggregate can see it. Worse: PLAN had SUCCEEDED, so the PLAN-only

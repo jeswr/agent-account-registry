@@ -923,6 +923,217 @@ def _repo_confirmed_private(repo, token):
     return isinstance(payload, dict) and payload.get("private") is True
 
 
+# =================================================================================
+# THE ROUTE'S OTHER HALF: THE YAML BINDING (#1776)
+# =================================================================================
+# `_alert_route` below decides the DESTINATION from ALERT_REPO/ALERT_TOKEN. It cannot decide
+# which values ever reach it — the workflow binding does, and no route row can see a binding.
+# This lane shipped `${{ secrets.ALERT_REPO }}` while every other ALERT_REPO binding in the
+# estate carried `|| vars.ALERT_REPO || ''`. Nothing red, and nothing detectable: an unset
+# SECRET renders empty exactly as the canonical form does, so the two are indistinguishable
+# until a deployment configures the route through a repository `vars.ALERT_REPO` — at which
+# point every other alert goes to the private destination and this one to the public registry.
+# A split-brain route surfaces during an incident, which is the worst time to discover it.
+#
+# ⚠️ EXACT match, never containment: `${{ secrets.ALERT_REPO }}`'s inner text is a SUBSTRING of
+# the canonical expression, so a containment check passes over precisely this regression.
+ALERT_REPO_BINDING = "${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}"
+
+# THE TOKEN HAS NO `vars` FALLBACK, and must never grow one — which is the asymmetry that makes
+# the `vars` fallback above safe. Repository variables are not secrets: they are unmasked in logs
+# and readable by anyone who can read settings, so a `vars.ALERT_TOKEN` would publish the private
+# route's credential in order to make the private route work.
+#
+# ⚠️ EXACT match against this allowlist, never containment. `"secrets.ALERT_TOKEN" in expr` also
+# accepts `${{ secrets.ALERT_TOKEN_DROPPED }}` and `${{ secrets.ALERT_TOKEN || secrets.OTHER }}`:
+# the first is a secret that does not exist, renders EMPTY, and drops the route back to the
+# public registry with the private repo still bound — the #1776 failure in its other half, and
+# invisible for the same reason (an unset secret and a misspelled one are the same empty string).
+# TWO spellings are live in this estate and both are approved: `|| ''` only makes the empty
+# rendering explicit, and neither reads `vars.`. A third spelling is a decision, not a typo, so
+# it lands here in the same PR that introduces it.
+ALERT_TOKEN_BINDINGS = (
+    "${{ secrets.ALERT_TOKEN }}",
+    "${{ secrets.ALERT_TOKEN || '' }}",
+)
+
+# A FLOOR ON THE EVIDENCE, the same shape as MIN_SCHEDULED_LANES and for the same reason: a
+# uniformity assertion over an EMPTY scan is vacuously green, and a thin checkout or a pattern
+# that stopped matching is exactly how the scan goes empty. 19 consumers on master today; a
+# floor, not a copy, so retiring a lane does not red this.
+#
+# ⚠️ A FLOOR CANNOT SEE A DELETION and was never meant to: 19 consumers minus one still clears
+# 15, and the survivors are still uniform. Deletion is caught by the ENROLLED CONSUMER SET
+# (ALERT_ROUTE_CONSUMERS below, compared for equality) — never by this number, and never by the
+# pairing check, which only ever judges consumers that are still in the map.
+MIN_ALERT_REPO_BINDINGS = 15
+
+# Anchored to the start of a line so prose that mentions `ALERT_REPO:` inside a comment is not
+# read as a binding, and to the WHOLE name so `REGISTRY_ALERT_REPO:` is not swept in. This is the
+# SECOND oracle only: it reads lines, so it cannot name the consumer a binding sits on and it
+# cannot see spellings it does not model (a quoted `"ALERT_REPO":`, whitespace before the colon).
+# `alert_route_consumers` is the primary reading; the seam requires the parse to cover this scan.
+ALERT_REPO_BINDING_RE = re.compile(r"^[ \t]*ALERT_REPO:[ \t]*(\S.*?)[ \t]*$", re.M)
+
+# EVERY live consumer of the alert route on master, by STRUCTURAL IDENTITY (file::job::step).
+# COMPLETE and compared for EQUALITY — this is the one oracle in this section that is not
+# derived from the bindings it watches.
+#
+# ⚠️ WHY A SUBSET WAS NOT ENOUGH (review round 2 of #1776's PR). Every other check here reads a
+# population DISCOVERED BY the binding: `alert_route_consumers` returns a step only because that
+# step binds ALERT_REPO or ALERT_TOKEN, and the raw line scan only sees surviving ALERT_REPO
+# lines. Delete a step's WHOLE `env` block and it stops being a consumer in both readings at
+# once — the floor still clears (19 minus one is still above 15), the pairing check has nothing
+# left to find unpaired, and the canonical/exact-token checks judge only the survivors. The step
+# then resolves the PUBLIC-registry fallback on every tick with the estate reading perfectly
+# clean. Pinning two identities made exactly two of the nineteen steps observable and left the
+# other seventeen deletable in silence; nothing short of the complete set closes that.
+#
+# EQUALITY, not containment, in BOTH directions. `unenrolled` is not bureaucracy: an unlisted
+# consumer inherits precisely the blindness above, so a new alert step is a failure HERE, on the
+# PR that adds it, rather than a silent gap discovered during an incident. Enrolling it is the
+# same edit that makes its own future deletion visible.
+#
+# ⚠️ Adding or renaming an alert step is therefore a TWO-FILE change, on purpose.
+# At this seam a rename is indistinguishable from a deletion (`_step_identity` explains why the
+# key must not be positional), and guessing between them is how the deletion ships.
+ALERT_ROUTE_CONSUMERS = (
+    f"{WORKFLOWS_DIR}/dispatch.yml::claim::claim",
+    f"{WORKFLOWS_DIR}/dispatch.yml::claim::usage-alert",
+    f"{WORKFLOWS_DIR}/dispatch.yml::plan-alert::"
+    "Alert maintainer that the dispatch PLAN job hard-failed",
+    f"{WORKFLOWS_DIR}/groom-core.yml::groom::"
+    "Decide + raise/close model-access health alerts",
+    f"{GROOM_WORKFLOW}::groom::Decide + raise/close model-access health alerts",
+    f"{GROOM_WORKFLOW}::metrics-stale::metrics-stale",
+    f"{GROOM_WORKFLOW}::dispatch-stall::dispatch-stall",
+    f"{GROOM_WORKFLOW}::ci-latency::ci-latency",
+    f"{GROOM_WORKFLOW}::ratelimit-budget::ratelimit-budget",
+    f"{GROOM_WORKFLOW}::mint-gap::mint-gap",
+    f"{GROOM_WORKFLOW}::groom-alert::"
+    "Alert maintainer that the scheduled GROOM job hard-failed",
+    f"{WORKFLOWS_DIR}/metrics.yml::metrics-alert::metrics-alert",
+    f"{WORKFLOWS_DIR}/pat-validity.yml::probe::"
+    "Probe PAT validity + upsert the rolling alert",
+    f"{WORKFLOWS_DIR}/review-fix.yml::outcome::"
+    "Record the target-identity refusal (terminal, counted, no round charged)",
+    f"{WORKFLOWS_DIR}/review-fix.yml::outcome::outcome",
+    f"{WORKFLOWS_DIR}/review-fix.yml::outcome::arm",
+    f"{WORKFLOWS_DIR}/review-fix.yml::outcome::"
+    "Apply the fix outcome (host-side markers, labels, escalation)",
+    f"{WORKFLOWS_DIR}/review-fix.yml::unresolvable::"
+    "Route the PR and its source issue to a human",
+    f"{WORKFLOWS_DIR}/worker.yml::provenance::provenance",
+)
+
+
+def alert_route_consumer_drift(consumers, enrolled=ALERT_ROUTE_CONSUMERS):
+    """(gone, unenrolled) — the two directions every binding-derived check is blind to (#1776).
+
+    `gone`: an enrolled consumer that is no longer in the live map at all — its `env` block was
+    deleted outright, or its job/step identity moved. No check that reads the map's VALUES can
+    see this, because the deleted consumer contributes no value to read.
+
+    `unenrolled`: a live consumer nobody wrote down, which is the same hole one PR later.
+
+    Pure and total: it compares two identity sets and never inspects a binding, so it stays
+    exactly as sound when every surviving binding is canonical — which is the state a
+    whole-block deletion leaves behind.
+    """
+    live = set(consumers)
+    return sorted(set(enrolled) - live), sorted(live - set(enrolled))
+
+
+def _step_identity(step: dict, index: int) -> str:
+    """A step's stable name for the consumer map: its `id`, else its `name`, else its position.
+
+    Position LAST on purpose. An identity that shifts when an unrelated step is inserted above
+    would red on a reorder, and — the direction that matters — it would let a DELETED consumer
+    look like a renamed one, which is exactly the observation these keys exist to make.
+    """
+    for field in ("id", "name"):
+        value = step.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return f"step[{index}]"
+
+
+def alert_route_consumers(root) -> dict[str, dict]:
+    """Every LIVE consumer of the alert ROUTE in this directory, from PARSED structure (#1776).
+
+    -> {"<path>::<job>::<step>": {"ALERT_REPO": expr|None, "ALERT_TOKEN": expr|None}} for every
+    workflow/job/step `env` binding EITHER name; workflow-level and job-level bindings key as
+    "<path>::env" and "<path>::<job>::env".
+
+    WHY PARSED, AND WHY THE SET IS THE POINT. `ALERT_REPO_BINDING_RE` answers "what do the lines
+    of this directory say"; it cannot answer "which STEP is this bound on", so every check built
+    on it is a statistic over an anonymous population. A count tolerates a binding VANISHING (the
+    survivors clear any floor and are still uniform) and a uniformity verdict over the survivors
+    is silent about the one that left. That is the #1776 regression running backwards: a live
+    alert step with no ALERT_REPO resolves the public-registry fallback on every tick, while the
+    estate reads perfectly clean. Keying by structure makes the consumer SET observable, so a
+    deletion is a MISSING KEY and a move to another step is a CHANGED key — observable, but only
+    against something written down independently: this map is DISCOVERED BY the bindings, so a
+    step that loses its whole `env` block simply stops appearing here. ALERT_ROUTE_CONSUMERS is
+    that independent record and `alert_route_consumer_drift` is the comparison.
+
+    BOTH names, one map, because the pair is the invariant: a step exporting ALERT_TOKEN and no
+    ALERT_REPO sends the private credential to the public registry, and one exporting ALERT_REPO
+    with no ALERT_TOKEN cannot write to the private one. Neither is visible to a scan that only
+    ever looks for one of them.
+
+    FAIL CLOSED in every direction that would quietly shrink the map: a missing workflows
+    directory raises, unparseable or non-mapping YAML raises, and two consumers that cannot be
+    told apart raise rather than one silently overwriting the other. A consumer this function
+    does not return is a binding the estate check does not watch, which is indistinguishable
+    from a lane that never bound one.
+    """
+    if yaml is None:  # pragma: no cover - fail loud rather than report an empty estate
+        raise AlarmError(f"PyYAML unavailable: {_YAML_IMPORT_ERROR}")
+    wf_dir = Path(root) / WORKFLOWS_DIR
+    if not wf_dir.is_dir():
+        raise AlarmError(f"no workflows directory at {wf_dir}")
+    out: dict[str, dict] = {}
+
+    def record(key: str, env) -> None:
+        if not isinstance(env, dict):
+            return
+        bound = {name: str(env[name]) for name in ("ALERT_REPO", "ALERT_TOKEN") if name in env}
+        if not bound:
+            return
+        if key in out:
+            raise AlarmError(
+                f"two alert-route consumers share the identity {key!r}; which one the estate "
+                "check watches is not a question it gets to guess at")
+        out[key] = {"ALERT_REPO": bound.get("ALERT_REPO"),
+                    "ALERT_TOKEN": bound.get("ALERT_TOKEN")}
+
+    for path in sorted(wf_dir.glob("*.yml")) + sorted(wf_dir.glob("*.yaml")):
+        rel = f"{WORKFLOWS_DIR}/{path.name}"
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            raise AlarmError(f"unparseable workflow YAML in {rel}: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise AlarmError(f"{rel} is not a YAML mapping: refusing to report it as binding "
+                             "nothing")
+        record(f"{rel}::env", doc.get("env"))
+        jobs = doc.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for job_id, job in sorted(jobs.items()):
+            if not isinstance(job, dict):
+                continue
+            record(f"{rel}::{job_id}::env", job.get("env"))
+            steps = job.get("steps")
+            if not isinstance(steps, list):
+                continue
+            for index, step in enumerate(steps):
+                if isinstance(step, dict):
+                    record(f"{rel}::{job_id}::{_step_identity(step, index)}", step.get("env"))
+    return out
+
+
 def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
     """(repo, token) for the alert issue — locked decision 22c / issue #39, identical
     semantics and signature to the other alert routers: ALERT_REPO is selected ONLY when its
@@ -1586,6 +1797,215 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         pass
     except Exception:
         chk("exclusive lanes: a missing workflows directory raised the wrong error", False)
+
+    # --- alert_route_consumers on a HERMETIC tree (#1776). The live-tree rows in the seam
+    # section can only say "the estate is uniform today"; the DIRECTIONS that matter — a binding
+    # deleted from a live step, a spelling the raw line scan cannot see, a map that shrank — are
+    # unreachable against a healthy tree and live here. ---
+    with tempfile.TemporaryDirectory() as _atmp:
+        _awf = Path(_atmp) / WORKFLOWS_DIR
+        _awf.mkdir(parents=True)
+        _canonical = ALERT_REPO_BINDING
+        # A step with an `id`, a step identified only by its `name`, a step with neither, a
+        # job-level env and a workflow-level env — every level the derivation walks, so a level
+        # it stopped walking cannot pass by being absent from the fixture.
+        (_awf / "alerts.yml").write_text(
+            "on:\n  push:\n"
+            "env:\n"
+            f"  \"ALERT_REPO\": {_canonical}\n"     # QUOTED KEY: the raw line scan misses this
+            "  ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}\n"
+            "jobs:\n"
+            "  watch:\n"
+            "    env:\n"
+            f"      ALERT_REPO: {_canonical}\n"
+            "      ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}\n"
+            "    steps:\n"
+            "      - id: identified\n"
+            "        run: true\n"
+            "        env:\n"
+            f"          ALERT_REPO: {_canonical}\n"
+            "          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}\n"
+            "      - name: named only\n"
+            "        run: true\n"
+            "        env:\n"
+            f"          ALERT_REPO: {_canonical}\n"
+            "          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}\n"
+            "      - run: true\n"
+            "        env:\n"
+            f"          ALERT_REPO: {_canonical}\n"
+            "          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}\n"
+            "      - run: true\n"                        # binds NEITHER: not a consumer at all
+            "        env:\n"
+            "          REGISTRY_ALERT_REPO: nope\n")
+        # SHAPES THE DERIVATION MUST WALK PAST WITHOUT STUMBLING, none of which the estate
+        # carries today: no `jobs:` at all, a job that is not a mapping, and a step that is not
+        # a mapping. A malformed neighbour must not stop this function reading the lanes that
+        # ARE bound — that would shrink the watched set exactly when the tree is already odd.
+        (_awf / "nojobs.yml").write_text("on:\n  push:\n")
+        (_awf / "odd-shapes.yml").write_text(
+            "on:\n  push:\njobs:\n"
+            "  not-a-mapping: []\n"
+            "  scalar-step:\n    steps:\n      - a bare string is not a step mapping\n")
+        _seen = alert_route_consumers(_atmp)
+        chk("alert route: every LEVEL that can bind the route is walked, and a step is named by "
+            f"its id, else its name, else its position ({sorted(_seen)})",
+            sorted(_seen) == [f"{WORKFLOWS_DIR}/alerts.yml::env",
+                              f"{WORKFLOWS_DIR}/alerts.yml::watch::env",
+                              f"{WORKFLOWS_DIR}/alerts.yml::watch::identified",
+                              f"{WORKFLOWS_DIR}/alerts.yml::watch::named only",
+                              f"{WORKFLOWS_DIR}/alerts.yml::watch::step[2]"])
+        chk("alert route: a step binding NEITHER name is not a consumer (`REGISTRY_ALERT_REPO` "
+            "is a different variable and must not be swept in)",
+            f"{WORKFLOWS_DIR}/alerts.yml::watch::step[3]" not in _seen)
+        # THE TWO ORACLES ARE NOT THE SAME ORACLE, demonstrated rather than asserted in prose:
+        # the workflow-level binding here uses a QUOTED KEY, which is valid YAML that the line
+        # scan's pattern — anchored to a bare `ALERT_REPO:` — cannot match. A seam that trusted
+        # the raw scan alone would be reading four consumers of five.
+        _raw = ALERT_REPO_BINDING_RE.findall((_awf / "alerts.yml").read_text(encoding="utf-8"))
+        chk(f"alert route: the parse sees a spelling the raw line scan CANNOT (parsed "
+            f"{len(_seen)}, raw {len(_raw)}) — a quoted key is a valid binding and an invisible "
+            "one, which is why the parse is the primary reading",
+            len(_seen) == 5 and len(_raw) == 4)
+        # `.get` throughout this block, never `[...]`: a derivation that stopped returning a
+        # consumer must RED THE NAMED ROW, not raise a KeyError that aborts the suite and
+        # records as a kill while every row below it never runs (AGENTS.md pre-flight 4).
+        chk("alert route: the parse recovers the canonical VALUE from that quoted spelling "
+            "(a binding it cannot compare is a binding it does not watch)",
+            (_seen.get(f"{WORKFLOWS_DIR}/alerts.yml::env") or {}).get("ALERT_REPO")
+            == _canonical)
+        # THE DELETION MUTANT, non-crashing, in the form a count floor cannot see: one live
+        # consumer loses ALERT_REPO and keeps everything else. The map stays big, every REMAINING
+        # binding stays canonical — and the pairing check is what reds.
+        _dropped = (_awf / "alerts.yml").read_text(encoding="utf-8").replace(
+            f"          ALERT_REPO: {_canonical}\n"
+            "          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}\n"
+            "      - name: named only\n",
+            "          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}\n"
+            "      - name: named only\n", 1)
+        (_awf / "alerts.yml").write_text(_dropped)
+        _after = alert_route_consumers(_atmp)
+        _key = f"{WORKFLOWS_DIR}/alerts.yml::watch::identified"
+        chk("alert route: DELETING one live ALERT_REPO leaves the consumer COUNT and every "
+            f"surviving value untouched (still {len(_after)}, all canonical) — this is exactly "
+            "what a floor plus a uniformity verdict reads as healthy",
+            len(_after) == len(_seen)
+            and all(c["ALERT_REPO"] in (None, _canonical) for c in _after.values()))
+        _mutated = _after.get(_key) or {}
+        chk("alert route: ...and the PAIRING check reds on it — the step still exports "
+            "ALERT_TOKEN, so it sends the private credential to the public registry",
+            _mutated.get("ALERT_TOKEN") is not None and "ALERT_REPO" in _mutated
+            and _mutated["ALERT_REPO"] is None)
+        # ...and the second kill, by identity: the whole env block goes, so the consumer no
+        # longer exists. This is the mutant that survived review round 1 anywhere outside the two
+        # then-pinned steps, so it is now run against EVERY estate check at once: the enrolled-set
+        # comparison is the only one that reds, and the rows below prove the others do not.
+        (_awf / "alerts.yml").write_text(
+            _dropped.replace("      - id: identified\n"
+                             "        run: true\n"
+                             "        env:\n"
+                             "          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}\n",
+                             "      - id: identified\n        run: true\n", 1))
+        _gone_tree = alert_route_consumers(_atmp)
+        chk("alert route: a consumer whose env block is deleted OUTRIGHT leaves the map — "
+            "pairing is blind to it, so only an identity written down INDEPENDENTLY can see it",
+            _key not in _gone_tree)
+        # The three binding-derived verdicts on that same mutated tree, stated as facts rather
+        # than as prose: each one is GREEN, which is why the enrolled set has to be complete.
+        chk("alert route: ...and on that tree the PAIRING, canonical-value and exact-token "
+            "checks all pass — the deleted consumer contributes no value for them to judge",
+            [k for k, c in _gone_tree.items()
+             if c["ALERT_REPO"] is None or c["ALERT_TOKEN"] is None] == []
+            and [k for k, c in _gone_tree.items()
+                 if c["ALERT_REPO"] != _canonical] == []
+            and [k for k, c in _gone_tree.items()
+                 if c["ALERT_TOKEN"] not in ALERT_TOKEN_BINDINGS] == [])
+        # THE ORACLE THAT DOES RED, exercised exactly as the seam uses it: the enrolled identities
+        # here are the PRISTINE tree's own keys, so this is the estate-wide deletion mutant the
+        # finding describes, on a consumer that is not the lane this script runs in.
+        chk("alert route: drift against the enrolled set NAMES the vanished consumer, and names "
+            "nothing else, when its whole env block is deleted",
+            alert_route_consumer_drift(_gone_tree, sorted(_seen)) == ([_key], []))
+        chk("alert route: ...and reports NO drift on the pristine tree (an oracle that always "
+            "reports something is not an oracle)",
+            alert_route_consumer_drift(_seen, sorted(_seen)) == ([], []))
+        chk("alert route: a consumer that is LIVE but not enrolled is reported too — unlisted, "
+            "it inherits exactly the blindness above",
+            alert_route_consumer_drift(_seen, [k for k in sorted(_seen) if k != _key])
+            == ([], [_key]))
+        (_awf / "collide.yml").write_text(
+            "on:\n  push:\njobs:\n  watch:\n    steps:\n"
+            "      - name: twin\n        run: true\n        env:\n"
+            f"          ALERT_REPO: {_canonical}\n"
+            "      - name: twin\n        run: true\n        env:\n"
+            f"          ALERT_REPO: {_canonical}\n")
+        try:
+            alert_route_consumers(_atmp)
+            chk("alert route: two consumers with the SAME identity raise rather than one "
+                "silently overwriting the other — the overwritten one is unwatched", False)
+        except AlarmError:
+            pass
+        except Exception:
+            chk("alert route: colliding consumer identities raised the wrong error", False)
+        (_awf / "collide.yml").unlink()
+        (_awf / "notamap.yml").write_text("- a\n- b\n")
+        try:
+            alert_route_consumers(_atmp)
+            chk("alert route: a workflow file that is not a MAPPING raises rather than being "
+                "reported as binding nothing", False)
+        except AlarmError:
+            pass
+        except Exception:
+            chk("alert route: a non-mapping workflow file raised the wrong error", False)
+        (_awf / "notamap.yml").unlink()
+        (_awf / "broken.yaml").write_text("on: push\njobs: [\n")
+        try:
+            alert_route_consumers(_atmp)
+            chk("alert route: UNPARSEABLE workflow YAML raises — a file the parse skipped is a "
+                "lane whose bindings nobody read", False)
+        except AlarmError:
+            pass
+        except Exception:
+            chk("alert route: unparseable workflow YAML raised the wrong error", False)
+    try:
+        # The directory is gone with the context manager: a thin checkout must not read as
+        # "this estate binds no alert route anywhere".
+        alert_route_consumers(_atmp)
+        chk("alert route: a MISSING workflows directory raises rather than returning {}", False)
+    except AlarmError:
+        pass
+    except Exception:
+        chk("alert route: a missing workflows directory raised the wrong error", False)
+
+    # --- The enrolled record's own integrity. It is the ONE oracle here that is not derived from
+    # the tree, so nothing else can notice it decaying. ---
+    chk("alert route: ALERT_ROUTE_CONSUMERS lists each identity ONCE (a repeated entry shrinks "
+        f"the set the seam compares against) ({len(ALERT_ROUTE_CONSUMERS)} entries)",
+        len(set(ALERT_ROUTE_CONSUMERS)) == len(ALERT_ROUTE_CONSUMERS))
+    chk(f"alert route: the enrolled record clears the SAME evidence floor as the estate scan "
+        f"({len(ALERT_ROUTE_CONSUMERS)} enrolled, floor {MIN_ALERT_REPO_BINDINGS}) — thinning it "
+        "back toward a sample is exactly the review-round-2 defect",
+        len(set(ALERT_ROUTE_CONSUMERS)) >= MIN_ALERT_REPO_BINDINGS)
+
+    # --- The approved binding allowlists, both directions. `in ALERT_TOKEN_BINDINGS` is an
+    # EXACT membership test and the old check was `"secrets.ALERT_TOKEN" in expr`, which the
+    # first two rows below satisfy while resolving to an empty credential. ---
+    for _bad, _why in (
+            ("${{ secrets.ALERT_TOKEN_DROPPED }}",
+             "a secret that does not exist renders EMPTY, so the private route silently "
+             "becomes the public one"),
+            ("${{ secrets.ALERT_TOKEN || secrets.ALERT_TOKEN_DROPPED }}",
+             "an unintended second source for the credential"),
+            ("${{ vars.ALERT_TOKEN }}",
+             "a repository variable is unmasked in logs — publishing the credential"),
+            ("", "no binding at all")):
+        chk(f"alert token: {_bad!r} is NOT approved ({_why})", _bad not in ALERT_TOKEN_BINDINGS)
+    chk("alert token: the two live spellings ARE approved (the rejections above are not "
+        "vacuous — an allowlist that accepts nothing would pass them all)",
+        all(b in ALERT_TOKEN_BINDINGS
+            for b in ("${{ secrets.ALERT_TOKEN }}", "${{ secrets.ALERT_TOKEN || '' }}")))
+    chk("alert repo: `${{ secrets.ALERT_REPO }}` — the exact #1776 regression, and a SUBSTRING "
+        "of the canonical expression — is not equal to it",
+        "${{ secrets.ALERT_REPO }}" != ALERT_REPO_BINDING)
 
     # --- exclusive_minute_violations: PURE, both directions, on maps written here. The minute
     # sets below are chosen so a partial overlap cannot be confused with a full one and so no
@@ -2380,6 +2800,79 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         chk("seam: every lane that claims a private cron minute HAS one — repointing any lane "
             f"in this directory onto a claimed minute reds here ({_violations})",
             _violations == [])
+        # --- THE ALERT ROUTE BINDING (#1776), across the WHOLE directory --------------
+        # See ALERT_REPO_BINDING for why a route row cannot see this and why an unset secret
+        # makes the divergence invisible. Scanned over every lane, not just this one, because
+        # the hazard is ASYMMETRY: one lane bound differently is a route that splits under a
+        # `vars`-configured deployment, and each lane's own self-test can only ever see its own
+        # binding. The population is derived from PARSED workflow/job/step structure, so the
+        # observable is the consumer SET (a deletion is a missing key), not an anonymous count.
+        _consumers = alert_route_consumers(root)
+        _repo_bindings = []
+        for _p in sorted(_wf_dir.glob("*.yml")) + sorted(_wf_dir.glob("*.yaml")):
+            _repo_bindings += ALERT_REPO_BINDING_RE.findall(_p.read_text(encoding="utf-8"))
+        # TWO UNRELATED READINGS OF THE TREE, cross-checked exactly as the schedule map is above.
+        # The parse is the one that can NAME a consumer; the raw scan is the one that cannot be
+        # fooled by a structure the parse forgot to walk (a level added to the schema, an `env`
+        # under a shape this function does not descend into). A binding the lines show and the
+        # parse does not is a consumer nobody watches, so the parse must cover the scan.
+        # The raw scan carries its OWN floor: a second oracle that stopped matching agrees with
+        # the first about everything, so a blind pattern would make this row vacuously green.
+        _unparsed = sorted(set(_repo_bindings) - {c["ALERT_REPO"] for c in _consumers.values()})
+        chk(f"seam: the PARSED consumer derivation covers a raw line scan that is itself still "
+            f"reading (parsed {len(_consumers)} consumers, raw {len(_repo_bindings)} lines, "
+            f"floor {MIN_ALERT_REPO_BINDINGS}; values the parse never saw: {_unparsed})",
+            len(_repo_bindings) >= MIN_ALERT_REPO_BINDINGS
+            and len(_consumers) >= len(_repo_bindings) and _unparsed == [])
+        chk(f"seam: the alert-route consumer set clears the evidence floor of "
+            f"{MIN_ALERT_REPO_BINDINGS} (saw {len(_consumers)}) — a thin checkout or a "
+            "derivation that stopped matching yields none, and a uniformity check over an "
+            "empty population is vacuously green",
+            len(_consumers) >= MIN_ALERT_REPO_BINDINGS)
+        # THE PAIR IS THE INVARIANT, and it catches the HALF deletion — one of the two names
+        # dropped while the step stays a consumer. The floor above cannot (19 minus one still
+        # clears 15) and the uniformity check below cannot (it only judges bindings that are
+        # still there). A step that exports the token and not the repo hands the private
+        # credential to the public registry; one that exports the repo and not the token cannot
+        # write to the private destination at all.
+        # ⚠️ It is blind to the WHOLE-block deletion, which removes the consumer from this map
+        # entirely and leaves nothing to be unpaired — that one is the enrolled-set row below.
+        _unpaired = sorted(k for k, c in _consumers.items()
+                           if c["ALERT_REPO"] is None or c["ALERT_TOKEN"] is None)
+        chk("seam: every alert-route consumer binds ALERT_REPO **and** ALERT_TOKEN — dropping "
+            f"either from a live step leaves the estate uniform and the route split ({_unpaired})",
+            _unpaired == [])
+        _divergent = sorted((k, c["ALERT_REPO"]) for k, c in _consumers.items()
+                            if c["ALERT_REPO"] != ALERT_REPO_BINDING)
+        chk("seam: EVERY ALERT_REPO binding in this directory is the canonical expression — a "
+            "lane bound to `secrets.ALERT_REPO` alone cannot be configured through a repository "
+            "`vars.ALERT_REPO`, so that deployment routes the rest of the estate privately and "
+            f"this lane to the public registry ({_divergent})",
+            _divergent == [])
+        # The token gets the same EXACT treatment estate-wide, against the allowlist rather than
+        # a containment test — see ALERT_TOKEN_BINDINGS for the misspelled-secret expression a
+        # containment test accepts while it resolves to an empty credential.
+        _token_divergent = sorted((k, c["ALERT_TOKEN"]) for k, c in _consumers.items()
+                                  if c["ALERT_TOKEN"] not in ALERT_TOKEN_BINDINGS)
+        chk("seam: EVERY ALERT_TOKEN binding is one of the approved EXACT expressions, so none "
+            "reads `vars.` (a repository variable is unmasked in logs) and none resolves to an "
+            f"empty credential through a misspelled secret ({_token_divergent})",
+            _token_divergent == [])
+        # AND BY NAME, for EVERY consumer in the estate — the only row here that is not derived
+        # from the bindings it watches. Every check above reads a population the binding itself
+        # produced, so a step that loses its whole `env` block leaves all of them green: it is
+        # not in the map to be unpaired, not in the map to be non-canonical, and the floor
+        # tolerates the missing row. It just alerts to the public registry from then on.
+        # BOTH directions in ONE comparison, deliberately: `== ([], [])` cannot be made
+        # half-inert at the call site, and each direction is killed on its own by the hermetic
+        # rows above, so making one of them vacuous means editing the helper into a red suite.
+        _drift = alert_route_consumer_drift(_consumers)
+        chk("seam: the live alert-route consumer set is EXACTLY the enrolled one "
+            f"(vanished: {_drift[0]}; unenrolled: {_drift[1]}) — a vanished identity is a step "
+            "whose route was deleted or renamed, and an unenrolled one is a consumer no check "
+            "here can see the deletion of. Enrol/retire it in ALERT_ROUTE_CONSUMERS in the same "
+            "PR that adds/removes the step",
+            _drift == ([], []))
         wf = yaml.safe_load((root / GROOM_WORKFLOW).read_text())
         jobs = wf.get("jobs", {})
         chk("seam: groom-sweep.yml hosts a `ci-latency` job", "ci-latency" in jobs)
@@ -2429,6 +2922,23 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                        == "python3 registry/scripts/ci-latency-alert.py"]
         chk("seam: the ALERT step DOES carry continue-on-error (asymmetry is deliberate)",
             len(alert_steps) == 1 and alert_steps[0].get("continue-on-error") is True)
+        # ...and the route that step actually EXPORTS, pinned by exact expression. The estate
+        # scan above cannot see WHICH step a binding sits on: move ALERT_REPO onto the checkout
+        # or the self-test step and the estate stays perfectly uniform while the live detector
+        # resolves the registry fallback on every tick. That mutant dies here and nowhere else.
+        _alert_env = (alert_steps[0].get("env") or {}) if len(alert_steps) == 1 else {}
+        chk("seam: the ALERT step binds ALERT_REPO to the canonical expression EXACTLY "
+            f"(saw {_alert_env.get('ALERT_REPO')!r})",
+            _alert_env.get("ALERT_REPO") == ALERT_REPO_BINDING)
+        # THE TOKEN, pinned to an approved expression EXACTLY — never by containment. See
+        # ALERT_TOKEN_BINDINGS: `"secrets.ALERT_TOKEN" in expr` also accepts
+        # `${{ secrets.ALERT_TOKEN_DROPPED }}`, which is a secret that does not exist, renders
+        # EMPTY, and drops this lane back to the public registry with the private repo still
+        # bound — while the assertion's own prose says the token comes from the intended secret.
+        _token_expr = str(_alert_env.get("ALERT_TOKEN", ""))
+        chk(f"seam: the ALERT step binds ALERT_TOKEN to an approved expression EXACTLY, so it "
+            f"is read from `secrets.` and never from `vars.` (saw {_token_expr!r})",
+            _token_expr in ALERT_TOKEN_BINDINGS)
         for step in job.get("steps", []):
             uses = step.get("uses")
             if uses:
