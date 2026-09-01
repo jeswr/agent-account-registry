@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6149,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "21e1efd2f05d2797931cb393315dce6fd44149bb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 confirms the prior approval. The selector remains fail-closed: the optimization is enabled only with a resolvable merge base and readable blobs, while missing PyYAML, parsing failures, content differences, and declined proofs retain the existing full-run trigger. The conjunction is sound for the stated scope: verbatim equality of all non-comment lines prevents YAML source rewrites that PyYAML might normalize differently from GitHub Actions, and parsed-document equality detects whole-line comment changes that alter block-scalar contents. Selection wiring preserves unrelated crate and full-run triggers. The tests exercise both load-bearing proof halves, dependency absence, unreadable and malformed inputs, decline auditing, eligibility, fallback behavior, and mixed-path selection without appearing vacuous.",
+  "verdict": "approve"
+ }
+}
