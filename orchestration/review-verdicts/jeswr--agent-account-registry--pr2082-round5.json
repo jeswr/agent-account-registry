@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 2082,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "54c57cbb20361f07cc3cf83742210732793ed90f",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Re-verified at the PR head; unchanged since round 3, and the head commit has not moved since round 4.\n\nworkflow_triggers moved to cron_map.py and its failure type changed from AlarmError to CronMapError. The two are unrelated siblings \u2014 ci-latency-alert.py:127 `class AlarmError(RuntimeError)`, cron_map.py `class CronMapError(RuntimeError)` \u2014 so neither catches the other.\n\nThe LIVE path still calls it: run() -> fetch_lanes() -> workflow_triggers() at ci-latency-alert.py:911, with no intermediate handler (I read fetch_lanes at lines 896-924 again this round; the call at 911 is bare). main() at line 2414 catches only `AlarmError`. So a workflow file that is unparseable YAML, or is not a mapping, or a runner without PyYAML, now propagates an uncaught traceback (exit 1, no annotation) instead of taking the designed branch: `::error::ci-latency watchdog infrastructure failure: {exc}` and return code 2.\n\nThe diff updated exactly one call site for this rename \u2014 the self-test at line 1349 (`except AlarmError` -> `except CronMapError`) \u2014 and left the live handler untouched. That asymmetry is the tell: the self-test was made to pass while the production contract silently drifted.\n\nNot fail-open (the step still errors, and groom-sweep.yml's step is `continue-on-error: true` either way), so major rather than blocker. But it breaks the error taxonomy AlarmError documents as \"The detector itself is broken. Never mask a choke.\", and no assertion covers it.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Either (a) catch both at the entry point: `except (AlarmError, CronMapError) as exc:` at ci-latency-alert.py:2414, or (b) preferably re-establish the single taxonomy at the seam \u2014 wrap the workflow_triggers call at line 911 (or fetch_lanes) so CronMapError is re-raised as AlarmError with the offending path in the message. Then add a self-test row asserting the polarity: feed main()/fetch_lanes a tree containing an unparseable workflow and assert it returns the infrastructure-failure code / emits the `::error::` annotation rather than raising \u2014 otherwise this same drift recurs on the next move.",
+    "severity": "major",
+    "title": "UNADDRESSED from rounds 3 and 4: workflow_triggers now raises CronMapError, which main()'s `except AlarmError` still does not catch"
+   },
+   {
+    "body": "Re-verified at the PR head; unchanged.\n\nThe removed workflow_triggers was the only reader of `_YAML_IMPORT_ERROR` (assigned at line 105). A grep of the module now shows exactly one occurrence \u2014 the assignment at 105 \u2014 and no reader.\n\nMore than cosmetic: the `yaml is None` check that turned a missing PyYAML into a named AlarmError went with it, but ci-latency-alert.py still calls `yaml.safe_load(...)` directly at line 2204 (the groom-sweep seam block) with no guard anywhere in the module. With PyYAML absent, `yaml` is None and that line raises `AttributeError: 'NoneType' object has no attribute 'safe_load'` instead of the intended fail-loud AlarmError. cron_map.py keeps its own guard, so the live lane path is covered \u2014 this is the self-test seam only, and groom-sweep.yml installs PyYAML in a prior step, which is why it will not bite in CI today.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Either drop the now-dead `try/except ImportError` block and `_YAML_IMPORT_ERROR` from ci-latency-alert.py and import yaml unconditionally (letting ImportError surface at module load), or keep the guard and add an explicit `if yaml is None: raise AlarmError(f\"PyYAML unavailable: {_YAML_IMPORT_ERROR}\")` before the safe_load at line 2204.",
+    "severity": "minor",
+    "title": "UNADDRESSED from rounds 3 and 4: _YAML_IMPORT_ERROR is orphaned, and the remaining yaml.safe_load lost its fail-loud guard"
+   },
+   {
+    "body": "Re-verified at the PR head; unchanged.\n\nexpand_field is exported and consumed by ci-latency-alert.py's expected_firings (lines 362-366) with four other bound pairs: hours (0,23), day-of-month (1,31), month (1,12) and day-of-week (0,7) \u2014 the last relying on the unusual hi=7 plus the caller's `d % 7` fold.\n\nEvery assertion in cron_map.py's _self_test reaches expand_field only through cron_minutes, i.e. always with lo=0, hi=59. The boundary behaviour this module now OWNS for the other four ranges (notably that 7 is accepted for dow, and that dom starts at 1 rather than 0) is asserted nowhere in the owning module. That coverage survives only incidentally via expected_firings rows in the consumer's suite \u2014 exactly the arrangement this PR exists to eliminate, since a future consumer could drop those rows and leave the owner untested at those bounds.",
+    "file": "scripts/cron_map.py",
+    "fix_hint": "Add a few direct expand_field rows to cron_map.py's _self_test with hand-computed expectations, e.g. `check(\"dow accepts 7 as the second Sunday spelling\", expand_field(\"7\", 0, 7), {7})`, `check(\"dom is 1-based\", raises(CronError, lambda: expand_field(\"0\", 1, 31)), True)`, and one hour-range case such as `check(\"hour range\", expand_field(\"22-23\", 0, 23), {22, 23})`.",
+    "severity": "minor",
+    "title": "UNADDRESSED from rounds 3 and 4: expand_field now owns five field ranges but the self-test only exercises minutes (0-59)"
+   },
+   {
+    "body": "Re-verified at the PR head; unchanged.\n\n_workflow_crons wraps parse failures to append `at {path}`, which is genuinely useful when one of ~13 lanes is malformed. But the cron expansion happens later, in schedule_minute_map's `minutes.update(cron_minutes(expression))` loop, outside that wrapper: a bad cron raises CronError carrying only the expression, e.g. \"value outside 0-59 in '3,60 * * * *'\", with no indication of which workflow file it came from.\n\nThe fail-closed polarity is correct and is asserted (\"malformed lane refuses instead of disappearing\"); this is purely about the operator's ability to find the offending lane from the failure message.",
+    "file": "scripts/cron_map.py",
+    "fix_hint": "Wrap the per-expression loop in schedule_minute_map so the path is attached, e.g. `try: minutes.update(cron_minutes(expression))` / `except CronError as exc: raise CronError(f\"{exc} in {WORKFLOWS_DIR}/{path.name}\") from exc`. Keep the raised type CronError so the existing self-test row and the fail-closed contract are unchanged.",
+    "severity": "nit",
+    "title": "UNADDRESSED from rounds 3 and 4: schedule_minute_map annotates CronMapError with the offending path but not CronError"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 of the cron-expansion extraction into scripts/cron_map.py. The PR head is still commit 54c57cbb2 (\"fix: address review round 1\") \u2014 byte-identical to the tree I graded in round 4 \u2014 so every round-3/4 finding is re-verified as UNADDRESSED at the same severity. This is a re-statement, not new analysis; no new defects surfaced.\n\nWhat is still good, re-checked this round: cron_map.py has no cross-script imports, so both importlib consumers exec a small standalone file (dispatch-tick-floor.py:767 _cron_minutes_module via CRON_MINUTES_SCRIPT, regate-sweep.py:1051 _cron_map_module via CRON_MAP_SCRIPT). Both consumers wrap the load in `except Exception` (dispatch-tick-floor.py:823, regate-sweep.py:1084), so the CronMapError/AlarmError rename does NOT break their reporting seams, and both still RAISE rather than falling back to a private copy when the owner is absent. All three sparse-checkout seams remain exact and derived from constants, not hand-copied: dispatch-tick-floor.py REQUIRED_FILES (line 306) interpolates CRON_MINUTES_SCRIPT and dispatch.yml matches; regate-sweep.py REQUIRED_FILES (line 209) interpolates CRON_MAP_SCRIPT and regate-sweep.yml matches per line; ci-latency-alert.py REQUIRED_FILES (line 116) gained scripts/cron_map.py and groom-sweep.yml:580 gained the same line. cron_map.py is enrolled in selftest-suite.txt, and its --self-test is NON-VACUOUS: hand-computed expectations, a refusal probe carrying BOTH polarities so raises() cannot be always-true, and the missing-tree case correctly placed OUTSIDE the TemporaryDirectory. No permissions, secret, token-handling or action-pinning changes; no fail-open path introduced.\n\nStill blocking on the same MAJOR: the refactor changed an exception type on a LIVE code path and updated only the self-test call site. workflow_triggers now raises CronMapError (cron_map.py:145+), but ci-latency-alert.py's fetch_lanes still calls it at line 911 on the live run() path, and main() at line 2414 st\u2026 [truncated 531 chars]",
+  "verdict": "request_changes"
+ }
+}
