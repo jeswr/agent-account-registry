@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6098,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d1a434d6525720047655ba17b1e06ca5f8c501b4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The `tool_update` doc says the session write check is `fail-closed, atomic`, but the same diff documents that `update_in_place` leaves a partially applied prefix on an apply-time budget error, and `PodStore::update_inner` calls `update_in_place_with_budget` rather than the available atomic variant. A multi-operation request can therefore mutate the pod before returning an error. This is a public, security-relevant contract contradiction, and the new tests only use single-operation updates, so they do not validate the atomic claim.",
+    "file": "crates/sparq-mcp/src/solid.rs",
+    "fix_hint": "Either remove the `atomic` claim everywhere and state the precise partial-apply contract, or change the store path to use an atomic budgeted update and add a multi-operation regression test where an early operation succeeds and a later WHERE evaluation exhausts the budget, asserting full rollback. Ensure any authorization-view rematerialization semantics remain correct for the chosen approach.",
+    "severity": "major",
+    "title": "Update tool is documented as atomic although its budgeted apply path is non-atomic"
+   },
+   {
+    "body": "The new `update_as_with_budget` documentation says authorization `runs to completion` and that `a denied update is denied whatever the budget`. In the implementation, `resolve_var_graphs` invokes `query_with_budget` during authorization and immediately returns `BudgetExceeded`; with an expired budget, an update whose resolved graph would be unauthorized returns a budget error before authorization completes. The MCP authorization-budget test explicitly confirms this early-return behavior, so the stated contract is demonstrably false.",
+    "file": "crates/sparq-solid/src/lib.rs",
+    "fix_hint": "Rewrite the contract to say static requirements are checked normally, while a budget trip during variable-graph target resolution aborts before a complete allow/deny decision and leaves the store untouched. Remove the `denied whatever the budget` assertion unless the implementation is changed to establish denial independently of the bounded evaluation.",
+    "severity": "major",
+    "title": "Documentation falsely says denied updates are denied regardless of budget"
+   }
+  ],
+  "progress": null,
+  "summary": "The budget is threaded through both the variable-graph authorization query and the engine apply path, and the added tests exercise both real paths. However, the newly edited public documentation makes contradictory and false atomicity/authorization-order guarantees. The implementation deliberately calls the non-atomic in-place updater, so an apply-time budget failure can retain an earlier operation's mutations; additionally, an authorization-query budget failure can return before a deny decision is reached. These honesty-sensitive contract statements must be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
