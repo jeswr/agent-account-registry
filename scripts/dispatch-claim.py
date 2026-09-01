@@ -23136,16 +23136,27 @@ def _escalation_call_site(source):
 #     `for _ in [*xs]:` / `{**m}`, whose unpacking can yield nothing;
 #   - `1 < "a"` raises at run time rather than deciding, so folding it would be a lie;
 #   - `is` / `in` are identity and container semantics, not value comparison, so they never fold;
-#   - a node made unreachable by an earlier `return`/`raise` is not seen at all.
-# A live-but-actually-dead node only makes the seam KEEP SCANNING a subtree, so the failure
-# direction of a mis-read is a refused seam, never a certified one.
+#   - a statement made unreachable by an EARLIER `return`/`raise` in its own list is STILL SEEN
+#     here. Per-node liveness reads a node's ANCESTORS, never its siblings' control flow, so it
+#     cannot see statement order at all — which is why the pairing below, not this pruning, is
+#     what refuses `targets = ...`, `return`, then the parking loop.
+# A live-but-actually-dead node makes the seam KEEP SCANNING a subtree it could have skipped, and a
+# scan that reaches a park loop CERTIFIES it — so "scan more" is not automatically the safe
+# direction, and every certification still has to clear the pairing.
 #
 # ...and the pairing is a floor in the OTHER direction: it refuses whatever it cannot prove, so a
-# real-but-unprovable path costs a refusal rather than a false certification. It does not know that
-# the binding SURVIVES to the loop (a later rebind is invisible), it does not reason across loop
-# iterations (a binding written after the loop but inside a surrounding one is refused, although
-# the next iteration would reach it), and any divergence into different FIELDS of one construct —
-# not just the arms of an `if` — refuses rather than case-splitting on which pairs stay ordered.
+# real-but-unprovable path costs a refusal rather than a false certification. It proves the
+# UNIVERSAL claim — every pass that reaches the loop has already run the binding — from two facts
+# it can read off the source: the binding provably reaches the statement list the loop is reached
+# from (`_exits_to_enclosing_list`: a binding nested under a guard that `return`s, or inside a
+# `while True:`, never gets there), and every statement BETWEEN the two provably falls through to
+# the next one (`_falls_through`). It does not know that the binding SURVIVES to the loop (a later
+# rebind is invisible), it does not reason across loop iterations (a binding written after the
+# loop but inside a surrounding one is refused, although the next iteration would reach it), any
+# divergence into different FIELDS of one construct — not just the arms of an `if` — refuses
+# rather than case-splitting on which pairs stay ordered, and any COMPOUND statement between the
+# two halves refuses rather than case-splitting on its arms, so a `while True:` and a `while True:`
+# that does `break` are refused alike.
 _SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 # The comparisons that are pure value folds on two literals. `Is`/`IsNot` (identity of literals is
@@ -23283,21 +23294,91 @@ def _node_paths(root):
     return paths
 
 
-def _one_pass_order(binding_path, loop_path):
-    """[registry #1710] True when a single pass that reaches `loop_path` can ALREADY have run
-    `binding_path` — both chains as `_node_paths` numbers them, from the same enclosing function.
+# The statements whose NORMAL completion is certain: running one of these always continues to the
+# next statement in its list. Everything absent is undecidable HERE and refuses the pairing —
+# `return`/`raise` obviously, but also EVERY compound statement, because proving that an `if`, a
+# `try` or a `while` falls through means case-splitting on arms this floor does not model. `assert`
+# is absent for the same reason (`assert x` raises whenever `x` is falsy), which keeps the set to
+# statements that cannot alter control flow at all.
+#
+# HONEST BOUNDARY: a statement is judged on its NORMAL completion, so an `ast.Expr` calling
+# `sys.exit()` — which leaves by SystemExit — counts as falling through. Exceptional exits are not
+# modelled here (any expression can raise), the same convention every reachability analysis makes.
+_FALL_THROUGH_STATEMENTS = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr, ast.Pass)
+
+
+def _falls_through(stmt):
+    """[registry #1710] True when a pass that RUNS `stmt` provably continues to the statement
+    written after it — the whitelist above, so an unrecognised statement REFUSES."""
+    return isinstance(stmt, _FALL_THROUGH_STATEMENTS)
+
+
+def _path_target(root, path):
+    """The node a `_node_paths` chain names, walked back down from `root`."""
+    node = root
+    for field, index in path:
+        value = getattr(node, field)
+        node = value[index] if isinstance(value, list) else value
+    return node
+
+
+# The constructs a pass provably LEAVES by the statement written after them, once their body runs
+# to the end: an `if`/`else` arm falls out of the `if`, and a `for` body falls into the next
+# iteration and out when the iterable is exhausted. `while` is ABSENT — `while True:` completes
+# only by `break`/`return`/an exception and this floor does not case-split on which — as are `try`
+# (a `finally` can return) and `with`, so a binding nested in one of those is refused rather than
+# case-split. A `for` over a non-terminating iterator is the same exceptional case as a call that
+# never returns: judged on NORMAL completion, per `_FALL_THROUGH_STATEMENTS`.
+_ESCAPABLE_NESTS = (ast.If, ast.For)
+
+
+def _exits_to_enclosing_list(root, path, depth):
+    """[registry #1710] True when a pass that runs the node at `path` provably continues to the
+    statement written after `path[depth]` in ITS list — i.e. the binding, however deeply nested
+    below that step, actually gets out to where the loop is reached from.
+
+    Each level below `depth` must be a nest a pass leaves (`_ESCAPABLE_NESTS`) with every statement
+    written after it there falling through, so a `return` under the same guard as the binding —
+    which is what makes the two halves un-pairable — refuses."""
+    for level in range(depth + 1, len(path)):
+        parent = _path_target(root, path[:level])
+        if not isinstance(parent, _ESCAPABLE_NESTS):
+            return False
+        field, index = path[level]
+        if not all(_falls_through(stmt) for stmt in getattr(parent, field)[index + 1:]):
+            return False
+    return True
+
+
+def _one_pass_order(root, binding_path, loop_path):
+    """[registry #1710] True when EVERY pass that reaches `loop_path` has ALREADY run
+    `binding_path` — both chains as `_node_paths` numbers them, from the enclosing function `root`.
 
     Node-at-a-time liveness cannot answer this: each half can be live under conditions that are
     never both true, and certifying that pair is the same dead-code route as certifying a park
     loop under `if False:`. Proven here only in the shape that needs no path conditions at all —
-    the two diverge inside ONE statement list, with the binding earlier in it — and refused
-    otherwise, so the undecidable directions cost a refusal."""
-    for step, other in zip(binding_path, loop_path):
+    the binding reaching one statement list (`_exits_to_enclosing_list`), the loop reached from a
+    LATER statement of that same list, and every statement in between provably falling through to
+    the next — and refused otherwise, so the undecidable directions cost a refusal.
+
+    Index order alone is NOT that proof, and was the hole this docstring used to paper over: a
+    statement list runs in order, but only until something ends the pass. `targets = ...`, then an
+    unconditional `return`, then the parking `for` puts the two halves in one list in the right
+    order while NO execution reaches the loop — so the segment between them is walked, not just
+    measured."""
+    for depth, (step, other) in enumerate(zip(binding_path, loop_path)):
         if step == other:
             continue              # same arm, same statement so far — keep descending
         if step[0] != other[0]:
             return False          # opposite ARMS of one construct: no pass takes both
-        return step[1] < other[1]  # one statement list: the binding must be written FIRST
+        if step[1] >= other[1]:
+            return False          # one statement list: the binding must be written FIRST
+        if not _exits_to_enclosing_list(root, binding_path, depth):
+            return False          # the binding is NESTED below this list and the pass that ran it
+                                  # can leave by a route that never reaches the list at all
+        statements = getattr(_path_target(root, binding_path[:depth]), step[0])
+        return all(_falls_through(stmt)
+                   for stmt in statements[step[1] + 1:other[1]])
     return False                  # the loop CONTAINS the binding — and a `for` evaluates its
                                   # iterable BEFORE its body, so this pass never saw the binding
 
@@ -23327,7 +23408,12 @@ def _park_call_site(source):
       - a binding NOT CO-REACHABLE with the loop     -> two live halves that no single pass runs
         (registry #1710)                                together — opposite arms of one `if`, or a
                                                        binding written after (or inside) the loop
-                                                       it is supposed to feed.
+                                                       it is supposed to feed;
+      - a statement that does not provably FALL      -> a `return`, a `raise` or a `while True:`
+        THROUGH between the binding and the loop,       ends the pass where it is written, so a
+        or after the binding in its own nest            loop below it — or a loop the guarded
+        (registry #1710)                                binding never gets out to — is certified by
+                                                       index order alone while nothing reaches it.
 
     Every ACCEPTING scan therefore runs over `_live_nodes`, never `ast.walk`. The asymmetry with
     the slice probe is deliberate: a scan that REFUSES keeps raw `ast.walk`, so a `[:1]` hidden in
@@ -23358,7 +23444,8 @@ def _park_call_site(source):
             named = [node for name, node in bound if name in iter_names]
             if not named:
                 continue                  # `for t in (targets if False else [])` iterates nothing
-            if not any(_one_pass_order(paths[id(node)], paths[id(loop)]) for node in named):
+            if not any(_one_pass_order(func, paths[id(node)], paths[id(loop)])
+                       for node in named):
                 continue                  # both halves live, but never in the SAME pass
             if any(isinstance(node, ast.Slice) for node in ast.walk(loop.iter)):
                 continue                  # `targets[:1]` is the per-tick cap of 1, re-typed
@@ -23411,9 +23498,11 @@ def _park_seam_arms(**swaps):
 
 
 # Each row is (what, expected verdict, arm, the BODY of `tick`). `arm` names WHY the row lands
-# where it does, and the three non-vacuity legs below read it: "live" and "shape" rows are decided
+# where it does, and the four non-vacuity legs below read it: "live" and "shape" rows are decided
 # without any reachability reasoning, "1028" rows by the literal-only core, "1710" rows ONLY by the
-# pruning arms this issue added, and "path" rows ONLY by its binding/loop pairing. The park call
+# pruning arms this issue added, "path" rows ONLY by its binding/loop pairing, and "flow" rows ONLY
+# by that pairing's fall-through walk — over the statements BETWEEN the two halves, and over the
+# ones written after the binding in its own nest. The park call
 # site is certified only when ONE pass through `tick` can run the `starvation_park_targets` binding
 # and then reach both the `for` over it and the `park_starved_partition_holder` inside — "only
 # when", never "exactly when": every direction the floor cannot prove is refused, not certified.
@@ -23537,6 +23626,18 @@ _PARK_SEAM_ROWS = (
         else:
             for target in targets:
                 park_starved_partition_holder(repo, target)
+    """),
+    # [#1710] The statements BETWEEN the binding and the loop are WALKED (see the `flow` rows), and
+    # an ordinary one keeps the loop reachable. Without this row `_FALL_THROUGH_STATEMENTS` could
+    # shrink to the empty tuple — refusing every segment — with every refusal above still green,
+    # while production refused the moment a log line landed between its two adjacent halves. Both
+    # statements matter: an assignment and a call are separate members of that whitelist.
+    ("ordinary statements between the binding and the loop", "tick", "live", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        count = len(targets)
+        print(f"parking {count} holder(s)")
+        for target in targets:
+            park_starved_partition_holder(repo, target)
     """),
     # ---- REFUSED by the literal core: dead branches -------------------------------------------
     ("loop under `if False:`", None, "1028", """
@@ -23725,6 +23826,56 @@ _PARK_SEAM_ROWS = (
             targets = starvation_park_targets(items, starved, occupancy)
             park_starved_partition_holder(repo, target)
     """),
+    # ...and a binding nested in a construct the pass never LEAVES. A `while True:` completes only
+    # by `break`, `return` or an exception, and the pairing does not case-split on which — so only
+    # a nest it can prove is left behind (`_ESCAPABLE_NESTS`: an `if`/`else` arm, a `for` body)
+    # carries a binding out to the list the loop is reached from. Reds if `while` joins that set.
+    ("binding nested in a `while True:` the pass never leaves", None, "path", """
+        while True:
+            targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    # ---- REFUSED on STATEMENT FLOW: written in order, but the pass ENDS in between -------------
+    # Order proves only where the two halves are WRITTEN. A statement list runs in order and ONLY
+    # until something ends the pass, so the segment between the binding and the loop has to be
+    # walked. Every node in these rows is locally live and every path check above is satisfied —
+    # index order was the last thing standing between them and a certification of code that parks
+    # nothing, which is the same lie as certifying a loop under `if False:`.
+    #
+    # The walk runs on the binding's OWN nest too, which index order cannot see past at all: the
+    # pass that ran this binding left through the `return` under the same guard, and the pass that
+    # reaches the loop is the one where `repo` was falsy and `targets` was never bound.
+    ("binding NESTED in a live guard that returns", None, "flow", """
+        if repo:
+            targets = starvation_park_targets(items, starved, occupancy)
+            return
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    ("`return` between the binding and the loop", None, "flow", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        return
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    ("`raise` between the binding and the loop", None, "flow", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        raise DispatchError("the tick is over")
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
+    # A `while True:` completes only by `break`, `return` or an exception, so nothing written after
+    # it is proven reachable — and this floor does not case-split on which, so a `while True:` that
+    # DOES break is refused too. That is the fail-CLOSED direction: an unprovable pass costs a
+    # refusal, never a certification.
+    ("`while True:` between the binding and the loop", None, "flow", """
+        targets = starvation_park_targets(items, starved, occupancy)
+        while True:
+            pass
+        for target in targets:
+            park_starved_partition_holder(repo, target)
+    """),
     # ---- REFUSED on SHAPE: the three #822 re-scalarisations, none of which had a fixture ------
     ("no loop at all — park(targets[0])", None, "shape", """
         targets = starvation_park_targets(items, starved, occupancy)
@@ -23753,15 +23904,15 @@ def _park_call_site_reachability_self_test():
     the exact 1-holder-per-tick defect #822 removed, or removes parking altogether, with the whole
     suite green.
 
-    NON-VACUITY IS MEASURED HERE, NOT ASSERTED. Every refusal is re-run three times, each with ONE
+    NON-VACUITY IS MEASURED HERE, NOT ASSERTED. Every refusal is re-run four times, each with ONE
     arm of the predicate swapped BACK to a form that shipped — `ast.walk`, the literal-only branch
-    test, and the pooled binding/loop match — and each refusal that arm is responsible for must
-    flip to a certification. A row that refuses for an unrelated reason (a missing binding, say)
-    therefore cannot pose as coverage of the arm it is filed under.
+    test, the pooled binding/loop match, and the index-only statement order — and each refusal that
+    arm is responsible for must flip to a certification. A row that refuses for an unrelated reason
+    (a missing binding, say) therefore cannot pose as coverage of the arm it is filed under.
     """
     shipped = {name: globals()[name] for name in
                ("_live_nodes", "_constant_test_truth", "_empty_literal_iterable",
-                "_one_pass_order")}
+                "_one_pass_order", "_falls_through")}
 
     for what, expect, _arm, block in _PARK_SEAM_ROWS:
         verdict = _park_seam_verdict(block)
@@ -23771,15 +23922,15 @@ def _park_call_site_reachability_self_test():
             "reports the batch park as structurally proven while the partition is never released.")
 
     arms = Counter(arm for _w, _e, arm, _b in _PARK_SEAM_ROWS)
-    assert arms == {"live": 14, "1028": 12, "1710": 10, "path": 4, "shape": 3}, (
-        f"#1710 expected 14 live / 12 literal-core / 10 widened / 4 co-reachability / 3 shape "
-        f"park-seam rows, got {dict(arms)} — a row was dropped from _PARK_SEAM_ROWS, which is how "
-        "a refusal quietly stops being tested")
+    assert arms == {"live": 15, "1028": 12, "1710": 10, "path": 5, "flow": 4, "shape": 3}, (
+        f"#1710 expected 15 live / 12 literal-core / 10 widened / 5 co-reachability / 4 statement-"
+        f"flow / 3 shape park-seam rows, got {dict(arms)} — a row was dropped from "
+        "_PARK_SEAM_ROWS, which is how a refusal quietly stops being tested")
 
     # ---- LEG 1: the pruning ITSELF is what refuses, not some incidental property -------------
     # `ast.walk` is the pre-fix checker exactly. Under it every reachability row must certify
-    # SOMETHING — "tick", or the uncalled helper's own name — while the shape rows and the live
-    # rows are untouched, because none of them is decided by reachability.
+    # SOMETHING — "tick", or the uncalled helper's own name — while the live, `path`, `flow` and
+    # `shape` rows are untouched, because none of them is decided by per-NODE liveness.
     with _park_seam_arms(_live_nodes=ast.walk):
         for what, expect, arm, block in _PARK_SEAM_ROWS:
             verdict = _park_seam_verdict(block)
@@ -23815,11 +23966,12 @@ def _park_call_site_reachability_self_test():
     # that really does reach its loop, so a checker that pooled every live binding in the function
     # and matched it against every live loop — which is what this file shipped — passes both. This
     # installs exactly that pooling ("any live binding pairs with any live loop") and requires the
-    # `path` rows, and only those, to go back to certified.
-    with _park_seam_arms(_one_pass_order=lambda binding_path, loop_path: True):
+    # `path` and `flow` rows — every row the pairing decides — and only those, to go back to
+    # certified. Leg 4 then splits that group, so neither half rides on the other.
+    with _park_seam_arms(_one_pass_order=lambda root, binding_path, loop_path: True):
         for what, expect, arm, block in _PARK_SEAM_ROWS:
             verdict = _park_seam_verdict(block)
-            if arm == "path":
+            if arm in ("path", "flow"):
                 assert verdict is not None, (
                     f"#1710 VACUOUS ROW [{what}]: it is refused even when ANY live binding is "
                     "allowed to pair with ANY live loop, so it proves nothing about "
@@ -23831,6 +23983,29 @@ def _park_call_site_reachability_self_test():
                     f"pairing must not decide, yet pooling the bindings changed its verdict to "
                     f"{verdict!r} — the pairing is refusing a shape a single pass really reaches")
 
+    # ---- LEG 4: the STATEMENT-FLOW walk inside the pairing is load-bearing on its own ---------
+    # Leg 3 groups every row the pairing decides, so it stays green on a pairing that compared the
+    # two indices and stopped — which is what this file shipped, and what certified `targets = ...`
+    # then `return` then the parking loop. Every row legs 1-3 decide has an EMPTY segment between
+    # the halves and nothing written after its binding in its own nest, so none of them can see the
+    # walk at all. This assumes every statement in those segments
+    # falls through — the index-only order, exactly — and requires the `flow` rows, and only those,
+    # to go back to certified.
+    with _park_seam_arms(_falls_through=lambda stmt: True):
+        for what, expect, arm, block in _PARK_SEAM_ROWS:
+            verdict = _park_seam_verdict(block)
+            if arm == "flow":
+                assert verdict is not None, (
+                    f"#1710 VACUOUS ROW [{what}]: it is refused even when EVERY statement between "
+                    "the binding and the loop is assumed to fall through, so it proves nothing "
+                    "about statement flow — it is refused for some other reason and must be "
+                    "re-written or re-filed under the arm that actually decides it")
+            else:
+                assert verdict == expect, (
+                    f"#1710 park-seam row [{what}] is filed as {arm!r}, which the statement-flow "
+                    f"walk must not decide, yet assuming fall-through changed its verdict to "
+                    f"{verdict!r} — the walk is refusing a segment one pass really runs through")
+
     for name, function in shipped.items():
         assert globals()[name] is function, (
             f"#1710 the {name} swap-back must be restored — a leaked stand-in would leave every "
@@ -23839,7 +24014,8 @@ def _park_call_site_reachability_self_test():
     print(f"  ok   #1710 park call-site seam decides REACHABILITY, not existence: "
           f"{arms['live']} live shapes certify while {arms['1028'] + arms['1710']} dead ones "
           f"(incl. `False and _`, `0 == 1`, `for _ in []`), {arms['path']} whose binding and loop "
-          f"never share a pass, and {arms['shape']} re-scalarisations are refused — each proved "
+          f"never share a pass, {arms['flow']} whose pass ENDS before the loop (`return`, `raise`, "
+          f"`while True:`), and {arms['shape']} re-scalarisations are refused — each proved "
           "non-vacuous by swapping its own arm back")
 
 
