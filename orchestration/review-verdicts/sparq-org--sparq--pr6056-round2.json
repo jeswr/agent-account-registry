@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6056,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e2087cb563dcc61f8b239543f398654731c45797",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`runAtStableRevision` validates the revision immediately after `runBatch`, but `load` later records `storeEpoch: liveRef.current.epoch`. If the store mutates after the helper's final revision read and before this snapshot object is built, the old query results are stamped with the new epoch. `consistent` remains true and the subsequent stale check also remains false because both snapshot and context now carry the new epoch. This directly contradicts the claim that a mutation after the last query is caught by the stale notice. The unit test exercises mutations during `batch`, not this post-validation/pre-publication window.",
+    "file": "gui/app/src/components/workbench/overview-tool.tsx",
+    "fix_hint": "Have `runAtStableRevision` return the exact validated ending revision (or a revision/size token), and stamp the snapshot with that returned token rather than rereading `liveRef`. Any later mutation will then make the existing stale comparison fire. Add a component-level or extracted-load test that advances the revision after the final validation read but before publication and asserts the published snapshot is stale (or discarded), never current-and-consistent.",
+    "severity": "major",
+    "title": "Validated results can be stamped with a later store revision"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 substantially addresses the bubble-encoding and query-cap findings, and it adds a best-effort revision retry. One load-bearing consistency race remains: the batch is stamped with the live revision after validation rather than the revision that was validated. A mutation in that interval can therefore make old query results appear current and consistent. The prior three findings have been reduced to this narrower form, so progress is improving, but the remaining major correctness issue prevents approval.",
+  "verdict": "request_changes"
+ }
+}
