@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6127,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7b82817be09d15045a874f84107e1fc13318e17c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`NotifyState` changes from a non-generic public type to `NotifyState<S>`, `NotifyState::new(hub, base_url)` is replaced by `NotifyState::new(Arc<LdpState<S>>)`, and all three public handlers acquire a `S: Store` type parameter. These are source-breaking public API changes. The repository maintenance rule requires the matching `skills/solid-lws-server/SKILL.md` documentation to be updated in the same change, but that path is absent from the diff. Existing consumers following the documented construction or handler API can therefore be left with stale, non-compiling instructions.",
+    "file": "crates/sparq-lws-core/src/notifications/ws.rs",
+    "fix_hint": "Update `skills/solid-lws-server/SKILL.md` (and any public crate README example that constructs `NotifyState` or calls these handlers) to use the new generic state constructed from `Arc<LdpState<S>>`. If these symbols are not intended as supported public API, reduce their visibility instead and keep only the router-facing surface public as needed. Include a compile-checked example if the skill exposes direct handler/state construction.",
+    "severity": "major",
+    "title": "Public notification API is changed without updating its usage skill"
+   }
+  ],
+  "progress": null,
+  "summary": "The WAC checks are wired into both subscribe and receive on the real router state, and the denial tests exercise the actual authorizer rather than a mock. However, the change also breaks the public notification API without the repository-required same-change usage documentation update, so it is not complete as submitted.",
+  "verdict": "request_changes"
+ }
+}
