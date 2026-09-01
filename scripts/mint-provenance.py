@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-5] The MINTING half of the #657 orchestrator-PR review admission (design record
+# [SPARQ agent] The MINTING half of the #657 orchestrator-PR review admission (design record
 # research/657-orchestrator-provenance-minting.md; the admission half is #759 + #821).
 #
 # WHAT THIS IS FOR. `enumerate_review_items` admits a PR to the autonomous review lane only when
@@ -982,6 +982,7 @@ def recorded_pr_numbers(repo, registry_repo, worker_pr, read_tree=None):
     directory, _, filename = template.rpartition("/")
     stem = filename[:-len(".json")] if filename.endswith(".json") else filename
     numbered = re.compile(rf"{re.escape(stem)}([1-9][0-9]*)\.json")
+    prefix = directory + "/"
     read_tree = read_tree or (lambda: _gh_json(
         ["api", f"repos/{registry_repo}/git/trees/{worker_pr.LEDGER_REF}?recursive=1"]))
     response = read_tree()
@@ -990,10 +991,13 @@ def recorded_pr_numbers(repo, registry_repo, worker_pr, read_tree=None):
     listing = response.get("tree")
     if not isinstance(listing, list):
         raise MintError("the ledger tree did not contain a file listing")
+    if not any(isinstance(entry, dict) and isinstance(entry.get("path"), str)
+               and entry["path"].startswith(prefix) for entry in listing):
+        raise MintError("the ledger tree did not contain the provenance directory")
     numbers = set()
     for entry in listing:
-        path = entry.get("path") if isinstance(entry, dict) else None
-        prefix = directory + "/"
+        path = (entry.get("path") if isinstance(entry, dict)
+                and entry.get("type") == "blob" else None)
         name = path[len(prefix):] if isinstance(path, str) and path.startswith(prefix) else None
         match = numbered.fullmatch(name or "")
         if match:
@@ -1805,9 +1809,15 @@ def _self_test():                                                       # noqa: 
           referenced_issue_numbers({"title": "fix(x): thing", "body": "closes #7"}), [7])
     # The recorded-PR reader is derived from the PRODUCTION path builder, so a record for ANOTHER
     # target repo sharing the directory can never be counted as one of this repo's PRs.
-    _listing = [{"path": worker_pr.provenance_path(repo, 685)},
-                {"path": worker_pr.provenance_path("other/repo", 999)},
-                {"path": "orchestration/provenance/README.md"}, {"path": None}]
+    _basename = worker_pr.provenance_path(repo, 686).rpartition("/")[2]
+    _listing = [{"path": worker_pr.provenance_path(repo, 685), "type": "blob"},
+                {"path": worker_pr.provenance_path("other/repo", 999), "type": "blob"},
+                {"path": "orchestration/provenance/README.md", "type": "blob"},
+                {"path": "orchestration/provenance-archive/" + _basename, "type": "blob"},
+                {"path": _basename, "type": "blob"},
+                {"path": "orchestration/provenance/sub/" + _basename, "type": "blob"},
+                {"path": worker_pr.provenance_path(repo, 687), "type": "tree"},
+                {"path": None, "type": "blob"}]
     check("the recorded-PR reader counts THIS repo's records only",
           recorded_pr_numbers(repo, "reg/istry", worker_pr,
                               read_tree=lambda: {"tree": _listing, "truncated": False}), {685})
@@ -1830,6 +1840,17 @@ def _self_test():                                                       # noqa: 
     else:
         check("...and a truncated tree RAISES rather than reading as 'nothing recorded'",
               "no raise", "MintError")
+    for description, unreadable in (("a null response", None),
+                                    ("an API error payload", {"message": "Not Found"})):
+        try:
+            recorded_pr_numbers(repo, "reg/istry", worker_pr,
+                                read_tree=lambda unreadable=unreadable: unreadable)
+        except MintError as exc:
+            check(f"...and {description} RAISES rather than reading as 'nothing recorded'",
+                  "unreadable" in str(exc), True)
+        else:
+            check(f"...and {description} RAISES rather than reading as 'nothing recorded'",
+                  "no raise", "MintError")
     try:
         recorded_pr_numbers(repo, "reg/istry", worker_pr,
                             read_tree=lambda: {"truncated": False, "tree": None})
@@ -1838,6 +1859,18 @@ def _self_test():                                                       # noqa: 
               "file listing" in str(exc), True)
     else:
         check("...and an unreadable tree RAISES rather than reading as 'nothing recorded'",
+              "no raise", "MintError")
+    try:
+        recorded_pr_numbers(
+            repo, "reg/istry", worker_pr,
+            read_tree=lambda: {"truncated": False,
+                               "tree": [{"path": "renamed/provenance/README.md",
+                                         "type": "blob"}]})
+    except MintError as exc:
+        check("...and a renamed provenance directory RAISES rather than matching nothing",
+              "provenance directory" in str(exc), True)
+    else:
+        check("...and a renamed provenance directory RAISES rather than matching nothing",
               "no raise", "MintError")
 
     # ---- the enrolment ordering constraint ----------------------------------------------------
