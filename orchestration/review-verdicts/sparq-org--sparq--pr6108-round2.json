@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6108,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ed1a303d8f8176e9db5e0cdb623a062e706390a4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The slotless evaluator is implemented as a separate advisory shadow lane and preserves the existing required gate during the staged migration. The evaluator reuses the existing verdict renderer, fails closed on missing observations or unknown draft state, separates draft and full status contexts, confirms terminal/fail-fast observations before publishing, bounds fetch retries, and limits its token to the required status write plus reads. The new tests exercise the real evaluator and publisher paths, include anti-vacuity controls, and the complete ci_summary_gate test suite passes (222 tests, 3 skipped). No correctness, security, or test-validity defect is evident in the diff-scoped evidence.",
+  "verdict": "approve"
+ }
+}
