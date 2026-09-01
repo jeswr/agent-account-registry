@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6135,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f66bc8213e06d8679a0452269500ef514710276b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently applies rust-cache's main-only save guard to workflows that both run on branch refs and have a main-push path capable of reseeding the cache. The structural parser distinguishes PR/merge-group workflows, tag-only pushes, PR-only workflows, and unfiltered or explicitly main-filtered pushes; the expanded non-vacuity tests pin the intended scope and the existing step walker checks every discovered rust-cache use. The focused test suite passes (13 tests), and no correctness, security, or vacuity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
