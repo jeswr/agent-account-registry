@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import importlib.util
 import json
 import os
 import re
@@ -100,6 +101,31 @@ except ImportError as _exc:  # pragma: no cover - fail loud rather than skip M1
     yaml = None
     _YAML_IMPORT_ERROR = _exc
 
+
+def _import_sibling(module_name, filename):
+    """Import a sibling script by path (the #715 idiom — these scripts have no package)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - a broken checkout, not a choke
+        raise RuntimeError(f"cannot load {filename}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# THE cron map — field expansion, one cron's minute set, and the per-lane map derived from the
+# workflow directory — lives in its own module (#1280) so a consumer can check out one small file
+# instead of this watchdog. IMPORTED, never re-declared: `expected_firings` below is the only
+# thing here that touches a cron, and it reads the SAME `_expand_field` every other consumer does.
+CRON_MAP_SCRIPT = "scripts/cron_map.py"
+cron_map = _import_sibling("registry_cron_map", "cron_map.py")
+_expand_field = cron_map._expand_field
+cron_minutes = cron_map.cron_minutes
+schedule_minute_map = cron_map.schedule_minute_map
+MIN_SCHEDULED_LANES = cron_map.MIN_SCHEDULED_LANES
+WORKFLOWS_DIR = cron_map.WORKFLOWS_DIR
+CronError = cron_map.CronError
+
 ALERT_LABEL = "ops-alert"
 MARKER_PREFIX = "ci-latency-alert:v1"
 MAINTAINER_HANDLE = os.environ.get("MAINTAINER_HANDLE", "jeswr")
@@ -109,6 +135,10 @@ MAINTAINER_HANDLE = os.environ.get("MAINTAINER_HANDLE", "jeswr")
 # YAML-seam assertions silently unreachable on the live path.
 REQUIRED_FILES = (
     "scripts/ci-latency-alert.py",
+    # The cron map this file's M1 expansion and its schedule seam are BUILT ON (#1280). The live
+    # path imports it at module load, so a checkout without it does not merely disable an
+    # assertion — the watchdog does not start.
+    CRON_MAP_SCRIPT,
     ".github/workflows/groom-sweep.yml",
     # M3's floor is DERIVED from this file's `worker_timeout_minutes` (see EXEC_FLOOR_SECONDS).
     # Without it in the checkout the derivation assertion would be unreachable on the live
@@ -117,15 +147,10 @@ REQUIRED_FILES = (
 )
 GROOM_WORKFLOW = ".github/workflows/groom-sweep.yml"
 POLICY_FILE = "policy/repos.toml"
-WORKFLOWS_DIR = ".github/workflows"
 
 
 class AlarmError(RuntimeError):
     """The detector itself is broken. Never mask a choke."""
-
-
-class CronError(ValueError):
-    """An unparseable cron. Fail-safe QUIET, but COUNTED in the census."""
 
 
 # --- M1 -----------------------------------------------------------------------------
@@ -348,78 +373,9 @@ M4_INDETERMINATE_STATES = ("not-sampled", "no-concluded-run")
 
 
 # ---------------------------------------------------------------------------------
-# cron expansion
+# cron expansion — `_expand_field` and `cron_minutes` are cron_map.py's (#1280); only the
+# WINDOW COUNT lives here, because it is M1's detection variable and nothing else reads it.
 # ---------------------------------------------------------------------------------
-def _expand_field(spec: str, lo: int, hi: int) -> set[int]:
-    """Expand one cron field to the set of values it matches.
-
-    OUT OF RANGE IS A REFUSAL, NOT A FILTER (#1279). This used to expand every atom and then
-    drop whatever fell outside `lo..hi`, which reads as fail-closed and is not: it only ever
-    raises when the WHOLE field is out of range, so `3,13,23,33,43,53,60` — the dispatch
-    schedule plus one impossible minute — came back as exactly the six valid minutes. A caller
-    asking "how many times an hour does this fire" then gets a truthful-looking six for a cron
-    that GitHub will not run at all, and every count it derives is green on a broken schedule.
-    Rejecting the atom (and each range ENDPOINT) instead means a malformed field can never be
-    silently rounded down to a plausible one.
-
-    The emptiness refusal below is DEAD under this grammar once the range check is in place —
-    an accepted part has `a <= b` and `step >= 1`, so it contributes at least `a` — and it is
-    kept anyway, declared unreachable, as the structural backstop for a future term form that
-    does not hold that property (the same call dashboard-gen.py's own expander makes for the
-    same reason). It is a refusal, so the honest thing is to say it cannot execute rather than
-    to delete it and leave an empty set reaching a consumer that reads it as "fires never".
-    """
-    if not spec:
-        raise CronError("empty field")
-    out: set[int] = set()
-    for part in spec.split(","):
-        if not part:
-            raise CronError(f"empty list element in {spec!r}")
-        step = 1
-        if "/" in part:
-            part, raw = part.split("/", 1)
-            if not raw.isdigit():
-                raise CronError(f"bad step in {spec!r}")
-            step = int(raw)
-            if step <= 0:
-                raise CronError(f"non-positive step in {spec!r}")
-        if part in ("*", "?"):
-            a, b = lo, hi
-        elif "-" in part:
-            lhs, rhs = part.split("-", 1)
-            if not (lhs.isdigit() and rhs.isdigit()):
-                raise CronError(f"bad range in {spec!r}")
-            a, b = int(lhs), int(rhs)
-            if a > b:
-                raise CronError(f"inverted range in {spec!r}")
-        else:
-            if not part.isdigit():
-                raise CronError(f"not a number: {part!r}")
-            a = b = int(part)
-        if a < lo or b > hi:
-            raise CronError(f"value outside {lo}-{hi} in {spec!r}")
-        out |= set(range(a, b + 1, step))
-    if not out:  # unreachable under the grammar above - see the docstring
-        raise CronError(f"field matches nothing: {spec!r}")
-    return out
-
-
-def cron_minutes(expr: str) -> set[int]:
-    """The minutes past the hour `expr` can fire at. THE definition of that expansion (#1046).
-
-    Hour/day/month restrictions are deliberately IGNORED, and that is the fail-closed
-    direction for the one question this answers — *is this minute already taken?*
-    `41 6 * * 1` (pat-validity, weekly) therefore still holds :41. Over-reporting a taken
-    minute costs a schedule author one alternative; under-reporting it hands them a collision.
-    """
-    if not isinstance(expr, str):
-        raise CronError(f"not a string: {expr!r}")
-    fields = expr.split()
-    if len(fields) != 5:
-        raise CronError(f"expected 5 fields, got {len(fields)}: {expr!r}")
-    return _expand_field(fields[0], 0, 59)
-
-
 def expected_firings(expr: str, start: dt.datetime, end: dt.datetime) -> int:
     """How many times `expr` fires in (start, end]. Minute-resolution walk.
 
@@ -465,17 +421,17 @@ def expected_firings(expr: str, start: dt.datetime, end: dt.datetime) -> int:
 # workflow scope
 # ---------------------------------------------------------------------------------
 def workflow_triggers(text: str) -> dict:
-    """-> the parsed `on:` mapping. `on` is YAML 1.1 `true`, hence the two-key lookup."""
-    if yaml is None:  # pragma: no cover
-        raise AlarmError(f"PyYAML unavailable: {_YAML_IMPORT_ERROR}")
+    """-> the parsed `on:` mapping. cron_map.py owns the parse (#1280).
+
+    A THIN ADAPTER, not a second reading: it re-raises cron_map's refusal as this watchdog's
+    own `AlarmError` so a workflow it cannot read still reaches `main`'s fail-loud handler
+    instead of escaping as a bare traceback. The refusal itself — and the reason it is a
+    refusal rather than an empty mapping — belongs to cron_map.
+    """
     try:
-        doc = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise AlarmError(f"unparseable workflow YAML: {exc}") from exc
-    if not isinstance(doc, dict):
-        raise AlarmError("workflow YAML is not a mapping")
-    on = doc.get(True, doc.get("on"))
-    return on if isinstance(on, dict) else {}
+        return cron_map.workflow_triggers(text)
+    except cron_map.CronMapError as exc:
+        raise AlarmError(str(exc)) from exc
 
 
 def m1_scope(on: dict) -> tuple[bool, list[str], bool]:
@@ -491,48 +447,12 @@ def m1_scope(on: dict) -> tuple[bool, list[str], bool]:
     """
     if "schedule" not in on:
         return False, [], False
-    sched = on.get("schedule") or []
-    crons = [s.get("cron") for s in sched
-             if isinstance(s, dict) and isinstance(s.get("cron"), str)]
+    # The cron LIST is cron_map's `schedule_crons` (#1280) — the same reading the derived
+    # minute map is built from, so M1's population and the map can never disagree about which
+    # lanes declare a schedule. What is M1's own is the SCOPE verdict and `cron_only`.
+    crons = cron_map.schedule_crons(on)
     cron_only = set(on) <= INVISIBLE_TRIGGERS
     return bool(crons), crons, cron_only
-
-
-def schedule_minute_map(root) -> dict[str, set[int]]:
-    """THE registry cron-minute map — which minute is taken by which workflow — DERIVED (#1046).
-
-    Before this existed the map was hand-copied into five places, and one copy was already
-    stale: `regate-sweep` asserted :00/:15/:30/:45 was dashboard's after dashboard had moved,
-    which would have walked the next schedule author straight into a collision. That is the
-    #958 shape (one literal, N definitions, consumers blind to a repoint) applied to a
-    schedule. A consumer that needs the map READS THE TREE through this function; prose that
-    names other lanes' minutes is a copy waiting to go stale.
-
-    -> {".github/workflows/<name>.yml": {minutes}} for every workflow carrying a schedule.
-    FAIL CLOSED in both directions a caller could be misled by: a missing workflows directory
-    raises, and an unparseable cron raises rather than dropping the lane from the map. A lane
-    silently absent from this map reads to a collision check as a free minute.
-    """
-    wf_dir = Path(root) / WORKFLOWS_DIR
-    if not wf_dir.is_dir():
-        raise AlarmError(f"no workflows directory at {wf_dir}")
-    out: dict[str, set[int]] = {}
-    for path in sorted(wf_dir.glob("*.yml")) + sorted(wf_dir.glob("*.yaml")):
-        _, crons, _ = m1_scope(workflow_triggers(path.read_text(encoding="utf-8")))
-        if not crons:
-            continue
-        minutes: set[int] = set()
-        for expr in crons:
-            minutes |= cron_minutes(expr)
-        out[f"{WORKFLOWS_DIR}/{path.name}"] = minutes
-    return out
-
-
-# A FLOOR ON THE EVIDENCE, not a copy of the map: this repo carries 13 scheduled lanes today,
-# and the failure this guards is a map derived from a thin checkout or a broken parse, which
-# yields 0-1 lanes and makes every collision assertion built on it vacuously green. A floor
-# survives retiring a lane; it does not survive the derivation reading nothing.
-MIN_SCHEDULED_LANES = 10
 
 
 # =================================================================================
@@ -1508,13 +1428,10 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         "(1.25/h = 30/day; the sparq deployment's 0.5 is a different repo's load)",
         CRON_MAX_CREDIBLE_FIRINGS_PER_HOUR == 1.25)
     chk("CRON_GRACE_MINUTES is 15", CRON_GRACE_MINUTES == 15)
-    # Same trap, on the schedule-map floor (#1046). A floor of 0 or 1 has no teeth: the case it
-    # exists to catch is a sparse checkout yielding exactly the ONE lane its consumer already
-    # knows about, and every collision assertion built on that map is then vacuously green.
-    # Bounded above by the 13 lanes this repo actually carries, so it cannot be raised into a
-    # permanent red either.
-    chk("MIN_SCHEDULED_LANES is a floor with teeth (strictly above the one-lane thin checkout) "
-        "and stays reachable by this repo's real lane count", 2 <= MIN_SCHEDULED_LANES <= 13)
+    # (MIN_SCHEDULED_LANES' own band is pinned in cron_map.py, which owns the constant — a
+    # second copy of that floor here would make each one individually unkillable, AGENTS.md
+    # pre-flight item 4. What this file still asserts is the LIVE-tree floor at the seam,
+    # because that is the precondition its own #1278 exclusivity rows are only meaningful under.)
     chk("EXEC_OVERRUN_MULTIPLE is inside the band that still catches the 2.08x outlier",
         1.25 <= EXEC_OVERRUN_MULTIPLE <= 2.0)
     # THE FLOOR HAS TO CLEAR REALITY FROM BOTH SIDES: above the longest run this repo has
@@ -1588,24 +1505,48 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         except Exception:
             chk(f"cron {bad!r} raised the wrong error", False)
 
-    # --- cron_minutes: the expansion the DERIVED schedule map is built on (#1046) ---
-    # Every expected value here is hand-computed. Writing it as `_expand_field(...)` would
-    # read the expectation out of the code under test, which is the assertion shape that
-    # cannot fail (AGENTS.md pre-flight 2b).
-    chk("cron_minutes */15 -> :00/:15/:30/:45", cron_minutes("*/15 * * * *") == {0, 15, 30, 45})
-    chk("cron_minutes 7-59/15 -> :07/:22/:37/:52 — a stepped RANGE does not restart at :00, "
-        "and reading it as */15 is exactly how a hand-copied map lies about a taken minute",
-        cron_minutes("7-59/15 * * * *") == {7, 22, 37, 52})
-    chk("cron_minutes 3,13,23,33,43,53 -> the six explicit minutes",
-        cron_minutes("3,13,23,33,43,53 * * * *") == {3, 13, 23, 33, 43, 53})
-    chk("cron_minutes ignores the hour/day fields — a weekly 06:41 lane still HOLDS :41, "
-        "because the question this answers is `is this minute taken`",
-        cron_minutes("41 6 * * 1") == {41})
+    # --- WHOSE cron expansion (#1280). The expander, the minute set and the derived map are
+    # cron_map.py's; this file BINDS them and adds `expected_firings` on top. The rows that
+    # exercise the expansion itself live in that module's own self-test, and these say only
+    # that nothing here has grown a private second copy — which is exactly how the wrong
+    # answer came back last time (#1279: a stepped range read as `*/15`). Identity, not
+    # behaviour: a re-declared `_expand_field` below the import would satisfy every
+    # behavioural row above while breaking the single definition. ---
+    chk("the cron expander, the minute set and the derived map are cron_map.py's objects — a "
+        "private copy re-declared in this file reds HERE rather than drifting silently",
+        (_expand_field is cron_map._expand_field,
+         cron_minutes is cron_map.cron_minutes,
+         schedule_minute_map is cron_map.schedule_minute_map)
+        == (True, True, True))
+    chk("...and so are the two constants the schedule seam and its floor are read through",
+        (MIN_SCHEDULED_LANES == cron_map.MIN_SCHEDULED_LANES,
+         WORKFLOWS_DIR == cron_map.WORKFLOWS_DIR) == (True, True))
+    chk("cron_map.py is a REQUIRED_FILE — the LIVE path imports it at module load, so a "
+        "checkout without it does not disable an assertion, it stops the watchdog starting",
+        CRON_MAP_SCRIPT in REQUIRED_FILES)
+    # THE ADAPTER, in both directions. cron_map refuses a workflow it cannot read with its own
+    # `CronMapError`, which `main`'s handler does not catch: unwrapped, an unparseable lane
+    # would leave the tick as a bare traceback instead of the reported alarm path.
+    try:
+        workflow_triggers("on: [\njobs:\n")
+        chk("a workflow this watchdog cannot parse must raise", False)
+    except AlarmError:
+        pass
+    except Exception:
+        # cron_map raises CronMapError, which is NOT an AlarmError: unwrapped it lands here,
+        # and `main`'s `except AlarmError` would not have caught it on the live path either.
+        chk("an unparseable workflow raises AlarmError, so main's handler still reports it — "
+            "cron_map's own error class escaping here would traceback the tick", False)
+    chk("...and the adapter is a re-raise, not a rewrite: a readable workflow still yields the "
+        "parsed `on:` mapping cron_map returns",
+        workflow_triggers("on:\n  schedule:\n    - cron: '4 * * * *'\njobs: {}\n")
+        == {"schedule": [{"cron": "4 * * * *"}]})
 
     # --- OUT OF RANGE IS REFUSED, NOT FILTERED (#1279) --------------------------------
-    # The loop below only ever fed WHOLLY invalid fields, which the old post-hoc filter
-    # happened to catch by emptying the set. The fail-open case is the MIXED field, and it
-    # needed its own rows.
+    # cron_map.py carries this refusal for the MINUTE field. What it cannot carry is the claim
+    # that the bound is read PER FIELD, because `cron_minutes` only ever passes 0-59 — and
+    # `expected_firings` is this repo's only caller of the other four bounds, so those rows
+    # stay here, against this file's own function.
     def _raises_cron(thunk):
         try:
             thunk()
@@ -1619,74 +1560,19 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     # could only answer True would satisfy all of them while asserting nothing.
     chk("the CronError probe answers False for a call that does not raise, and False for a "
         "call that raises something else — it can say no",
-        (_raises_cron(lambda: cron_minutes("3 * * * *")),
+        (_raises_cron(lambda: expected_firings("3 * * * *", H6, NOW)),
          _raises_cron(lambda: 1 / 0)) == (False, False))
-    # THE DEFECT. Every atom but the last is a real dispatch minute, so an expander that DROPS
-    # the impossible :60 instead of refusing it answers with exactly the six-minute set of a
-    # VALID schedule — a consumer counting firings per hour then confirms six firings for a cron
-    # GitHub will not run at all. :60 appears in no valid minute expansion, so this row cannot
-    # pass by colliding with a value the harness already uses.
-    chk("cron_minutes REFUSES a minute list that is valid except for one out-of-range atom — "
-        "filtering :60 away would answer with the six real dispatch minutes and read as green",
-        _raises_cron(lambda: cron_minutes("3,13,23,33,43,53,60 * * * *")))
-    chk("cron_minutes REFUSES a range whose END runs past :59 instead of truncating it to :59",
-        _raises_cron(lambda: cron_minutes("55-70 * * * *")))
-    # ...and the refusal is about what cron cannot fire at, not about largeness: the boundary
-    # values still expand, so a mutant that rejected the whole field would red here.
-    chk("cron_minutes still accepts the boundary minutes :00 and :59",
-        cron_minutes("0,59 * * * *") == {0, 59})
-    # The same refusal on a field with a DIFFERENT bound, so the check reads each field's own
-    # `hi` rather than hard-coding 59: hour 24 does not exist, and `1,24` filtered down to `1`
-    # would be a plausible 01:xx lane.
+    # The refusal on a field with a NON-MINUTE bound, which cron_map's own rows for
+    # `cron_minutes` cannot reach — that function only ever passes 0-59, so a hard-coded :59
+    # would satisfy every one of them. `expected_firings` is the only caller in this repo that
+    # passes the other four bounds, so the "per field, not per :59" claim is enforced HERE.
+    # Hour 24 does not exist, and `1,24` filtered down to `1` would be a plausible 01:xx lane.
     chk("expected_firings REFUSES an HOUR list that is valid except for the impossible 24 — the "
         "bound is per field, not a hard-coded :59",
         _raises_cron(lambda: expected_firings("3 1,24 * * *", H6, NOW)))
     chk("...while the same hour list with 24 replaced by a real hour still expands (the hour "
         "bound refuses 24, it does not refuse lists)",
         expected_firings("3 1,23 * * *", D1, NOW) == 2)
-
-    for bad in ("", "* * * *", "* * * * * *", "60 * * * *", "*/0 * * * *", 41, None):
-        try:
-            cron_minutes(bad)
-            chk(f"cron_minutes {bad!r} must raise CronError", False)
-        except CronError:
-            pass
-        except Exception:
-            chk(f"cron_minutes {bad!r} raised the wrong error", False)
-
-    # --- schedule_minute_map on a HERMETIC tree. The live-tree rows in the seam section can
-    # only exercise the POSITIVE direction (this repo has no malformed cron and no missing
-    # workflows directory), and the whole fail-closed claim lives in the negative one: a lane
-    # that vanishes from the map reads to a collision check as a FREE minute. ---
-    with tempfile.TemporaryDirectory() as _tmp:
-        _wf = Path(_tmp) / WORKFLOWS_DIR
-        _wf.mkdir(parents=True)
-        (_wf / "a.yml").write_text("on:\n  schedule:\n    - cron: '4,24,44 * * * *'\njobs: {}\n")
-        (_wf / "b.yml").write_text("on:\n  schedule:\n    - cron: '*/15 * * * *'\n"
-                                   "    - cron: '7 1 * * *'\njobs: {}\n")
-        (_wf / "c.yml").write_text("on:\n  push:\njobs: {}\n")
-        chk("schedule map: one entry per SCHEDULED lane, minutes UNIONED across that lane's "
-            "crons, unscheduled lanes absent",
-            schedule_minute_map(_tmp) == {f"{WORKFLOWS_DIR}/a.yml": {4, 24, 44},
-                                          f"{WORKFLOWS_DIR}/b.yml": {0, 7, 15, 30, 45}})
-        (_wf / "d.yml").write_text("on:\n  schedule:\n    - cron: 'every 5 min'\njobs: {}\n")
-        try:
-            schedule_minute_map(_tmp)
-            chk("schedule map: an UNPARSEABLE cron RAISES — dropping that lane would hand a "
-                "collision check a minute it cannot see is taken", False)
-        except CronError:
-            pass
-        except Exception:
-            chk("schedule map: an unparseable cron raised the wrong error", False)
-    try:
-        # The directory is gone with the context manager: an absent tree must not read as
-        # "no lanes are scheduled".
-        schedule_minute_map(_tmp)
-        chk("schedule map: a MISSING workflows directory raises rather than returning {}", False)
-    except AlarmError:
-        pass
-    except Exception:
-        chk("schedule map: a missing workflows directory raised the wrong error", False)
 
     # --- exclusive_minute_lanes on a HERMETIC tree (#1278). The live-tree rows in the seam
     # section can only say "the claims held today"; every way the claim set can silently
@@ -2010,6 +1896,18 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("M1 still reports cron_only for information", m1_scope(sched_only)[2] is True)
     chk("M1 watches a schedule+other-trigger lane", m1_scope(mixed)[0] is True)
     chk("M1 excludes an unscheduled workflow", m1_scope({"pull_request": None})[0] is False)
+    # M1 sums `expected_firings` over EVERY cron the lane declares, so a reading that returned
+    # only the first would halve a two-cron lane's expectation and make the deficit ratio pass
+    # on a lane delivering half its schedule. The list is cron_map's `schedule_crons` (#1280) —
+    # the same reading the derived minute map is built from, asserted here against a
+    # hand-written pair rather than against that function's own output.
+    _two_crons = {"schedule": [{"cron": "*/15 * * * *"}, {"cron": "7 1 * * *"}]}
+    chk("M1 reports EVERY cron a lane declares, not just the first — a truncated list "
+        "under-states the expectation and the deficit ratio goes green on a half-dead lane",
+        m1_scope(_two_crons)[1] == ["*/15 * * * *", "7 1 * * *"])
+    chk("...and that reading is the SAME one the derived minute map is built from, so M1's "
+        "population and the map can never disagree about what a lane declares",
+        m1_scope(_two_crons)[1] == cron_map.schedule_crons(_two_crons))
 
     # --- M1 detection ---
     f, c = find_cron_deficits([_lane(fires=CAP, now=NOW)], NOW)

@@ -570,6 +570,8 @@ jobs:
       # M1 derives each lane's expectation from the workflow files themselves, and
       # `policy/repos.toml` is the one M3's execution-overrun floor is derived from
       # (1.5x the longest `worker_timeout_minutes`) — the self-test reds if they diverge.
+      # `scripts/cron_map.py` owns the cron expansion M1 counts firings with (#1280) and is
+      # imported at MODULE LOAD, so without it the watchdog does not start at all.
       - name: Check out ONLY the watchdog's inputs (pinned, sparse, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -577,6 +579,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts/ci-latency-alert.py
+            scripts/cron_map.py
             scripts/selftest-suite.txt
             .github/workflows/groom-sweep.yml
             .github/workflows

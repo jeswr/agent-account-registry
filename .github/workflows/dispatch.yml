@@ -101,14 +101,15 @@ jobs:
           # this very block, so a trimmed checkout goes RED instead of making the YAML-seam
           # assertions silently unreachable on the live path.
           #
-          # ci-latency-alert.py is an INPUT, not incidental (#1279): it owns the ONE definition of
+          # cron_map.py is an INPUT, not incidental (#1279): it owns the ONE definition of
           # cron-minute expansion (#1046), which the floor's schedule assertion now consumes rather
           # than keeping a private copy that mis-expanded a stepped range. The LIVE floor never
           # imports it — only `--self-test` does — but that self-test runs in this job, so dropping
-          # it here reds the job instead of silently disabling the assertion.
+          # it here reds the job instead of silently disabling the assertion. It is a small shared
+          # module since #1280; this job used to check out the whole CI-latency watchdog for it.
           sparse-checkout: |
             scripts/dispatch-tick-floor.py
-            scripts/ci-latency-alert.py
+            scripts/cron_map.py
             .github/workflows/dispatch.yml
           sparse-checkout-cone-mode: false
 
