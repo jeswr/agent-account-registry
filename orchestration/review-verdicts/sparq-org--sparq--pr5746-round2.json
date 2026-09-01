@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5746,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b8b4df6556e5e56074923bf37ce32a3df43863c9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. The classifier now consumes the ownership map using the same first-match semantics as closure selection, while explicitly preventing full-run triggers and crates/** paths from being made inert. Missing, unreadable, malformed, or entry-invalid map data degrades conservatively to the pre-change engine classification. The three workflow consumers recognize the new map-safe token consistently, and the focused tests cover the real classifier/select and classify-only paths, protected ZK anchors, trigger/crate exclusions, mixed-class composition, malformed inputs, default and explicit map discovery, workflow token drift, and a mutation check. No correctness, soundness, security, test-vacuity, or prompt-injection issue is present in the supplied diff.",
+  "verdict": "approve"
+ }
+}
