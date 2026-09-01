@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6031,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "79f915c8fe2a66123679985bee8ddd33d63f34be",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 6 remains correct and complete for its explicitly constrained in-process, honest-majority semi-honest simulation scope. The implementation uses independently seeded party-local generators, completes the commitment barrier before sharing, verifies round- and party-bound openings, freshly Shamir-shares every contribution, and sums shares only at matching party points. Counter exhaustion, nonzero-mask rejection, unsupported VSS, and deployment all fail closed. The tests exercise the real construction path and its load-bearing invariants, including reconstruction and quorum consistency, inclusion and independent randomness of every party, commitment binding, share addressing, batching and round accounting, counter exhaustion, nonzero masks, and deployment refusal. The code, design record, capability matrix, and MPC skill consistently disclose that opening verification and zero rejection are centralized simulation artefacts, malicious off-commitment sharing remains undetected, no malicious-tier or deployability property is established, and external review sq-qhy4 is pending. No reviewer-directed instruction appears in the diff. With no findings in round 5 and none newly identified, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
