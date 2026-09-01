@@ -11,9 +11,10 @@
 > `refs/acct-claims/` — is **actively unsafe** in that namespace, whose load-bearing invariant is
 > that nothing in it is ever deleted (§4).
 >
-> What *is* unprotected is the assumption the above rests on: **nothing in the repo enforces that
-> `account-usage.py` stays the only body writer** (§5). That is the cheap, real piece of work here,
-> and it is a self-test, not a lock. Filed as follow-up.
+> What *is* unprotected is the assumption the above rests on: the repo has **eighteen** production
+> `gh issue edit --body` sites (§2.2) and **nothing enforces that `account-usage.py` stays the only
+> one aimed at the account catalog** (§5). That is the cheap, real piece of work here, and it is a
+> self-test, not a lock. Filed as follow-up.
 >
 > This record deliberately does **not** re-litigate `research/1051-catalog-clobber-auto-restore.md`
 > §6 (move the `limits:` line off the mutable body). #317 and #1051 §6 converge on the same place
@@ -88,20 +89,65 @@ Two corollaries worth stating explicitly, because they close the hole from the o
   and its soundness does not depend on that workflow config." The docstring is correct against the
   code; #317 is what disagrees with both.
 
-### 2.2 `account-usage.py:713` is the only `gh issue edit --body` against the account catalog in the repo.
+### 2.2 `account-usage.py:713` is the only `gh issue edit --body` against the account catalog — full census
 
-Searched across `scripts/**.py` and `.github/workflows/**.yml`. The other `issue edit ... --body`
-call sites write **`ops-alert`-labelled alert issues**, discovered by
-`gh issue list --label ops-alert`, never the account catalog:
+> **Correction (PR #2120 review round 1).** An earlier draft of this section listed only three
+> other `issue edit … --body` sites and called that the complete set. **That was wrong**: this
+> checkout has **eighteen** production body-edit call sites across fifteen scripts. The conclusion
+> below survives, but it now rests on an enumerated census rather than an under-run grep — and the
+> miss is itself the §5 argument, since nothing in the repo would have caught it.
 
-| site | target |
-|---|---|
-| `scripts/park-stock-alert.py:304` | `ALERT_LABEL = "ops-alert"` (`:56`) |
-| `scripts/ratelimit-alert.py:450` | `ALERT_LABEL = "ops-alert"` (`:59`, listing at `:419`) |
-| `scripts/plan-alert.py:314` | `ALERT_LABEL = "ops-alert"` (`:60`, listing at `:272`) |
+Census method (re-run on this checkout, `scripts/**.py` + `.github/workflows/**.yml`): every line
+matching `issue` + `edit` was read, then split into (a) production body writes, (b) label-only
+edits, (c) self-test scaffolding and comment prose. **18 production body writes**, of which **one**
+is the catalog writer:
 
-`scripts/grant-account.py:2118` is inside the **fake `gh`** its self-test drives, not a writer.
-`scripts/regate-sweep.py` and `scripts/worker-pr.py` edit labels on PRs/issues, never bodies.
+| site(s) | how the target issue is selected | target |
+|---|---|---|
+| **`account-usage.py:713`** | **unlabelled** `gh issue list --state open` (`:766`), then `title == handle` against the usage-snapshot keys (`:788-790`) | **account catalog** |
+| `park-stock-alert.py:304` | `issue list --label ALERT_LABEL` (`:280`) | `ops-alert` (`:56`) |
+| `ratelimit-alert.py:450` | `issue list --label ALERT_LABEL` (`:419`) | `ops-alert` (`:59`) |
+| `plan-alert.py:314` | `issue list --label ALERT_LABEL` (`:272`) | `ops-alert` (`:60`); the only site that also rewrites `--title` |
+| `usage-alert.py:393` | `issue list --label ALERT_LABEL` (`:381`) | `ops-alert` (`:49`) |
+| `metrics-alert.py:312` | `issue list --label ALERT_LABEL` (`:270`) | `ops-alert` (`:67`) |
+| `groom-alert.py:171` | `issue list --label ALERT_LABEL` (`:139`) | `ops-alert` (`:36`) |
+| `ledger-identity-watch.py:320` | `issue list --label ALERT_LABEL` (`:288`) | `ops-alert` (`:77`) |
+| `dispatch-stall-alert.py:537` | `issue list --label ALERT_LABEL` (`:511`) | `ops-alert` (`:77`) |
+| `groom-mint-alert.py:536` | `issue list --label ALERT_LABEL` (`:503`) | `ops-alert` (`:71`) |
+| `triage-stock-alert.py:487` | `issue list --label ALERT_LABEL` (`:463`) | `ops-alert` (`:59`) |
+| `ci-latency-alert.py:1160` | `issue list --label ALERT_LABEL` (`:1135`) | `ops-alert` (`:103`) |
+| `model-health.py:2759`, `:2778` | `_find_marker_issue` → `issue list --label ALERT_LABEL` (`:2688`, `:2716`) | `ops-alert` (`:520`) |
+| `metrics.py:1088`, `:1093` | `_find_marker_issue` → `issue list --label ALERT_LABEL` (`:1049`) | `throughput-alert` (`:98`) |
+| `pat-validity.py:614`, `:786` | `_find_alert` (`:565`) → `issues?labels=ALERT_LABEL`, then **exact-title** match (`:583-585`) | `from:agent` (`:118`) + `ALERT_TITLE`/`PROBE_ALERT_TITLE` (`:117`, `:146`) |
+
+**Not writers**, and why:
+
+- **Label-only edits** (no `--body`): `set-up-account.yml:1216`/`:1490`, `triage-issue.yml:201`,
+  `triage.py:1396`, `regate-sweep.py` (argv vocabulary pinned at `:1748-1749`),
+  `worker-pr.py:6122`/`:6128` (PRs), and `curate-frontier.py:1231-1236` — the last is the only
+  writer that **builds its argv dynamically**, and it appends only `--add-label`/`--remove-label`.
+- **Self-test scaffolding**, in two distinct shapes. Stub `gh` *parsers* that branch on the verb —
+  `grant-account.py:2118`, `triage.py:3780`, `model-health.py:6348`/`:6502`/`:6713` — are argv
+  *consumers* and a scan keyed on `issue edit … --body` will not see them. But
+  `usage-alert.py:871` is a genuine `_gh(["issue", "edit", "1", "--body", …])` call inside a
+  self-test: it is **textually indistinguishable from a writer** and any census must exclude it
+  deliberately. Comment prose also matches (`account-usage.py:645`, `:684`, `:708`, `:1703`), as
+  does one label-only argv fixture (`gh_retry.py:1197`).
+
+**What the census proves, and what it does not.** All 17 non-catalog writers reach their target
+through a **label-filtered listing** — `ops-alert`, `throughput-alert`, or `from:agent` narrowed
+further by exact title. Catalog issues are created with `--label account --label provider:$PROVIDER
+--label status:pending` (`set-up-account.yml:824-826`) and carry none of those labels, so no alert
+writer enumerates an account issue. That is disjointness by **label convention**, not by an
+enforced invariant: nothing stops an `ops-alert` label from being applied to an account issue.
+
+The **reverse** direction is weaker still and is worth stating plainly: `account-usage.py`'s own
+listing (`:766`) is **not** label-filtered. It reads every open issue and selects on
+`title == handle`. An alert issue whose title happened to equal an account handle would be written
+by `persist_limits`. Alert titles are fixed emoji-prefixed sentences (e.g. `pat-validity.py:117`)
+and handles are account names, so this is not a live hazard — but it is convention, not a check,
+and it is the reason §5's test cannot be phrased as "prove the target sets are disjoint" (see
+§5).
 
 ### 2.3 The concurrency-group names in #317 are not the ones in the file.
 
@@ -193,12 +239,30 @@ depends on them:
 - `scripts/dispatch-tick-floor.py` pins a `dispatch.yml` YAML seam to a measured bound
   (`dispatch.yml:1636`).
 
-The analogous assertion here is a **non-vacuous** self-test in `account-usage.py`: scan
-`scripts/*.py` and `.github/workflows/*.yml` in the checkout for `issue edit … --body` call sites,
-and require the account-catalog set to be exactly `{account-usage.py:_persist_one}` — with the
-`ops-alert` writers of §2.2 named as an explicit, enumerated allow-list so the assertion is not
-trivially satisfiable. Non-vacuity matters: the test must be shown to FAIL when a second writer is
-added, or it is decoration. This is the piece of work #317 should have asked for.
+The analogous assertion here is a **non-vacuous** self-test in `account-usage.py`. §2.2's census
+constrains its shape more than the earlier draft of this record assumed, in three ways:
+
+1. **It cannot classify targets statically.** Every writer picks its issue at runtime — the alert
+   writers from a label-filtered listing, `account-usage.py` from a title match against a usage
+   snapshot. "Is this site a catalog writer?" is not decidable from source text. So the assertion
+   must be a **census pin**, not a target proof: enumerate every `issue edit … --body` site and
+   require the set to equal a checked-in allow-list. A new writer then cannot land without a human
+   adding itself to the list and recording, in that entry, which issues it targets and why they
+   are not account issues. The test enforces the *review*, which is the actual missing control.
+2. **The allow-list is 17 entries, not 3.** All of §2.2's non-catalog sites must be enumerated, or
+   the test cannot pass on the pristine tree — the defect this review round caught.
+3. **It must exclude self-test scaffolding without hand-waving.** Per §2.2, a naive scan also
+   matches comment prose, a label-only argv fixture, and — the hard one — `usage-alert.py:871`, a
+   real body-edit call that exists only to drive a fake `gh`. Keying the allow-list on `file:line`
+   makes it churn-prone; keying it on `file` plus an occurrence count is coarse but stable. Either
+   is defensible; the choice belongs to the implementer, and it should be stated in the test's
+   docstring rather than left implicit.
+
+Non-vacuity is the gate, and §2.2 gives it a concrete two-sided obligation the implementer must
+demonstrate: the test **passes on the pristine tree with all 18 sites accounted for**, and **fails
+when a nineteenth `gh issue edit --body` is added** — including when it is added to
+`account-usage.py` itself. Absent both demonstrations it is decoration. This is the piece of work
+#317 should have asked for.
 
 It is a change to `scripts/`, so this doc-only record does not make it. Filed as follow-up.
 
@@ -262,3 +326,13 @@ dissolves it, not onto a lock that would serialize this writer against nothing.
 - **The §5 test is specified, not designed.** Whether it scans source text, an argv vocabulary, or
   a parsed YAML seam — and how it stays non-vacuous under refactors that rename the call site — is
   the implementer's call, and the "prove it fails" step is part of the work, not a formality.
+- **Writer/target disjointness is convention, not a proved invariant.** §2.2 shows the 17
+  non-catalog writers all select by label and that account issues carry none of those labels, and
+  that the catalog writer selects by title from an unlabelled listing. Both directions hold *by
+  current naming*; neither is enforced anywhere, and this record did not check the live repo's
+  labels. A mislabelled account issue, or an alert titled like a handle, breaks the separation
+  without breaking any test — including the one §5 proposes, which pins the writer set rather than
+  the target sets.
+- **The census is a snapshot of this checkout, and was wrong once already.** The first draft of
+  §2.2 named 3 of 18 sites. It was caught in review, not by any check — which is the §5 argument
+  restated. Re-run the census before relying on it; do not cite this table as current.
