@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6056,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "046fc56575f8713ae603aaa827a4d048bb9fa8d5",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`onSelectClass` changes `selection` before validating the new IRI, but increments `instanceRef` only after `instanceListQuery` succeeds. If a safe class request is in flight and the user next selects a class with an IRI rejected by `instanceListQuery`, the old request retains the current ticket and may later overwrite the rejection error with its rows. Those rows are then rendered under `Instances of <new class>`, silently attributing instances to the wrong class.",
+    "file": "gui/app/src/components/workbench/overview-tool.tsx",
+    "fix_hint": "Allocate/increment the instance request ticket immediately on entry to `onSelectClass`, before building or validating the query, so every new selection invalidates prior work. Add a focused interleaving test: start request A, select an unsafe class B, resolve A, and assert B retains its rejection error and never displays A's rows.",
+    "severity": "major",
+    "title": "Rejected class selection does not cancel the previous drill-down request"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The stable-revision publication race fixed in round 3 remains resolved, but round 4 still has a separate drill-down race: selecting a class whose IRI cannot safely be embedded returns before invalidating the prior instance request. A previously started request can then resolve and publish rows beneath the newly selected, rejected class, contradicting the panel's claim that drill-down results belong to the selected bubble. The focused tests cover IRI rejection and request cancellation independently, but not this real interleaving.",
+  "verdict": "request_changes"
+ }
+}
