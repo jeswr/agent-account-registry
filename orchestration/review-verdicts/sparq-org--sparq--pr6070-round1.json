@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6070,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c093169303d785b7c289019b31c35fd5f4561bad",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 1 says all three upstream branches had already been merged before the imported revision, that their content arrived wholesale, and that there is no upstream commit to port. But the same section says the upstream repository/branches were not inspected and admits that they may contain additional work. `git log -S` in sparq can establish when selected symbols first appeared locally; it cannot establish branch ancestry, complete branch contents, or absence of an unported delta. This is especially consequential for the DNS-verifier and existence-nondisclosure security branches. The record therefore overstates its evidence and does not complete the requested port-or-drop triage.",
+    "file": "research/lws-branch-port-triage.md",
+    "fix_hint": "Fetch or otherwise inspect each named `jeswr/solid-server-rs` branch and compare its merge-base/full diff against upstream revision `1e555b10`, then cite the relevant upstream commit IDs and update each verdict from that evidence. If upstream refs are unavailable, change the verdicts to HOLD/UNVERIFIED rather than DROP and remove claims that they were merged wholesale or that no code remains to port.",
+    "severity": "major",
+    "title": "DROP verdicts are not supported by the inspected evidence"
+   }
+  ],
+  "progress": null,
+  "summary": "The comment cleanups are consistent with the checked-in implementation, but the new triage record reaches its central DROP-AS-ALREADY-LANDED verdict without inspecting the upstream branches it purports to triage. Local history proves only that similarly named functionality entered sparq in the import commit; it cannot prove that each upstream branch was merged before the imported revision or that no additional branch delta remains. The document acknowledges this evidence gap, yet still states the stronger conclusion as fact and says there is nothing to port. Because that unsupported conclusion is the primary deliverable and could cause security-relevant upstream changes to be dropped, this needs correction before approval.",
+  "verdict": "request_changes"
+ }
+}
