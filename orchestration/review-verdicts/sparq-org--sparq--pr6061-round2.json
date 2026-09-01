@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6061,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7336877c6737e905e53796211b2a013df01b2d57",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. The documentation-only change accurately classifies the missing IEEE754 rounding mode as non-applicable within this repository: the Rust SPARQL path uses Num::round and round_half_to_pos_inf, with focused tests covering positive and negative ties through the helper and public numeric entry points; the Noir differential test calls the SPARQL-facing round_double implementation and pins the F&O-required negative-zero case; and the compose manifest identifies sparq_ieee754 as a pinned comparison dependency, with no in-repository round_to_integral use. The text separately and honestly records the engine's negative-zero defect, preserves the distinct directed-arithmetic follow-up, and makes no unaudited soundness or privacy claim. No correctness, security, or test-validity issue is apparent. Findings are materially unchanged from round 1, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
