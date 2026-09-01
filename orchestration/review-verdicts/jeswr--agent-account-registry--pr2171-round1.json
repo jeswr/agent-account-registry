@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2171,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5d9317b58759bc795bee5fc73aff13af10d5b838",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4 says that when no bot comment has a `sparq-park-reason` marker, Path A owns the PR and it \"needs no decision\". But `_migrate_legacy_park` does not guarantee release for that population. A recognized question-class cause is recorded and deliberately left on `review:needs-user`; a capacity cause also defers when `provable` fails, issue-side `needs:user` is not proven machine-owned, or a residual `needs:*` hold remains. Section 3 itself describes these gates. Therefore absence of the marker proves only that the legacy classifier gets the first look, not that the PR can be removed from the residual human ask. The ordered lookup can undercount the decisions it is intended to size, undermining the headline conclusion that the machine-path checks may leave zero.",
+    "file": "research/870-negated-injection-human-terminal.md",
+    "fix_hint": "Rewrite step 2 to require inspecting Path A's actual classification/result. Treat a successful capacity migration as machine-owned; treat a question-class result or any ownership/residual-hold refusal as a remaining human decision on that specific reason; and treat transient `provable` failure as deferred/unknown rather than automatically decision-free. Align the summary and upper-bound claim with those outcomes.",
+    "severity": "major",
+    "title": "Step 2 confuses Path A eligibility with proof that no human decision is needed"
+   }
+  ],
+  "progress": null,
+  "summary": "The record correctly describes the narrowed injection classifier, but its maintainer procedure overstates what absence of a park-reason marker proves. That test identifies the legacy migration entry population; it does not establish that no human decision is needed. The migration can classify a question cause while deliberately retaining the human terminal, and can also defer capacity causes on ownership/residual-hold gates. Because the document's headline recommendation and claimed upper-bound reduction rely on that procedure, this is a major operational correctness issue in the only changed file.",
+  "verdict": "request_changes"
+ }
+}
