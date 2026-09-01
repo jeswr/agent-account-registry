@@ -22,16 +22,6 @@
   },
   {
    "account": "f79434c3ffba014f",
-   "claim_id": "dff298e56c7d439aa1157c1ccd83f8da",
-   "holder": "jeswr/agent-account-registry#1663@33502618396.1",
-   "package": "groom",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1788262096,
-   "expires_at": 1788265900
-  },
-  {
-   "account": "f79434c3ffba014f",
    "claim_id": "cb03f74b710543f7bda63d4161c08fe8",
    "holder": "fix:jeswr/agent-account-registry#2072@33502647958.1",
    "package": "review-loop",
