@@ -2215,9 +2215,21 @@ def _obs_trigger_rows(items):
     loudly rather than published on the public page.
 
     [#1570] `items` is UNBOUNDED here — `_obs_capped` truncates at 20 on the way OUT, after
-    every row has been walked — and each row contributes up to 8 evidence drops, so the
+    every row has been walked — and since #2009 so is each row's `evidence` list, so the
     announcement is capped per BUILD rather than per row: a hoisted-into-the-loop counter would
-    still let N rows write 8N lines.
+    still let N rows write N lists' worth of lines.
+
+    [#2009] The evidence slice is COUNTED, then capped, in the #1868 shape its sibling arrays
+    already carry — and it is the one seam #1868 could not enumerate, because the cap is per FIRE
+    rather than per card. Both halves were silent: an alarm with 12 pieces of evidence published
+    exactly the same five links as one with five, and a `[:8]` cap on the READ truncated the list
+    before this loop, so links past the 8th were neither published NOR announced when they failed
+    the github.com pin — invisible in both directions, which is why the read cap is gone. `items`
+    was already walked whole for exactly this reason (a total taken over a truncated input cannot
+    see what the truncation hid); the evidence list now is too, and `evidence_total` counts the
+    links that SURVIVED the pin, never the raw input — a refused link is a different fact, already
+    announced on stdout by `drops`, and folding it in would put a number on the public page that no
+    rendered link can account for.
 
     [#1867] The ROW drops are announced too, which REVERSES the decision #1570 asserted (that a
     non-object fire row stays silent). The evidence drops were loud while the row CARRYING them was
@@ -2252,17 +2264,23 @@ def _obs_trigger_rows(items):
                            f"(row `rule` {_obs_text(rule, 64)!r} is not a safe token)")
             continue
         evidence = []
-        for link in (item.get("evidence") if isinstance(item.get("evidence"), list) else [])[:8]:
+        for link in item.get("evidence") if isinstance(item.get("evidence"), list) else []:
             if isinstance(link, str) and OBS_EVIDENCE_RE.fullmatch(link):
                 evidence.append(link)
             else:
                 drops.drop("a non-GitHub observability evidence link")
+        # [#2009] Published UNCONDITIONALLY beside the slice, cap hit or not, like every other
+        # `_obs_capped` total: `dashboard/app.js` turns `evidence_total > shown` into a per-row
+        # `+7 more`, and a count emitted only when it has something to say is one a mutant can
+        # silence on the quiet fire (AGENTS.md pre-flight item 8).
+        evidence, evidence_total = _obs_capped(evidence, 5)
         task = item.get("enqueued_task")
         rows.append({
             "rule": rule,
             "fired_at": _utc_iso(item.get("fired_at")),
             "summary": _obs_text(item.get("summary"), 240),
-            "evidence": evidence[:5],
+            "evidence": evidence,
+            "evidence_total": evidence_total,
             "enqueued_task": task if isinstance(task, str)
             and OBS_TOKEN_RE.fullmatch(task) else None,
         })
@@ -6383,6 +6401,10 @@ esac
             {"rule": "worker-failure-rate", "fired_at": "2025-06-15T15:01:40Z",
              "summary": "worker failure rate 67% over 3 consecutive runs",
              "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/1"],
+             # [#2009] TWO links in, one pinned: `evidence_total` counts the links that SURVIVED
+             # the github.com pin, so a total taken over the raw input reads 2 here. Nothing is
+             # truncated, and the count publishes anyway — that is the other half.
+             "evidence_total": 1,
              "enqueued_task": "heal-2a-0001"}],
         "trigger_fires_total": 1,
         "thresholds": {"workflow_failure_rate": 0.5, "defer_reason_hourly": 4,
@@ -7301,7 +7323,7 @@ esac
           ([{"class": "2a", "depth": 1, "oldest_age_minutes": None}],
            [{"rule": "quiet-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
              "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/7"],
-             "enqueued_task": None}], []))
+             "evidence_total": 1, "enqueued_task": None}], []))
     # ---- [#1867] A DROPPED FIRE ROW MUST NAME ITSELF. The evidence-LINK drops above are loud while
     # the row CARRYING them was not, so a collector that spells a rule with a space lost the whole
     # alarm — panel row, summary, every link — on a green build with the loss visible nowhere. That
@@ -7314,7 +7336,7 @@ esac
     _FIRE_ROWS = "observability trigger fire rows"
     _KEPT_FIRE = {"rule": "kept-rule", "fired_at": now - 300, "summary": "s", "evidence": []}
     _KEPT_PUBLISHED = {"rule": "kept-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
-                       "evidence": [], "enqueued_task": None}
+                       "evidence": [], "evidence_total": 0, "enqueued_task": None}
     # THE REGRESSION, in the shape the issue names. Both directions in one row: the unreadable rule
     # is announced, AND the row beside it still publishes — this is a drop diagnostic, not a new
     # fatality and not a reason to fail the panel.
@@ -7395,6 +7417,208 @@ esac
           + [_EVIDENCE_DROP] * 12
           + [_SUPPRESSED.format(8, _FIRE_ROWS, 20),
              _SUPPRESSED.format(4, "observability evidence links", 16)])
+    # ---- [#2009] THE NESTED PER-FIRE EVIDENCE SLICE IS A DISPLAY CAP TOO, AND IT IS THE ONE SEAM
+    # #1868 LEFT SILENT. Its enumeration was of the ROW arrays; the evidence links nested inside one
+    # fire were capped at 5 with no count, so an alarm carrying twelve pieces of evidence rendered
+    # exactly like one carrying five. The second half was worse: the reader truncated at `[:8]`
+    # BEFORE the github.com pin ran, so a link past the eighth was neither published NOR counted as
+    # dropped — the evidence `_ObsDropLog` could only ever see the first eight, and its total (the
+    # one number that says how much was refused) understated by everything the read cap hid.
+    # Every input SIZE and every expected string below is a literal written here: sizing the input
+    # from the 5/8 the code reads is pre-flight 2(c)'s tautology, and reading the published slice
+    # back as the expectation is 2(b)'s. The links are numbered so WHICH five survive is pinned.
+    _RUN = "https://github.com/jeswr/agent-account-registry/actions/runs/{}"
+
+    def obs_evidence(links):
+        """(published `evidence`, its `evidence_total`, the evidence warnings printed)."""
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["trigger_fires"] = [{"rule": "evidence-rule", "fired_at": now - 300,
+                                     "summary": "s", "evidence": links}]
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        fires = document["trigger_fires"]
+        row = fires[0] if isinstance(fires, list) and fires else document
+        # `.get`, not a subscript: a mutant that stops publishing the key must red THESE rows, not
+        # abort the suite under a KeyError with every check below it unrun — the
+        # crash-after-partial-run shape ObsRefusal exists for (AGENTS.md pre-flight item 4).
+        return (row.get("evidence"), row.get("evidence_total"),
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen: dropped a non-GitHub")])
+
+    check("[#2009] a fire carrying TWELVE well-formed pinned links publishes FIVE and STATES that "
+          "it collected twelve. The `[:8]` read cap reds the total at 8, a total derived from the "
+          "slice reds it at 5, and a moved display cap reds the slice",
+          obs_evidence([_RUN.format(index) for index in range(1, 13)]),
+          ([_RUN.format(1), _RUN.format(2), _RUN.format(3), _RUN.format(4), _RUN.format(5)],
+           12, []))
+    # The accept path, and the quiet fire: a count emitted only when the cap bit is the census that
+    # never zero-seals (pre-flight item 8) — the page could then no longer tell `3 of 3` from a
+    # producer that stopped sending the count. These two rows are what keep the row above and the
+    # loud row below non-vacuous: an unconditional `+N`, or a total hoisted off the raw input,
+    # reds here.
+    check("[#2009] a fire UNDER the cap publishes every link it collected and its total ANYWAY, "
+          "silently — a truncation of links this seam READ is a display contract, not the "
+          "producer/consumer mismatch the warnings announce",
+          obs_evidence([_RUN.format(21), _RUN.format(22), _RUN.format(23)]),
+          ([_RUN.format(21), _RUN.format(22), _RUN.format(23)], 3, []))
+    check("[#2009] ...and a fire carrying NO evidence at all publishes its ZERO rather than "
+          "omitting the count — 0 links collected is a reading, not an absence",
+          obs_evidence([]), ([], 0, []))
+    # THE REGRESSION the issue names, in the direction the drop log could not see. With the read cap
+    # in place the 9th..11th links never reached the pin: three warnings instead of six, and an
+    # `_ObsDropLog` total that under-reported the refusal it exists to count.
+    check("[#2009] five pinned links followed by SIX non-GitHub ones announce all SIX drops — the "
+          "read cap truncated the list before the pin, so links past the eighth were refused in "
+          "SILENCE. The total still counts only the links that SURVIVED the pin, never the input",
+          obs_evidence([_RUN.format(index) for index in range(1, 6)]
+                       + ["https://evil.example/exfil"] * 6),
+          ([_RUN.format(1), _RUN.format(2), _RUN.format(3), _RUN.format(4), _RUN.format(5)],
+           5, [_EVIDENCE_DROP] * 6))
+    # ...and THE PAGE IS WHAT THIS HAS TO DELIVER INTO (pre-flight item 11): a count published into
+    # site/data.json that no panel renders leaves the operator exactly where the issue found them.
+    # #1868's card-level `showing N of M` is the WRONG affordance for this one — the cap is nested
+    # inside ONE alarm, and a note under a stack of alarms names none of them — so the fire states
+    # its own `+7 more`. EXECUTED against dashboard/app.js under the shared DOM shim (a lexical
+    # assertion is satisfiable by a comment — the #612 round-4 lesson), collected by EXACT
+    # className, and the card-level `obs-truncated` note on the same stack is collected beside it so
+    # a `+N more` delivered by re-labelling or by consuming the #1868 affordance cannot read as a
+    # pass.
+    _OBS_EVIDENCE_PAGE_BODY = r"""
+  const byClass = (root, wanted) => {
+    const found = [];
+    const walk = (el) => {
+      if (!el) return;
+      if (el.className === wanted) found.push(flat(el).join(" ").trim());
+      for (const kid of el.children || []) walk(kid);
+    };
+    walk(root);
+    return found;
+  };
+  const notes = (root) => {
+    const found = [];
+    const walk = (el) => {
+      if (!el) return;
+      if (el.className === "obs-evidence-more") {
+        found.push([flat(el).join(" ").trim(), (el.attributes || {}).title || null]);
+      }
+      for (const kid of el.children || []) walk(kid);
+    };
+    walk(root);
+    return found;
+  };
+  const out = {};
+  for (const [name, document] of Object.entries(input.documents)) {
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      scope.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    out[name] = {
+      error,
+      fires: ids["obs-triggers"].children
+        .filter((kid) => kid.className === "obs-trigger-row")
+        .map((row) => [byClass(row, "obs-evidence"), notes(row)]),
+      panel: byClass(ids["obs-triggers"], "obs-truncated"),
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+
+    def evidence_note(hidden, plural="s are"):
+        """The `+N more` chip and its hover title, as test-side literals (pre-flight 2(b)).
+
+        The title is asserted because it carries the only other reading of the count and the ONE
+        branch the visible text has none of — the singular below is otherwise an unkillable region
+        (pre-flight item 4's equivalent survivor)."""
+        return [f"+{hidden} more",
+                f"{hidden} further evidence link{plural} pinned to this fire in the collector "
+                "snapshot than this row displays"]
+    # Real `_normalize_observability` output, so the page is handed the document this build actually
+    # publishes rather than one hand-shaped to suit the assertion. Three fires, newest first.
+    evidence_page_input = copy.deepcopy(obs_fixture)
+    evidence_page_input["trigger_fires"] = [
+        {"rule": "twelve-link-rule", "fired_at": now - 300, "summary": "twelve",
+         "evidence": [_RUN.format(index) for index in range(1, 13)]},
+        {"rule": "three-link-rule", "fired_at": now - 400, "summary": "three",
+         "evidence": [_RUN.format(21), _RUN.format(22), _RUN.format(23)]},
+        {"rule": "no-link-rule", "fired_at": now - 500, "summary": "none", "evidence": []}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        evidence_page_doc = obs_normalized(evidence_page_input)
+    # Every unusable `evidence_total` a future, tampered or pre-#2009 producer can put beside five
+    # links — a string, a boolean, a negative, a null, one EQUAL to the slice, one SMALLER than it,
+    # a fractional one, and the LEGACY row that carries no total at all. None may draw a note: an
+    # unknown total is not a truncation, and `+undefined more` is a worse lie than the silence.
+    hostile_evidence_doc = copy.deepcopy(evidence_page_doc)
+    hostile_evidence_doc["trigger_fires"] = [
+        {"rule": f"hostile-rule-{index}", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+         "evidence": [_RUN.format(1), _RUN.format(2)], "evidence_total": total,
+         "enqueued_task": None}
+        for index, total in enumerate(("12", True, -1, None, 2, 1, 7.5))]
+    hostile_evidence_doc["trigger_fires"].append(
+        {"rule": "legacy-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+         "evidence": [_RUN.format(1), _RUN.format(2)], "enqueued_task": None})
+    # The one document that separates "links this row DREW" from "entries the array holds". This
+    # generator cannot produce it — every link it publishes has already passed the pin — so
+    # `shown = links.length` is an EQUIVALENT survivor against any document it can (pre-flight item
+    # 4), and the decision is only assertable against a hand-edited page. TWO rows, because the
+    # count feeds the note through two independent paths and one row cannot red both: the first
+    # pins the ARITHMETIC (3 collected, 1 reachable, so `+2 more` rather than the `+1` of
+    # `total - links.length`), the second pins the PREDICATE (2 collected under a 3-entry array, so
+    # the note must still fire — `links.length > total` would silence it and stay green on the
+    # first row alone).
+    unreachable_evidence_doc = copy.deepcopy(evidence_page_doc)
+    unreachable_evidence_doc["trigger_fires"] = [
+        {"rule": "unreachable-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+         "evidence": [_RUN.format(1), "https://evil.example/exfil"], "evidence_total": 3,
+         "enqueued_task": None},
+        {"rule": "unreachable-rule-2", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+         "evidence": [_RUN.format(1), "https://evil.example/exfil", "https://evil.example/two"],
+         "evidence_total": 2, "enqueued_task": None}]
+    # ...beside a card-level total that matches the fires, so the empty `panel` control below is
+    # asserting the per-row affordance and not merely inheriting the three-fire total copied above.
+    unreachable_evidence_doc["trigger_fires_total"] = 2
+    evidence_page = _executed_page(
+        _page_harness("renderObservability", _OBS_EVIDENCE_PAGE_BODY),
+        {"documents": {"capped": copy.deepcopy(evidence_page_doc),
+                       "hostile": hostile_evidence_doc,
+                       "unreachable": unreachable_evidence_doc}})
+
+    def obs_evidence_page(name):
+        rendered = evidence_page.get(name)
+        return ((rendered.get("fires"), rendered.get("panel"), rendered.get("error"))
+                if isinstance(rendered, dict) else evidence_page)
+
+    check("[#2009] EXECUTED page script: the twelve-link fire draws its five links AND `+7 more`; "
+          "the three-link fire and the no-link fire draw no note at all. The card-level "
+          "`obs-truncated` note is empty on the same stack, so the per-row affordance is its own "
+          "and did not arrive by relabelling the #1868 one",
+          obs_evidence_page("capped"),
+          ([[["evidence 1", "evidence 2", "evidence 3", "evidence 4", "evidence 5"],
+             [evidence_note(7)]],
+            [["evidence 1", "evidence 2", "evidence 3"], []],
+            [[], []]], [], None))
+    check("[#2009] EXECUTED page script: an unusable `evidence_total` draws NOTHING — a string, a "
+          "boolean, a negative, a null, one equal to the links beside it, one smaller, a "
+          "FRACTIONAL one, and a legacy row carrying no total at all are each 'no truncation "
+          "known', never a fabricated `+N more`. The links themselves still render on every row",
+          obs_evidence_page("hostile"),
+          ([[["evidence 1", "evidence 2"], []]] * 8, [], None))
+    check("[#2009] EXECUTED page script: `+N more` counts the links the READER can reach, not the "
+          "entries the array holds — one anchor out of 3 collected is `+2 more`, never the `+1` of "
+          "`total - links.length`, and a row holding MORE entries than its total still states the "
+          "one link it hid rather than reading as untruncated. No document this generator produces "
+          "can tell either apart",
+          obs_evidence_page("unreachable"),
+          ([[["evidence 1"], [evidence_note(2)]],
+            [["evidence 1"], [evidence_note(1, " is")]]], [], None))
     # ---- [#1880] A FLOW STAT THE COLLECTOR SENT AND THIS BUILD CANNOT READ MUST NOT PUBLISH AS A
     # HEALTHY NUMBER. `_obs_count(...) or 0` mapped every unreadable park/sample count to 0, so
     # `parks_1h: {"needs_user": "lots", "needs_orchestrator": -3}` published `0 user · 0 orch` on
