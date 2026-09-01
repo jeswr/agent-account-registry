@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2116,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f0538283e9098a616912e57ac37c2d20a7098b46",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`alert_route_consumers` discovers consumers only by finding `ALERT_REPO` or `ALERT_TOKEN`, and the raw oracle likewise discovers only surviving `ALERT_REPO` lines. If an alerting step other than the two entries in `ALERT_ROUTE_PINNED_CONSUMERS` loses its entire env block, it vanishes from both readings. With 19 current consumers and a floor of 15, the count remains healthy; pairing, canonical-value, and exact-token checks inspect only survivors and also pass. The hermetic test explicitly proves `_key not in alert_route_consumers(...)` after whole-block deletion, but its only identity assertion is not generalized to the live estate. Consequently the comments and assertions claiming the pair check catches deletion anywhere / every live consumer are unsound, and the prior round's estate-wide deletion mutant remains reproducible outside the two newly pinned steps.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Derive the expected live alert consumers independently from the alert execution sites (for example, structurally identify steps invoking the approved alert scripts/actions), then require each such identity to appear in the route-binding map with both exact bindings. Alternatively maintain and exact-check a complete explicit consumer identity set. Add a non-crashing live-tree mutant that removes the whole env block from an unpinned consumer and show a named assertion fails with the pristine check count preserved.",
+    "severity": "major",
+    "title": "Unpinned live alert consumers can still disappear from both oracles"
+   }
+  ],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 fixes the exact-token weakness and structurally pins both workflow consumers changed by this PR, so it is materially improving. One major soundness gap remains in the broader estate-wide claim: the parsed consumer map is still derived only from the bindings being protected. Removing an entire env block from any unpinned alerting step removes it from both the parsed and textual populations, while the remaining count stays above the floor and every value/pair assertion stays green. The hermetic deletion test demonstrates that blindness but does not connect it to an independently derived inventory of live alert invocations. Thus the two changed consumers are protected, but the advertised every-consumer guard is not.",
+  "verdict": "request_changes"
+ }
+}
