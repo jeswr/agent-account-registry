@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2153,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8e7feed23b5420cf3847ddc4b83d608b910dbcd1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change remains correct and complete. The window parser enforces the exact inclusive `#<low>..#<high>` grammar, rejects malformed, padded, reversed, non-string, extra-bound, and trailing-text forms, and validates each positive integer record number against the parsed bounds before constructing its target-scoped filename. Failure paths remain closed: invalid manifests raise `AuditError`, absent or incomplete claims cannot produce revocation candidates, and the report exposes only the scope actually validated. The self-test contains positive controls for accepted fixtures and inclusive boundaries, distinct below/above refusal cases, a multi-digit no-prefix case that prevents a masked assertion, and exception-aware refusal checks. Documentation and CLI help consistently state both the new containment guarantee and the remaining freshness limitation. No reviewer-directed instruction or other prompt-injection text appears in the diff.",
+  "verdict": "approve"
+ }
+}
