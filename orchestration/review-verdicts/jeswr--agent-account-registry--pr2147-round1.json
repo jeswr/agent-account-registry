@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2147,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7bdf0783ce0706c26b51582db403afefd25f94bc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_park_call_site` collects any live `starvation_park_targets` assignment into `bound`, then independently scans all live loops in the function. `_live_nodes` only prunes locally constant-dead children; it does not preserve or compare path conditions. For example, `if repo: targets = starvation_park_targets(...)` followed by `else: for target in targets: park_starved_partition_holder(...)` is certified as `tick`, although no execution can both initialize `targets` on the first arm and enter the loop on the second (the else path fails while evaluating the iterable). This directly contradicts the new claim that a single pass reaches both operations and leaves a dead-code certification route open.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make the structural proof path-aware enough to require a compatible control-flow path from the selected assignment to the loop and call, failing closed when compatibility cannot be proved. Add an explicit refused seam row with the assignment and loop/call in opposite arms of the same conditional, plus a non-vacuity mutation showing the row flips when that compatibility guard is removed.",
+    "severity": "major",
+    "title": "Reachability scan does not prove binding and loop are co-reachable"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new traversal rejects several syntactically dead ancestors, but it does not establish the advertised property that one execution can reach the target binding and the parking loop together. The seam can still certify a batch whose binding and consumer are on mutually exclusive paths. Because this AST result is a trust-plane structural proof and the new non-vacuity battery omits that path-correlation case, the change is incomplete.",
+  "verdict": "request_changes"
+ }
+}
