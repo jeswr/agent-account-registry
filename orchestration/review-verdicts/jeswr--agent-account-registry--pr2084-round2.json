@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2084,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "02fecdca7b60a96c6421a1ced67352d369829a0e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "data/README.md already states the general contract (\"every group optional, and an optional group means omit it \u2014 a group supplied with nothing readable in it is not a group of zeros\"), which this change makes TRUE of the three flow stats as well. But the very next sentence \u2014 \"`cache` is the one that had this backwards (issue #1557)\" \u2014 is now stale: `flow.review_rounds` / `flow.parks_1h` / `flow.arm_to_merge_minutes_24h` had it backwards in exactly the same way and are being fixed here. A collector author reading only the prose could still ship `parks_1h: {}` for a quiet hour and be surprised by a drop line on every dashboard build. This stays a nit because the README explicitly names `_normalize_observability()` as the consumer-side contract and tells collector authors to build against the code, not the prose, and because the general rule above already covers the new behaviour.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Optionally amend the observability section of data/README.md so `cache` is described as the FIRST group corrected under this rule rather than the only one, adding one sentence that the three `flow` stats follow it too: omit an unmeasured stat, because a stat carrying no parseable field is dropped and named on stdout rather than published from its defaults.",
+    "severity": "nit",
+    "title": "data/README.md still frames the \"nothing readable in it is not a group of zeros\" rule as a cache-only correction"
+   },
+   {
+    "body": "AGENTS.md pre-flight item 11 asks that a drop be shown landing on the PAGE, and the seam's own convention here is to deliver the drop into the panel: the executed-page rows at 7351-7365 exercise `flow_unreadable` (a stat dropped because a field was unreadable). The new empty-stat path is asserted only at the normalizer boundary; nothing runs a `{}`-stat document through `dashboard/app.js`. Low value in practice \u2014 both paths converge on the same published `flow.<key> = None`, and the page's `if (parks)` / `if (rounds)` guards are the same branch the existing row already covers \u2014 so a new page row would assert the same rendering through the same code path. Noted only because the empty-stat case is the one this change introduces.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "If you want the coverage, normalize a fixture whose `flow.parks_1h` is `{}`, add it to the `documents` map fed to `_OBS_FLOW_STAT_PAGE_BODY`, and assert the `Parked / 1h` metric is absent from the rendered metric list while the siblings render unchanged; otherwise leave as is and rely on the existing `unreadable` page row.",
+    "severity": "nit",
+    "title": "No executed-page row for the empty-stat drop (the page rows cover only the unreadable-field path)"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2. The diff is materially the round-1 change and it remains correct and fail-closed-strengthening. Verified against the checkout at head, not just the diff.\n\nLogic (scripts/dashboard-gen.py:1995-2011): `parsed` is set only in the `else` branch AFTER the reader returns a non-None value, so (a) an absent/explicit-null field still takes its `default` silently when a sibling parses, (b) a genuine measured zero (`{\"needs_user\": 0, \"needs_orchestrator\": 0}`, `{\"p50\": None, \"samples\": 0}`) still publishes SILENTLY, preserving the census zero-row property, and (c) a stat that is present but has NO field this build could parse now hides and announces `the stat has no parsed fields` instead of publishing a full row synthesised from defaults. That fabricated row is real: `dashboard/app.js:1116-1136` renders every count through `obsNum(value, 0)`, so an empty `review_rounds` previously rendered `max 0 \u00b7 0 budget-exhausted / 1h`, and an empty `parks_1h` rendered `0 user \u00b7 0 orch` \u2014 the false-healthy panel this seam exists to prevent. Because the page guards are `if (rounds)` / `if (parks)` / `if (latency)`, `None` genuinely removes the metric.\n\nSoundness of the guard: `readable and not parsed` is mutually exclusive with the per-field drops (readable is False whenever a field dropped), so the seam still emits at most `len(fields)` drops per stat, the 8-drop bound in the cap comment at 2156-2160 stays accurate and `OBS_DROP_WARN_MAX` is still unreachable. Absent/explicit-null STAT (`source is None`) is untouched: silent hide, no drop.\n\nTest validity \u2014 not vacuous. Removing the new block reds the three `{}` rows (7177-7181) and the all-nulls row (7182-7186); making the announcement unconditional reds the silent-default rows (7169-7176, 7187-7190) and the fractional-field rows (7246-7255); dropping `readable` from the return reds the parsed-sibling rows (7206-7240); `parsed = True` at init reds the empty-stat rows. Inputs and expected strings are literal\u2026 [truncated 443 chars]",
+  "verdict": "approve"
+ }
+}
