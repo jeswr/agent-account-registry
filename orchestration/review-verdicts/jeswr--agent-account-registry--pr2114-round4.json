@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2114,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3f78961fa7a7fd159b22b9e45b47b1f7bd8c29cd",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior finding is not fixed. `if any(entry[0][0] in FLOW_WORDS for entry in lists)` checks only the first token of each `;`/`&`-delimited list. The later `commands.extend(split_on(list_tokens, \"&&\"))` can still record commands after a flow-control command that occurs later in that same list. For example, with PyYAML proven in a separate RUN, `RUN true && exit 0 && jq --version` is accepted: the list begins with `true`, splitting records `[\"jq\", \"--version\"]`, but `exit 0` terminates the shell before jq and the build remains green. `exec true` gives the same bypass. The new `deps-flow.Dockerfile` fixture uses `RUN set -eux; exit 0; jq --version`, where `exit` begins its semicolon-delimited list, so it passes even if the vulnerable post-`&&` path remains.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Reject a RUN when a flow-control word begins any command produced after splitting an and-or list at `&&`, before recording any probes from that RUN. Add non-vacuous fixtures with the other dependency genuinely proven and `RUN true && exit 0 && jq --version` plus the analogous `exec true` form, asserting rejection and that jq is named.",
+    "severity": "major",
+    "title": "Flow control after && still permits unreachable probes"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major remains unchanged: flow-control rejection still examines only the first token of each semicolon/ampersand-delimited list, before that list is split at `&&`. A later `exit` or `exec` can therefore make a recorded probe unreachable while the RUN succeeds. The added test still covers only `exit` at the start of a list, so it does not exercise the reported bypass. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
