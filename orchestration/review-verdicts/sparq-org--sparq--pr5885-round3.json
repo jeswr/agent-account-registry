@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5885,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ebadd8a415ec1cf2fa9f9d32ab650bf2ee69aedf",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-3 diff remains correct and complete. `native_summary_spoke` exactly centralizes the validity predicate used by `native_open_blockers`, including rejection of booleans and malformed or negative counts. `open_blocker_count` compares channels only when native data is valid, preserves the existing fail-closed maximum, and avoids duplicate warnings for absent or malformed summaries. The added self-tests exercise native-only and marker-only disagreement, agreement, closed markers, absent and malformed summaries, warning cardinality, and unchanged dispatch counts on the real helper path. No correctness, soundness, security, test-validity, or prompt-injection issue is apparent. Because round 2 also had no findings and this round introduces none, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
