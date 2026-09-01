@@ -2149,6 +2149,14 @@ def report_orphan_claims(args: argparse.Namespace) -> int:
 # read differs), so the day a fresh read is short-circuited for an issue the snapshot already
 # called absent, this ordering stops being safe and the suite says so.
 #
+# [#1745] The PULL listing carries the OTHER half of that same load-bearing absence, and the
+# argument above did not cover it: `_terminal_non_pr_claims` reads a pull entry missing from this
+# walk as "no open worker PR", which is the stand-down that KEEPS a PR-backed claim, so a skipped
+# worker PR row could release a claim whose PR is alive. The reap boundary now corroborates that
+# half with a read KEYED to the candidate issue (`_worker_pulls_for_issue`), whose blind spot is
+# disjoint from this walk's; the union, and the residual it does not close, are argued at that
+# call site.
+#
 # The duplicate guard stays. Under this ordering a duplicate is no longer a race, so it is evidence
 # of a genuinely inconsistent snapshot; groom mutates labels and state off this snapshot, and
 # silently collapsing two differing copies of one issue risks double-processing it.
@@ -2198,9 +2206,15 @@ def _issues(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
     return result
 
 
-def _pulls(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
+def _pull_snapshot(api: GitHubAPI, repo: str, path: str) -> dict[int, dict[str, Any]]:
+    """{number: pull} for a pull listing, with every row validated the same way.
+
+    Factored out for issue #1745 so the repo-wide open-pull walk and the per-issue keyed read
+    below share ONE validator: two copies of a guard make each copy individually unkillable
+    (AGENTS.md pre-flight item 4), and this one is what turns a malformed row into a refusal
+    the reap boundary defers on."""
     result: dict[int, dict[str, Any]] = {}
-    for pull in api.paginate(_stably_ordered(f"/repos/{repo}/pulls?state=open")):
+    for pull in api.paginate(path):
         if not isinstance(pull, dict):
             raise GroomError(f"target pull request snapshot is malformed for {repo}")
         number = pull.get("number")
@@ -2214,6 +2228,70 @@ def _pulls(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
             )
         result[number] = pull
     return result
+
+
+def _pulls(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
+    return _pull_snapshot(
+        api, repo, _stably_ordered(f"/repos/{repo}/pulls?state=open")
+    )
+
+
+def _worker_pulls_for_issue(
+    api: GitHubAPI, repo: str, issue: int
+) -> dict[int, dict[str, Any]]:
+    """[#1745] Open PRs in ``repo`` whose head is a worker branch for ``issue``, read WITHOUT
+    walking the repo-wide open-pull listing.
+
+    #509's reap boundary proves its ISSUE half off a direct per-issue read; this is the same
+    shape for its PR half, because "no open worker PR" was otherwise proven off the page-walked
+    `_pulls` listing whose residual skip (STABLE_LISTING_ORDER: a row removed mid-walk pulls
+    later rows forward) can silently drop one still-open row at a page boundary.
+
+    Two KEYED reads, neither a walk over a population that can shift under the cursor:
+
+      * every ``sparq-agent/issue-<issue>-*`` head ref, via an exact-prefix `matching-refs` read.
+        The trailing hyphen is load-bearing — it is what stops `issue-7-` matching `issue-70-`.
+      * the open PRs from each of those heads (`?head=<owner>:<branch>`), which is at most one
+        per base branch. The head value is fully percent-encoded: a ref name is not restricted
+        to the worker's own `[A-Za-z0-9._-]` alphabet, and an unencoded `&` would smuggle a
+        second query parameter into a trust-surface read.
+
+    Rows come back RAW and unfiltered by identity. The caller merges them into the boundary's
+    pull view so `_current_links` applies the ONE worker-PR identity gate (App author, same-repo
+    head, worker body marker) and keys them by the branch-encoded issue; a second copy of that
+    gate here would make both individually unkillable. Over-inclusion is therefore harmless and
+    under-inclusion is what matters — so an unreadable answer RAISES, exactly like the listing
+    read it corroborates, and the caller defers the reap rather than confirming it.
+
+    Who can write what this reads (AGENTS.md pre-flight item 5): anyone who can push to the target
+    repo can create a worker-SHAPED ref, and anyone can open a PR from one. Neither buys anything
+    a release depends on — every row found here can only ADD linkage, whose effect is the reap
+    stand-down, so the worst a forged ref achieves is DELAYING a reap by one tick, exactly as it
+    already could through the repo-wide listing. Nothing here can cause a release."""
+    prefix = f"sparq-agent/issue-{issue}-"
+    encoded = WORKER_BRANCH.match(prefix)
+    if encoded is None or int(encoded.group("issue")) != issue:
+        # The search prefix is a literal restatement of WORKER_BRANCH's own; checking it against
+        # the compiled pattern at runtime is what stops the two drifting silently. If the branch
+        # grammar moves, this refuses (and the reap defers) instead of searching for nothing.
+        raise GroomError(
+            f"worker head prefix for {repo}#{issue} does not match the worker branch grammar"
+        )
+    owner = repo.split("/")[0]
+    found: dict[int, dict[str, Any]] = {}
+    for ref in api.paginate(f"/repos/{repo}/git/matching-refs/heads/{prefix}"):
+        name = ref.get("ref") if isinstance(ref, dict) else None
+        if not isinstance(name, str) or not name.startswith("refs/heads/"):
+            raise GroomError(f"worker head ref listing is malformed for {repo}#{issue}")
+        branch = name[len("refs/heads/"):]
+        match = WORKER_BRANCH.match(branch)
+        if match is None or int(match.group("issue")) != issue:
+            continue  # not a worker head for THIS issue: it cannot carry this issue's worker PR
+        head = quote(f"{owner}:{branch}", safe="")
+        found.update(
+            _pull_snapshot(api, repo, f"/repos/{repo}/pulls?state=open&head={head}")
+        )
+    return found
 
 
 # [#1624] ONE clean re-read before an inconsistent snapshot costs a repo its whole sweep cycle.
@@ -3552,7 +3630,10 @@ def _terminal_non_pr_claims(
     down because dispatch-claim owns the stricter head/latch coherence proof for that PR.  With
     no such PR, a ``needs:*`` issue is terminally parked and an issue absent from the open-issue
     snapshot is orphaned, so either claim can be reaped without trusting a split PR snapshot.
-    Revalidation immediately before the CAS release repeats this predicate on fresh target reads.
+    Revalidation immediately before the CAS release repeats this predicate on fresh target reads:
+    a DIRECT per-issue read for the issue half, and (issue #1745) the UNION of the fresh open-pull
+    listing with a per-candidate keyed head read for the ``pulls`` half, because a page-walked
+    listing alone cannot prove the ABSENCE this predicate stands down on.
     """
     links = {
         repo: _current_links(repo, pulls.get(repo, {}), bot_login)
@@ -4148,6 +4229,26 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         # `{}` — "no worker PR" — so an unread listing would CONFIRM a release it never proved.
         # The repo's candidates are withdrawn and their leases RETAINED instead, and every other
         # repo's reap, and every run-proven dead claim, still reclaims this tick.
+        #
+        # [#1745] This listing is NO LONGER the sole PR-half witness, because it cannot be one: it
+        # is the same oldest-first page walk whose residual skip #1121 pinned on the issue half (a
+        # row removed mid-walk pulls later rows forward, so one still-open row can be dropped at a
+        # page boundary), and a dropped worker PR reads here as "no worker PR" — the stand-down
+        # that would otherwise have KEPT the claim. That skip is undetectable from the listing
+        # alone under `asc`, so no amount of strictness in `_pulls` can close it; only a read
+        # keyed to the candidate can. Each surviving candidate therefore also gets
+        # `_worker_pulls_for_issue` below, and what is merged into this view is the UNION.
+        #
+        # The two witnesses are kept BOTH because their blind spots are disjoint, so a reap now
+        # requires both to be silent at once:
+        #   * the walk can drop a row at a page boundary, but it sees a PR whose head branch was
+        #     deleted while the PR stayed open (the PR record keeps `head.ref`);
+        #   * the keyed read cannot be page-skipped (an exact ref prefix, at most one open PR per
+        #     head+base), but it enumerates heads from `matching-refs`, so it cannot see a PR
+        #     whose head ref is gone.
+        # The honest residual, stated rather than hidden: a PR that is BOTH dropped by the walk
+        # and missing its head ref in the same tick is still invisible here, and its terminally
+        # parked, run-proven-dead claim would still be reaped.
         current_pulls: dict[str, dict[int, dict[str, Any]]] = {}
         for repo in sorted({parse_holder(lease["holder"]).repo for lease in candidate_leases}):
             try:
@@ -4185,6 +4286,26 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                     f"ALERT lease claim={lease['claim_id'][:8]}: {exc} — terminal reap "
                     f"revalidation deferred for {holder.repo}#{holder.issue}; the lease is "
                     "RETAINED (an unread issue must never confirm a release)"
+                )
+                reap_deferrals.append(f"{holder.repo}#{holder.issue}: {exc}")
+                unproven_claims.add(lease["claim_id"])
+                continue
+            # [#1745] The PR half, keyed to THIS candidate — see the union argument above. Read
+            # after the fresh issue read so a claim already disqualified by a refused issue read
+            # never spends these requests, and merged into the repo's view so the confirmation
+            # below still asks the ONE predicate. Bounded by MAX_TERMINAL_REAPS_PER_TICK
+            # candidates x (1 ref read + 1 read per matching head), and only on a reaping tick.
+            try:
+                current_pulls[holder.repo].update(
+                    _worker_pulls_for_issue(
+                        groomable[holder.repo], holder.repo, holder.issue
+                    )
+                )
+            except GroomError as exc:
+                print(
+                    f"ALERT lease claim={lease['claim_id'][:8]}: {exc} — terminal reap "
+                    f"revalidation deferred for {holder.repo}#{holder.issue}; the lease is "
+                    "RETAINED (an unread worker head cannot prove the ABSENCE of a worker PR)"
                 )
                 reap_deferrals.append(f"{holder.repo}#{holder.issue}: {exc}")
                 unproven_claims.add(lease["claim_id"])
@@ -6865,6 +6986,97 @@ def _self_test() -> int:
           _terminal_non_pr_claims(
               terminal_issue, {"owner/repo": backed_pull}, [base], "app[bot]"),
           set())
+
+    # ---- #1745: _worker_pulls_for_issue, the KEYED PR-half read ------------------------------
+    # The reap boundary's end-to-end legs live with the sweep fixtures below; these pin the
+    # reader's own three refusals and its one filter, none of which the sweep can reach.
+    class _RefListingAPI:
+        """Paginated pages by path, recording every path it is asked for."""
+
+        def __init__(self, pages: dict[str, list[Any]]) -> None:
+            self.pages = pages
+            self.paths: list[str] = []
+
+        def paginate(self, path: str) -> list[Any]:
+            self.paths.append(path)
+            return list(self.pages.get(path, []))
+
+    keyed_refs = "/repos/owner/repo/git/matching-refs/heads/sparq-agent/issue-7-"
+    keyed_head = "/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-7-92-1"
+    retry_head = "/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-7-94-2"
+    other_head = "/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-70-93-1"
+
+    def _keyed_pull(number: int, branch: str) -> dict[str, Any]:
+        return {**backed_pull[92], "number": number,
+                "head": {"ref": branch, "repo": {"full_name": "owner/repo"}}}
+
+    # A `refs/heads/main` row and an issue-**70** row alongside the two real ones. The prefix read
+    # cannot return either (that is what the trailing hyphen buys), so this is the belt-and-braces
+    # re-derivation of the issue from the BRANCH: dropping it makes the reader spend a request on
+    # #70's head and merge its PR into #7's view, and both halves of that red below. The SECOND
+    # issue-7 head is a re-dispatched attempt's leftover branch: every matching head is read and
+    # its PRs accumulated, so an early return (or an assignment in place of the merge) reds too.
+    keyed_api = _RefListingAPI({
+        keyed_refs: [
+            {"ref": "refs/heads/main", "object": {"sha": "a" * 40}},
+            {"ref": "refs/heads/sparq-agent/issue-7-92-1", "object": {"sha": "b" * 40}},
+            {"ref": "refs/heads/sparq-agent/issue-70-93-1", "object": {"sha": "c" * 40}},
+            {"ref": "refs/heads/sparq-agent/issue-7-94-2", "object": {"sha": "d" * 40}},
+        ],
+        keyed_head: [backed_pull[92]],
+        retry_head: [_keyed_pull(94, "sparq-agent/issue-7-94-2")],
+        other_head: [_keyed_pull(93, "sparq-agent/issue-70-93-1")],
+    })
+
+    def _keyed_read(api: Any, issue: int = 7) -> Any:
+        # TOTAL: any exception is reported as a value (AGENTS.md item 4), so a mutant that makes
+        # the reader raise cannot abort the suite and score itself a kill. Measured: deleting the
+        # trailing hyphen from the search prefix trips the grammar cross-check, and without this
+        # the raise took the suite down at check 185 of 593 instead of reddening a row.
+        try:
+            return _worker_pulls_for_issue(api, "owner/repo", issue)
+        except GroomError as exc:
+            return str(exc)
+        except Exception as exc:  # noqa: BLE001
+            return f"raised {type(exc).__name__}"
+
+    check(
+        "#1745: the keyed read returns EVERY open worker PR for the issue, asks the EXACT "
+        "hyphen-terminated ref prefix and percent-encoded head paths, and never reads a head "
+        "belonging to another issue",
+        (_keyed_read(keyed_api), keyed_api.paths),
+        ({92: backed_pull[92], 94: _keyed_pull(94, "sparq-agent/issue-7-94-2")},
+         [keyed_refs, keyed_head, retry_head]),
+    )
+
+    def _keyed_refusal(pages: dict[str, list[Any]], issue: int = 7) -> Any:
+        return _keyed_read(_RefListingAPI(pages), issue)
+
+    keyed_ref_row = {"ref": "refs/heads/sparq-agent/issue-7-92-1"}
+    check(
+        "#1745: the keyed read FAILS CLOSED — a malformed ref row, a ref outside refs/heads/, "
+        "and an issue number the worker-branch grammar cannot express all REFUSE, and so does a "
+        "malformed PR row (the keyed head query goes through the SAME `_pull_snapshot` validator "
+        "as the repo-wide walk); a clean empty listing is the only way to answer 'no worker PR'",
+        (
+            _keyed_refusal({keyed_refs: ["refs/heads/sparq-agent/issue-7-92-1"]}),
+            _keyed_refusal({keyed_refs: [{"object": {"sha": "d" * 40}}]}),
+            _keyed_refusal({keyed_refs: [{"ref": "refs/tags/sparq-agent/issue-7-92-1"}]}),
+            _keyed_refusal({}, issue=0),
+            _keyed_refusal({keyed_refs: [keyed_ref_row], keyed_head: ["not-a-pull"]}),
+            _keyed_refusal({keyed_refs: [keyed_ref_row], keyed_head: [{"number": 0}]}),
+            _keyed_refusal({}),
+        ),
+        (
+            "worker head ref listing is malformed for owner/repo#7",
+            "worker head ref listing is malformed for owner/repo#7",
+            "worker head ref listing is malformed for owner/repo#7",
+            "worker head prefix for owner/repo#0 does not match the worker branch grammar",
+            "target pull request snapshot is malformed for owner/repo",
+            "target pull request number is malformed for owner/repo",
+            {},
+        ),
+    )
     check("#509 live nonterminal issue-only claim remains",
           _terminal_non_pr_claims(
               {"owner/repo": {7: {
@@ -8629,6 +8841,158 @@ def _self_test() -> int:
             ((0, [set()]), (1, [{race_claim}]), (1, [{race_claim}])),
         )
 
+        # The refusal envelope every scenario below builds its GroomError from — GitHub's own
+        # 403 body, replayed through the LIVE GitHubAPI.request (`_live_http_failure`) so no
+        # assertion here compares against a string this file wrote by hand.
+        forbidden_envelope = (
+            '{"message":"Resource not accessible by integration","documentation_url":'
+            '"https://docs.github.com/rest/issues/labels#add-labels-to-an-issue","status":"403"}'
+        )
+
+        # ---- #1745: the PR half of the boundary is proven PER CANDIDATE, not off the walk ------
+        #
+        # #1121 (above) closed the ISSUE half of the same paging residual. The PR half read "no
+        # open worker PR" off the very same oldest-first walk, and `_terminal_non_pr_claims` reads
+        # a missing pull entry as exactly that — the stand-down that KEEPS a PR-backed claim. So a
+        # row the walk skipped at a page boundary could release a claim whose worker PR is alive.
+        #
+        # Every leg shares ONE lease, an EMPTY fresh pull listing (the skip) and an ABSENT fresh
+        # issue (so the issue half always confirms and only the PR half decides), and differs only
+        # in what the KEYED reads answer:
+        #   (a) ref + open worker PR from that head       -> RETAIN. Deleting the keyed read, or
+        #       ignoring its result, reds only this leg — it is the whole point of the issue.
+        #   (b) NO ref at all                             -> RELEASE. Retention is not universal,
+        #       so (a) cannot be satisfied by simply never reaping.
+        #   (c) ref exists, no open PR from it            -> RELEASE. A leftover branch is not a
+        #       PR; the over-conservative shape (treat any matching ref as PR-backed) would
+        #       strand every reap behind an undeleted branch and reds here.
+        #   (d) ref + an OUTSIDER-authored PR from it     -> RELEASE. The keyed rows go through
+        #       `_current_links`' worker-PR identity gate like every other row; a second copy of
+        #       that gate inside the reader, or none at all, reds here.
+        #   (e)/(f) either keyed read REFUSED             -> RETAIN, loudly, and counted as a
+        #       deferral. An unread head cannot prove a PR's ABSENCE any more than an unread
+        #       issue can, so the fail direction is the reap loop's, not record-and-continue.
+        # (a) also pins the two request paths EXACTLY (item 6): the trailing hyphen that stops
+        # `issue-7-` matching `issue-70-`, and the percent-encoded `head=` value.
+        worker_refs_path = "/repos/owner/repo/git/matching-refs/heads/sparq-agent/issue-7-"
+        worker_head_path = (
+            "/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-7-900-1"
+        )
+        worker_ref_row = {
+            "ref": "refs/heads/sparq-agent/issue-7-900-1",
+            "object": {"sha": "c" * 40, "type": "commit"},
+        }
+        skipped_pull = {
+            "number": 900,
+            "state": "open",
+            "updated_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat(),
+            "head": {"ref": "sparq-agent/issue-7-900-1",
+                     "repo": {"full_name": "owner/repo"}},
+            "user": {"login": "app[bot]"},
+            "body": WORKER_PR_MARKER + "\n\nFixes #7",
+        }
+
+        # The COMPANION candidate for the refusal legs: same repo, a different issue, and nothing
+        # in `pages` for its keyed reads, so it revalidates cleanly and reclaims. It is what keeps
+        # (e)/(f) about a SCOPED deferral — with the refused claim alone the whole batch fails,
+        # run_sweep's "every revalidation failed" precedence raises, and the assertion could no
+        # longer tell a scoped retention from a systemic abort.
+        companion_claim = "9" * 32
+        companion_lease = {
+            **base, "claim_id": companion_claim, "holder": "owner/repo#8@778.1",
+            "issued_at": 1, "expires_at": 2,
+        }
+
+        def _pr_half(
+            pages: dict[str, Any], refusals: dict[str, GroomError] | None = None,
+            extra: tuple[dict[str, Any], ...] = (),
+        ) -> tuple[Any, list[set[str]], list[str], str]:
+            terminal_sweep_leases[:] = [dict(skipped_lease), *(dict(x) for x in extra)]
+            saved_pages = terminal_sweep_env.get("pages")
+            saved_failures = terminal_sweep_env.get("paginate_failures")
+            first_read = len(terminal_sweep_env.get("paginated", []))
+            terminal_sweep_env.update(
+                planned_issues=[], fresh_issues={}, pulls=[], writes=[],
+                pages=dict(pages), paginate_failures=dict(refusals or {}),
+            )
+            terminal_sweep_releases.clear()
+            pr_half_log = io.StringIO()
+            saved_pr_half_stdout = sys.stdout
+            sys.stdout = pr_half_log
+            try:
+                # TOTAL: any exception is reported as a value, so a mutant that makes the sweep
+                # blow up cannot abort the suite and score itself a kill (AGENTS.md item 4).
+                try:
+                    summary: Any = _terminal_sweep()[0]
+                except Exception as exc:  # noqa: BLE001
+                    summary = f"raised {type(exc).__name__}"
+            finally:
+                sys.stdout = saved_pr_half_stdout
+                terminal_sweep_env["pages"] = saved_pages if saved_pages else {}
+                terminal_sweep_env["paginate_failures"] = (
+                    saved_failures if saved_failures else {}
+                )
+            keyed = [
+                path for path in terminal_sweep_env["paginated"][first_read:]
+                if "matching-refs" in path or "head=" in path
+            ]
+            return (summary, list(terminal_sweep_releases), keyed,
+                    pr_half_log.getvalue())
+
+        backed = _pr_half({worker_refs_path: [worker_ref_row],
+                           worker_head_path: [skipped_pull]})
+        no_ref = _pr_half({})
+        leftover = _pr_half({worker_refs_path: [worker_ref_row], worker_head_path: []})
+        outsider = _pr_half({
+            worker_refs_path: [worker_ref_row],
+            worker_head_path: [{**skipped_pull, "user": {"login": "outsider"}}],
+        })
+        check(
+            "#1745: a worker PR the pull page walk SKIPPED is still found by the per-candidate "
+            "KEYED read and RETAINS its claim (a), while no ref (b), a leftover ref with no open "
+            "PR (c), and an OUTSIDER-authored PR from that ref (d) are all still reaped — and (a) "
+            "issued exactly the prefixed ref read and the percent-encoded head read",
+            (backed[:3], no_ref[:2], leftover[:2], outsider[:2]),
+            (
+                (0, [set()], [worker_refs_path, worker_head_path]),
+                (1, [{race_claim}]),
+                (1, [{race_claim}]),
+                (1, [{race_claim}]),
+            ),
+        )
+        refs_refused = _pr_half(
+            {worker_refs_path: [worker_ref_row], worker_head_path: [skipped_pull]},
+            {worker_refs_path: _live_http_failure(
+                "GET", worker_refs_path, forbidden_envelope)},
+            extra=(companion_lease,),
+        )
+        head_refused = _pr_half(
+            {worker_refs_path: [worker_ref_row], worker_head_path: [skipped_pull]},
+            {worker_head_path: _live_http_failure(
+                "GET", worker_head_path, forbidden_envelope)},
+            extra=(companion_lease,),
+        )
+        check(
+            "#1745: a REFUSED keyed read — the ref listing (e) or the head query (f) — RETAINS "
+            "that claim's lease while the readable claim in the SAME batch still reclaims, names "
+            "the claim and the target, and counts as a deferral. Swallowing either refusal reads "
+            "as 'no worker PR' and releases on a read that never returned.",
+            (
+                (refs_refused[0], refs_refused[1]),
+                f"ALERT lease claim={race_claim[:8]}:" in refs_refused[3],
+                "cannot prove the ABSENCE of a worker PR" in refs_refused[3],
+                "Resource not accessible by integration" in refs_refused[3],
+                "reap_deferred=1" in refs_refused[3],
+                (head_refused[0], head_refused[1]),
+                "terminal reap revalidation deferred for owner/repo#7" in head_refused[3],
+                "reap_deferred=1" in head_refused[3],
+            ),
+            (
+                (1, [{companion_claim}]), True, True, True, True,
+                (1, [{companion_claim}]), True, True,
+            ),
+        )
+
         terminal_sweep_leases[:] = [
             {
                 **base,
@@ -8857,10 +9221,6 @@ def _self_test() -> int:
         # whose later phases include reclaim. Both loops are driven END-TO-END through the real
         # run_sweep here, with the LOWEST-numbered object refused (the head-of-line position that
         # made #644 permanent), and each scenario is checked in both precedence directions.
-        forbidden_envelope = (
-            '{"message":"Resource not accessible by integration","documentation_url":'
-            '"https://docs.github.com/rest/issues/labels#add-labels-to-an-issue","status":"403"}'
-        )
 
         def _stale_worker_pr(number: int) -> dict[str, Any]:
             """A non-draft worker PR wedged in a bad merge state: a park (hand-off) candidate."""
@@ -11369,7 +11729,9 @@ def _self_test() -> int:
                 "(AGENTS.md item 8 — a counter that only appears when non-zero trains its reader "
                 "to read absence as health). Without this pair the checks above would pass "
                 "against a sweep that simply re-reads every listing twice — the same reaping "
-                "tick issues ONE issue listing per repo and TWO pull listings, not three",
+                "tick issues ONE issue listing per repo and TWO reads of the repo-wide open-pull "
+                "path, not three (#1745's per-candidate keyed head reads are a different path "
+                "and are deliberately outside this count)",
                 (
                     "snapshot_rereads=0" in quiet_log,
                     (_issue_reads("owner/repo"), _issue_reads("owner/other")),
