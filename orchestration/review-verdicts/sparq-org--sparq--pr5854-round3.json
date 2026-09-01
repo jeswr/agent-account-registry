@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5854,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5e0069a213f0c533eec1d1e6e2d016b7a146a0f5",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The three contributor-facing install hints pin wasm-pack to 0.15.0, matching the gating js workflow's exact v0.15.0 action input. The guardrail extracts that workflow pin rather than duplicating it, checks every changed hint site, and the complete 10-test suite passes, including anti-vacuity and mutation tests. No correctness, soundness, test-validity, or security issue was found. Round 3 remains clean with no findings, so progress is stagnant relative to round 2 under the required scale.",
+  "verdict": "approve"
+ }
+}
