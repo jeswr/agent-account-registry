@@ -11,26 +11,6 @@
    "expires_at": 1788242582
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "6243e767d71040ae9f4404ec3d6a8c89",
-   "holder": "review:sparq-org/sparq#5856@33470262416.1",
-   "package": "ci",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1788237210,
-   "expires_at": 1788241410
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "621869f8a93b4f45a13fd989b74f43ad",
-   "holder": "review:sparq-org/sparq#6095@33470317837.1",
-   "package": "ci",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1788237265,
-   "expires_at": 1788241465
-  },
-  {
    "account": "f79434c3ffba014f",
    "claim_id": "0d1d68d7b17f448e9e319760679ae0da",
    "holder": "fix:sparq-org/sparq#6031@33472913086.1",
