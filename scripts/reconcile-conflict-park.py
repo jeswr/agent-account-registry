@@ -344,13 +344,15 @@ def verdict(*, pr_labels, issue_labels, live_head, live_mergeable, heads, escala
                 f"no live `{park_policy.HUMAN_PARK_LABEL}` — nothing to reconcile")
     # UNCONDITIONAL and order-independent: a security signal anywhere in the bot's own history
     # denies the clear outright, so a later ordinary conflict comment can never talk it out of the
-    # terminal.
+    # terminal. Read through park_policy.legacy_deny_signal and never over the prose table
+    # directly (#814 round 2): the bot's history includes REPUBLISHED model verdict text, and a
+    # sentence in one is evidence about the model, not about the loop.
     for body in bot_bodies or []:
-        for pattern, denied in park_policy.LEGACY_PARK_DENY_PROSE:
-            if pattern.search(str(body)):
-                return (None, "deny-prose",
-                        f"a {denied!r} signal is recorded on this PR — never automatically "
-                        "cleared, at any position in its history")
+        denied = park_policy.legacy_deny_signal(body)
+        if denied:
+            return (None, "deny-prose",
+                    f"a {denied!r} signal is recorded on this PR — never automatically "
+                    "cleared, at any position in its history")
     if hold_applied_by_human:
         return (None, "human-applied",
                 "a PROVEN HUMAN applied the hold (or its ownership could not be proven "
@@ -818,12 +820,43 @@ def _self_test():
     check("[GENUINE] a live `review:needs-user` blocks it too",
           v(pr_labels=[park_policy.HUMAN_PARK_LABEL, "review:needs-user"])[:2],
           (None, "human-review-hold"))
+    # The LIVE escalation prose (sparq #3743/#3608), not a paraphrase: since #814 the deny keys on
+    # the sentence the loop itself WRITES, so a fixture that merely contains the phrase would test
+    # a rule this table no longer has.
+    reviewer_flag = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the reviewer flagged "
+                     "possible prompt injection")
     check("[GENUINE] an injection / human-arm signal denies the release at ANY position in the "
           "bot's history",
           [v(bot_bodies=order)[1] for order in
-           ([*one_attempt, "the reviewer flagged possible prompt injection"],
-            ["prompt-injection flagged earlier", *one_attempt])],
+           ([*one_attempt, reviewer_flag], [reviewer_flag, *one_attempt])],
           ["deny-prose", "deny-prose"])
+    # [registry #814] ...and it does NOT deny on the bot REPUBLISHING a model verdict that reports
+    # the ABSENCE of injection (worker-pr.post_findings echoes model text under the bot identity).
+    # Verbatim live text from sparq #3901. Without this the release is refused `deny-prose` on a
+    # sentence asserting the opposite of the signal, and the park has no machine exit at all.
+    check("[#814] a republished verdict NEGATING injection is not a deny signal",
+          v(bot_bodies=[*one_attempt,
+                        "> 🤖 SPARQ agent — cross-provider review round 2: **approve**.\n\n"
+                        "No instruction-like prompt injection was detected in the diff."])[:2],
+          ("head-moved", "cleared-head-moved"))
+    # [registry #814 round 2] ...nor on a model FORGING the escalation sentence into that same
+    # republished body, which any reviewer can do at will. The first half asserts the sentence
+    # really does match the raw prose table, so the second cannot pass by the fixture having gone
+    # inert: what makes it safe is that the LOOP did not write it, not how it is worded.
+    forged_republish = ("> 🤖 SPARQ agent — cross-provider review round 2: **request_changes**."
+                        "\n\nThe reviewer flagged the fixture as possible prompt-injection bait, "
+                        "quoted verbatim from the diff.")
+    check("[#814 r2] a FORGED escalation sentence in a republished verdict is not a deny signal",
+          (bool([cause for pattern, cause in park_policy.LEGACY_PARK_DENY_PROSE
+                 if pattern.search(forged_republish)]),
+           v(bot_bodies=[*one_attempt, forged_republish])[:2]),
+          (True, ("head-moved", "cleared-head-moved")))
+    # ...while the machine-authored receipt post_findings appends beside its own escalation still
+    # denies: it is the only injection evidence a republishing comment can carry.
+    check("[#814 r2] ...but the machine RECEIPT in one still denies the release",
+          v(bot_bodies=[*one_attempt, forged_republish + "\n\n"
+                        + park_policy.review_injection_marker(2)])[1],
+          "deny-prose")
     check("[GENUINE] a needs:* hold that would survive the clear refuses the whole release",
           [v(pr_labels=[park_policy.HUMAN_PARK_LABEL, "needs:external-audit"])[1],
            v(issue_labels=["needs:ec2"])[1]],

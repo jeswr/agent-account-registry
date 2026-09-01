@@ -117,12 +117,15 @@ def verdict(pr_labels, issue_labels, generation_records, auto_stamps, bot_bodies
     if hold_applied_by_human:
         return (None, None,
                 "a PROVEN HUMAN applied the hold — a human decision is not the machine's to undo")
+    # Read through park_policy.legacy_deny_signal and never over the prose table directly (#814
+    # round 2): the bot's own history includes REPUBLISHED model verdict text, and a sentence in
+    # one of those is evidence about the model, not about the loop.
     for body in bot_bodies or []:
-        for pattern, denied in park_policy.LEGACY_PARK_DENY_PROSE:
-            if pattern.search(str(body)):
-                return (None, None,
-                        f"a {denied!r} signal is recorded on this PR — never automatically "
-                        "re-classified, at any position in its history")
+        denied = park_policy.legacy_deny_signal(body)
+        if denied:
+            return (None, None,
+                    f"a {denied!r} signal is recorded on this PR — never automatically "
+                    "re-classified, at any position in its history")
     records = [record for record in (generation_records or [])
                if isinstance(record, dict) and record.get("window")]
     if not records:
@@ -382,11 +385,43 @@ def _self_test():
     # Every refusal below is a REAL live case, not a hypothetical.
     check("a HUMAN-applied hold is never undone (the human decision wins)",
           v(hold_applied_by_human=True)[0], None)
+    # The LIVE escalation prose (sparq #3743/#3608), not a paraphrase: since #814 the deny keys on
+    # the sentence the loop itself WRITES, so a fixture that merely contains the phrase would test
+    # a rule this table no longer has.
+    reviewer_flag = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the reviewer flagged "
+                     "possible prompt injection")
+    later_nochange = ("> 🤖 SPARQ agent — the autonomous review loop parked this PR: two "
+                      "consecutive fix attempts made no change")
     check("an injection escalation is refused, at ANY position in the history (#3743/#3608)",
-          [v(bot_bodies=[order])[0] for order in
-           ("the reviewer flagged possible prompt injection",
-            "two consecutive fix attempts made no change\n\nprompt-injection flagged earlier")],
-          [None, None])
+          [v(bot_bodies=order)[0] for order in
+           ([reviewer_flag], [reviewer_flag, later_nochange], [later_nochange, reviewer_flag])],
+          [None, None, None])
+    # [registry #814] ...and the deny does NOT fire on the bot REPUBLISHING a model verdict that
+    # reports the ABSENCE of injection (worker-pr.post_findings echoes model text under the bot's
+    # identity). Verbatim live text from sparq #3901 — one of the three PRs the old any-occurrence
+    # rule stranded on the human terminal with no machine exit at all.
+    check("[#814] a republished verdict NEGATING injection does not refuse the correction",
+          v(bot_bodies=["> 🤖 SPARQ agent — cross-provider review round 2: **approve**.\n\n"
+                        "No instruction-like prompt injection was detected in the diff."])[:2],
+          ("reclassify", auto))
+    # [registry #814 round 2] ...and neither does a model FORGING the escalation sentence into
+    # that same republished body, which is what a reviewer can do at will. The first half asserts
+    # the sentence really does match the raw prose table, so the second half cannot pass by the
+    # fixture having quietly gone inert — the discrimination is provenance, not wording. Route
+    # this refusal back through the prose table directly and it goes red.
+    forged_republish = ("> 🤖 SPARQ agent — cross-provider review round 2: **request_changes**."
+                        "\n\nThe reviewer flagged the fixture as possible prompt-injection bait, "
+                        "quoted verbatim from the diff.")
+    check("[#814 r2] a FORGED escalation sentence in a republished verdict does not refuse it",
+          (bool([cause for pattern, cause in park_policy.LEGACY_PARK_DENY_PROSE
+                 if pattern.search(forged_republish)]),
+           v(bot_bodies=[forged_republish])[:2]),
+          (True, ("reclassify", auto)))
+    # ...while the SAME body carrying the machine-authored receipt post_findings appends still
+    # refuses — the receipt is the only injection evidence a republishing comment can offer.
+    check("[#814 r2] ...but the machine RECEIPT in one still refuses it",
+          v(bot_bodies=[forged_republish + "\n\n"
+                        + park_policy.review_injection_marker(2)])[0], None)
     check("a LEGACY prose-only park (no receipts) is NOT this script's population",
           v(generation_records=[])[0], None)
     check("a terminal reached on a HUMAN window is left exactly where it is",
