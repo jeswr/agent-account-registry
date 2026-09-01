@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5682,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "198d1c04791776a6c2d46ceef380ad8ca49c28eb",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 6 remains correct and complete on the supplied diff. All five affected workflow trigger lists preserve `labeled`, explicitly exclude `unlabeled`, and retain the default pull-request events. The asymmetric behavior is fail-toward-more: applying a full-work label immediately widens execution, while removing one leaves the previously wider result standing only until another subscribed event re-evaluates the current labels. The comments and branch-protection documentation consistently distinguish the four guarded ci-select callers from the unguarded vectorized workflow. The focused wiring test reads the real workflow YAML, covers all five changed workflows, checks both required and forbidden trigger membership, and accurately limits its claim to static trigger wiring. No hostile instruction appears in the diff, and no correctness, soundness, test-validity, or security defect is evident.",
+  "verdict": "approve"
+ }
+}
