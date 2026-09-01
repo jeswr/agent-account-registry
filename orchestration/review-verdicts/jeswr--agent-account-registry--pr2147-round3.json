@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2147,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "93f340bcd5a35d88f125785e7ae949a83e9e271a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_exits_to_enclosing_list` proves only that a pass which executes the binding can leave its enclosing `if` or `for`; it does not prove the universal claim in `_one_pass_order` that every pass reaching the later loop executed the binding. For example, `if repo: targets = starvation_park_targets(...); for target in targets: park_starved_partition_holder(...)` is certified: `ast.If` is in `_ESCAPABLE_NESTS`, there are no trailing statements in its body, and the outer indices are ordered. But when `repo` is false, execution reaches the loop without running the binding. The same defect occurs when the binding is in a `for` body whose iterable may be empty. The existing nested-guard flow row includes a `return`, so it tests trailing-statement fall-through and misses this dominance failure.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Require proof that entry into an accepted nested construct necessarily executes the binding before it exits to the loop; do not treat arbitrary `if` arms or `for` bodies as sufficient merely because a pass that entered them can fall through. Add refused rows for a binding alone under a runtime `if` followed by the parking loop and for a binding inside a possibly-empty `for` followed by the loop. Extend the non-vacuity leg with a stand-in that restores the faulty escapable-nest behavior so both rows demonstrably flip to certification.",
+    "severity": "major",
+    "title": "Escapable nests do not prove that the binding dominates the loop"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-two termination examples are now refused and have non-vacuous rows, but the replacement pairing proof still confuses a binding's ability to exit a conditional nest with dominance of the later loop. A binding inside an ordinary runtime `if` or a possibly-empty `for` is accepted even though another pass can reach the parking loop without executing that binding. This is a new major false-certification shape in the same trust seam, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
