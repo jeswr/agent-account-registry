@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6185,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "312a17fd23de224537e037c26728f3929e8c07d5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The auth-comparison-v1 block deliberately omits secx:SemiHonest and claims honest-majority malicious-with-abort. But the changed skills/mpc/SKILL.md itself states that auth_mul's second-operand adoption applies to the comparison chain too and that it does not abort on every tamper. Thus a malicious-security preference can admit a protocol with a known active-deviation hole. Marking assurance as Claimed/ExternalSignOffPending does not cure the incorrect adversary-model classification.",
+    "file": "crates/sparq-mpc/ontologies/secprop-methods.ttl",
+    "fix_hint": "Conservatively add secx:SemiHonest to auth-comparison-v1 and update README/module docs/helpers/tests to exclude it from malicious-security selection. Do not remove that assumption until the adoption attack is fixed and a real end-to-end adversarial witness demonstrates abort for the relevant tamper classes.",
+    "severity": "blocker",
+    "title": "Authenticated comparison is incorrectly admitted as malicious-secure"
+   },
+   {
+    "body": "requiring_malicious_security_excludes_the_semi_honest_set_but_admits_the_it_mac_comparison asserts admission solely from Turtle metadata. It never exercises an active second-operand tamper through malicious_greater_than, so it is vacuous as evidence for the load-bearing malicious-with-abort classification and will stay green while the known adoption weakness exists.",
+    "file": "crates/sparq-mpc/tests/secprop_annotations.rs",
+    "fix_hint": "Change the expected classification to fail closed now. If the protocol is later hardened, require an end-to-end tamper witness on the real comparison pipeline that goes red when adoption is reintroduced before changing the annotation.",
+    "severity": "major",
+    "title": "Headline test pins the disputed claim instead of testing its security invariant"
+   }
+  ],
+  "progress": null,
+  "summary": "The new annotation graph overstates the authenticated comparison's security posture. The repository's own MPC guidance says the second-operand adoption weakness applies to the auth_compare chain, so it is not malicious-with-abort against arbitrary active tampering. Nevertheless, the graph omits secx:SemiHonest for auth-comparison-v1 and the public helper therefore admits it for a malicious-security requirement. This is an honesty- and security-critical wrong classification while external review sq-qhy4 remains pending. The tests merely pin that classification and do not validate the underlying security invariant.",
+  "verdict": "request_changes"
+ }
+}
