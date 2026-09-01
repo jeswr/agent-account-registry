@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2145,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2211671e0ec0cb975c3c8e495a87e4db652ccdc3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior provenance defect. Republished findings are now identified by the machine-authored positional lead and excluded from prose-based denial, while a reserved-namespace receipt appended only after model-field neutralization preserves genuine injection evidence. The shared reader is used by all three reclassification/reconciliation consumers. The added tests exercise both forged deny-shaped model text with injection_detected=false and genuine emitted findings with the receipt, including writer-to-reader end-to-end behavior, quoted/fenced/embedded marker rejection, and the receipt-less control. I found no remaining diff-scoped correctness, soundness, test-validity, or security issue.",
+  "verdict": "approve"
+ }
+}
