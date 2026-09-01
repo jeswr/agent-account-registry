@@ -42,16 +42,6 @@
   },
   {
    "account": "f79434c3ffba014f",
-   "claim_id": "ed46bfd8e35244ada8ce50499a99e272",
-   "holder": "sparq-org/sparq#3533@33482579948.1",
-   "package": "sparq-mpc",
-   "role": "soundness",
-   "model": "opus5",
-   "issued_at": 1788247933,
-   "expires_at": 1788254233
-  },
-  {
-   "account": "f79434c3ffba014f",
    "claim_id": "22b7cd4a7d7f46f89208b13d2b354f2b",
    "holder": "jeswr/agent-account-registry#1650@33482640371.1",
    "package": "groom",
