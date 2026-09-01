@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6095,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0883db681c73ddc338643f135c770c5a036ac3a4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The negative lookbehind correctly prevents declaration-keyword matches when preceded by a word character or hyphen while preserving genuine declaration forms. The new regression tests exercise both false-positive rejection through the real classify path and successful T0 declarations, and the scope-partition assertions prevent the existing property loops from passing vacuously or omitting rules. The full targeted test module passes (39 tests).",
+  "verdict": "approve"
+ }
+}
