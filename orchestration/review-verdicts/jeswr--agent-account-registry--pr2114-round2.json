@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2114,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d70bcab4c66dc1ffcc6ab830c6a89ab875ac86d2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The parser splits on `&&` and `||` and records every resulting token list in `commands`, but it does not model whether shell control flow reaches that command. For example, `RUN true || jq --version` yields `[\"jq\", \"--version\"]` and satisfies the jq row even though jq never runs; paired with a genuine PyYAML probe, the assertion returns success and the image build succeeds without exercising jq. Likewise, `RUN false && jq --version || true` makes the build succeed while skipping jq. This contradicts the load-bearing claim that the probe must execute and leaves a fail-open inert-probe mutation after the round-1 containment issue.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Require probes to occur in an execution form whose reachability the checker can establish, rather than accepting arbitrary shell command-list members. A simple fail-closed option is a narrowly machine-checkable RUN stanza/form with unconditional sequential probes. Add reject fixtures for at least `true || jq --version` and `false && jq --version || true`, with the other dependency genuinely proven, and assert that jq is named in the refusal.",
+    "severity": "major",
+    "title": "Short-circuited probes are accepted as executed proof"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 1's inline-comment and quoted-data cases are now rejected, but the replacement parser still does not prove that a matched command executes. It treats every syntactic command-list member as executed regardless of shell short-circuit control flow. A Dockerfile can therefore retain the exact probe behind a branch that never runs and still pass the gate and build successfully. This is the same marquee proof-vs-presence security property remaining unsound through a new realistic inert-probe shape, so changes are still required.",
+  "verdict": "request_changes"
+ }
+}
