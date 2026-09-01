@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2160,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fdc430d190763561fa2339345fc3bf4dd9d1db98",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly counts every validated GitHub evidence link before applying the five-link display cap, publishes the total even at zero, and renders a per-fire hidden-count affordance from the number of links the reader actually accepted. The tests exercise producer output, rejected-link diagnostics beyond the former read cap, zero/under-cap cases, malformed and legacy totals, singular/plural text, reader-refused links, and the executed producer-to-page path with independent literal expectations. The shared predicate remains sound at its existing health-card gate: nonempty slices satisfy the preceding length checks, while the only predicate-relevant empty arrays coerce to zero. No trust check is weakened and no hostile instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
