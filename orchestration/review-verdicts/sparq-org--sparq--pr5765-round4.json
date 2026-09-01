@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5765,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "282f7440b7098ffa44cea0b6ffd6198a3252e1d4",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 defines (C) as the PR corpus being the audited eight packages 'or a superset of them', then sections 4.2, 4.3, and 5 say that under (C) #13265's path is never reached and #13264's fire branch is unreachable/entailed. Those conclusions hold if the corpus is exactly the audited set, but not merely a superset: any additional package or out-of-tree probe may contain a radix decomposition or a constant non-2^n-1 mask feeding Truncate and therefore exercise the rewrite. The text itself acknowledges unaudited extras/probes, making the inference internally inconsistent. The same overbroad condition is propagated into the other changed research documents.",
+    "file": "research/noir-corpus-row-audit-13263-13266.md",
+    "fix_hint": "Split the condition by inference direction. For absence/non-evidential conclusions, require that the actual corpus equal the audited eight (or separately audit every additional member and establish the construct is absent). Reserve the 'superset' condition only for positive reachability evidence, where a witnessed path in the eight remains present. Update the conditional verdict table and all companion amendments to use the corrected conditions.",
+    "severity": "major",
+    "title": "Condition (C) does not support absence conclusions for supersets"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The audit's central condition (C) is logically too weak for several conclusions drawn under it. Defining (C) as the PR corpus being the audited eight packages 'or a superset' does not let absence/reachability findings from the eight transfer to the extra members of a superset. In particular, extra packages could contain radix decompositions or a qualifying mask/Truncate chain, so the actual corpus row could exercise the changed path even when the audited eight do not. This flaw is repeated in the companion summary and amendments and affects the advertised conditional verdicts. Round 3 had no findings, so this newly identified major issue makes progress regressing.",
+  "verdict": "request_changes"
+ }
+}
