@@ -5248,16 +5248,16 @@ case "${endpoint}" in
     jq -r "${filter}" < "${STUB_DIR}/artifacts.json"
     ;;
   *"/runs?per_page=30")
-    if [ "${STUB_LIVE_FAIL}" = 1 ]; then
-      printf 'gh-stub: live-run read failed\n' >&2
-      exit 1
+    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
+    if [[ "${filter}" == *'status != "completed"'* ]]; then
+      if [ "${STUB_LIVE_FAIL}" = 1 ]; then
+        printf 'gh-stub: live-run read failed\n' >&2
+        exit 1
+      fi
+      jq -r "${filter}" < "${STUB_DIR}/live-${wf}.json"
+    else
+      jq -r "${filter}" < "${STUB_DIR}/runs-${wf}.json"
     fi
-    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
-    jq -r "${filter}" < "${STUB_DIR}/live-${wf}.json"
-    ;;
-  *"/runs?per_page=1")
-    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
-    jq -r "${filter}" < "${STUB_DIR}/runs-${wf}.json"
     ;;
   *)
     printf 'gh-stub: unexpected argv: %s\n' "$*" >&2
@@ -5270,8 +5270,9 @@ esac
     def _ka_stamp(age):
         return _utc_iso(keepalive_now - age)
 
-    def _ka_run(age, status="completed"):
-        return {"id": 1, "status": status, "conclusion": "success", "created_at": _ka_stamp(age)}
+    def _ka_run(age, status="completed", conclusion="success"):
+        return {"id": 1, "status": status, "conclusion": conclusion,
+                "created_at": _ka_stamp(age)}
 
     def run_keepalive_leg(script, specs, *, artifacts=(), runs=None, live=None,
                           artifacts_fail=False, live_fail=False):
@@ -5431,6 +5432,23 @@ esac
     keepalive_check(
         "[#922] the run-anchored legs still key on run age, and only the stale one is kicked",
         (code, kicked), (0, ["groom-core.yml"]), log)
+    # #1375: GitHub creates one-second `action_required` runs when it refuses to ingest a
+    # workflow. Their timestamps are evidence of rejection, not execution. Put a fresh rejected
+    # run ahead of an old accepted run so selecting the newest row without filtering stays green
+    # and fails this outcome; then supply only rejected runs to cover the visible refusal path.
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(60)],
+        runs={"metrics.yml": [_ka_run(60, conclusion="action_required"), _ka_run(9_999)]})
+    keepalive_check(
+        "[#1375] a fresh action_required run cannot hide the newest accepted run's stale age",
+        (code, kicked), (0, ["metrics.yml"]), log)
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(60)],
+        runs={"metrics.yml": [_ka_run(60, conclusion="action_required")]})
+    keepalive_check(
+        "[#1375] a pure rejected-run stream is stale AND emits an explicit workflow error",
+        (code, kicked, "::error::keepalive: metrics.yml has no accepted run" in log),
+        (0, ["metrics.yml"], True), log)
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)])
     keepalive_check(
         "[#922] control: a fleet that is fresh on BOTH anchors is kicked not at all",
@@ -5526,6 +5544,21 @@ esac
     keepalive_check(
         "[#559] control: a sweeper that ran inside its threshold is not kicked at all — the leg is "
         "not simply dispatching on every fire", (code, dispatched), (0, []), log)
+    code, dispatched, log = run_keepalive_leg(
+        sparq_script, sparq_specs,
+        runs={sparq_target: [_ka_run(60, conclusion="action_required"),
+                            _ka_run(sparq_limit + 600)]})
+    keepalive_check(
+        "[#1375] the cross-repo run anchor also skips a fresh rejected run and sees the stale "
+        "accepted run behind it", (code, dispatched), (0, [sparq_dispatch]), log)
+    code, dispatched, log = run_keepalive_leg(
+        sparq_script, sparq_specs,
+        runs={sparq_target: [_ka_run(60, conclusion="action_required")]})
+    keepalive_check(
+        "[#1375] a pure rejected cross-repo stream is stale AND visible as a workflow error",
+        (code, dispatched,
+         "::error::keepalive: sparq-org/sparq rearm-sweeper.yml has no accepted run" in log),
+        (0, [sparq_dispatch], True), log)
 
     # --- #935: the SEAM around that leg, which no amount of executing the body can reach. The rows
     # above drive the script directly; production reaches it only through a step-level `if:`, and
