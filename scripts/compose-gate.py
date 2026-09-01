@@ -193,6 +193,24 @@ RUNNER_ARM = "run-selftest)"
 #   structurally complete fix is INVERSE POLARITY (require a recognised positive verdict line), which
 #   needs 7 of 56 entries normalised onto a `PASSED/FAILED`-shaped terminal line first; a follow-up,
 #   not a one-token addition here.
+#   ⚠️ AND THAT NORMALISATION HAS THREE TERMINAL SHAPES TO COVER, NOT TWO — enumerate them, do not
+#   infer them from `PASSED`'s absence. Since #1740 `retriage.py --self-test` prints a third terminal
+#   line, `retriage self-test ENV-BLOCKED`, beside `PASSED`/`FAILED` (a dependency its EXECUTED rows
+#   shell out to is missing), and the sibling follow-up would give the other dependency-bearing
+#   entries the same class, so expect the shape to spread. It is emphatically NOT a positive verdict:
+#   it exits non-zero, and a genuine row failure OUTRANKS it and still prints `FAILED`. So the
+#   inverse-polarity check must list it as a RECOGNISED NON-POSITIVE verdict — a refusal, graded as a
+#   failure, exactly as today — and never let it fall through the unrecognised-shape branch into NOT
+#   GRADEABLE. Neither reading is fail-open (both block), but ungradeable loses the attribution: it
+#   asserts the HARNESS faulted when the harness worked and the entry returned a considered refusal,
+#   and its receipt tells the operator re-running clears it, which a missing dependency does not.
+#   ⚠️ An entry's own ENV-BLOCKED is a DIFFERENT OBJECT from the harness's (`worker-live:
+#   registry-selftest gate: ENV-BLOCKED`, a fault by the marker below, because there the SANDBOX
+#   could not run the entry at all). The two are told apart ONLY by the `worker-live: ` prefix, so a
+#   bare `"ENV-BLOCKED"` added to the markers would swallow the entry's verdict line with it; both
+#   directions are pinned by self-test rows. Nothing to change on the composed side today —
+#   compose-gate runs on ubuntu-latest, where jq and PyYAML are present, so the entry-level class is
+#   not reachable there.
 #   The broad `"worker-live: "` substring is a latent FAIL-CLOSED trip: a future self-test that echoes
 #   such a line ON SUCCESS would be read as ungradeable. Measured zero false positives across all 56
 #   known-PASS logs today, and the failure direction is a visible red, never a silent green.
@@ -915,6 +933,15 @@ def _self_test():
             chk(f"{why} is a HARNESS FAULT, never a verdict", harness_fault(marker), True)
         chk("a plain failing self-test is NOT a harness fault",
             harness_fault("  FAIL something: 1 (want 2)\ndispatch-claim self-test FAILED"), False)
+        # ⚠️ THE OTHER ENV-BLOCKED, and the pair is the point. The loop above pins the HARNESS's
+        # ENV-BLOCKED (the sandbox could not run the entry) as a fault; an ENTRY's own #1740 terminal
+        # line is a considered REFUSAL the harness delivered intact, so it stays a verdict — graded a
+        # failure, which is the fail-closed direction. The two differ ONLY by the `worker-live: `
+        # prefix, so a bare `"ENV-BLOCKED"` marker would swallow this one; that mutant reds here and
+        # nowhere else. See the INVERSE POLARITY note by HARNESS_FAULT_MARKERS.
+        chk("an ENTRY's own ENV-BLOCKED verdict line is NOT a harness fault",
+            harness_fault("ENV-BLOCKED jq is unavailable — the EXECUTED sweep-paging rows run the "
+                          "workflow's own step body\nretriage self-test ENV-BLOCKED"), False)
         chk("a gh-escape is NOT a harness fault — the sandbox WORKED and caught a real escape",
             harness_fault("::error::gh-escape dispatch-claim.py reached the real gh"), False)
         chk("clean output is not a fault", harness_fault(""), False)
