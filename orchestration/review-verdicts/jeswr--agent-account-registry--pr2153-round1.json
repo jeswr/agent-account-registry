@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2153,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8e7feed23b5420cf3847ddc4b83d608b910dbcd1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly narrows manifest windows to an exact inclusive `#<low>..#<high>` grammar and fail-closes on malformed, reversed, padded, non-string, extra-bound, and out-of-range inputs. The implementation compares validated integer bounds directly with each validated PR number, preserves the existing no-manifest/partial-corpus protections, and surfaces the checked window without treating it as independently proven freshness. The self-test exercises both accepted boundary values and distinct refusal paths, including the multi-digit no-prefix case that avoids a masked assertion; its refusal helper also distinguishes expected `AuditError` refusals from crashes. Documentation and CLI help consistently describe the new contract. No reviewer-directed instruction or other prompt-injection text appears in the diff.",
+  "verdict": "approve"
+ }
+}
