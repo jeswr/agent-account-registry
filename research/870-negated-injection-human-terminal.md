@@ -119,7 +119,9 @@ directly (`:120-128`).
 
 **A PR in NEITHER population is the genuine residue**: it carries a park-reason marker (so Path A
 declines it as already-classified) but reached the terminal on a window no auto-readmit stamp
-matches (so Path B cannot prove mis-escalation). `scripts/worker-pr.py:9406-9424` names exactly
+matches (so Path B cannot prove mis-escalation). That is the residue by *population*; being in
+Path A's population is not itself a release, because every gate above it fails toward leaving the
+park alone (§4 step 2), so the residue by *outcome* is larger. `scripts/worker-pr.py:9406-9424` names exactly
 this boundary from the write side and says the receipt-less terminals are the **pre-#677
 historical** ones — *"which is the population #870 owns"*.
 
@@ -134,15 +136,33 @@ Per PR, in order — each step is a lookup on the PR itself, not a judgement:
    no signal, and the absence of a Tier-A affirmative marker that #870 already reports is the
    same fact from the other side. Re-admitting "by hand for the negation" now decides something
    the machine no longer gets wrong.
-2. **Does any bot comment carry a `sparq-park-reason` marker?** No → Path A owns it; it needs no
-   decision and no hand-run: the next dispatch tick migrates it if its cause is capacity-class and
-   `provable` holds. Yes → step 3.
+2. **Does any bot comment carry a `sparq-park-reason` marker?** Yes → step 3. No → Path A gets the
+   **first look**, which is not the same thing as a release. `_migrate_legacy_park`
+   (`scripts/dispatch-claim.py:5677`) has four exits after the deny and only one of them removes
+   the PR from the ask, so read its **outcome**, not its eligibility. All four are decided from
+   inputs already listed in §3 — the cause recognised in the bot's prose, `provable`, the source
+   issue's `needs:user` ownership, and any residual `needs:*`:
+   - **Migrated** — a capacity-class cause (`budget` / `dispatch-missed` / `nochange` / `gatefail`
+     / `cold-groom`), `provable` holds, the issue-side `needs:user` proven machine-applied, and no
+     residual hold. Machine-owned: **no decision and no hand-run**, on the next dispatch tick
+     (≤ `LEGACY_PARK_MIGRATION_MAX = 5` PRs per tick, `:5652`).
+   - **Classified but not moved** — a question-class cause (`history-rewritten`, `marker-corrupt`,
+     `routing-unresolvable`). The tick records the marker and deliberately leaves the terminal.
+     That is a **remaining human decision**, on that recorded cause → step 4.
+   - **Deferred on the hold axis** — the issue half is proven human-applied or its timeline is
+     unreadable, or a residual `needs:*` would survive the conversion (`:5760-5771`). Also a
+     **remaining human decision**, on that hold → step 4.
+   - **Deferred on `provable`** — the cause is machine-owned but no exit could open right now, so
+     the tick refuses to trade a visible stall for a silent one. This is **deferred/unknown, not
+     decision-free**: re-read on a later tick, where it becomes one of the outcomes above.
+   A cause no table recognises returns `(None, None, …)` and the park stands — step 4.
 3. **Does its latest park-generation receipt's window match one of its own `sparq-auto-readmit`
    stamps?** Yes → Path B owns it: run `reconcile-park-misescalation.py` **dry-run first**, read
    the per-PR audit basis it prints, then `--apply`. It disposes of a PR whose two automatic
    re-admissions are already spent (`AUTO_READMISSION_MAX = 2`, `park_policy.py:212`) by
    `retire` rather than by re-parking it into a class with no exit.
-4. **Neither** → this is a real human decision, and it is **not** about injection. It is one of:
+4. **Neither path disposes of it** — step 2 reached a non-migrating outcome, or step 3 found no
+   matching stamp → this is a real human decision, and it is **not** about injection. It is one of:
    a question-class cause (`history-rewritten`, `marker-corrupt`, `routing-unresolvable`) where
    the terminal is already the correct state; a human-applied hold on either half of the park
    pair; a residual `needs:*` (e.g. `needs:external-audit`) that no automation may form an opinion
@@ -150,7 +170,12 @@ Per PR, in order — each step is a lookup on the PR itself, not a judgement:
    table of negated sentences is not evidence about any of them.
 
 So the honest shape of the ask is: **at most three decisions, none of them an injection decision,
-and each one first checked against steps 2–3, which may leave zero.**
+and each one first checked against steps 2–3.** What remains is the count of PRs those steps do
+not *dispose* of: a PR Path A actually migrates, or Path B retires, costs nothing; a PR Path A
+classifies as a question or defers on the hold axis is still a decision — on that reason, never on
+injection; a PR deferred only on `provable` is neither yet, and is re-read rather than decided.
+Zero is reachable, but only if all three land in a disposing outcome — it is a possible floor of
+the residue, not the expected one.
 
 ## 5. What is not measured here, and what would settle it
 
