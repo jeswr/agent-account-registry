@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2120,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "eb3d75c9e42f9003109324384277c6ad33aa20fc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2.2 says the other `issue edit ... --body` call sites are the three listed ops-alert writers, after searching `scripts/**.py` and workflows. That is false in this checkout. Production call sites also exist in, among others, `scripts/metrics-alert.py`, `scripts/ledger-identity-watch.py`, `scripts/pat-validity.py`, `scripts/model-health.py`, `scripts/usage-alert.py`, `scripts/metrics.py`, `scripts/groom-alert.py`, `scripts/triage-stock-alert.py`, `scripts/groom-mint-alert.py`, `scripts/dispatch-stall-alert.py`, and `scripts/ci-latency-alert.py`. They may all target non-catalog issues, but the record neither enumerates nor proves that. This matters directly to the recommendation in section 5: a checkout-wide scan with the stated explicit allow-list of only the section 2.2 writers cannot pass on the current tree. Because the no-lock decision rests on `account-usage.py` being the sole catalog-body writer, an incomplete census leaves that premise unproved rather than merely imprecisely documented.",
+    "file": "research/317-catalog-body-write-serialization.md",
+    "fix_hint": "Re-run and document a complete census of every production issue-body edit site, classify each target from independent routing evidence (labels/repository/issue selection), and update section 2.2 and the proposed test design accordingly. The invariant should be target-aware and should explicitly account for all current non-catalog writers; demonstrate that it passes the pristine tree and fails when a second catalog-targeting writer is introduced.",
+    "severity": "major",
+    "title": "The claimed exhaustive body-writer census omits many production writers"
+   }
+  ],
+  "progress": null,
+  "summary": "The central conclusion that set-up-account does not edit existing account bodies is supported, but the record's supposedly exhaustive writer census is materially false. The repository contains many additional production `issue edit --body` call sites beyond the three listed, so the proposed exact allow-list test would reject the current tree and the document has not actually established its load-bearing single-writer premise with the claimed method. Correct the census and specify a target-aware invariant that accounts for every current writer before relying on it to WONTFIX the lock.",
+  "verdict": "request_changes"
+ }
+}
