@@ -7424,16 +7424,31 @@ esac
       // [label, the value cell INCLUDING its sub-label] per metric, in render order.
       metrics: grid ? grid.children.map((cell) => [cell.children[0].textContent,
                                                    flat(cell.children[1]).join(" ").trim()]) : null,
+      // [#1986] The card's child CLASSES in render order. `metrics` alone cannot assert the
+      // NEGATIVE side of `if (grid.childElementCount)`: a `null` there is equally what an
+      // absent — or unrecognisable — Queue & flow card reports, so a row keyed only on it would
+      // pass against a panel that drew nothing. This names every child the card DOES carry and,
+      // by exhaustion, that `obs-metric-grid` is not among them.
+      groups: card ? card.children.map((kid) => kid.className) : null,
     };
   }
   process.stdout.write(JSON.stringify(out));
 """
+    # [#1986] ...and the third document is the one no fixture supplied: a WELL-FORMED flow group
+    # that simply carries none of the four metric sources. `.pop` without a default on purpose —
+    # if a source is ever renamed, this row must go red rather than quietly stop removing it.
+    metricless = copy.deepcopy(obs_fixture)
+    for metric_source in ("review_rounds", "parks_1h", "arm_to_merge_minutes_24h",
+                          "target_ci_queue"):
+        metricless["flow"].pop(metric_source)
     with contextlib.redirect_stdout(io.StringIO()):
         flow_measured = obs_normalized(copy.deepcopy(obs_fixture))
         flow_unreadable = obs_normalized(stat_dropped)
+        flow_metricless = obs_normalized(metricless)
     flow_stat_page = _executed_page(
         _page_harness("renderObservability", _OBS_FLOW_STAT_PAGE_BODY),
-        {"documents": {"measured": flow_measured, "unreadable": flow_unreadable}})
+        {"documents": {"measured": flow_measured, "unreadable": flow_unreadable,
+                       "metricless": flow_metricless}})
 
     def flow_metrics(name):
         rendered = flow_stat_page[name]
@@ -7454,6 +7469,20 @@ esac
           ([["Review rounds", "1.44 avg max 3 · 0 budget-exhausted / 1h"],
             ["Arm → merge", "18m p50 55.5m p90 · 9 samples / 24h"],
             ["CI queue · sparq-org/sparq", "5 pending target CI runs"]], None))
+    # [#1986] The NEGATIVE side of the same guard the row above rides on. `obsFlowCard` builds its
+    # `obs-metric-grid` unconditionally and attaches it only `if (grid.childElementCount)`; with no
+    # fixture supplying a flow group free of all four metric sources, deleting that guard appended
+    # an EMPTY grid — a bare gap-sized box between the queue list and the lease bars — with every
+    # other row on this suite green. The card's remaining children are named in ORDER, so the row
+    # states both halves: the grid is absent AND the card that would have carried it is intact.
+    metricless_card = flow_stat_page["metricless"]
+    check("[#1986] EXECUTED page script: a flow group carrying NONE of the four metric sources "
+          "attaches NO metric grid to the Queue & flow card — the queue rows, the lease bars and "
+          "the trend render around the hole, and no empty `obs-metric-grid` box appears between "
+          "them",
+          (metricless_card.get("metrics"), metricless_card.get("groups"),
+           metricless_card.get("error")),
+          (None, ["obs-card-title", "obs-reasons", "obs-reasons", "obs-spark-wrap"], None))
     overflow = copy.deepcopy(obs_fixture)
     overflow["flow"]["review_rounds"]["mean"] = 1e309       # JSON 1e309 decodes to +Infinity
     overflow["thresholds"]["workflow_failure_rate"] = 1e309
