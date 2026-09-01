@@ -2443,9 +2443,19 @@ def _collect_defuse_prs(
     now: int,
     stale_seconds: int,
     bot_login: str,
-) -> dict[tuple[str, int], tuple[str, str]]:
-    """Collect live safe-class parked PRs; an unreadable latch skips only that PR."""
+) -> tuple[dict[tuple[str, int], tuple[str, str]], list[str]]:
+    """Collect live safe-class parked PRs; an unreadable latch defers only that PR.
+
+    The deferrals are RETURNED alongside the candidates, never merely logged (issue #1650 review
+    r1). They are per-object failures of the DEFUSE phase, so they belong in the DefuseOutcome
+    `defuse_exit_failure` judges: a tick whose every defuse candidate was unreadable completed
+    nothing, and precedence rule 2 must be able to see that. Logging them and returning only the
+    survivors is the exit-zero-swallows-failure shape #644 exists to forbid — and broadening this
+    handler from a failure CLASS to the failure BOUNDARY widened exactly what would be swallowed,
+    since a malformed payload used to abort the run loudly instead.
+    """
     candidates: dict[tuple[str, int], tuple[str, str]] = {}
+    deferrals: list[str] = []
     for number, listed in sorted(pulls.items()):
         try:
             if _parked_pr_snapshot(listed, now, stale_seconds, bot_login) is None:
@@ -2462,11 +2472,13 @@ def _collect_defuse_prs(
             # function, is missed by the per-repo snapshot try that calls it, and propagates out of
             # run_sweep before _release_claims — so the whole tick's reclaim is lost to one PR's
             # malformed latch payload.
-            print(f"ALERT PR {repo}#{number}: {_deferral_detail(exc)} — defuse deferred")
+            detail = _deferral_detail(exc)
+            print(f"ALERT PR {repo}#{number}: {detail} — defuse deferred")
+            deferrals.append(f"{repo}#{number}: {detail}")
             continue
         if snapshot is not None:
             candidates[(repo, number)] = snapshot
-    return candidates
+    return candidates, deferrals
 
 
 def _gh_failure_detail(result: Any, token: str) -> str:
@@ -2549,14 +2561,19 @@ def phase_exit_failure(outcome: PhaseOutcome) -> str | None:
     failure happens in a READ — before it counts the object as attempted — must not be able to
     report nothing-completed-and-something-failed as green; the disjunction makes that swallow
     unrepresentable rather than merely unlikely. It is a no-op for the defuse phase, which counts
-    the attempt before anything it records as a deferral.
+    an attempt for everything it records as a deferral.
 
     A deliberate SKIP counts as a COMPLETED object, not a failure: a phase that correctly decided
     to do nothing to every object it saw is a working phase (this is what keeps rule 2 from
-    red-flagging, say, a hand-off loop whose every candidate was revalidated away). Defuse keeps
-    its own narrower counting — deferrals from its PRE-redraft revalidation are recorded nowhere,
-    since those reads already failed closed per PR before #644 and counting them would change an
-    unrelated path's status semantics.
+    red-flagging, say, a hand-off loop whose every candidate was revalidated away).
+
+    Defuse's PRE-redraft READS — the candidate latch read in `_collect_defuse_prs` and the
+    mutation-boundary revalidation in `_execute_defuse_actions` — record their deferrals here too
+    (issue #1650 review r1). They used to be recorded nowhere, on the argument that they already
+    failed closed per PR; broadening both handlers from a failure CLASS to the failure BOUNDARY
+    retired that argument, because the failures they newly absorb used to abort the run loudly
+    instead. An unrecorded deferral in a phase that completed nothing is a silent green, and no
+    phase in this module gets one.
     """
     if outcome.unavailable:
         return (
@@ -3144,6 +3161,7 @@ def _execute_defuse_actions(
     now: int,
     stale_seconds: int,
     bot_login: str = "",
+    collection_deferrals: list[str] | tuple[str, ...] = (),
 ) -> DefuseOutcome:
     """Revalidate and redraft bounded safe-class actions, then write one audit comment.
 
@@ -3154,10 +3172,16 @@ def _execute_defuse_actions(
     on every run for hours. A PR that cannot be converted to draft is not a reason to stop
     reclaiming dead leases. The failures are RECORDED, not swallowed: defuse_exit_failure decides
     the run's exit status from this outcome once the sweep has finished.
+
+    `collection_deferrals` carries the PRs whose latch read failed in `_collect_defuse_prs`, one
+    phase step earlier (issue #1650 review r1). They never became actions, so they can only be
+    seeded here — and they must be, because this outcome is the ONLY one the defuse phase reports
+    through. Each counts as an attempt as well as a deferral, so rule 2's report reads "<n>
+    attempted, 0 completed" rather than claiming the phase took nothing up.
     """
     changed = 0
-    attempted = 0
-    deferred: list[str] = []
+    attempted = len(collection_deferrals)
+    deferred: list[str] = list(collection_deferrals)
     unavailable: list[str] = []
     for action in actions:
         if action.mode != "defuse":
@@ -3185,8 +3209,16 @@ def _execute_defuse_actions(
             # non-GroomError escaping here aborts the sweep before _release_claims. Nothing in the
             # revalidation reads can raise RedraftUnavailable — only _redraft_pr does, below — so
             # this handler needs no ordering carve-out; the MUTATION block does, and keeps one.
-            print(f"ALERT PR {action.repo}#{action.number}: {_deferral_detail(exc)} — "
-                  "defuse deferred")
+            #
+            # [#1650 review r1] RECORDED, like every other broadened handler in this module. The
+            # attempt is counted HERE rather than before the read on purpose: a candidate that
+            # revalidates cleanly and is then SKIPPED is a deliberate decision not to act, and
+            # counting THAT as an attempt would let rule 2 red a tick in which the phase correctly
+            # did nothing. Only a failed read is an attempt this phase could not finish.
+            detail = _deferral_detail(exc)
+            print(f"ALERT PR {action.repo}#{action.number}: {detail} — defuse deferred")
+            attempted += 1
+            deferred.append(f"{action.repo}#{action.number}: {detail}")
             continue
         if snapshot != (action.head_sha, action.updated_at):
             print(
@@ -3870,6 +3902,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     snapshot_attempted = 0
     snapshot_completed = 0
     snapshot_deferrals: list[str] = []
+    # [#1650 review r1] The defuse candidates whose latch read failed during collection. They are
+    # carried across to `_execute_defuse_actions` rather than recorded here: the defuse phase
+    # reports through ONE outcome, and a deferral filed against the snapshot phase instead would
+    # both mis-name the failure and let a repo whose snapshot otherwise completed report clean.
+    defuse_collect_deferrals: list[str] = []
     # [#1624] The tick's re-read allowance: ONE extra listing per repo, shared by that repo's issue
     # and pull reads, so a persistently inconsistent repo cannot double the sweep's request budget.
     reread_budget = _SnapshotRereadBudget()
@@ -3890,7 +3927,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             repo_pulls = _consistent_snapshot(
                 lambda: _pulls(api, repo), repo, reread_budget
             )
-            repo_defuse = _collect_defuse_prs(
+            repo_defuse, repo_defuse_deferrals = _collect_defuse_prs(
                 api, repo, repo_pulls, now, defuse_stale_seconds, bot_login
             )
         except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #1650)
@@ -3912,6 +3949,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         issues[repo] = repo_issues
         pulls[repo] = repo_pulls
         defuse_prs.update(repo_defuse)
+        defuse_collect_deferrals.extend(repo_defuse_deferrals)
         for number, issue in issues[repo].items():
             # THE SWEEP'S DOMINANT COST (registry #1303). One request per commented issue, every
             # tick, against the partition every other lane's `issues`/`pulls` reads also draw on
@@ -4392,7 +4430,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     )
 
     defuse_outcome = _execute_defuse_actions(
-        pull_actions, groomable, target_tokens, now, defuse_stale_seconds, bot_login
+        pull_actions, groomable, target_tokens, now, defuse_stale_seconds, bot_login,
+        defuse_collect_deferrals,
     )
 
     (unpark_outcome, unpark_count, converge_count, stalled_count,
@@ -5766,7 +5805,7 @@ def _self_test() -> int:
             return {}
 
     defuse_api = _DefuseAPI()
-    defuse_candidates = _collect_defuse_prs(
+    defuse_candidates, defuse_collect_deferrals = _collect_defuse_prs(
         defuse_api,
         "owner/repo",
         defuse_details,
@@ -5861,6 +5900,51 @@ def _self_test() -> int:
         "#548 tripwire (d): GraphQL auto-merge and unknown latch states fail closed",
         {("owner/repo", number) in defuse_candidates for number in (7, 8, 9)},
         {False},
+    )
+    # [#1650 review r1] The tripwire above cannot tell an UNREADABLE latch from a cleanly excluded
+    # PR — both are simply absent from the candidate map. That is the distinction the phase's exit
+    # status now turns on, so it gets its own exact-match assertion: #8's missing REST `auto_merge`
+    # and #9's missing GraphQL `autoMergeRequest` are FAILURES and are returned as deferrals, while
+    # #7 (auto-merge legitimately enabled) and every non-candidate above contribute NOTHING. Drop
+    # the `deferrals.append` and this reds; append on the clean paths too and it reds the other way.
+    check(
+        "#1650 review r1: an unreadable defuse latch is RETURNED as a per-PR deferral, cause and "
+        "all — and a PR that is merely not a candidate is not one",
+        defuse_collect_deferrals,
+        [
+            "owner/repo#8: parked pull request auto_merge state is unknown",
+            "owner/repo#9: parked pull request merge-latch state is unknown",
+        ],
+    )
+    collect_only_outcome = _execute_defuse_actions(
+        [], {}, {}, defuse_now, defuse_stale_seconds, DEFUSE_BOT_LOGIN,
+        defuse_collect_deferrals,
+    )
+    check(
+        "#1650 review r1: those collection deferrals REACH the phase outcome and red a defuse "
+        "phase that completed nothing — seeded as attempts as well as deferrals, so rule 2's "
+        "report counts them (pass them nowhere and this phase reports a silent green)",
+        (
+            collect_only_outcome.attempted,
+            collect_only_outcome.deferred,
+            defuse_exit_failure(collect_only_outcome),
+            # The SAME deferrals alongside a completed defuse stay a per-PR ALERT (rule 3) — the
+            # broadened recording must not turn one unreadable latch into a red run outright.
+            defuse_exit_failure(DefuseOutcome(
+                changed=1, attempted=2, deferred=tuple(defuse_collect_deferrals)
+            )),
+        ),
+        (
+            2,
+            (
+                "owner/repo#8: parked pull request auto_merge state is unknown",
+                "owner/repo#9: parked pull request merge-latch state is unknown",
+            ),
+            "every parked PR defuse failed (2 attempted, 0 completed): "
+            "owner/repo#8: parked pull request auto_merge state is unknown; "
+            "owner/repo#9: parked pull request merge-latch state is unknown",
+            None,
+        ),
     )
     check(
         "#548 tripwire (e): an already-draft parked PR is a no-op",
@@ -6210,9 +6294,74 @@ def _self_test() -> int:
         ),
         (False, [21, 22], 0, 2, True),
     )
+    # [#1650 review r1] THE PRE-REDRAFT REVALIDATION READ, recorded. It used to ALERT and continue
+    # without touching the outcome, so a tick whose every candidate's re-read failed reported a
+    # green run for a phase that completed nothing. `_RedraftAPI`'s latch reads always succeed, so
+    # refusing a chosen detail GET isolates THIS handler from the mutation one above — `gh` is
+    # never reached for the refused PR. Both directions of rule 2 are driven from the same fixture.
+    class _RevalRefusingAPI(_RedraftAPI):
+        """A defuse API whose PRE-redraft revalidation read refuses for chosen PRs."""
+
+        def __init__(self, refused: set[int]):
+            super().__init__()
+            self.refused = refused
+
+        def request(self, method, path, body=None, allow_404=False, **kwargs):
+            if method == "GET" and int(path.rsplit("/", 1)[1]) in self.refused:
+                raise GroomError("HTTP 502 while re-reading the parked pull request")
+            return super().request(method, path, body, allow_404, **kwargs)
+
+    reval_api = _RevalRefusingAPI({21})
+    reval, reval_aborted, reval_drafted = _run_defuse(reval_api, failing=set())
     check(
-        "#644: a phase with NO attempted candidate is green (an unreadable latch already defers "
-        "per PR by design; that unrelated path's status semantics are unchanged)",
+        "#1650 review r1: a refused PRE-redraft revalidation read is RECORDED as that PR's "
+        "deferral AND counted as an attempt, not merely ALERT-logged — #21 is neither redrafted "
+        "nor audited, #22 still completes, and rule 3 leaves the run GREEN",
+        (
+            reval_aborted,
+            reval_drafted,
+            reval_api.comments,
+            reval.changed if reval else -1,
+            reval.attempted if reval else -1,
+            reval.deferred if reval else "aborted",
+            defuse_exit_failure(reval) if reval else "aborted",
+        ),
+        (
+            False,
+            [22],
+            ["/repos/owner/repo/issues/22/comments"],
+            1,
+            2,
+            ("owner/repo#21: HTTP 502 while re-reading the parked pull request",),
+            None,
+        ),
+    )
+    all_reval_api = _RevalRefusingAPI({21, 22})
+    all_reval, _reval_aborted, all_reval_drafted = _run_defuse(all_reval_api, failing=set())
+    all_reval_reason = defuse_exit_failure(all_reval) if all_reval else None
+    check(
+        "#1650 review r1 (rule 2, the direction the silent green lived in): when EVERY candidate's "
+        "revalidation read is refused the phase completes nothing, so the run exits NON-zero and "
+        "names both PRs — drop either the `deferred.append` or the `attempted += 1` and this is a "
+        "green run for a phase that redrafted nothing",
+        (
+            all_reval_drafted,
+            all_reval.changed if all_reval else -1,
+            all_reval.attempted if all_reval else -1,
+            all_reval_reason,
+        ),
+        (
+            [],
+            0,
+            2,
+            "every parked PR defuse failed (2 attempted, 0 completed): "
+            "owner/repo#21: HTTP 502 while re-reading the parked pull request; "
+            "owner/repo#22: HTTP 502 while re-reading the parked pull request",
+        ),
+    )
+    check(
+        "#644: a phase with NO attempted candidate and NO deferral is green (a phase that saw "
+        "nothing to do is a working phase; every failure it DID see is recorded — #1650 review r1)",
         defuse_exit_failure(DefuseOutcome()),
         None,
     )
@@ -11630,11 +11779,23 @@ def _self_test() -> int:
                 "ALERT PR owner/repo#21:" in vd_collect_log,
                 "defuse deferred" in vd_collect_log,
                 str(parse_ts_failure) in vd_collect_log,
-                vd_collect_error,
                 "snapshot_deferred=0" in vd_collect_log,
-                "defused_prs=0" in vd_collect_log,
+                "defused_prs=0 defuse_deferred=1" in vd_collect_log,
             ),
-            ([{"e" * 32}], True, True, True, "", True, True),
+            ([{"e" * 32}], True, True, True, True, True),
+        )
+        # [#1650 review r1] …and the deferral must reach the PHASE, not just the log. The
+        # collection read is the one that never became an action, so it can only arrive at the
+        # outcome by being carried across from `_collect_defuse_prs`; return the candidates alone
+        # and the only defuse candidate of the tick vanishes into a green run. Asserted as the
+        # WHOLE error string, so the phase label, the census and the masked cause are all pinned.
+        check(
+            "#1650 review r1 (_collect_defuse_prs): the deferred candidate reaches the DEFUSE "
+            "phase outcome — the phase completed nothing, so the sweep exits NON-zero naming it "
+            "and the PR (stop propagating the collection deferrals and this reads \"\")",
+            vd_collect_error,
+            "every parked PR defuse failed (1 attempted, 0 completed): "
+            "owner/repo#21: not a timestamp: None",
         )
 
         # (10a) `_execute_defuse_actions`' REVALIDATION handler. Same PR, same failure, a LATER
@@ -11672,11 +11833,21 @@ def _self_test() -> int:
                 "ALERT PR owner/repo#21:" in vd_defuse_reval_log,
                 "defuse deferred" in vd_defuse_reval_log,
                 str(parse_ts_failure) in vd_defuse_reval_log,
-                vd_defuse_reval_error,
                 "snapshot_deferred=0" in vd_defuse_reval_log,
-                "defused_prs=0" in vd_defuse_reval_log,
+                "defused_prs=0 defuse_deferred=1" in vd_defuse_reval_log,
             ),
-            ([{"e" * 32}], True, True, True, "", True, True),
+            ([{"e" * 32}], True, True, True, True, True),
+        )
+        # [#1650 review r1] Same obligation as the collection handler, one step later: this PR was
+        # the phase's ONLY candidate and it completed nothing, so precedence rule 2 must red the
+        # run. Delete the handler's `deferred.append`/`attempted += 1` pair and this reads "" —
+        # which is exactly the silent green the broadened boundary would otherwise have bought.
+        check(
+            "#1650 review r1 (_execute_defuse_actions revalidation): the refused re-read reaches "
+            "the DEFUSE phase outcome, so the sweep exits NON-zero naming the phase and the PR",
+            vd_defuse_reval_error,
+            "every parked PR defuse failed (1 attempted, 0 completed): "
+            "owner/repo#21: not a timestamp: None",
         )
 
         # (10b) `_execute_defuse_actions`' MUTATION handler, the one that sits BEHIND the
