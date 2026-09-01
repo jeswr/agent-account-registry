@@ -5453,6 +5453,83 @@ def _target_is_human_maintainer(repo, login):
     return _park_policy.probe_maintainer(repo, login, read_permission)
 
 
+def _cache_positive_maintainer_probes(probe):
+    """Reuse only positively proved maintainer identities within one PR decision.
+
+    One admission evaluates the same cached PR/issue timelines several times. Each park-policy
+    helper creates its own login cache, so without this wrapper the same collaborator permission is
+    re-read across those views even though they form one decision over one timeline snapshot.
+    Negative and failed probes are deliberately NOT cached. A transient failure must not be
+    amplified even within the decision, and a later successful proof must remain observable.
+    Exceptions propagate so each caller keeps its existing, operation-specific failure direction.
+
+    The caller MUST create a fresh wrapper for every PR. A repo-sweep cache would widen the
+    authorisation staleness window: permission revoked after PR A must be observed before a human
+    gesture on PR B can authorise re-admission (#2109).
+    """
+    confirmed = set()
+
+    def cached(login):
+        if login in confirmed:
+            return True
+        answer = probe(login)
+        if answer is True:
+            confirmed.add(login)
+            return True
+        return False
+
+    return cached
+
+
+def _cache_timeline_events_for_decision(fetch_events):
+    """Give one PR decision a single timeline view per repo/issue surface.
+
+    Park admission deliberately reasons over a PR and its source issue as one snapshot, but its
+    human-gesture, park-application, and budget helpers each request those same timelines. Cache a
+    successful read for the duration of one decision so those helpers cannot mix views or pay for
+    the same paginated target-API read repeatedly. Failures are not cached: every consumer keeps its
+    existing operation-specific failure direction and a later read may recover. Callers must create
+    a fresh wrapper for every PR, for the same staleness-bound reason as the maintainer cache.
+    """
+    events_by_surface = {}
+
+    def cached(repo, number):
+        key = (repo, number)
+        if key not in events_by_surface:
+            events = fetch_events(repo, number)
+            # park_policy deliberately turns malformed timeline rows into a conservative
+            # per-consumer result instead of raising out of the whole sweep. Validate the
+            # shared structural boundary HERE first: otherwise the first consumer can observe
+            # a malformed row, recover conservatively, and leave that failed read memoised for
+            # every later consumer in the same decision. Match park_policy._event_rows exactly:
+            # every label event needs a readable name, but only events for READMISSION_LABELS
+            # need a strict timestamp. Assignment stays strictly after validation, so a later
+            # read can recover just like an exception from fetch_events.
+            malformed = not isinstance(events, list)
+            if not malformed:
+                for event in events:
+                    if not isinstance(event, dict):
+                        malformed = True
+                        break
+                    kind = event.get("event")
+                    if kind in {"labeled", "unlabeled"}:
+                        label = event.get("label")
+                        name = label.get("name") if isinstance(label, dict) else None
+                        if (not isinstance(name, str)
+                                or (name in _park_policy.READMISSION_LABELS
+                                    and not _park_policy.valid_timestamp(
+                                        event.get("created_at")))):
+                            malformed = True
+                            break
+            if malformed:
+                raise DispatchError(
+                    f"target timeline for {repo}#{number} is structurally malformed")
+            events_by_surface[key] = events
+        return events_by_surface[key]
+
+    return cached
+
+
 def _read_model_health_window(model_health, registry_repo, now, api=None):
     """Read the task-decline evidence through model-health's authoritative validated reader.
 
@@ -5871,6 +5948,12 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
             # skip THIS PR (its park simply stands) and never abort the sweep — the whole tick's
             # claim runs under this call.
             labels = set(_labels(row))
+            # One timeline snapshot and one permission view per PR decision. Never hoist this out
+            # of the loop: a cross-PR cache could outlive a maintainer permission revocation and
+            # incorrectly authorise a later PR's human-gesture readmission (#2109).
+            is_human_maintainer = _cache_positive_maintainer_probes(
+                lambda login: _target_is_human_maintainer(repo, login))
+            cached_timeline = _cache_timeline_events_for_decision(timeline_fn)
             # `record` was read above the candidate filter (#835): the orchestrator waiver is a
             # function OF the record, so the record has to exist before the gates it can waive
             # are evaluated. ONE read per PR per tick — a second `provenance.get` here would be a
@@ -5897,9 +5980,8 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                         issue_hold_machine_owned=(
                             lambda issue, label:
                                 _park_policy.label_application_machine_owned(
-                                    repo, issue, label, timeline_fn,
-                                    is_human=lambda probe: _target_is_human_maintainer(
-                                        repo, probe),
+                                    repo, issue, label, cached_timeline,
+                                    is_human=is_human_maintainer,
                                     log=log)),
                         log=log):
                     migrated += 1
@@ -5963,19 +6045,9 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                         park_census, repo, number,
                         _park_policy.PARK_REFUSAL_FOREIGN_EPISODE, age_detail)
                     continue
-            # ONE timeline read per surface per PR: the admission consults the timelines several
-            # times (the human cutoff, the park applications, the ownership probe) and every read
-            # must see the SAME view anyway — a mid-decision change would mix two worlds.
-            timelines = {}
-
-            def cached_timeline(_repo, timeline_number, _cache=timelines):
-                if timeline_number not in _cache:
-                    _cache[timeline_number] = timeline_fn(_repo, timeline_number)
-                return _cache[timeline_number]
-
             action, evidence, detail = _park_policy.capacity_park_admission(
                 repo, number, issue_number, cached_timeline,
-                is_human=lambda probe_login: _target_is_human_maintainer(repo, probe_login),
+                is_human=is_human_maintainer,
                 consumed=worker_pr.park_generation_cutoffs(comments, bot_login),
                 auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                 auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
@@ -6925,6 +6997,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         finish_pending()
         number = item["pr_number"]
         lane = _review_item_lane(item["state"])
+        # Scope the proof snapshot to this PR. See _cache_positive_maintainer_probes: carrying it
+        # across items would turn a revoked permission into stale authorisation on a later PR.
+        is_human_maintainer = _cache_positive_maintainer_probes(
+            lambda login: _target_is_human_maintainer(repo, login))
+        cached_timeline = _cache_timeline_events_for_decision(_issue_timeline_events)
         lanes[lane]["planned"] += 1
         if lane == "fix":
             # Issue #460: count at the actual PLAN->CLAIM enumeration boundary, not just
@@ -7044,8 +7121,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # receipted decision.
                 park_action, _park_evidence, park_detail = \
                     _park_policy.capacity_park_admission(
-                        repo, number, issue_number, _issue_timeline_events,
-                        is_human=lambda login: _target_is_human_maintainer(repo, login),
+                        repo, number, issue_number, cached_timeline,
+                        is_human=is_human_maintainer,
                         consumed=park_receipts,
                         auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                         auto_marker_count=worker_pr.auto_readmission_marker_count(
@@ -7254,8 +7331,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 if readmission_cutoff is _UNPROBED:
                     readmission_cutoff = _park_policy.effective_readmission_cutoff(
                         _park_policy.readmission_cutoff(
-                            _repo, _number, _issue, _issue_timeline_events,
-                            is_human=lambda login: _target_is_human_maintainer(_repo, login)),
+                            _repo, _number, _issue, cached_timeline,
+                            is_human=is_human_maintainer),
                         worker_pr.auto_readmission_stamps(comments, bot_login))
                 return readmission_cutoff
 
@@ -22449,6 +22526,155 @@ agent = "impl"
         assert "maintainer probe FAILED" in probe_out.getvalue(), probe_out.getvalue()
     finally:
         globals()["_run_gh_target_api"] = prev_target_api
+
+    # ---- [registry #2109] ONE PR-DECISION VIEW OF POSITIVELY PROVEN MAINTAINERS -------------
+    # False and failure must remain live probes, because memoising either would amplify a transient
+    # outage even within one decision and could miss a later successful proof. Production must
+    # create a fresh cache PER PR: a repo-sweep cache could outlive a permission revocation and
+    # authorise a human-gesture re-admission on a later PR.
+    maintainer_probe_calls = []
+
+    def changing_maintainer_probe(login):
+        maintainer_probe_calls.append(login)
+        attempts = maintainer_probe_calls.count(login)
+        if login == "confirmed":
+            return True
+        if login == "eventual":
+            return attempts >= 2
+        if login == "broken":
+            raise DispatchError("probe unavailable")
+        return False
+
+    cached_maintainer_probe = _cache_positive_maintainer_probes(changing_maintainer_probe)
+    assert [cached_maintainer_probe("confirmed") for _ in range(4)] == [True] * 4
+    assert maintainer_probe_calls.count("confirmed") == 1, maintainer_probe_calls
+    assert [cached_maintainer_probe("outsider") for _ in range(3)] == [False] * 3
+    assert maintainer_probe_calls.count("outsider") == 3, maintainer_probe_calls
+    assert cached_maintainer_probe("eventual") is False
+    assert cached_maintainer_probe("eventual") is True
+    assert cached_maintainer_probe("eventual") is True
+    assert maintainer_probe_calls.count("eventual") == 2, maintainer_probe_calls
+    for _ in range(2):
+        try:
+            cached_maintainer_probe("broken")
+            raise AssertionError("a probe exception must preserve the caller's failure path")
+        except DispatchError as exc:
+            assert str(exc) == "probe unavailable", exc
+    assert maintainer_probe_calls.count("broken") == 2, maintainer_probe_calls
+
+    timeline_probe_calls = []
+    timeline_payloads = {}
+
+    def changing_timeline_probe(probe_repo, number):
+        key = (probe_repo, number)
+        timeline_probe_calls.append(key)
+        if key == ("example/repo", 9) and timeline_probe_calls.count(key) == 1:
+            raise DispatchError("timeline unavailable")
+        if timeline_probe_calls.count(key) == 1:
+            if key == ("example/repo", 11):
+                return ["malformed-event"]
+            if key == ("example/repo", 12):
+                return [{"event": "labeled", "label": {},
+                         "created_at": "2026-08-31T00:00:00Z"}]
+            if key == ("example/repo", 13):
+                return [{"event": "unlabeled", "label": {"name": "review:parked"},
+                         "created_at": "not-a-timestamp"}]
+            if key == ("example/repo", 14):
+                return [{"event": "labeled", "label": {"name": "area:docs"},
+                         "created_at": "not-a-timestamp"}]
+        return timeline_payloads.setdefault(key, [{"surface": key}])
+
+    cached_timeline_probe = _cache_timeline_events_for_decision(changing_timeline_probe)
+    first_timeline = cached_timeline_probe("example/repo", 7)
+    assert cached_timeline_probe("example/repo", 7) is first_timeline
+    assert timeline_probe_calls.count(("example/repo", 7)) == 1, timeline_probe_calls
+    other_repo_timeline = cached_timeline_probe("other/repo", 7)
+    assert other_repo_timeline is not first_timeline
+    assert timeline_probe_calls.count(("other/repo", 7)) == 1, timeline_probe_calls
+    try:
+        cached_timeline_probe("example/repo", 9)
+        raise AssertionError("a timeline failure must preserve the caller's failure path")
+    except DispatchError as exc:
+        assert str(exc) == "timeline unavailable", exc
+    recovered_timeline = cached_timeline_probe("example/repo", 9)
+    assert cached_timeline_probe("example/repo", 9) is recovered_timeline
+    assert timeline_probe_calls.count(("example/repo", 9)) == 2, timeline_probe_calls
+    for malformed_number in (11, 12, 13):
+        try:
+            cached_timeline_probe("example/repo", malformed_number)
+            raise AssertionError("a malformed timeline must preserve the caller's failure path")
+        except DispatchError as exc:
+            assert "structurally malformed" in str(exc), exc
+        recovered_malformed_timeline = cached_timeline_probe(
+            "example/repo", malformed_number)
+        assert (cached_timeline_probe("example/repo", malformed_number)
+                is recovered_malformed_timeline)
+        assert timeline_probe_calls.count(("example/repo", malformed_number)) == 2, \
+            timeline_probe_calls
+    irrelevant_label_timeline = cached_timeline_probe("example/repo", 14)
+    assert irrelevant_label_timeline == [
+        {"event": "labeled", "label": {"name": "area:docs"},
+         "created_at": "not-a-timestamp"}]
+    assert cached_timeline_probe("example/repo", 14) is irrelevant_label_timeline
+    assert timeline_probe_calls.count(("example/repo", 14)) == 1, timeline_probe_calls
+
+    # The helper test above cannot prove production uses it or scopes it correctly. Parse both
+    # latency-dominant sweeps and require their migration/readmission and review/budget call sites to
+    # receive the SAME cached callable, created INSIDE the per-PR loop. This is exact AST wiring, not
+    # source containment: replacing one keyword with the old live lambda, leaving an unused cache,
+    # or hoisting the cache to repo scope makes this row red.
+    cache_source = ast.parse(Path(__file__).resolve().read_text(encoding="utf-8"))
+    for fn_name, expected_uses in (("_readmit_capacity_parks", 2),
+                                   ("_dispatch_review_items", 2)):
+        fn_node = next(node for node in ast.walk(cache_source)
+                       if isinstance(node, ast.FunctionDef) and node.name == fn_name)
+        parent_of = {child: parent for parent in ast.walk(fn_node)
+                     for child in ast.iter_child_nodes(parent)}
+        cache_assignments = [
+            node for node in ast.walk(fn_node) if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "is_human_maintainer"
+                    for target in node.targets)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "id", "") == "_cache_positive_maintainer_probes"
+        ]
+        uses = [
+            keyword.value for node in ast.walk(fn_node) if isinstance(node, ast.Call)
+            for keyword in node.keywords if keyword.arg == "is_human"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "is_human_maintainer"
+        ]
+        assert len(cache_assignments) == 1, (fn_name, len(cache_assignments))
+        cursor = cache_assignments[0]
+        enclosing_loops = []
+        while cursor in parent_of:
+            cursor = parent_of[cursor]
+            if isinstance(cursor, (ast.For, ast.While)):
+                enclosing_loops.append(cursor)
+        assert len(enclosing_loops) == 1, (fn_name, len(enclosing_loops))
+        assert len(uses) == expected_uses, (fn_name, len(uses), expected_uses)
+        timeline_assignments = [
+            node for node in ast.walk(fn_node) if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "cached_timeline"
+                    for target in node.targets)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "id", "") == "_cache_timeline_events_for_decision"
+        ]
+        timeline_uses = [
+            arg for node in ast.walk(fn_node) if isinstance(node, ast.Call)
+            for arg in node.args if isinstance(arg, ast.Name) and arg.id == "cached_timeline"
+        ]
+        assert len(timeline_assignments) == 1, (fn_name, len(timeline_assignments))
+        cursor = timeline_assignments[0]
+        enclosing_loops = []
+        while cursor in parent_of:
+            cursor = parent_of[cursor]
+            if isinstance(cursor, (ast.For, ast.While)):
+                enclosing_loops.append(cursor)
+        assert len(enclosing_loops) == 1, (fn_name, len(enclosing_loops))
+        assert len(timeline_uses) == expected_uses, (fn_name, len(timeline_uses), expected_uses)
+    print("  ok   [#2109] positive maintainer proofs and timeline reads collapse within one PR "
+          "decision; negative/failing reads stay live, and both production sweeps scope/use both "
+          "caches per PR")
 
     # deferred-retry lease filter: a live lease suppresses the retry, expiry re-admits it
     deferred_items = [{"number": 9, "deferred": True}, {"number": 7, "deferred": False}]
