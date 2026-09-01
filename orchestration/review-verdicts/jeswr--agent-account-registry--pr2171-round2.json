@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2171,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "31299207d89909bb1f6a53ef6888c1aeb90c76ac",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 operational correctness issue is resolved. Section 4 now distinguishes Path A eligibility from its actual outcome: successful capacity migration is decision-free, question-class classification and hold-axis refusals remain human decisions, and a `provable` refusal is explicitly deferred/unknown rather than counted as disposed. The summary and upper-bound language are correspondingly narrowed to at most three non-injection decisions, with zero only a possible floor when all three PRs reach disposing outcomes. These distinctions agree with `_migrate_legacy_park`'s fail-closed branches and with Path B's receipt-bound decision flow. The document also clearly separates checkout-measured classifier behavior from unavailable live-PR facts. No new correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
