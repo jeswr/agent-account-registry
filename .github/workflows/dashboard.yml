@@ -459,9 +459,12 @@ jobs:
           # workflow-file:stale-threshold-seconds[:executed-marker-artifact] (cadence + slack)
           #
           # THE ANCHOR (#922, #1375). With no third field the liveness signal is the newest
-          # non-action_required RUN's created_at. That is a valid proxy only where an accepted run
-          # IMPLIES the workflow did its work,
-          # and dispatch.yml is the one listed workflow where it does not: since the #819 tick
+          # non-action_required RUN's created_at. The #559 live-run guard first protects queued or
+          # in-progress environment-approval waits; unlike ci-latency-alert.py's M4 fingerprint,
+          # this recovery loop does not query jobs to distinguish settled approval-gated runs.
+          # That run anchor is a valid proxy only where an accepted run IMPLIES the workflow did
+          # its work, and dispatch.yml is the one listed workflow where it does not: since the
+          # #819 tick
           # floor, a within-floor ring concludes `success` in ~30s having executed NOTHING, and
           # #79's registry-internal ring sources make those no-op runs the NORMAL case (dispatch is
           # rung roughly every <=7 min). Anchored on runs, this leg therefore reads a dispatcher
@@ -479,6 +482,8 @@ jobs:
           # This leg is NOT retired in favour of that watchdog: dispatch-stall-alert PAGES A HUMAN,
           # the keepalive RE-DISPATCHES. Losing it would turn every cron-delivery gap on the
           # busiest workflow in the fleet into a manual recovery.
+          # On a pure ingestion-rejected stream a kick is knowingly non-curative; the error
+          # annotation is the payload, with ci-latency-alert.py's M4 alarm owning human recovery.
           for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200:dispatch-tick groom-core.yml:1800 retriage.yml:3600; do
             wf="${spec%%:*}"; rest="${spec#*:}"; limit="${rest%%:*}"
             if [ "$rest" != "$limit" ]; then marker="${rest#*:}"; else marker=""; fi
@@ -509,8 +514,8 @@ jobs:
             else
               anchor="ran"
               last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=30" \
-                     --jq '[.workflow_runs[] | select(.conclusion != "action_required")]
-                            | .[0].created_at // empty' || true)
+                     --jq '[.workflow_runs[] | select(.conclusion != "action_required")
+                            | .created_at] | max // empty' || true)
               if [ -z "$last" ]; then
                 echo "::error::keepalive: ${wf} has no accepted run among its newest 30; action_required runs are not liveness evidence"
               fi
@@ -569,8 +574,8 @@ jobs:
               continue
             fi
             last=$(gh api "repos/sparq-org/sparq/actions/workflows/${wf}/runs?per_page=30" \
-                   --jq '[.workflow_runs[] | select(.conclusion != "action_required")]
-                          | .[0].created_at // empty' || true)
+                   --jq '[.workflow_runs[] | select(.conclusion != "action_required")
+                          | .created_at] | max // empty' || true)
             if [ -z "$last" ]; then
               echo "::error::keepalive: sparq-org/sparq ${wf} has no accepted run among its newest 30; action_required runs are not liveness evidence"
             fi

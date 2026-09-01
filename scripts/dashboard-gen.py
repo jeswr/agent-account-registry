@@ -5255,8 +5255,11 @@ case "${endpoint}" in
         exit 1
       fi
       jq -r "${filter}" < "${STUB_DIR}/live-${wf}.json"
-    else
+    elif [[ "${filter}" == *'action_required'* ]]; then
       jq -r "${filter}" < "${STUB_DIR}/runs-${wf}.json"
+    else
+      printf 'gh-stub: unexpected argv: %s\n' "$*" >&2
+      exit 64
     fi
     ;;
   *)
@@ -5306,12 +5309,18 @@ esac
                 env=dict(os.environ,
                          PATH=f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
                          GITHUB_REPOSITORY="o/r", GH_TOKEN="stub",
+                         METRICS_RESULT="failure",
                          STUB_DIR=str(stubs), STUB_CALLS=str(calls),
                          STUB_ARTIFACTS_FAIL="1" if artifacts_fail else "0",
                          STUB_LIVE_FAIL="1" if live_fail else "0"))
             dispatched = sorted(line for line in calls.read_text(encoding="utf-8").split("\n")
                                 if "/dispatches" in line)
-        return completed.returncode, dispatched, completed.stdout + completed.stderr
+        log = completed.stdout + completed.stderr
+        # The production reads deliberately fail open with `|| true`; without carrying the stub's
+        # refusal out-of-band, an unmodelled read can therefore look exactly like an empty stale
+        # anchor and satisfy the outcome rows. Preserve the stub's promised loud exit instead.
+        code = 64 if "gh-stub: unexpected argv:" in log else completed.returncode
+        return code, dispatched, log
 
     def run_keepalive_step(**fixtures):
         """The REGISTRY leg, subject of the #922 rows. -> (exit code, [workflows kicked], log)."""
@@ -5449,6 +5458,24 @@ esac
         "[#1375] a pure rejected-run stream is stale AND emits an explicit workflow error",
         (code, kicked, "::error::keepalive: metrics.yml has no accepted run" in log),
         (0, ["metrics.yml"], True), log)
+    metrics_dispatch = ("api -X POST "
+                        "repos/o/r/actions/workflows/dashboard.yml/dispatches -f ref=master")
+    code, dispatched, log = run_keepalive_leg(
+        metrics_keepalive_script, metrics_specs,
+        runs={"dashboard.yml": [_ka_run(60, conclusion="action_required"), _ka_run(9_999)]})
+    keepalive_check(
+        "[#1375] metrics.yml's third mesh leg also skips a fresh rejected dashboard run and "
+        "dispatches from the stale accepted run behind it",
+        (code, dispatched), (0, [metrics_dispatch]), log)
+    code, dispatched, log = run_keepalive_leg(
+        metrics_keepalive_script, metrics_specs,
+        runs={"dashboard.yml": [_ka_run(60, conclusion="action_required")]})
+    keepalive_check(
+        "[#1375] a pure rejected dashboard stream in the third mesh leg is stale AND visible as "
+        "a workflow error",
+        (code, dispatched,
+         "::error::keepalive: dashboard.yml has no accepted run" in log),
+        (0, [metrics_dispatch], True), log)
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)])
     keepalive_check(
         "[#922] control: a fleet that is fresh on BOTH anchors is kicked not at all",
