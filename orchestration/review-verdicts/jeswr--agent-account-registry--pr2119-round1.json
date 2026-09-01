@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2119,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d672c109dd02f235e800b7b20abeb4f1ce807224",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The two new rows cover a wrongly-TYPED age (`\"12m\"` -> `type str`) and an ABSENT age. They do not cover the other half of `_obs_minutes`'s contract: a value that is an int/float but outside `0 <= value < 10_000_000` (e.g. `-1`, `1e9`, `float('nan')`), which also returns None and now drops the row with a message reading `row `oldest_age_minutes` (type int) is not a non-negative number of minutes`.\n\nThis is a coverage nit, not a bug: the out-of-range value reaches the same `age is None` branch that the str case already exercises, so no branch is unexecuted. But the sibling `depth` seam deliberately pins BOTH its wrong-type row (`\"4\"`) and its negative row (`-1`) side by side, and a future loosening of `_obs_minutes`'s range check (dropping the upper bound, or `<=` on the lower) would leave the suite fully green today. `-1` is also the sentinel a collector is most likely to emit for 'no items in this class', so it is the value whose handling an operator would most want written down.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Add one row beside the two new ones, mirroring the `depth` pair's shape, e.g.:\n\n    check(\"[#1919] a NEGATIVE queue age is SENT-and-unreadable too \u2014 the range check is part of \"\n          \"the contract, not just the type\",\n          obs_queue([{\"class\": \"2a\", \"depth\": 9, \"oldest_age_minutes\": -1}]),\n          ([], [_QUEUE_DROP.format(\n              \"row `oldest_age_minutes` (type int) is not a non-negative number of minutes\")]))\n\nKeep the expected string a literal. Optional second row for the upper bound (`10_000_000`) if you want the ceiling pinned as well.",
+    "severity": "nit",
+    "title": "No self-test row pins a numerically-typed but out-of-range age (negative / >=10,000,000 / NaN)"
+   }
+  ],
+  "progress": null,
+  "summary": "[#1919] `_obs_flow` now distinguishes an UNSENT queue-row `oldest_age_minutes` (absent or explicit null -> row kept, age None, silent) from a SENT-but-unreadable one (row dropped, one announced reason). Verified against the head checkout, not just the diff.\n\nCorrectness: the `raw_age is not None and age is None` guard matches the seam's established sent-vs-absent rule (`_obs_stat`, #1557) and sits after the depth guard so each drop still names exactly the field that failed. `_obs_minutes` returns None for non-numerics, bools, negatives, NaN/inf and >=10,000,000, and its `0 <= value < 10_000_000` compares the raw int, so an arbitrary-precision JSON integer cannot raise OverflowError past the DashboardError contract (the #1880 hazard). Dropping the whole row rather than only the age matches how an unreadable `class`/`depth` is already handled on this seam, and the drop stays tolerant (announced, never fatal) and capped by the existing `_ObsDropLog`.\n\nSecurity: the new drop line emits only this build's own field name plus a Python type name \u2014 no collector value reaches the build log, so the log-injection surface that `_obs_text(queue_class, 16)` guards on the class field does not exist here.\n\nTest validity (non-vacuous): the loud row asserts BOTH the published queue is `[]` and the exact literal warning string; reverting the guard publishes `{depth: 9, oldest_age_minutes: None}` and reds it. The silent row asserts the row survives with `oldest_age_minutes: None` and NO warning; over-dropping on absence, or an unconditional announce, reds it. Expected strings are literals, not read back off the module (pre-flight 2(b)). I checked every other queue fixture in `_self_test` (golden 6140/6185, over-cap 6665, #1570 flood rows, 7000/7050/7540) \u2014 none sends an unreadable age, so no existing row silently changes meaning. I could not execute `--self-test` (Bash execution not permitted in this sandbox); the assessment above is static.\n\nNo blocker or major is\u2026 [truncated 29 chars]",
+  "verdict": "approve"
+ }
+}
