@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6147,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "156336e73721100d5a9cfbc68ef4a7d0d067c412",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "fetch_bd_map records ambiguity independently per trust class, then apply_migration aborts on every touched ambiguous id. If a legitimate issue already has MIGRATION_LABEL, one marker-only copy is inert as intended, but two unprivileged marker-only issues with the same bd-id make the unverified class collide and put that id in ambiguous. The trusted issue is still canonical, so these decoys should remain inert; instead any user able to open two issues can stop --apply for that bead. This contradicts the stated threat-model rationale and is not exercised by the new tests.",
+    "file": "scripts/bd-to-issues.py",
+    "fix_hint": "Exclude unverified-class collisions from ambiguous when the same bd-id has a trusted entry (or filter those collisions before aborting), while retaining trusted-class duplicate detection. Add a regression test with one MIGRATION_LABEL issue plus two marker-only copies and assert ambiguity is empty and apply_migration resumes the trusted issue.",
+    "severity": "major",
+    "title": "Two marker-only decoys can abort a trusted resume"
+   }
+  ],
+  "progress": null,
+  "summary": "The new duplicate detection closes the arbitrary same-class selection case, but it introduces an unprivileged denial-of-service against otherwise canonical authenticated resumes. The implementation says marker-only copies of an authenticated issue are inert, yet two such copies are classified as ambiguous and abort --apply. The tests cover only one shadow copy, so they miss this security-relevant boundary.",
+  "verdict": "request_changes"
+ }
+}
