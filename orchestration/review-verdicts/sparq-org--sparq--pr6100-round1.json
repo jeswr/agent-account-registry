@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6100,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e570befb3413db8dca360a53af13062a74fe22f4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_features_table()` reads only `data[\"features\"]`, and `check_declared_sensitive_features()` iterates only those keys. Cargo also declares an implicit feature for each optional dependency when that dependency is not referenced via `dep:<name>` in the feature table. For example, `[dependencies] foo = { version = \"...\", optional = true }` plus `#![cfg(feature = \"foo\")]` defines a real sensitive Cargo feature, but this check never classifies `foo`. If no leg activates it, `--enforce` still reports success, contradicting invariant (3)'s stated purpose and completeness claim.",
+    "file": "scripts/feature-matrix-tiers.py",
+    "fix_hint": "Parse dependency tables (including target-specific dependency tables as applicable) and add optional dependency names that Cargo exposes as implicit features, excluding names whose implicit feature is suppressed by a `dep:<name>` reference. Add a hermetic regression test with an optional dependency, a `cfg(feature = \"<dependency-name>\")` test, and no leg activating it; assert `check_declared_sensitive_features` returns `VIOLATION(3)`.",
+    "severity": "major",
+    "title": "Implicit optional-dependency features are not enumerated"
+   }
+  ],
+  "progress": null,
+  "summary": "The new invariant is wired into enforcement and its direct tests pass, but its declared-feature enumeration is incomplete relative to Cargo's feature model. Cargo creates implicit features for optional dependencies unless the dependency is referenced with `dep:` syntax; those features do not appear as keys in `[features]`. Because `_features_table` returns only that table, a sensitive implicit optional-dependency feature with no matrix leg remains invisible, preserving the zero-leg blind spot this PR claims to close.",
+  "verdict": "request_changes"
+ }
+}
