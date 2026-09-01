@@ -2493,7 +2493,8 @@ def _self_test():
     # STRUCTURALLY against the parsed workflow, and fail CLOSED if the workflow, the job, or the
     # step cannot be found — "zero steps matched" must never read as a pass.
     try:
-        import yaml  # lazy, self-test only: a hard self-test-suite dependency already
+        from yaml_dependency import require_yaml
+        yaml = require_yaml("select-and-claim workflow-seam self-test")
         from pathlib import Path as _Path
         groom_path = (_Path(__file__).resolve().parent.parent / ".github" / "workflows" / "groom-core.yml")
         groom_doc = yaml.safe_load(groom_path.read_text(encoding="utf-8"))

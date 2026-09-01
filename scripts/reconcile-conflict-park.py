@@ -1514,7 +1514,8 @@ def _self_test():
     # Every uncaught mutant in this repo's measured mutation runs lived at a workflow `if:`, a
     # step, or a call site. Deleting the invocation, dropping --apply or either cap, adding
     # continue-on-error, or appending `|| true` reds one of these three checks.
-    import yaml as workflow_yaml
+    from yaml_dependency import require_yaml
+    workflow_yaml = require_yaml("reconcile-conflict-park workflow-seam checks")
 
     workflow_path = (Path(__file__).resolve().parent.parent
                      / ".github/workflows/reconcile-conflict-park.yml")

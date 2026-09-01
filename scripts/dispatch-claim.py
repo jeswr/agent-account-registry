@@ -12296,7 +12296,8 @@ def _self_test():
     # indentation-bearing literals via str.index(). Round-trip the workflow through the YAML parser
     # to produce a REFLOWED-BUT-EQUIVALENT document (a different serialisation entirely — the old
     # slice literal is gone from the text) and require the SAME block back. ----
-    import yaml as _yaml  # already a hard self-test-suite dependency (resolve-conflicts.py)
+    from yaml_dependency import require_yaml
+    _yaml = require_yaml("dispatch-claim self-test workflow fixtures")
     _rf_text = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
                 / "review-fix.yml").read_text(encoding="utf-8")
     _rf_reflowed = _yaml.safe_dump(_yaml.safe_load(_rf_text), default_flow_style=False, width=4096)
@@ -24983,7 +24984,8 @@ def _census_seam_violations(document):
 
 
 def _census_yaml_seam_self_test():
-    import yaml  # self-test-only, same lazy import as _workflow_step_python
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("dispatch-claim census workflow-seam self-test")
     path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "dispatch.yml"
     live = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert _census_seam_violations(live) == [], _census_seam_violations(live)
@@ -25213,7 +25215,8 @@ def _park_cause_site_self_test():
 
 
 def _starvation_yaml_seam_self_test():
-    import yaml  # self-test-only, same lazy import as _workflow_step_python
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("dispatch-claim starvation workflow-seam self-test")
     path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "dispatch.yml"
     live = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert _starvation_seam_violations(live) == [], _starvation_seam_violations(live)
@@ -26232,7 +26235,8 @@ def _ledger_seam_violations(document, source=None):
 
 
 def _identity_refusal_seam_self_test():
-    import yaml  # self-test-only, same lazy import as _workflow_step_python
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("dispatch-claim delivery workflow-seam self-test")
     import ast
     worker_pr = _probe_worker_pr()
     path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml"

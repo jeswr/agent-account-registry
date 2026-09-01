@@ -638,7 +638,8 @@ def _require(path):
 
 
 def _load_workflow(path):
-    import yaml  # hard requirement: regex-over-YAML is how permissive misparses get in
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("groom-mint-alert workflow-seam checks")
     return yaml.safe_load(_require(path))
 
 

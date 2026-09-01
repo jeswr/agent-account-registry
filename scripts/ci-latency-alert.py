@@ -95,8 +95,9 @@ import tempfile
 from pathlib import Path
 
 try:
-    import yaml
-except ImportError as _exc:  # pragma: no cover - fail loud rather than skip M1
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("ci-latency workflow-seam checks")
+except RuntimeError as _exc:  # pragma: no cover - fail loud rather than skip M1
     yaml = None
     _YAML_IMPORT_ERROR = _exc
 

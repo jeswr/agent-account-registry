@@ -975,7 +975,8 @@ def _test_workflow_seam(chk):
     `needs:` edge, a permissions block, or a call site — not in the Python.
 
     So each condition is pinned EXACTLY and then EVALUATED across every upstream outcome."""
-    import yaml  # lazy: available on ubuntu-latest (verified live, run 30279870348) and in pr-gate
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("metrics-alert workflow-seam checks")
 
     metrics_wf = yaml.safe_load(_require(".github/workflows/metrics.yml"))
     groom_wf = yaml.safe_load(_require(".github/workflows/groom-sweep.yml"))

@@ -772,7 +772,8 @@ def _test_workflow_seam(chk):
     """THE YAML SEAM. Every uncaught mutant measured in this estate sat one level above the shell
     body — in an `if:`, a `with:` value, or a call site — never in the Python. So each is pinned by
     EXACT match, never containment."""
-    import yaml  # lazy: available on ubuntu-latest and in pr-gate
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("ledger-identity-watch workflow-seam checks")
 
     def crons(document):
         """How many `schedule:` entries a workflow document declares.

@@ -2611,7 +2611,8 @@ def _test_cron_collisions(chk):
 # the YAML seam
 # ---------------------------------------------------------------------------------------------
 def _load_workflow(path):
-    import yaml  # hard requirement: regex-over-YAML is how permissive misparses get in
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("regate-sweep workflow-seam checks")
     return yaml.safe_load(_require(path))
 
 

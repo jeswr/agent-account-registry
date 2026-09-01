@@ -809,7 +809,8 @@ def _self_test():
           3. anything after the heredoc terminator — even WITH `-e`, a trailing successful
              command is the step's exit status if the heredoc is not last.
         """
-        import yaml  # lazy: same shape as dispatch-secrets-guard's parsed step-level ban
+        from yaml_dependency import require_yaml
+        yaml = require_yaml("dispatch-plan exit-status workflow-seam checks")
         with open(path, encoding="utf-8") as handle:
             document = yaml.safe_load(handle)
         found = []
@@ -876,7 +877,8 @@ def _self_test():
         does not: the `plan-snapshot.py` INVOCATION must be the script's last command, because a
         shell exits with its last command's status.
         """
-        import yaml  # lazy, same as _refuse_exit_zero_swallow
+        from yaml_dependency import require_yaml
+        yaml = require_yaml("dispatch-plan snapshot workflow-seam checks")
         with open(path, encoding="utf-8") as handle:
             document = yaml.safe_load(handle)
         found = []
@@ -945,7 +947,8 @@ def _self_test():
 
         Fail-closed like its neighbours: anything it cannot resolve raises rather than passes.
         """
-        import yaml  # lazy, same as _refuse_exit_zero_swallow
+        from yaml_dependency import require_yaml
+        yaml = require_yaml("dispatch-plan cache workflow-seam checks")
         # The artifact name is read from the PRODUCT, never restated here: a literal copy is a
         # second place for the workflow and the reader to drift apart silently.
         _STORE_ARTIFACT = _load("registry_plan_snapshot_seam", "plan-snapshot.py").STORE_ARTIFACT

@@ -1632,7 +1632,7 @@ _pr_gate_manifest_derivation() {
 # Row format: <label>|<probe-kind>|<probe-arg>|<consumer-ERE>. The ERE is LAST because it contains
 # `|` itself; `read` hands the unsplit remainder to its final variable.
 SELFTEST_ENV_REQUIREMENTS='jq|command|jq|(^|[^[:alnum:]_./-])jq([^[:alnum:]_-]|$)
-PyYAML|pymodule|yaml|^[[:space:]]*(import[[:space:]]+yaml|from[[:space:]]+yaml[[:space:]]+import)'
+PyYAML|pymodule|yaml|^[[:space:]]*(import[[:space:]]+yaml|from[[:space:]]+yaml[[:space:]]+import|from[[:space:]]+yaml_dependency[[:space:]]+import)'
 
 # Probe ONE dependency: rc 0 present, rc 1 absent. Not pure by nature -- it asks the environment.
 # An unrecognised probe kind reports ABSENT, never present: a typo'd requirement row must fail the
@@ -4098,9 +4098,11 @@ self_test() {
   local dep_fixture="$tmp/dep-preflight"
   mkdir -p "$dep_fixture"
   printf '%s\n' 'import yaml' 'value = 1' > "$dep_fixture/uses-yaml.py"
+  printf '%s\n' 'from yaml_dependency import require_yaml' \
+    'yaml = require_yaml("fixture workflow seam")' > "$dep_fixture/uses-yaml-helper.py"
   printf '%s\n' '#!/usr/bin/env bash' 'jq -r .a "$1"' > "$dep_fixture/uses-jq.sh"
   printf '%s\n' 'import json' 'note = "mentions jqueue, not the binary"' > "$dep_fixture/plain.py"
-  local dep_suite='uses-yaml.py uses-jq.sh plain.py'
+  local dep_suite='uses-yaml.py uses-yaml-helper.py uses-jq.sh plain.py'
   _dep_probe_all_present() { return 0; }
   _dep_probe_none_present() { return 1; }
   _dep_probe_no_yaml() { if [[ "$2" == yaml ]]; then return 1; fi; return 0; }
@@ -4118,6 +4120,8 @@ self_test() {
     "$(printf '%s\n' "$dep_out" | grep -c '^ENV-BLOCKED PyYAML ')" "1"
   chk "#824 preflight: the report names the blocked row" \
     "$(printf '%s\n' "$dep_out" | grep -c 'uses-yaml\.py')" "1"
+  chk "#1428 preflight: the shared actionable loader remains classified as a PyYAML consumer" \
+    "$(printf '%s\n' "$dep_out" | grep -c 'uses-yaml-helper\.py')" "1"
   chk "#824 preflight: it does NOT blame rows the present dependencies cover" \
     "$(printf '%s\n' "$dep_out" | grep -c 'uses-jq\.sh')" "0"
   chk "#824 preflight: a PRESENT dependency emits no line of its own" \

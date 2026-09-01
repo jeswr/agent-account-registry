@@ -2202,7 +2202,8 @@ def _test_publish_cas_and_wiring(chk):
     # the moment the snapshot exists. These assertions pin the wire contract, the dedupe that
     # stops the retained cron fallback doubling the deploys, and the liveness mesh the dedupe is
     # forbidden to touch.
-    import yaml  # lazy, self-test only: already a hard self-test-suite dep (resolve-conflicts.py)
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("metrics workflow-seam self-test")
     dg = _load_dashboard_gen()
     dash = yaml.safe_load(dashboard_workflow)
     coll = yaml.safe_load(collector_workflow)

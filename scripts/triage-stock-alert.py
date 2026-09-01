@@ -779,7 +779,8 @@ def _self_test():
     if not workflow.exists():
         chk("retriage.yml is present to assert against", str(workflow), "a readable file")
     else:
-        import yaml  # noqa: PLC0415 — self-test only; the runner image ships PyYAML
+        from yaml_dependency import require_yaml
+        yaml = require_yaml("triage-stock-alert workflow-seam self-test")
         spec = yaml.safe_load(workflow.read_text(encoding="utf-8"))
         jobs = spec.get("jobs", {})
         job = jobs.get("stock-alert", {})

@@ -1269,7 +1269,8 @@ def _self_test():
     if not os.path.isdir(workflows):
         print("  note  workflow directory absent (sparse checkout) -- YAML seam not asserted")
     else:
-        import yaml as workflow_yaml
+        from yaml_dependency import require_yaml
+        workflow_yaml = require_yaml("latch-watchdog workflow-seam checks")
         with open(os.path.join(workflows, "latch-watchdog.yml"), encoding="utf-8") as handle:
             doc = workflow_yaml.safe_load(handle.read())
         steps = doc["jobs"]["watch"]["steps"]
