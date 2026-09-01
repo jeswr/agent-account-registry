@@ -2183,7 +2183,10 @@ def _obs_flow(flow):
     # 26-class backlog and a 12-class one stop rendering identically. See `_obs_capped`.
     queue, queue_total = _obs_capped(queue, 12)
     ci_queue, ci_queue_total = _obs_capped(ci_queue, 12)
-    return {"queue": queue, "queue_total": queue_total,
+    # [#1896] The build log is not the layer an operator reads. Publish the refused-row count so
+    # the page can distinguish a genuinely empty queue from one whose entire input was unreadable,
+    # and so its depth trend can refuse an incomplete sample instead of fabricating a zero.
+    return {"queue": queue, "queue_total": queue_total, "queue_dropped": drops.dropped,
             "lease_utilization_1h": lease_utilization,
             "review_rounds": review_rounds,
             "parks_1h": parks_1h, "arm_to_merge_minutes_24h": arm_to_merge,
@@ -6185,6 +6188,9 @@ esac
         "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.3},
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3.0}],
                  "queue_total": 2,
+                 # [#1896] One malformed queue row in the golden input is published as loss
+                 # evidence; the surviving-row total above deliberately remains 2.
+                 "queue_dropped": 1,
                  # [#374] three validated lease rows in, ZERO published: only the mean/max of the
                  # utilizations that parsed (0.8, 0.4 -> 0.6/0.8). The unparseable third row proves
                  # the aggregate is taken over reporting rows, and the count itself never appears.
@@ -6636,6 +6642,72 @@ esac
            for name, rendered in (obs_window_page.items()
                                   if isinstance(obs_window_page, dict) else ())},
           {"measured": None, "quiet": None, "unread": None, "hostile": None})
+    # ---- [#1896] DROPPED QUEUE ROWS MUST REACH THE PAGE. The log warning tested by #982 is not
+    # visible to an operator reading a green dashboard. Exercise the real page twice per scenario:
+    # the warning distinguishes total loss from a measured empty queue, while the trend must plot
+    # the measured zero and refuse the incomplete sample. Literal expectations keep the page and
+    # generator sides from agreeing tautologically on a renamed signal (pre-flight 2(b)).
+    _OBS_QUEUE_LOSS_PAGE_BODY = r"""
+  const out = {};
+  for (const [name, documents] of Object.entries(input.scenarios)) {
+    const page = new Function(source + "; return { renderObservability };")();
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers", "warning"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      for (const document of documents) page.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    const card = ids["obs-grid"].children.find((kid) => kid.tagName === "article"
+      && kid.children[0] && kid.children[0].textContent === "Queue & flow");
+    const reasons = card ? card.children.find((kid) => kid.className === "obs-reasons"
+      && kid.children[0] && kid.children[0].textContent === "task queue depth · oldest age") : null;
+    const spark = card ? card.children.find((kid) => kid.className === "obs-spark-wrap"
+      && flat(kid).join(" ").includes("queue depth trend")) : null;
+    out[name] = {
+      error,
+      queueText: reasons ? flat(reasons).join(" ").trim().replace(/\s+/g, " ") : null,
+      queuePlotted: spark ? spark.children.some((kid) => kid.tagName === "svg") : null,
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+
+    def obs_queue_scenario(rows):
+        documents = []
+        for offset in (0, 60):
+            fixture = copy.deepcopy(obs_fixture)
+            fixture["generated_at"] = now + offset
+            fixture["flow"]["queue"] = copy.deepcopy(rows)
+            with contextlib.redirect_stdout(io.StringIO()):
+                documents.append(obs_normalized(fixture))
+        return documents
+
+    queue_loss_page = _executed_page(
+        _page_harness("renderObservability", _OBS_QUEUE_LOSS_PAGE_BODY),
+        {"scenarios": {
+            "empty": obs_queue_scenario([]),
+            "dropped": obs_queue_scenario([{"class": 17, "depth": 4}]),
+            "measured": obs_queue_scenario([{"class": "2a", "depth": 0}]),
+        }})
+
+    def queue_loss(name):
+        rendered = queue_loss_page.get(name)
+        return ((rendered.get("queueText"), rendered.get("queuePlotted"), rendered.get("error"))
+                if isinstance(rendered, dict) else queue_loss_page)
+
+    check("[#1896] EXECUTED page script: a queue whose only row the generator DROPPED carries an "
+          "unreadable-row warning, while a genuinely empty queue carries no backlog list at all",
+          (queue_loss("dropped"), queue_loss("empty")),
+          (("task queue depth · oldest age 1 queue row was unreadable", False, None),
+           (None, True, None)))
+    check("[#1896] EXECUTED page script: the accept control still renders its queue row and plots "
+          "a measured zero-depth trend — hiding every empty-looking sample cannot satisfy the fix",
+          queue_loss("measured"),
+          ("task queue depth · oldest age class 2a 0 deep", True, None))
     # ---- [#1868] A DISPLAY CAP MUST SAY WHAT IT HID. Every array this panel publishes is a top-N
     # slice, and the rows past the cap are WELL-FORMED ones — nothing announces them, by design
     # (#982/#1570/#1571 all decided a truncation of rows the seam READ is not a producer/consumer

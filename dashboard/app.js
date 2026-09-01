@@ -911,10 +911,13 @@ function obsRecordTrend(o) {
   const cache = o.cache || {};
   const lanes = Array.isArray(o.lanes) ? o.lanes : [];
   const queue = o.flow && Array.isArray(o.flow.queue) ? o.flow.queue : [];
+  const queueDropped = o.flow ? obsNum(o.flow.queue_dropped) : null;
   obsTrend.points.push({
     read: obsNum(cache.prompt_cache_read_fraction_1h),
     defers: obsLaneDefers(lanes),
-    queue: queue.reduce((sum, row) => sum + obsNum(row.depth, 0), 0),
+    queue: queueDropped === 0
+      ? queue.reduce((sum, row) => sum + obsNum(row.depth, 0), 0)
+      : null,
   });
   if (obsTrend.points.length > OBS_SPARK_POINTS) {
     obsTrend.points.splice(0, obsTrend.points.length - OBS_SPARK_POINTS);
@@ -1095,7 +1098,8 @@ function obsFlowCard(flow, thresholds) {
   const card = obsCard("Queue & flow");
   const queue = Array.isArray(flow.queue) ? flow.queue : [];
   const queueNote = obsTruncationNote(queue, flow.queue_total, "queue classes");
-  if (queue.length || queueNote) {
+  const queueDropped = obsNum(flow.queue_dropped);
+  if (queue.length || queueNote || (queueDropped !== null && queueDropped > 0)) {
     const list = node("div", "obs-reasons");
     list.append(node("p", "obs-spark-caption", "task queue depth · oldest age"));
     for (const row of queue) {
@@ -1110,6 +1114,10 @@ function obsFlowCard(flow, thresholds) {
       list.append(rowEl);
     }
     if (queueNote) list.append(queueNote);
+    if (queueDropped !== null && queueDropped > 0) {
+      list.append(node("p", "obs-truncation-note bad",
+        `${queueDropped} queue ${queueDropped === 1 ? "row was" : "rows were"} unreadable`));
+    }
     card.append(list);
   }
   const grid = node("div", "obs-metric-grid");
