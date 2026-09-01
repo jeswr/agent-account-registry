@@ -11,16 +11,6 @@
    "expires_at": 1788290812
   },
   {
-   "account": "f79434c3ffba014f",
-   "claim_id": "66818b7d71d44894981facd10d689e50",
-   "holder": "jeswr/agent-account-registry#1775@33543254520.1",
-   "package": "workflows",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1788286975,
-   "expires_at": 1788290895
-  },
-  {
    "account": "c0ac92ebee2c590e",
    "claim_id": "afd1c0385e084791863e77710eaa4c58",
    "holder": "fix:sparq-org/sparq#5773@33544387925.1",
@@ -29,16 +19,6 @@
    "model": "opus5",
    "issued_at": 1788287669,
    "expires_at": 1788293969
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "874d66fb86914f328a49133748119a3c",
-   "holder": "jeswr/agent-account-registry#1428@33544729281.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "sol",
-   "issued_at": 1788287872,
-   "expires_at": 1788290572
   },
   {
    "account": "f79434c3ffba014f",
