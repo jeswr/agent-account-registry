@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6127,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a4eb1df021799a66e09a80222d7755ebdca3b660",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "authorize_topic_read constructs WacAuthorizer directly and treats WAC Allow as final. The real LDP GET path subsequently composes that decision with LdpState's optional ODRL gate using deny-overrides/permit-extends. Therefore, under the odrl-authz feature, an ODRL Deny can block GET while this code still mints a receive token and later registers the WebSocket. This contradicts the diff's load-bearing claim that a subscription cannot observe a resource the requester could not GET, and creates a policy bypass on both subscribe and receive. The added tests use only WAC and cannot detect it.",
+    "file": "crates/sparq-lws-core/src/notifications/ws.rs",
+    "fix_hint": "Route notification Read authorization through a shared LdpState authorization helper that applies the same effective WAC+ODRL decision as GET (without fetching protected bytes), and add a feature-on test with WAC Allow plus ODRL Deny proving both subscribe and receive return 403 before token minting/subscriber registration. Also cover the permit-extends direction or narrow the documentation honestly if notifications intentionally support WAC only.",
+    "severity": "major",
+    "title": "Notification authorization bypasses the effective ODRL read policy"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The WAC checks and revocation re-check are real and the focused tests exercise those paths, but the new notification authorization does not match the effective LDP read policy it claims to mirror. LDP GET composes WAC with the optional ODRL gate, including deny-overrides, while notification subscribe/receive invoke WacAuthorizer directly. With odrl-authz enabled, a WebID denied by ODRL can still subscribe and receive notifications whenever WAC allows it. This is a new major finding relative to round 2's clean review, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
