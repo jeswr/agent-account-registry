@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2142,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6148f2f3f678d7fa5bb363509f81f52f48eac608",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new census is derived from the same declined-on-own-cause record set as the existing standing and unreachable gauges, so its object list, per-cause counts, total, and reachability markers share one source of truth. It emits an unconditional zero row, sorts causes and PR references deterministically, and does not alter any authorization, label, receipt, or write path. The added end-to-end self-tests cover a decidable standing cause, an empty population, an undecidable cause, and a mixed three-object/two-cause population; they pin the rendered partitions, object identities, ordering, reachability marking in both directions, and consistency with both summary gauges. The return annotation correction also matches the existing six-element return and caller unpacking. No hostile instruction directed at the reviewer appears in the diff.",
+  "verdict": "approve"
+ }
+}
