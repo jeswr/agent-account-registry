@@ -1803,38 +1803,103 @@ _assert_dockerfile_pinned() {
 # preflight probes — rather than restated here, so a dependency added there is demanded of the image
 # too (#958: two copies of one list make each individually unkillable). Each row must be PROVEN by a
 # build-time command in the Dockerfile, not merely apt-installed: an install line can silently stop
-# resolving to a working tool, and only the probe turns that into a red BUILD. Comment lines are not
-# proof — a dependency NAMED in prose and absent from the image is precisely the #1342 state.
+# resolving to a working tool, and only the probe turns that into a red BUILD.
 #
-# Fails closed on: an unreadable file, an unrecognised dependency kind, a table that reads empty
-# (which would otherwise "provision" everything vacuously). Names the first unproven dependency.
+# [review r1 #2114] "PROVEN" means the probe is a command the shell EXECUTES, and the check is a
+# parse, not a text search. Containment fails open in the exact direction that matters: `RUN true #
+# jq --version` and `RUN printf '%s' "jq --version"` contain the probe's bytes and run nothing, so a
+# `grep -F` would call an image with no jq provisioned — the #1342 state wearing the proof's
+# clothes. So the file is parsed in two layers, Dockerfile then shell, and a row is satisfied only
+# when its probe is an ENTIRE command in a RUN instruction: not a comment, not quoted data, not an
+# argument to something else. Decoration (a redirect, an extra flag) is refused rather than guessed
+# at — the refusal prints the exact command expected.
+#
+# Fails closed on: an unreadable file, a RUN body that does not shell-parse, an unrecognised
+# dependency kind, a table that reads empty (which would otherwise "provision" everything
+# vacuously). Names the first unproven dependency.
 _assert_dockerfile_provisions_selftest_deps() {
   local file=$1 table=${2-$SELFTEST_ENV_REQUIREMENTS}
   [[ -f "$file" ]] || { printf 'worker-live: container definition missing: %s\n' "$file" >&2; return 1; }
-  local body label kind probe pattern proof checked=0
-  body=$(grep -v '^[[:space:]]*#' "$file" || true)
-  while IFS='|' read -r label kind probe pattern; do
-    [[ -n "$label" ]] || continue
-    case "$kind" in
-      command) proof="$probe --version" ;;
-      pymodule) proof="python3 -c 'import $probe'" ;;
-      *) printf 'worker-live: unrecognised dependency kind %q for %s — refusing to call %s provisioned\n' \
-           "$kind" "$label" "$file" >&2
-         return 1 ;;
-    esac
-    grep -qF -- "$proof" <<< "$body" || {
-      printf 'worker-live: the model sandbox never proves %s at build time (expected the command `%s`) in %s\n' \
-        "$label" "$proof" "$file" >&2
-      return 1
-    }
-    checked=$((checked + 1))
-  done <<< "$table"
-  [[ "$checked" -gt 0 ]] || {
-    printf 'worker-live: no dependency rows to check against %s — refusing (an empty requirement table proves nothing)\n' \
-      "$file" >&2
-    return 1
-  }
-  return 0
+  python3 - "$file" "$table" <<'PY'
+import shlex, sys
+
+path, table = sys.argv[1], sys.argv[2]
+
+def refuse(message):
+    print(f"worker-live: {message}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+except OSError as exc:  # unreadable -> refuse, never "nothing unproven found"
+    refuse(f"container definition unreadable: {path}: {exc}")
+
+# Layer 1, Dockerfile: drop comment LINES (the builder strips them even mid-continuation) and glue
+# `\`-continued physical lines back into the single instruction the builder hands the shell.
+instructions, pending = [], ""
+for raw in text.splitlines():
+    if raw.lstrip().startswith("#"):
+        continue
+    stripped = raw.rstrip()
+    if stripped.endswith("\\"):
+        pending += stripped[:-1]
+        continue
+    instructions.append(pending + raw)
+    pending = ""
+if pending:
+    instructions.append(pending)
+
+# Layer 2, shell: split every RUN body into the command lists the shell would actually execute.
+# shlex in posix mode drops `#` comments and resolves quoting, so probe text that is commented
+# out, quoted as data, or passed as another command's argument never surfaces as a command.
+SEPARATORS = {";", "&&", "||", "|", "&", "(", ")"}
+commands = []
+for instruction in instructions:
+    head = instruction.strip().split(None, 1)
+    if len(head) != 2 or head[0].upper() != "RUN":
+        continue
+    lexer = shlex.shlex(head[1], posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError as exc:  # unbalanced quote -> refuse, never "probe not found"
+        refuse(f"RUN instruction does not shell-parse in {path}: {exc}")
+    current = []
+    for token in tokens:
+        if token in SEPARATORS:
+            if current:
+                commands.append(current)
+            current = []
+        else:
+            current.append(token)
+    if current:
+        commands.append(current)
+
+checked = 0
+for row in table.splitlines():
+    fields = row.split("|", 3)  # the consumer ERE is last and contains `|` itself
+    label = fields[0]
+    if not label:
+        continue
+    kind = fields[1] if len(fields) > 1 else ""
+    probe = fields[2] if len(fields) > 2 else ""
+    if kind == "command":
+        proof = f"{probe} --version"
+    elif kind == "pymodule":
+        proof = f"python3 -c 'import {probe}'"
+    else:
+        refuse(f"unrecognised dependency kind {shlex.quote(kind)} for {label} "
+               f"— refusing to call {path} provisioned")
+    if shlex.split(proof) not in commands:
+        refuse(f"the model sandbox never proves {label} at build time (expected `{proof}` to run as "
+               f"a command of its own in a RUN instruction) in {path}")
+    checked += 1
+
+if not checked:
+    refuse(f"no dependency rows to check against {path} — refusing "
+           "(an empty requirement table proves nothing)")
+PY
 }
 
 # PURE (self-tested): [issue #524] every non-local `uses:` in a workflow must pin a FULL 40-hex
@@ -5237,8 +5302,10 @@ PY
   # build time, so the offline AGENTS.md pre-flight is runnable in the container the model actually
   # gets. Directions, each aimed at one way this could go quietly vacuous: the REAL image passes;
   # dropping EITHER dependency's probe is refused BY NAME (the point of #1342 is a named refusal,
-  # never a silent skip); a probe present only in a COMMENT is not proof; an unrecognised kind and
-  # an EMPTY table both refuse rather than "provision" everything. The fixture tables also keep the
+  # never a silent skip); a probe present only as TEXT — a whole-line comment, a trailing shell
+  # comment, a quoted string, another command's argument — is not proof, which is what separates a
+  # parse from the `grep -F` this replaced (review r1 #2114); an unrecognised kind and an EMPTY
+  # table both refuse rather than "provision" everything. The fixture tables also keep the
   # reject rows from deriving their input from the same constant the assertion reads (pre-flight
   # item 2c) — a mutant that empties SELFTEST_ENV_REQUIREMENTS still reds the empty-table row. ---
   local sandbox_df="$SCRIPT_DIR/../containers/worker-model.Dockerfile"
@@ -5285,6 +5352,70 @@ PY
   chk "a probe that appears only in a COMMENT is not proof (a dependency named in prose is the bug)" \
     "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-comment.Dockerfile" "$dep_table" \
         >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  # [review r1 #2114] The three shapes a TEXT-CONTAINMENT check accepts and a shell PARSE must not:
+  # a trailing `#` comment inside a RUN, the probe quoted as data, and the probe sitting in argument
+  # rather than command position. Each fixture leaves the OTHER dependency genuinely proven, so the
+  # refusal can only come from the row under test — and the name in the refusal pins that.
+  { printf '%s\n' 'FROM scratch' 'RUN set -eux; \'
+    printf '%s\n' "    python3 -c 'import yaml'; \\" '    true # jq --version'
+  } > "$tmp/deps-inline-comment.Dockerfile"
+  chk "a probe behind a trailing shell # inside a RUN never executes, so it is REJECTED" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-inline-comment.Dockerfile" \
+        "$dep_table" >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  chk "...and it is the COMMENTED-OUT dependency that is named, not the proven one" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-inline-comment.Dockerfile" \
+        "$dep_table" 2>&1 >/dev/null | grep -c 'never proves jq at build time' || true)" "1"
+  { printf '%s\n' 'FROM scratch' 'RUN jq --version'
+    printf '%s\n' "RUN printf '%s' \"python3 -c 'import yaml'\""
+  } > "$tmp/deps-quoted.Dockerfile"
+  chk "a probe QUOTED as another command's data is not proof, it is REJECTED" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-quoted.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  chk "...and the refusal names the dependency that was only echoed" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-quoted.Dockerfile" "$dep_table" \
+        2>&1 >/dev/null | grep -c 'never proves PyYAML at build time' || true)" "1"
+  { printf '%s\n' 'FROM scratch' "RUN python3 -c 'import yaml'"
+    printf '%s\n' 'RUN echo jq --version'
+  } > "$tmp/deps-argument.Dockerfile"
+  chk "a probe in ARGUMENT position (echoed, never run) is REJECTED" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-argument.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  # BUILD time is the claim: a probe in CMD/ENTRYPOINT runs when the container STARTS, if ever, so
+  # it cannot redden the build the way #1342 requires. It also pins the RUN filter itself.
+  { printf '%s\n' 'FROM scratch' "RUN python3 -c 'import yaml'"
+    printf '%s\n' 'CMD jq --version'
+  } > "$tmp/deps-cmd.Dockerfile"
+  chk "a probe in CMD is not a BUILD-time proof, so it is REJECTED" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-cmd.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  # A RUN body that does not shell-parse must refuse like an unparseable workflow does — reading it
+  # as "no probes found" would be the same fail-open by another door. (The dangling `\` on the last
+  # line also exercises the trailing-continuation arm: an instruction the file ends in mid-flight.)
+  printf '%s\n' 'FROM scratch' 'RUN echo "oops \' > "$tmp/deps-unparseable.Dockerfile"
+  chk "a RUN body that does not shell-parse REFUSES (fail closed, not 'nothing found')" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-unparseable.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  chk "...and it says the RUN did not parse, not that a dependency was missing" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-unparseable.Dockerfile" "$dep_table" \
+        2>&1 >/dev/null | grep -c 'does not shell-parse' || true)" "1"
+  # The opposite failure of an over-strict parser: a real image may chain probes with `&&` and quote
+  # the import either way. If this reds, the check has started refusing images that DO prove their
+  # dependencies — which pushes authors back to the #1342 workaround just as surely.
+  { printf '%s\n' 'FROM scratch'
+    printf '%s\n' 'RUN apt-get install -y jq python3-yaml && jq --version && python3 -c "import yaml"'
+  } > "$tmp/deps-chained.Dockerfile"
+  chk "probes chained with && and double-quoted still count as proof (parse, not pattern-luck)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-chained.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "provisioned"
+  # The builder drops a comment LINE even mid-continuation, so the probe below it is executed and
+  # must still read as proof. Pins the Dockerfile layer against the shell layer: a parser that ends
+  # the instruction at the comment loses the RUN prefix and false-refuses a provisioned image.
+  { printf '%s\n' 'FROM scratch' 'RUN apt-get install -y jq python3-yaml; \'
+    printf '%s\n' '# probes below, one per dependency' "    jq --version; python3 -c 'import yaml'"
+  } > "$tmp/deps-split-comment.Dockerfile"
+  chk "a comment LINE inside a continuation does not hide the probes that follow it" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-split-comment.Dockerfile" \
+        "$dep_table" >/dev/null 2>&1 && echo provisioned || echo missing)" "provisioned"
   # The bogus row is preceded by a SATISFIED one on purpose: with the bogus row alone the refusal
   # would also come from the empty-table floor below, and the two guards would mask each other
   # (measured — a `continue` mutant on this arm survived the single-row form).
