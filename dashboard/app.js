@@ -446,6 +446,16 @@ function renderHealth(health) {
   renderNoChangeCensus(health.no_change_reasons);
   const strip = byId("model-health");
   strip.replaceChildren();
+  // [#2008] The per-model strip is a top-20 DISPLAY slice of the WELL-FORMED provider/model pairs
+  // the generator read (dashboard-gen `_obs_capped`), and until now a fleet with 40 pairs rendered
+  // exactly like one with 20 — #1868's complaint, one card over. Drawn BEFORE the empty-state
+  // return below, for the reason the lane note is: `checks: []` beside a positive total is what a
+  // hand-edited data.json looks like, and gating the note on `checks.length` would make
+  // `showing 0 of 40 model checks` — the honest render of exactly that document — unreachable.
+  const truncation = byId("health-truncated");
+  truncation.replaceChildren();
+  const note = obsTruncationNote(health.checks, health.checks_total, "model checks");
+  if (note) truncation.append(note);
   if (!health.checks.length) {
     strip.append(node("p", "empty", "No recognized model checks in the snapshot."));
     return;
@@ -869,6 +879,9 @@ function obsLaneDefers(lanes) {
 // repositories and one with 12 render identically, which is the "indistinguishable from nothing
 // happened" complaint #1571 was filed about, one layer up. `<field>_total` is the pre-cap count of
 // well-formed rows, published beside every capped array (see dashboard-gen `_obs_capped`).
+// [#2008] `renderHealth` reaches this same helper for the model-health card's 20-pair strip: the
+// affordance is one function, not one per panel, so a capped array anywhere on the page states what
+// it hid by publishing its `<field>_total` and calling `obsTruncationNote`.
 //
 // The comparison is `total > shown` HERE rather than a flag from the generator, so nothing renders
 // on a healthy fleet whose array fit under its cap. An absent/unreadable total — a data.json

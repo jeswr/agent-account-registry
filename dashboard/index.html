@@ -70,6 +70,12 @@
           <p id="health-time" class="freshness"></p>
         </div>
         <div id="model-health" class="health-strip"></div>
+        <!-- Issue #2008: `showing 20 of 40 model checks` when the strip above is a truncated
+             slice, filled by renderHealth. It sits OUTSIDE the strip because that strip scrolls
+             horizontally — a note appended as its last flex item is the one row an operator
+             would have to scroll past the chips to find. Empty, and so invisible, when the
+             published `checks_total` says the cap hid nothing. -->
+        <div id="health-truncated"></div>
         <!-- Issue #1827: the no-change declared-reason census, filled by renderNoChangeCensus. -->
         <div id="health-no-change" hidden></div>
       </section>
