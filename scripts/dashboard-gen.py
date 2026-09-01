@@ -1564,7 +1564,8 @@ def _normalize_ledger_health(document):
     then derive one status per (provider, model): the NEWEST record's exit-class, folded to
     healthy/degraded/unhealthy/unknown. Records without a model alias (zero-dispatch fleet
     signals) carry no per-model information and are skipped; account hashes never reach the
-    output. Output is bounded: one check per distinct (provider, model), newest 20 pairs.
+    output. Output is bounded: one check per distinct (provider, model), newest 20 pairs, and
+    issue #2008 publishes `checks_total` beside them — the pre-cap count of well-formed pairs.
 
     Issue #1827: the same validated records also carry the declared no-diff reason, censused by
     `_no_change_reason_census` into `no_change_reasons` — a bounded 6-row distribution, always
@@ -1591,7 +1592,17 @@ def _normalize_ledger_health(document):
         key = (provider, model)
         if key not in latest or record["ts"] >= latest[key]["ts"]:
             latest[key] = record
-    newest_pairs = sorted(latest.items(), key=lambda item: item[1]["ts"], reverse=True)[:20]
+    # [#2008] The 20-pair cut is a DISPLAY cap over rows this seam READ successfully — the #1868
+    # shape one card over. #1868 was scoped to the observability seams it enumerated and left this
+    # panel silent, so a fleet running 40 distinct provider/model pairs rendered exactly like one
+    # running 20, on the page and in the build log. `_obs_capped` publishes the pre-cap count of
+    # WELL-FORMED pairs beside the slice (unconditionally, cap hit or not — pre-flight item 8) and
+    # `dashboard/app.js` turns `total > shown` into `showing 20 of 40 model checks`.
+    # It counts PAIRS that survived the token grammars above, never the ledger's record count: a
+    # fleet that wrote 900 records for 3 models has hidden nothing, and a count no rendered row can
+    # account for would be a worse number than the silence it replaces.
+    newest_pairs, checks_total = _obs_capped(
+        sorted(latest.items(), key=lambda item: item[1]["ts"], reverse=True), 20)
     checks = sorted(({
         "model": model,
         "provider": provider,
@@ -1600,7 +1611,7 @@ def _normalize_ledger_health(document):
     } for (provider, model), record in newest_pairs),
         key=lambda check: (check["provider"], check["model"]))
     generated_at = _utc_iso(max((record["ts"] for record in records), default=None))
-    return {"generated_at": generated_at, "checks": checks,
+    return {"generated_at": generated_at, "checks": checks, "checks_total": checks_total,
             "no_change_reasons": _no_change_reason_census(records, health)}
 
 
@@ -1625,7 +1636,7 @@ def _normalize_model_health(document):
     if not isinstance(candidates, list):
         candidates = []
     checks = []
-    for item in candidates[:50]:
+    for item in candidates:
         if not isinstance(item, dict):
             continue
         model = next((item.get(key) for key in ("model", "model_id", "name", "alias")
@@ -1642,12 +1653,17 @@ def _normalize_model_health(document):
             "checked_at": _utc_iso(
                 item.get("checked_at") or item.get("generated_at") or item.get("timestamp")),
         })
-        if len(checks) == 20:
-            break
+    # [#2008] Same DISPLAY cap as the ledger path above, and applied on the way OUT for the reason
+    # `_obs_lane_rows` records: this used to `break` INSIDE the loop, over a `candidates[:50]` input
+    # slice, so it stopped VALIDATING at the cap and could not have counted the models past it —
+    # a total derived from either bound would understate what the page is hiding. Nothing here does
+    # I/O or prints per row, so the unbounded scan costs one token match per candidate.
+    checks, checks_total = _obs_capped(checks, 20)
     # [#1827] NULL IS NOT ZERO. These legacy/ad-hoc shapes carry no health RECORDS, so there is no
     # population to census — publishing an all-zero distribution here would read as "no worker has
     # produced a no-change run", which is a measurement this input cannot support.
-    return {"generated_at": generated_at, "checks": checks, "no_change_reasons": None}
+    return {"generated_at": generated_at, "checks": checks, "checks_total": checks_total,
+            "no_change_reasons": None}
 
 
 def _live_leases(leases, now):
@@ -2863,10 +2879,25 @@ def _self_test_throughput_worker(check):
 # of PLACEMENT — a census drawn after the per-model strip's empty-state return renders on every
 # board except the one whose ledger is all no-change rows. The `models` field beside it records
 # which branch that surrounding renderer took, so the placement row cannot pass by accident.
+#
+# Issue #2008 renders the model-health card's own display-cap note through the same executed
+# renderer, and collects it by EXACT className — searching the card's text for "showing" would be
+# satisfied by any other string on it.
 _HEALTH_CENSUS_PAGE_BODY = r"""
+  const byClass = (root, wanted) => {
+    const found = [];
+    const walk = (el) => {
+      if (!el) return;
+      if (el.className === wanted) found.push(flat(el).join(" ").trim());
+      for (const kid of el.children || []) walk(kid);
+    };
+    walk(root);
+    return found;
+  };
   const out = {};
   for (const [name, health] of Object.entries(input.cases)) {
-    for (const id of ["health-section", "health-time", "model-health", "health-no-change"]) {
+    for (const id of ["health-section", "health-time", "model-health", "health-no-change",
+                      "health-truncated"]) {
       ids[id] = element("div#" + id);
     }
     scope.renderHealth(health);
@@ -2893,15 +2924,32 @@ _HEALTH_CENSUS_PAGE_BODY = r"""
           ? item.children[1].children[1].textContent : null,
       ]) : null,
       models: ids["model-health"].children.map((kid) => flat(kid).filter(Boolean).join("|")),
+      truncation: byClass(ids["health-truncated"], "obs-truncated"),
     };
   }
+  // [#2008] ...and the SAME container rendered twice, which the per-case loop above cannot see
+  // because it hands every case a fresh element. The page re-renders on every refresh tick, so a
+  // note that is not cleared outlives the snapshot that earned it — the card would keep stating a
+  // truncation the current fleet does not have, which is a worse lie than the silence it replaced.
+  for (const id of ["health-section", "health-time", "model-health", "health-no-change",
+                    "health-truncated"]) {
+    ids[id] = element("div#" + id);
+  }
+  scope.renderHealth(input.rerender[0]);
+  const firstNote = byClass(ids["health-truncated"], "obs-truncated");
+  scope.renderHealth(input.rerender[1]);
+  out["re-rendered"] = {
+    first: firstNote,
+    second: byClass(ids["health-truncated"], "obs-truncated"),
+  };
   process.stdout.write(JSON.stringify(out));
 """
 
 
 def _self_test_health_census(check, published, zero_census):
     """Issue #1827 — the declared-reason census on the PAGE, including the tick that has no
-    per-model check at all."""
+    per-model check at all. Issue #2008 adds the model-health card's display-cap note, rendered by
+    the same EXECUTED `renderHealth` and driven off the same payloads."""
     # The vocabulary as this suite expects to SEE it — written out, never imported from
     # `NO_CHANGE_REASONS` (pre-flight item 2(b)). The "published" row below still spells its six
     # chips out in full, so this tuple cannot mask a wrong vocabulary: that row and these two would
@@ -2913,38 +2961,64 @@ def _self_test_health_census(check, published, zero_census):
         return [{"reason": name, "count": counts.get(name, 0)} for name in vocabulary]
 
     zero_chips = [[name, "0"] for name in vocabulary]
+
+    def model_checks(count):
+        """[#2008] `count` well-formed per-model checks. The `capped-` prefix appears nowhere else
+        in this suite, so the rows below cannot pass by colliding with another fixture's model."""
+        return [{"model": f"capped-{index:02d}", "provider": "anthropic", "status": "healthy",
+                 "checked_at": None} for index in range(count)]
+
+    cases = {
+        # The payload build_dashboard REALLY publishes — the key name is the seam where this
+        # would otherwise be vacuous on both sides at once (pre-flight item 6).
+        "published": published,
+        # The tick this defect was invisible on: a ledger whose only rows are no-change/fleet
+        # signals publishes an EMPTY `checks`, so the per-model strip takes its empty-state
+        # return. Census rows all zero as well, so this is also the "would it emit at 100 %
+        # of one branch" row (pre-flight item 8).
+        "no-model-checks": {"generated_at": None, "checks": [],
+                            "no_change_reasons": zero_census},
+        # A snapshot with checks but NO census (the non-ledger normalizer's null): the panel
+        # is absent, never an all-zero distribution the input cannot support.
+        "no-census": {"generated_at": None, "no_change_reasons": None,
+                      "checks": [{"model": "fable", "provider": "anthropic",
+                                  "status": "healthy", "checked_at": None}]},
+        # One run — the singular, and a span that renders.
+        "one-run": {"generated_at": None, "checks": [],
+                    "no_change_reasons": {"runs": 1, "since": "2025-06-15T14:41:40Z",
+                                          "reasons": reasons(other=1)}},
+        # Unreadable values inside an otherwise well-formed census: the page states what it
+        # cannot read rather than printing `NaN`/`undefined` as a measurement.
+        "unreadable": {"generated_at": None, "checks": [],
+                       "no_change_reasons": {
+                           "runs": "many", "since": None,
+                           "reasons": [{"reason": "other", "count": None},
+                                       {"reason": 5, "count": 2}]}},
+        # No `reasons` array at all: hidden, not raised.
+        "no-rows": {"generated_at": None, "checks": [],
+                    "no_change_reasons": {"runs": 3, "since": None}},
+        # [#2008] The truncated strip, and its controls. 40 is a LITERAL that appears nowhere
+        # else in this suite and is not the cap the generator reads (pre-flight 2(b)/2(c)).
+        "truncated": {"generated_at": None, "no_change_reasons": None,
+                      "checks": model_checks(20), "checks_total": 40},
+        # A hand-edited data.json: nothing survived the slice, 40 pairs are still hidden.
+        "empty-slice": {"generated_at": None, "no_change_reasons": None,
+                        "checks": [], "checks_total": 40},
+        # The three shapes that are NOT a known truncation: a total equal to the slice, a
+        # string, and a finite number that is not a row count. (`no-census` above is the
+        # fourth — a payload published before this count existed.)
+        "equal-total": {"generated_at": None, "no_change_reasons": None,
+                        "checks": model_checks(3), "checks_total": 3},
+        "string-total": {"generated_at": None, "no_change_reasons": None,
+                         "checks": model_checks(20), "checks_total": "40"},
+        "fractional-total": {"generated_at": None, "no_change_reasons": None,
+                             "checks": model_checks(20), "checks_total": 20.5},
+    }
     page = _executed_page(
         _page_harness("renderHealth", _HEALTH_CENSUS_PAGE_BODY),
-        {"cases": {
-            # The payload build_dashboard REALLY publishes — the key name is the seam where this
-            # would otherwise be vacuous on both sides at once (pre-flight item 6).
-            "published": published,
-            # The tick this defect was invisible on: a ledger whose only rows are no-change/fleet
-            # signals publishes an EMPTY `checks`, so the per-model strip takes its empty-state
-            # return. Census rows all zero as well, so this is also the "would it emit at 100 %
-            # of one branch" row (pre-flight item 8).
-            "no-model-checks": {"generated_at": None, "checks": [],
-                                "no_change_reasons": zero_census},
-            # A snapshot with checks but NO census (the non-ledger normalizer's null): the panel
-            # is absent, never an all-zero distribution the input cannot support.
-            "no-census": {"generated_at": None, "no_change_reasons": None,
-                          "checks": [{"model": "fable", "provider": "anthropic",
-                                      "status": "healthy", "checked_at": None}]},
-            # One run — the singular, and a span that renders.
-            "one-run": {"generated_at": None, "checks": [],
-                        "no_change_reasons": {"runs": 1, "since": "2025-06-15T14:41:40Z",
-                                              "reasons": reasons(other=1)}},
-            # Unreadable values inside an otherwise well-formed census: the page states what it
-            # cannot read rather than printing `NaN`/`undefined` as a measurement.
-            "unreadable": {"generated_at": None, "checks": [],
-                           "no_change_reasons": {
-                               "runs": "many", "since": None,
-                               "reasons": [{"reason": "other", "count": None},
-                                           {"reason": 5, "count": 2}]}},
-            # No `reasons` array at all: hidden, not raised.
-            "no-rows": {"generated_at": None, "checks": [],
-                        "no_change_reasons": {"runs": 3, "since": None}},
-        }})
+        # [#2008] `rerender` drives the two payloads through ONE container, in this order: the
+        # truncated fleet, then the same card once the fleet fits under the cap.
+        {"cases": cases, "rerender": [cases["truncated"], cases["equal-total"]]})
     check("[#1827] EXECUTED: the census dashboard-gen really publishes reaches the page — one chip "
           "per vocabulary reason IN ORDER, zero rows drawn rather than dropped, the counted runs "
           "in the caption and a readable span stamp beside them",
@@ -2982,6 +3056,53 @@ def _self_test_health_census(check, published, zero_census):
            page["no-rows"]["panelHidden"], page["no-rows"]["chips"]),
           ("No-change runs by declared reason — count unknown in the retained health ledger",
            [["other", "—"], ["—", "2"]], True, None))
+    # [#2008] THE PAGE IS WHAT THIS HAS TO DELIVER INTO (pre-flight item 11): a `checks_total`
+    # published into site/data.json that no card renders leaves the operator exactly where the
+    # silent cap left them. So the affordance is EXECUTED through `renderHealth` — a lexical
+    # assertion here is satisfiable by the comment above the call (the #612 round-4 lesson) — and
+    # the note is collected by EXACT className, never by searching the card's text for "showing".
+    # Every expected string is a literal written here, not read back off the page (pre-flight 2(b)).
+    check("[#2008] EXECUTED page script: a truncated per-model strip STATES what the cap hid — "
+          "`showing 20 of 40 model checks`, beside the 20 rows it accounts for, first and last "
+          "named. A card that drew the note while dropping the content it sits beside reds this",
+          (page["truncated"]["truncation"], len(page["truncated"]["models"]),
+           page["truncated"]["models"][:1], page["truncated"]["models"][-1:]),
+          (["showing 20 of 40 model checks"], 20,
+           ["capped-00|anthropic|healthy"], ["capped-19|anthropic|healthy"]))
+    check("[#2008] EXECUTED page script: ...and nothing is stated when nothing is KNOWN to be "
+          "hidden — a total equal to the slice, a LEGACY payload published before the count "
+          "existed, a string total and a FRACTIONAL one are each 'no truncation known', never a "
+          "fabricated `showing 20 of undefined`; nor does the fleet build_dashboard really "
+          "published draw one. This is the control the row above rests on: a card that always "
+          "drew the note would pass that row and fail this one",
+          (page["equal-total"]["truncation"], page["no-census"]["truncation"],
+           page["string-total"]["truncation"], page["fractional-total"]["truncation"],
+           page["published"]["truncation"]),
+          ([], [], [], [], []))
+    check("[#2008] EXECUTED page script: an EMPTY slice beside a positive total still states it. "
+          "`showing 0 of 40 model checks` is the honest render of a hand-edited data.json, and a "
+          "note drawn after the strip's empty-state return would have been unreachable on exactly "
+          "that document — the placement defect #1827 fixed one panel over",
+          (page["empty-slice"]["truncation"], page["empty-slice"]["models"]),
+          (["showing 0 of 40 model checks"], ["No recognized model checks in the snapshot."]))
+    check("[#2008] EXECUTED page script: the note does not OUTLIVE the snapshot that earned it. "
+          "The page re-renders on every refresh tick into the SAME container, so a note that is "
+          "not cleared goes on stating a truncation the current fleet no longer has — the one "
+          "failure mode a per-case harness handing out fresh elements cannot see",
+          (page["re-rendered"]["first"], page["re-rendered"]["second"]),
+          (["showing 20 of 40 model checks"], []))
+    # ...and the one thing those EXECUTED rows are structurally blind to: the shim's
+    # `getElementById` AUTO-CREATES an unknown id, so they would pass just the same against a
+    # container index.html does not carry — while a browser's lookup returns null and the
+    # `replaceChildren` on it throws, taking the whole health section down with the note. Both
+    # halves of that seam are pinned by exact literal, at a CODE position on the app.js side so a
+    # comment cannot stand in for the call.
+    check("[#2008] the container those notes render into exists on the page, and the renderer "
+          "reaches for THAT id — one declaration in index.html, one lookup in renderHealth",
+          (len(re.findall(r'id="health-truncated"', _repo_file("dashboard", "index.html"))),
+           _js_code_count(_js_function_body(_repo_file("dashboard", "app.js"), "renderHealth"),
+                          'byId("health-truncated")')),
+          (1, 1))
 
 
 def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar):
@@ -3913,6 +4034,11 @@ def _self_test():
             {"model": "codex", "provider": "openai", "status": "degraded",
              "checked_at": _utc_iso(now - 300)},
         ],
+        # [#2008] The UNDER-CAP direction on the production payload: two pairs, and the total is
+        # published anyway rather than only when the cap bit. Emitting it conditionally is the
+        # census-that-never-zero-seals shape (pre-flight item 8) — the page could then no longer
+        # tell `2 of 2` from a producer that stopped sending the count at all.
+        "checks_total": 2,
         "no_change_reasons": {
             "runs": 4,
             "since": _utc_iso(now - 1500),
@@ -3926,6 +4052,57 @@ def _self_test():
             ],
         },
     })
+    # [#2008] THE OVER-CAP DIRECTION, which no fixture above could reach: every health ledger in
+    # this suite sits comfortably under the 20-pair cut, so the cut itself had NEVER EXECUTED
+    # (measured with `python3 -m trace --count --missing`) and a fleet of 40 provider/model pairs
+    # published the same 20 rows as a fleet of 20 — the #1868 shape, one card over. Every size here
+    # is a LITERAL — 23 pairs, one duplicate record, one alias-less fleet signal — never derived
+    # from the cap the code reads (pre-flight 2(b)/2(c)): an input sized off that constant would
+    # move with it and stay green through a re-tuning.
+    def capped_checks(document):
+        """(published checks, the total beside them) for one model-health input — or the refusal
+        itself, so a mutant that raises out of this seam reds the rows below BY NAME instead of
+        aborting the suite with every later check unrun (pre-flight item 4)."""
+        try:
+            normalized = _normalize_model_health(document)
+        except DashboardError as exc:
+            return str(exc)[:120]
+        if not isinstance(normalized, dict):
+            return normalized
+        return len(normalized.get("checks") or []), normalized.get("checks_total")
+
+    over_cap_pairs = [
+        {"ts": now - 1000 - index, "provider": "anthropic" if index % 2 else "openai",
+         "account": "a" * 16, "model_alias": f"pair-{index:02d}", "exit_class": "success",
+         "run_id": f"r{index:02d}"}
+        for index in range(23)]
+    check("[#2008] a 23-pair fleet publishes the newest 20 checks WITH the pre-cap count of "
+          "well-formed pairs beside them. Dropping the cut reds the left number; deriving the "
+          "total from the slice it published reds the right one; counting records, or counting "
+          "the raw input rather than the pairs that survived the token grammars, reds it by the "
+          "duplicate and the alias-less fleet signal this ledger was handed",
+          capped_checks({"records": over_cap_pairs + [
+              # A SECOND record for a pair already counted (same provider AND alias as index 0):
+              # the total counts PAIRS, so one taken over records reads 24 here instead of 23.
+              {"ts": now - 900, "provider": "openai", "account": "b" * 16,
+               "model_alias": "pair-00", "exit_class": "success", "run_id": "r97"},
+              # ...and a zero-dispatch fleet signal, whose empty alias is DROPPED by the loop
+              # above: a total over the RAW input rather than the surviving rows reads 25.
+              {"ts": now - 800, "provider": "fleet", "account": "c" * 16, "model_alias": "",
+               "exit_class": "success", "run_id": "r98"}]}),
+          (20, 23))
+    # ...and the same cap on the LEGACY/ad-hoc shape, which had TWO silent bounds: the 20-check
+    # `break` sat INSIDE the loop, over a `candidates[:50]` input slice, so it stopped VALIDATING
+    # at the cap and could not have counted the models past either bound. 60 well-formed models, so
+    # a total bounded by the break reads 20 and one bounded by the input slice reads 50.
+    check("[#2008] the legacy model-health shape caps the same way and says so: 20 published "
+          "checks beside a pre-cap total of 60, with the one unreadable model NOT counted — a "
+          "total no rendered row can account for is worse than the silence this replaces",
+          capped_checks(
+              {"models": [{"model": f"legacy-{index:02d}", "provider": "anthropic",
+                           "status": "ok"} for index in range(60)]
+               + [{"model": "not a model!", "provider": "anthropic", "status": "ok"}]}),
+          (20, 60))
     # ...and the ZERO row, which is the mutant item 3 exists for: a census emitted only
     # `if runs` reads identically to a healthy board on the quiet tick that is exactly when an
     # operator interrogates it. Same ledger shape, no no-change rows in it at all.
@@ -6116,6 +6293,8 @@ esac
           {"generated_at": "2025-06-15T15:06:40Z",
            "checks": [{"model": "fable", "provider": "anthropic",
                        "status": "healthy", "checked_at": None}],
+           # [#2008] the under-cap direction on this path too: one model, one published total.
+           "checks_total": 1,
            "no_change_reasons": None})
 
     # --- observability normalization (issue #246): accept path is a GOLDEN fixture (every field
