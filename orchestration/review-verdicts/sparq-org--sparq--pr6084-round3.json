@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6084,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4fbeb5fbabdcdb78ff19d4e72a59d5f3a36937ad",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's fail-closed queue-entry defect is addressed. Queue entry commit values are now shape- and SHA-validated; a null or missing head is accepted only as complete for the explicit QUEUED/no-group-yet state, while other unresolved heads mark the snapshot incomplete. The reap refuses incomplete snapshots before cancellation and repeats that check during immediate revalidation. The behavior tests exercise the real mutation path with null, missing, malformed, and revalidation-time degraded headCommit responses and assert that no cancellation occurs. No remaining correctness, soundness, test-validity, or security issue is evident in the diff-scoped change.",
+  "verdict": "approve"
+ }
+}
