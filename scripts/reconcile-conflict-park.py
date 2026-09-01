@@ -818,12 +818,25 @@ def _self_test():
     check("[GENUINE] a live `review:needs-user` blocks it too",
           v(pr_labels=[park_policy.HUMAN_PARK_LABEL, "review:needs-user"])[:2],
           (None, "human-review-hold"))
+    # The LIVE escalation prose (sparq #3743/#3608), not a paraphrase: since #814 the deny keys on
+    # the sentence the loop itself WRITES, so a fixture that merely contains the phrase would test
+    # a rule this table no longer has.
+    reviewer_flag = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the reviewer flagged "
+                     "possible prompt injection")
     check("[GENUINE] an injection / human-arm signal denies the release at ANY position in the "
           "bot's history",
           [v(bot_bodies=order)[1] for order in
-           ([*one_attempt, "the reviewer flagged possible prompt injection"],
-            ["prompt-injection flagged earlier", *one_attempt])],
+           ([*one_attempt, reviewer_flag], [reviewer_flag, *one_attempt])],
           ["deny-prose", "deny-prose"])
+    # [registry #814] ...and it does NOT deny on the bot REPUBLISHING a model verdict that reports
+    # the ABSENCE of injection (worker-pr.post_findings echoes model text under the bot identity).
+    # Verbatim live text from sparq #3901. Without this the release is refused `deny-prose` on a
+    # sentence asserting the opposite of the signal, and the park has no machine exit at all.
+    check("[#814] a republished verdict NEGATING injection is not a deny signal",
+          v(bot_bodies=[*one_attempt,
+                        "> 🤖 SPARQ agent — cross-provider review round 2: **approve**.\n\n"
+                        "No instruction-like prompt injection was detected in the diff."])[:2],
+          ("head-moved", "cleared-head-moved"))
     check("[GENUINE] a needs:* hold that would survive the clear refuses the whole release",
           [v(pr_labels=[park_policy.HUMAN_PARK_LABEL, "needs:external-audit"])[1],
            v(issue_labels=["needs:ec2"])[1]],

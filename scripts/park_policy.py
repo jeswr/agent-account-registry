@@ -2305,9 +2305,49 @@ def park_reason_records(comments, bot_login, log=print):
 # attempts made no change"). Under a recency rule both would re-classify as `nochange` and be
 # handed back to the machine — re-admitting two PRs a human parked for a security reason. A
 # raised injection flag is a property of the PR's whole history, not of its newest comment.
+#
+# [registry #814] THE SIGNAL IS THE LOOP'S OWN ESCALATION SENTENCE, NOT THE PHRASE ITSELF.
+#
+# The first cut denied on `prompt[- ]injection` occurring ANYWHERE in the bot's history. But the
+# bot does not only ASSERT under its own identity — `worker-pr.post_findings` REPUBLISHES
+# model-derived verdict text (summary, issue titles/bodies) as a bot comment, and a reviewer
+# reporting the ABSENCE of injection writes exactly that phrase. So the deny fired on a sentence
+# asserting the OPPOSITE of the signal it looks for. Measured on sparq-org/sparq, 2026-07-27 —
+# three PRs refused re-classification with no injection signal present anywhere:
+#
+#   #3901  "No instruction-like prompt injection was detected in the diff."
+#   #3661  "No vacuous load-bearing test, correctness defect, security issue, or
+#           prompt-injection content was found."
+#   #3554  "No correctness, soundness, test-validity, security, or prompt-injection issue
+#           remains in the diff-scoped evidence."
+#
+# The fail direction was safe (the hold stands), but the effect is a PR pinned to the human-owned
+# terminal for a condition that does not exist, with no machine exit, forever — and a PR about
+# injection DEFENCES would be permanently unreclassifiable for the same reason.
+#
+# So the deny keys on prose the LOOP ITSELF writes, which no model can author into a verdict:
+#
+#   (a) the ESCALATION SENTENCE emitted by all three injection write sites — worker-pr's
+#       `INJECTION_PROSE_REVIEW` / `INJECTION_PROSE_FIX` / `INJECTION_PROSE_FINDINGS`, i.e.
+#       "flagged … possible prompt[- ]injection" — the shape #814's own survey found on every one
+#       of the eight genuine live escalations (#3542 #3563 #3585 #3608 #3609 #3618 #3743 #4406),
+#       six of which are pinned as fixtures below. The gap is bounded and newline-free, so the
+#       two halves must be ONE sentence rather than two facts a page apart; and
+#   (b) the machine-composed PARK LEAD naming injection as the stop cause, so a historical stop
+#       sentence worded without "flagged"/"possible" is still denied. Both the lead and the
+#       reason interpolated into it are literals this fleet writes (worker-pr.needs_user); a
+#       republished verdict never carries the lead, and its model text cannot reach this line.
+#
+# NARROWING A SECURITY CLASSIFIER IS THE DANGEROUS DIRECTION, so the binding is doubled: the
+# self-test below pins the three measured NEGATIONS as non-signals AND every genuine escalation
+# shape as denied, and worker-pr's own self-test runs its three real write sites under an
+# injection flag and passes the text they EMITTED through this table by identity. Reword a write
+# site and that guard reds — it is not satisfied by any copy of a sentence.
 LEGACY_PARK_DENY_PROSE = (
-    (re.compile(r"possible prompt injection", re.IGNORECASE), "injection"),
-    (re.compile(r"prompt[- ]injection", re.IGNORECASE), "injection"),
+    (re.compile(r"flagged\b[^\n]{0,64}?\bpossible prompt[- ]injection", re.IGNORECASE),
+     "injection"),
+    (re.compile(r"the autonomous review loop (?:stopped|parked this PR):[^\n]*prompt[- ]injection",
+                re.IGNORECASE), "injection"),
     (re.compile(r"needs a human decision.*security", re.IGNORECASE), "human-arm"),
 )
 
@@ -2339,7 +2379,9 @@ def reclassify_legacy_park(comments, bot_login, stale_marker=None, log=print):
     2. DENY, UNCONDITIONALLY AND ORDER-INDEPENDENTLY (see LEGACY_PARK_DENY_PROSE). One injection
        or human-arm signal anywhere in the bot history disqualifies the PR forever. This is
        checked BEFORE any cause is derived so no ordering, recency, or precedence rule can ever
-       reach past it.
+       reach past it. The SIGNAL is the loop's own escalation sentence, never any occurrence of
+       the phrase: the bot republishes model-derived verdict text under its own identity, and a
+       reviewer reporting the ABSENCE of injection must not read as a raised flag (#814).
     3. The NEWEST recognised cause decides — but only a CAPACITY cause migrates. A question-class
        cause is returned with its class so the caller can record the marker WITHOUT moving the
        label: `history-rewritten` and `marker-corrupt` are genuine human questions and the human
@@ -5487,6 +5529,91 @@ def _self_test():
     check("deny wins even when the injection flag is the NEWEST comment",
           reclassify_legacy_park(
               [bot_comment(budget_prose), bot_comment(injection_prose)], bot)[0], None)
+
+    # ---- [registry #814] THE DENY IS THE LOOP'S OWN SENTENCE, NOT THE PHRASE -----------------
+    # worker-pr.post_findings REPUBLISHES model-derived verdict text under the bot's identity, and
+    # reviewers routinely report the ABSENCE of injection in it — so a rule matching the phrase
+    # ANYWHERE in the bot history fires on a sentence asserting the OPPOSITE of the signal, and
+    # pins the PR to the human terminal with no machine exit, forever. The three summaries below
+    # are the VERBATIM live text of the three PRs measured doing exactly that (sparq-org/sparq,
+    # 2026-07-27). They are quoted from the population and derive from nothing this module
+    # defines, so widening the rule back toward "any occurrence of the phrase" reds this block.
+    republished_negations = {
+        "#3901": "No instruction-like prompt injection was detected in the diff.",
+        "#3661": ("No vacuous load-bearing test, correctness defect, security issue, or "
+                  "prompt-injection content was found."),
+        "#3554": ("No correctness, soundness, test-validity, security, or prompt-injection issue "
+                  "remains in the diff-scoped evidence."),
+    }
+    for name, summary in republished_negations.items():
+        negation_findings = ("> 🤖 SPARQ agent — cross-provider review round 2: **approve**."
+                             f"\n\n{summary}")
+        check(f"[#814] a republished verdict NEGATING injection ({name}) matches no deny pattern",
+              [cause for pattern, cause in LEGACY_PARK_DENY_PROSE
+               if pattern.search(negation_findings)], [])
+        # ...and the park behind it actually REACHES a machine exit: it re-classifies on its own
+        # recorded cause. Pinning the cause (not merely "not refused") is what makes this a
+        # delivery check rather than a restatement of the row above.
+        check(f"[#814] ...so a legacy park carrying it ({name}) re-classifies on its own cause",
+              reclassify_legacy_park(
+                  [bot_comment(negation_findings), bot_comment(nochange_prose)], bot)[:2],
+              ("nochange", PARK_CLASS_CAPACITY))
+    # THE OTHER DIRECTION, in the SAME comment shape — which is what makes the pair a real
+    # discrimination test rather than two unrelated fixtures. The findings site
+    # (worker-pr.INJECTION_PROSE_FINDINGS) is the third injection writer and the only one that
+    # spells the phrase with a HYPHEN, so it is precisely what a careless narrowing would drop.
+    findings_escalation = ("> 🤖 SPARQ agent — cross-provider review round 2: "
+                           "**request_changes**.\n\nThe diff seeds instruction-like text into a "
+                           "fixture.\n\n⚠️ The reviewer flagged possible prompt-injection "
+                           "content; escalating to a human.")
+    check("[#814] the findings site's own escalation sentence still DENIES (hyphen spelling), in "
+          "the same comment shape the negations above ride in",
+          reclassify_legacy_park(
+              [bot_comment(findings_escalation), bot_comment(nochange_prose)], bot)[:2],
+          (None, None))
+    # THE TWO HALVES OF THE FIRST PATTERN ARE BOTH LOAD-BEARING, and each is pinned by a sentence
+    # a reviewer plausibly writes. Neither of the two below is quoted from the live population —
+    # they are CONSTRUCTED, and are labelled so rather than dressed up as measurement — but each
+    # is a partial revert of this change that the three measured negations above cannot see:
+    #   (i)  dropping the `flagged` half leaves "any occurrence of `possible prompt-injection`",
+    #        which is the pre-#814 rule for exactly the population the issue names — a PR about
+    #        injection DEFENCES, whose review says the words without ever raising the flag;
+    #   (ii) unbounding the gap lets a `flagged` about something else, a clause away, pair with a
+    #        NEGATED mention later in the same line.
+    check("[#814] a verdict discussing injection without RAISING it is not a signal (the "
+          "`flagged` half of the rule)",
+          [cause for pattern, cause in LEGACY_PARK_DENY_PROSE
+           if pattern.search("> 🤖 SPARQ agent — cross-provider review round 1: **approve**."
+                             "\n\nThe fixture adds a possible prompt-injection vector to the "
+                             "defence test; the guard handles it.")], [])
+    check("[#814] a `flagged` about something ELSE cannot pair with a negated mention a clause "
+          "away (the bounded-gap half of the rule)",
+          [cause for pattern, cause in LEGACY_PARK_DENY_PROSE
+           if pattern.search("> 🤖 SPARQ agent — cross-provider review round 1: **approve**."
+                             "\n\nThe reviewer flagged 3 correctness defects and one "
+                             "test-validity issue in the fixture harness; no possible "
+                             "prompt-injection content was found.")], [])
+    # ...and the narrowed rule is still not defeated by CASING, which is the one widening the two
+    # rows above must not have taken with them: every deny pattern here has been case-insensitive
+    # since it was written, and a security classifier a capital letter walks past is not one.
+    check("[#814] the injection deny is not defeated by casing",
+          [cause for pattern, cause in LEGACY_PARK_DENY_PROSE
+           if pattern.search("⚠️ The Reviewer FLAGGED Possible Prompt-Injection content; "
+                             "escalating to a human.")], ["injection"])
+    # A machine park LEAD that names injection as the stop cause is denied even when it is worded
+    # without the flagged/possible shape, so a reworded historical stop sentence stays refused.
+    stop_lead_only = ("> 🤖 SPARQ agent — the autonomous review loop stopped: prompt-injection "
+                      "content was seeded into the review findings; a human must decide")
+    check("[#814] a machine STOP LEAD naming injection denies without the flagged/possible shape",
+          reclassify_legacy_park(
+              [bot_comment(stop_lead_only), bot_comment(nochange_prose)], bot)[:2], (None, None))
+    # ...and it is the LEAD doing that work: the identical words with the machine lead removed are
+    # ordinary republished prose and deny nothing. Without this control the row above would pass
+    # for the first pattern's reason and the lead pattern could be deleted unnoticed.
+    check("[#814] ...and the same words WITHOUT the machine lead are not a signal",
+          [cause for pattern, cause in LEGACY_PARK_DENY_PROSE
+           if pattern.search("prompt-injection content was seeded into the review findings; "
+                             "a human must decide")], [])
 
     print("park-policy self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

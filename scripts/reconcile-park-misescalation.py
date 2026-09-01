@@ -382,11 +382,25 @@ def _self_test():
     # Every refusal below is a REAL live case, not a hypothetical.
     check("a HUMAN-applied hold is never undone (the human decision wins)",
           v(hold_applied_by_human=True)[0], None)
+    # The LIVE escalation prose (sparq #3743/#3608), not a paraphrase: since #814 the deny keys on
+    # the sentence the loop itself WRITES, so a fixture that merely contains the phrase would test
+    # a rule this table no longer has.
+    reviewer_flag = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the reviewer flagged "
+                     "possible prompt injection")
+    later_nochange = ("> 🤖 SPARQ agent — the autonomous review loop parked this PR: two "
+                      "consecutive fix attempts made no change")
     check("an injection escalation is refused, at ANY position in the history (#3743/#3608)",
-          [v(bot_bodies=[order])[0] for order in
-           ("the reviewer flagged possible prompt injection",
-            "two consecutive fix attempts made no change\n\nprompt-injection flagged earlier")],
-          [None, None])
+          [v(bot_bodies=order)[0] for order in
+           ([reviewer_flag], [reviewer_flag, later_nochange], [later_nochange, reviewer_flag])],
+          [None, None, None])
+    # [registry #814] ...and the deny does NOT fire on the bot REPUBLISHING a model verdict that
+    # reports the ABSENCE of injection (worker-pr.post_findings echoes model text under the bot's
+    # identity). Verbatim live text from sparq #3901 — one of the three PRs the old any-occurrence
+    # rule stranded on the human terminal with no machine exit at all.
+    check("[#814] a republished verdict NEGATING injection does not refuse the correction",
+          v(bot_bodies=["> 🤖 SPARQ agent — cross-provider review round 2: **approve**.\n\n"
+                        "No instruction-like prompt injection was detected in the diff."])[:2],
+          ("reclassify", auto))
     check("a LEGACY prose-only park (no receipts) is NOT this script's population",
           v(generation_records=[])[0], None)
     check("a terminal reached on a HUMAN window is left exactly where it is",
