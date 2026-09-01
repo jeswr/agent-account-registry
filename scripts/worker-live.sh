@@ -1814,6 +1814,13 @@ _assert_dockerfile_pinned() {
 # argument to something else. Decoration (a redirect, an extra flag) is refused rather than guessed
 # at — the refusal prints the exact command expected.
 #
+# [review r2 #2114] And appearing in the command list is still not enough: the shell's own control
+# flow can reach past a probe (`RUN true || jq --version`, `RUN false && jq --version || true`) or
+# discard its status (`RUN jq --version; python3 -c 'import yaml'` ends on python3's), each leaving a
+# green build with the dependency unproven — the same fail-open one layer in. A command therefore
+# counts as proof only in a form whose reachability the checker can ESTABLISH: unconditional, with
+# its failure reaching the builder. The rule is spelled out at CONDITIONAL/FLOW_WORDS below.
+#
 # Fails closed on: an unreadable file, a RUN body that does not shell-parse, an unrecognised
 # dependency kind, a table that reads empty (which would otherwise "provision" everything
 # vacuously). Names the first unproven dependency.
@@ -1853,7 +1860,62 @@ if pending:
 # Layer 2, shell: split every RUN body into the command lists the shell would actually execute.
 # shlex in posix mode drops `#` comments and resolves quoting, so probe text that is commented
 # out, quoted as data, or passed as another command's argument never surfaces as a command.
-SEPARATORS = {";", "&&", "||", "|", "&", "(", ")"}
+#
+# [review r2 #2114] Appearing in the command list is NOT the same as running, and a probe that runs
+# but whose failure the build discards proves just as little. `RUN true || jq --version` and
+# `RUN false && jq --version; true` both leave a green build with jq never executed; `RUN jq
+# --version; python3 -c 'import yaml'` runs jq but ends on someone else's exit status, so a missing
+# jq exits 127 into a successful RUN. So a command counts as proof only when the BUILD FAILS if it
+# does not run or does not succeed, which is decided in three steps:
+#
+#  1. `;` and `&` end an and-or list; `&` also DETACHES the list it ends, whose status the shell
+#     never waits for, so a backgrounded list proves nothing.
+#  2. Within a list, ONLY `&&` splits commands — never `||` or `|`. That is the whole reachability
+#     argument, and it works because `&&`/`||` are equal-precedence and LEFT-associative: a command
+#     that comes out of this split exactly equal to the probe therefore sits at a list boundary or
+#     directly after an `&&`, so if it is skipped the accumulated left-hand side FAILED and the list
+#     ends non-zero. A `||` that could swallow the probe's own status stays inside the probe's
+#     command (`jq --version || true` is one command, not two) and so cannot match it.
+#  3. That non-zero list status has to reach the builder: errexit must already be on, or the list
+#     must be the body's LAST — its status IS the RUN's.
+#
+# Two shapes break step 2's model outright rather than bending it, so they disqualify the WHOLE RUN
+# instead of one list: GROUPING (`( … )`, `{ … }`) — a `;` inside a group is not a list boundary,
+# and `( true; jq --version; ) || true` would otherwise read as an unconditional probe while the
+# group's failure is swallowed — and a command starting with a word that can transfer control
+# (`if`, `exit`, `eval`, a loop keyword…), past which the checker cannot say what executes at all.
+GROUPING = {"(", ")", "{", "}"}
+FLOW_WORDS = {"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case",
+              "esac", "exit", "exec", "eval", "trap", "source", ".", "return", "break", "continue"}
+
+
+def split_on(tokens, separator):
+    """The individual commands of an and-or list."""
+    out, current = [], []
+    for token in tokens:
+        if token == separator:
+            if current:
+                out.append(current)
+            current = []
+        else:
+            current.append(token)
+    if current:
+        out.append(current)
+    return out
+
+
+def errexit_after(tokens, state):
+    """errexit as a `set` builtin leaves it: `-eux` on, `+e` off, `-x`/`-o pipefail` unchanged."""
+    for index in range(1, len(tokens)):
+        token = tokens[index]
+        if token in ("-o", "+o"):
+            if tokens[index + 1: index + 2] == ["errexit"]:
+                state = token == "-o"
+        elif len(token) > 1 and token[0] in "-+" and token[1] != "-" and "e" in token[1:]:
+            state = token[0] == "-"
+    return state
+
+
 commands = []
 for instruction in instructions:
     head = instruction.strip().split(None, 1)
@@ -1865,16 +1927,27 @@ for instruction in instructions:
         tokens = list(lexer)
     except ValueError as exc:  # unbalanced quote -> refuse, never "probe not found"
         refuse(f"RUN instruction does not shell-parse in {path}: {exc}")
-    current = []
+    if any(token in GROUPING for token in tokens):
+        continue  # a group's `;` is not a list boundary -- this RUN cannot be modelled at all
+    lists, current = [], []
     for token in tokens:
-        if token in SEPARATORS:
-            if current:
-                commands.append(current)
+        if token in (";", "&"):
+            lists.append((current, token == "&"))
             current = []
         else:
             current.append(token)
-    if current:
-        commands.append(current)
+    lists.append((current, False))
+    lists = [entry for entry in lists if entry[0]]
+    if any(entry[0][0] in FLOW_WORDS for entry in lists):
+        continue  # control can leave the straight line -- this RUN proves nothing
+    errexit = False
+    for index, (list_tokens, backgrounded) in enumerate(lists):
+        if backgrounded:
+            continue  # detached: the builder never sees this list's status
+        if errexit or index == len(lists) - 1:
+            commands.extend(split_on(list_tokens, "&&"))
+        if list_tokens[0] == "set":
+            errexit = errexit_after(list_tokens, errexit)
 
 checked = 0
 for row in table.splitlines():
@@ -1893,7 +1966,11 @@ for row in table.splitlines():
                f"— refusing to call {path} provisioned")
     if shlex.split(proof) not in commands:
         refuse(f"the model sandbox never proves {label} at build time (expected `{proof}` to run as "
-               f"a command of its own in a RUN instruction) in {path}")
+               f"a command of its own in a RUN instruction, and to run UNCONDITIONALLY with its "
+               f"failure reaching the builder: put it in a `set -e` stanza or in an `&&` chain that "
+               f"ends the RUN — a probe behind `||`, a pipeline, `&` or a flow-control word may "
+               f"never execute, and one whose exit status a later command discards proves nothing) "
+               f"in {path}")
     checked += 1
 
 if not checked:
@@ -5410,11 +5487,103 @@ PY
   # The builder drops a comment LINE even mid-continuation, so the probe below it is executed and
   # must still read as proof. Pins the Dockerfile layer against the shell layer: a parser that ends
   # the instruction at the comment loses the RUN prefix and false-refuses a provisioned image.
-  { printf '%s\n' 'FROM scratch' 'RUN apt-get install -y jq python3-yaml; \'
+  { printf '%s\n' 'FROM scratch' 'RUN set -eux; apt-get install -y jq python3-yaml; \'
     printf '%s\n' '# probes below, one per dependency' "    jq --version; python3 -c 'import yaml'"
   } > "$tmp/deps-split-comment.Dockerfile"
   chk "a comment LINE inside a continuation does not hide the probes that follow it" \
     "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-split-comment.Dockerfile" \
+        "$dep_table" >/dev/null 2>&1 && echo provisioned || echo missing)" "provisioned"
+  # [review r2 #2114] APPEARING in the command list is not EXECUTING, and executing is not proving:
+  # the shell's own control flow reaches past a probe, or discards the status that would redden the
+  # build. Every fixture below leaves the OTHER dependency genuinely proven, so the refusal can only
+  # be the row under test — and the named-dependency rows pin that rather than assuming it. These
+  # are the shapes a member-of-the-command-list check accepts and a REACHABILITY check must not.
+  local dep_yaml_ok="RUN python3 -c 'import yaml'"
+  { printf '%s\n' 'FROM scratch' "$dep_yaml_ok"; printf '%s\n' 'RUN true || jq --version'
+  } > "$tmp/deps-orskip.Dockerfile"
+  chk "a probe the shell SKIPS via || (the left side succeeded) is REJECTED, not counted as run" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-orskip.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  chk "...and the skipped dependency is the one NAMED in the refusal" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-orskip.Dockerfile" "$dep_table" 2>&1 \
+        >/dev/null | grep -c 'never proves jq at build time' || true)" "1"
+  # The nastier form: `&&` skips the probe AND `|| true` swallows the failure, so the BUILD IS GREEN
+  # with no jq in the image — the #1342 state exactly, wearing the proof's clothes one layer in.
+  { printf '%s\n' 'FROM scratch' "$dep_yaml_ok"
+    printf '%s\n' 'RUN false && jq --version || true'
+  } > "$tmp/deps-shortcircuit.Dockerfile"
+  chk "a probe skipped by && and papered over by || true is REJECTED (the build would stay green)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-shortcircuit.Dockerfile" \
+        "$dep_table" >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  chk "...and it too NAMES jq, so the author is pointed at the probe that never ran" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-shortcircuit.Dockerfile" \
+        "$dep_table" 2>&1 >/dev/null | grep -c 'never proves jq at build time' || true)" "1"
+  # Running is still not proving: with no errexit the RUN exits on python3's status, so a jq that
+  # exits 127 (not installed) ships a GREEN build. Only errexit or the final list carries a failure.
+  printf '%s\n' 'FROM scratch' "RUN jq --version; python3 -c 'import yaml'" \
+    > "$tmp/deps-discarded.Dockerfile"
+  chk "a probe whose failure a later command DISCARDS is REJECTED (it cannot redden the build)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-discarded.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  chk "...naming jq — the probe that ran, not the one that carries the RUN's exit status" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-discarded.Dockerfile" "$dep_table" \
+        2>&1 >/dev/null | grep -c 'never proves jq at build time' || true)" "1"
+  # The errexit state is READ, not assumed present: `set +e` turns the stanza's guarantee back off,
+  # and a checker that only looked for a `set -e` token anywhere would keep calling this proven.
+  printf '%s\n' 'FROM scratch' "RUN set -eux; set +e; jq --version; python3 -c 'import yaml'" \
+    > "$tmp/deps-seterrexit-off.Dockerfile"
+  chk "a stanza that turns errexit back OFF before the probe is REJECTED" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-seterrexit-off.Dockerfile" \
+        "$dep_table" >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  # `set -o errexit` is the same guarantee spelled long, and `+o` revokes it: both arms of that
+  # branch are read, so neither the accept nor the revoke can rot into a no-op unnoticed.
+  printf '%s\n' 'FROM scratch' "RUN set -o errexit; jq --version; python3 -c 'import yaml'" \
+    > "$tmp/deps-seto.Dockerfile"
+  chk "errexit spelled 'set -o errexit' is honoured too (the long form is not a false refusal)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-seto.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "provisioned"
+  printf '%s\n' 'FROM scratch' \
+    "RUN set -o errexit; set +o errexit; jq --version; python3 -c 'import yaml'" \
+    > "$tmp/deps-seto-off.Dockerfile"
+  chk "...and 'set +o errexit' revokes it, so the same stanza is REJECTED" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-seto-off.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  # Control that can leave the straight line: past `exit` (or a loop/conditional keyword) the
+  # checker cannot say what executes, so the whole RUN proves nothing rather than being guessed at.
+  { printf '%s\n' 'FROM scratch' "$dep_yaml_ok"
+    printf '%s\n' 'RUN set -eux; exit 0; jq --version'
+  } > "$tmp/deps-flow.Dockerfile"
+  chk "a probe after a control-transferring word (exit) is REJECTED — reachability is unknowable" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-flow.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  # A BACKGROUNDED probe is not waited on, so its failure never reaches the builder either.
+  printf '%s\n' 'FROM scratch' "RUN set -eux; jq --version & python3 -c 'import yaml'" \
+    > "$tmp/deps-background.Dockerfile"
+  chk "a probe detached with & is REJECTED (the build never waits for its status)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-background.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  # GROUPING is where the and-or model BREAKS rather than bends, and it was measured, not guessed:
+  # the `;` inside `( … ; … ; )` is not a list boundary, so a flat reader sees an unconditional
+  # `jq --version` list while the shell has the group's failure swallowed by `|| true` — a green
+  # build, no jq. The whole RUN is disqualified, not the one list, because nothing in it can be
+  # located relative to the group.
+  { printf '%s\n' 'FROM scratch' "RUN python3 -c 'import yaml'"
+    printf '%s\n' 'RUN set -eux; ( true; jq --version; ) || true'
+  } > "$tmp/deps-group.Dockerfile"
+  chk "a probe inside a ( … ) group whose failure || swallows is REJECTED (grouping is not modelled)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-group.Dockerfile" "$dep_table" \
+        >/dev/null 2>&1 && echo provisioned || echo missing)" "missing"
+  chk "...and jq is NAMED, not reported as some unrelated parse failure" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-group.Dockerfile" "$dep_table" 2>&1 \
+        >/dev/null | grep -c 'never proves jq at build time' || true)" "1"
+  # ...and the over-strict direction of the SAME rule: `|| true` housekeeping is ordinary in a real
+  # install stanza, and it does not touch the reachability of the probes on their own lines. If this
+  # reds, the reachability model has started refusing images that genuinely prove their deps.
+  printf '%s\n' 'FROM scratch' \
+    "RUN set -eux; command -v foo || true; jq --version; python3 -c 'import yaml'" \
+    > "$tmp/deps-ortrue-elsewhere.Dockerfile"
+  chk "a || in a DIFFERENT command does not disqualify unconditional probes (not over-strict)" \
+    "$( _assert_dockerfile_provisions_selftest_deps "$tmp/deps-ortrue-elsewhere.Dockerfile" \
         "$dep_table" >/dev/null 2>&1 && echo provisioned || echo missing)" "provisioned"
   # The bogus row is preceded by a SATISFIED one on purpose: with the bogus row alone the refusal
   # would also come from the empty-table floor below, and the two guards would mask each other

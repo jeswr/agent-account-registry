@@ -17,7 +17,11 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 # reddens 16 unrelated rows, which is exactly what the pre-flight warns against.
 # The probes on the last two lines are load-bearing, not decoration: an apt resolution that stops
 # shipping one of these must break the BUILD, rather than leave a sandbox that is quietly missing a
-# tool and an author measuring a truncated suite.
+# tool and an author measuring a truncated suite. So is the `set -eux` that opens the stanza: it is
+# what carries a failing probe's status out to the builder, and the gate reads it — drop it and a
+# probe that is not the RUN's last command no longer proves anything, which the gate refuses (it
+# prints the form it wants). Probes stay unconditional here: behind a `||` or inside a `( … )` group
+# a probe can be skipped, or its failure swallowed, while the build goes green.
 RUN set -eux; \
     apt-get update; \
     apt-get install --no-install-recommends --yes jq python3 python3-yaml; \
