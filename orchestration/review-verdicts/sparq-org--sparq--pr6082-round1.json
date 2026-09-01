@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6082,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "918ba768a667f6a787cf3270003327fedb51c9ab",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The merge_group override is correctly given highest precedence in the reusable selector workflow, passes --full while retaining the revision-pair shape, and leaves pull_request label/shadow behavior unchanged. The executable wiring tests are non-vacuous: they run the actual shell body, verify the selector invocation and precedence, feed its argv into the real selector, and confirm mode=full with the complete workspace membership. The caller-coverage assertions also pin the two merge-group workflows. Documentation accurately records the safe rollout ordering and explicitly distinguishes the remaining independently justified queue reductions.",
+  "verdict": "approve"
+ }
+}
