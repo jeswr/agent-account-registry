@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6147,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2e3f649ff4070b24f6709f78383f20ae1af0cb25",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. Unverified duplicate markers are now suppressed from ambiguity only when a trusted issue for the same bd-id exists, while trusted duplicates and unverified-only duplicates still fail closed. The added tests cover the exact prior decoy shape through apply_migration, as well as trusted collisions, unverified-only collisions, unrelated ambiguity, and ambiguous edge endpoints. The touched-id scoping and trusted-map precedence are consistent with the stated threat model, and no new correctness, soundness, test-validity, or security issue is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
