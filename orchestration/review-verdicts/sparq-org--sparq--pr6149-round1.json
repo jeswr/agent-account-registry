@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6149,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "21e1efd2f05d2797931cb393315dce6fd44149bb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is fail-closed and the two-part inertness proof is sound for its stated scope: unchanged verbatim non-comment lines prevent YAML source rewrites, while parsed-document equality rejects edits to comment-looking text inside block scalars. Missing dependencies, unreadable blobs, merge-base failures, parse failures, and declined proofs all retain the prior full-run behavior. The selection wiring preserves other full-run triggers and crate changes, and the tests exercise both load-bearing halves plus fallback behavior without appearing vacuous.",
+  "verdict": "approve"
+ }
+}
