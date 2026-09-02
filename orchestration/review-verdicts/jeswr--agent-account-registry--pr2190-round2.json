@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2190,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b91f8760b9e89e232fa4afc202f1402919dda49a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. Each added row is site-specific and establishes a non-empty stale-value precondition immediately before invoking a runner path that parks nothing. The assertions then require the corresponding kwargs/reasons collections to be empty and also check the expected runner calls, so deleting any individual clear in run_raa, run_review_outcome, or run_fix_outcome makes that runner's own row fail. The tests are therefore non-vacuous and do not rely on another runner's clear. The change is confined to self-test coverage, preserves existing trust checks, and adds no security or fail-open behavior.",
+  "verdict": "approve"
+ }
+}
