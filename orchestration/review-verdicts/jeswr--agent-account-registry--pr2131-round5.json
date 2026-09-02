@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2131,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fff23b276526287709991b9512a37274af59a67c",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`phase_exit_failure` documents a deliberate skip as a completed object, but `_execute_defuse_actions` still takes the `snapshot != (action.head_sha, action.updated_at)` branch with a bare `continue`: it increments neither `changed` nor a separate completion census. The patch now seeds/increments `attempted` for collection and revalidation deferrals. Therefore, one such deferral plus a different action that revalidates cleanly to a skip leaves `attempted > 0`, `deferred` nonempty, and `changed == 0`, falsely producing `every parked PR defuse failed` although the second object completed successfully as a safe no-op. The added tests prove deferral-only failure and deferral alongside a successful mutation, not deferral alongside a clean skip, so they do not detect this case.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Record clean revalidation skips as completed phase work without inflating `defused_prs` (for example, use a distinct completion count consumed by phase exit accounting). Add exact tests for both mixed cases from the prior review: a collection deferral plus a different candidate's clean revalidation skip, and a revalidation-read deferral plus a different candidate's clean skip. Each should retain its per-object alert while avoiding a systemic phase failure.",
+    "severity": "major",
+    "title": "Deliberate defuse skips still do not satisfy phase completion accounting"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-four major remains. The patch now propagates collection and revalidation deferrals into DefuseOutcome, but a clean revalidation skip still executes `continue` without recording any completed work. In a tick with one deferred candidate and another candidate safely revalidated away, `attempted` is nonzero, `deferred` is nonempty, and `changed` remains zero, so phase_exit_failure still falsely reports that every defuse failed. The new tests cover deferral-only and deferral-plus-mutation cases, but still omit both requested deferral-plus-clean-skip combinations. Because the same issue remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
