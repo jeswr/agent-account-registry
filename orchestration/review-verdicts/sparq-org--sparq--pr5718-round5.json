@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5718,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "977f316c04875f6d5ad75e2ea2bd242c2dfcfc71",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 5 finds no correctness, soundness, test-validity, or security defect. The checker remains fail-closed for malformed or missing registry metadata, unresolved companion/source/anchor/recipe paths, incomplete scope-anchor annotations, and undeclared swept golden files. The focused mutation self-test and 14-test suite pass, including direct non-vacuous coverage of C1/C2/C3 and checks against all three live companions. The fast-fix workflow golden matches its source update. With no findings in either round 4 or round 5, progress is stagnant.",
+  "verdict": "approve"
+ }
+}
