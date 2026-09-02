@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6127,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "74b094ccbb91ddb413d98cae55917c2e8fb23bd7",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "NotifyState::authorize_topic_read constructs WacAuthorizer directly and treats WAC Allow as final. LdpState::authorize_read additionally calls compose_odrl_read when odrl-authz is enabled, applying the effective ODRL policy. A requester with WAC Read but an ODRL Deny can therefore subscribe, receive a token, and pass the receive re-check despite being unable to GET the topic. This contradicts the new claims that notification authorization is the same as GET, and the new tests instantiate only WAC state, so they cannot detect the bypass.",
+    "file": "crates/sparq-lws-core/src/notifications/ws.rs",
+    "fix_hint": "Route notification Read checks through a shared LdpState helper that computes the same effective WAC+ODRL decision as GET without reading protected bytes. Add odrl-authz feature-on tests proving WAC Allow plus ODRL Deny returns 403 before token minting/subscriber registration, and proving the intended permit-extends direction. Update the claims consistently if notifications are intentionally WAC-only.",
+    "severity": "major",
+    "title": "Notification authorization still bypasses effective ODRL read policy"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the round-4 major authorization mismatch remains. Notification authorization still calls WacAuthorizer directly, while the actual LDP GET path additionally applies compose_odrl_read when odrl-authz is enabled. Thus WAC Allow plus ODRL Deny can still mint a subscription token and pass the receive re-check even though GET is denied. The added tests cover WAC only and do not exercise effective WAC+ODRL composition.",
+  "verdict": "request_changes"
+ }
+}
