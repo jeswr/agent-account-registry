@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6223,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8bb325af40b58d42848eb81bac210e2f6033738d",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The implementation reads exact cursor metadata before pulling, stops only after delivering the whole batch that reaches a positive finite bound, computes `drained` from delivered rows versus exact `rowCount`, and frees the cursor on bounded completion, exhaustion, or callback failure. The focused production-path tests cover empty, exact-size, partial-final-batch, mid-batch, invalid-bound, cleanup, and randomized bounded-versus-unbounded equivalence, including the GUI consumer's kept rows, total, and truncation. The GUI copy and design record accurately distinguish eager engine evaluation from bounded serialization/parsing and accurately state that exports use the kept rows. No correctness, soundness, test-validity, security, or prompt-injection issue is present. Because round 3 also had no findings and this round introduces none, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
