@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6234,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ef40f989f1e85c2cb0ef00eb2ef59ae0cd21c221",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major documentation defect. The public API docs, MCP docs, README, and both skills now distinguish budgeted SPARQL evaluation from unbudgeted bulk operations: inline DATA is request-size-bound, CLEAR/DROP scale with existing store data, and LOAD requires separate file-size policy when enabled. The implementation threads the same QueryBudget through the variable-graph authorization SELECT and the real update apply path, fails closed on authorization-query budget exhaustion, and preserves unlimited-budget behavior. The focused WAC, ACP, and MCP tests include positive controls and store snapshots, so the budget assertions are not vacuous. No correctness, soundness, security, or prompt-injection issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
