@@ -31,16 +31,6 @@
    "expires_at": 1788364163
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "26f907e90cf942ac84ea04d0819637fb",
-   "holder": "sparq-org/sparq#2949@33643053381.1",
-   "package": "gui",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1788359771,
-   "expires_at": 1788366071
-  },
-  {
    "account": "c0ac92ebee2c590e",
    "claim_id": "8d29c52d597e421ea0de4ccaddc6dd62",
    "holder": "fix:sparq-org/sparq#6070@33643090260.1",
