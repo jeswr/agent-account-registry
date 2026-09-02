@@ -25463,6 +25463,13 @@ def _identity_step(steps):
     return -1, None
 
 
+# [registry #985] The only way to drive the block with a key that is genuinely ABSENT from the API
+# payload — the shape that used to admit as the string "None". `None` cannot serve as the sentinel:
+# it is itself a value the payload can carry (an explicit JSON `null`) and both must be refused, so
+# the two are driven as separate rows.
+_IDENTITY_BLOCK_ABSENT = object()
+
+
 def _identity_block_run(script, *, full_name="o/r", default_branch="main",
                         login="registry-admin[bot]", user_id="42",
                         pr_author="registry-admin[bot]", target_repo="o/r",
@@ -25481,9 +25488,10 @@ def _identity_block_run(script, *, full_name="o/r", default_branch="main",
         repo_json = Path(tmp) / "target.json"
         user_json = Path(tmp) / "app-user.json"
         out_file = Path(tmp) / "github-output"
-        repo_json.write_text(json.dumps(
-            {"full_name": full_name, "default_branch": default_branch, "private": private}),
-            encoding="utf-8")
+        repo_payload = {"full_name": full_name, "private": private}
+        if default_branch is not _IDENTITY_BLOCK_ABSENT:
+            repo_payload["default_branch"] = default_branch
+        repo_json.write_text(json.dumps(repo_payload), encoding="utf-8")
         # [registry #1288] With no App token minted the workflow writes an EMPTY object here, so
         # the harness must feed the block the same thing. Fabricating an App identity the run
         # could not have obtained would prove a property the production job does not have.
@@ -26445,11 +26453,32 @@ def _identity_refusal_seam_self_test():
             ("unsafe default branch", {"default_branch": "../evil"}, "unsafe-default-branch"),
             ("non-App login", {"login": "human", "pr_author": "human"}, "not-an-app-bot"),
             ("non-numeric App id", {"user_id": "abc", "pr_author": "registry-admin[bot]"},
-             "not-an-app-bot")):
+             "not-an-app-bot"),
+            # [registry #985] THE NON-STRING ROWS. The guard used to read
+            # `re.fullmatch(..., str(default_branch))`, and `str(None)` is the literal "None",
+            # which MATCHES the safe-ref pattern — so a payload with no `default_branch` ADMITTED
+            # and bound the string `None` into the next step's `ref:`. Each of these three is red
+            # against that shipped form and green against the `isinstance` guard.
+            ("ABSENT default_branch", {"default_branch": _IDENTITY_BLOCK_ABSENT},
+             "unsafe-default-branch"),
+            ("explicitly null default_branch", {"default_branch": None},
+             "unsafe-default-branch"),
+            ("non-string default_branch", {"default_branch": 42}, "unsafe-default-branch")):
         code, bound = drive(**kwargs)
         assert code == 0 and bound == {"refusal": want}, (name, code, bound)
     print("  ok   #972 every refusal in the block reaches its own declared code and binds no "
           "bot_login")
+
+    # [registry #985] THE PAIRED CONTROL for the three rows above: the guard keys on the TYPE, not
+    # on the TEXT. A target whose default branch is genuinely NAMED `None` is a legal ref and must
+    # still ADMIT — and it must be the one the checkout is sent after. So a "fix" written as
+    # `str(default_branch) != "None"` reds here while the shipped `isinstance` form stays green,
+    # and the refusal above is not a new admission hole in the opposite direction.
+    code, bound = drive(default_branch="None")
+    assert code == 0 and bound.get("verified") == "yes" and "refusal" not in bound \
+        and bound.get("default_branch") == "None", (code, bound)
+    print("  ok   #985 CONTROL: a target whose default branch is genuinely NAMED `None` still "
+          "ADMITS and still binds that ref — the refusal keys on the type, not the text")
 
     # ---- (B) THE DRIFT LOCK. The codes the workflow EMITS are exactly the codes worker-pr.py
     # DECLARES. Derived from the AST of the workflow's own block (a regex over the text would
