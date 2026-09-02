@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6193,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b647c966d74a72de487c27114e80d9127faf09c1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly implements the documented non-empty README waiver, applies it only to the benchmark and SKILL requirements while preserving the README requirement, and reuses the same predicate in the periodic drift scanner. The targeted gate and drift-scanner tests cover the positive path, reasonless/prose controls, on-disk lookup, README fail-closed behavior, and both waived scanner classes; both targeted test suites pass.",
+  "verdict": "approve"
+ }
+}
