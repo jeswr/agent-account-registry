@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2203,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d40b494d8d3dd5c530d8f0e5594dc4289cde3ba3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly numbers evidence anchors by the count of accepted, rendered links rather than by their source-array positions. The executed-page coverage is non-vacuous: it distinguishes the old implementation with both an interior refusal and leading refusals, and it retains an all-accepted control that catches off-by-one or collapsed-label regressions. The rendered `+N more` expectations also exercise the shared `shown` count. Documentation matches the implemented behavior, and this display-only change does not weaken the existing URL refusal or introduce a trust-plane, workflow-permission, token, or injection path.",
+  "verdict": "approve"
+ }
+}
