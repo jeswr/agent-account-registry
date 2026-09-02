@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2220,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4f41f21763c6ac1a8558464d4e85c76de4c04e39",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 closes the prior blocker. `_via_app_proof` now accepts an integer App ID only when it is non-boolean and strictly positive, while preserving the independently valid nonblank-slug path. The self-tests exercise `id: 0` and a negative ID through the pure ownership walk (which raises) and both wrapper projections (which conservatively return UNKNOWN/false), alongside positive-ID and slug-only acceptance cases. The ownership refactor consistently makes MACHINE a positive automation proof, preserves fail-closed UNKNOWN/UNATTRIBUTABLE behavior, and keeps malformed reads distinguishable at the reconciler call site. I found no new correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
