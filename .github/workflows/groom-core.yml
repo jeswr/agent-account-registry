@@ -256,6 +256,11 @@ jobs:
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
           # Privacy routing (locked decision 22c) + the #39 fix: ALERT_REPO without ALERT_TOKEN
           # falls back to the registry repo (never dropped silently). Identifiers stay salted.
+          # #432 round 1: the configured pair selects the DESTINATION, but the DETAILED body
+          # (fleet/failure counts, reset hints, diagnostics) additionally requires a POSITIVELY
+          # VERIFIED private destination — distinct from this registry repo AND confirmed
+          # `"private": true` by a live GET /repos/{ALERT_REPO} read under ALERT_TOKEN. Token
+          # presence alone is NOT verification; every other shape redacts to a generic signal.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
