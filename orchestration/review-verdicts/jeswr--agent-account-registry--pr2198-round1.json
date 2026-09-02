@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2198,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "921e65b14c02c2062436d644a988b9cb214397e1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_collect_defuse_prs` catches each arbitrary exception, prints an ALERT, and returns no indication that collection deferred; `_execute_defuse_actions` likewise catches mutation-boundary revalidation failures before incrementing `attempted` and neither appends `deferred` nor increments a completed count. If every admissible PR fails at either boundary, the resulting defuse `PhaseOutcome` is `(changed=0, attempted=0, deferred=())`, so `phase_exit_failure` returns `None`. That violates the module's precedence rule that an all-object failure is systemic and makes the newly broadened catch convert a repeated malformed-payload/runtime failure into a green run. The new collection and revalidation tests deliberately include a succeeding #31/#22, so they cannot detect this all-failed path.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Carry collection and pre-attempt revalidation deferrals into the defuse phase outcome (with accounting that lets `phase_exit_failure` distinguish no candidates from candidates that all failed), and add separate all-candidates-fail self-tests for both boundaries asserting a non-zero systemic exit reason. Preserve the existing one-fails/one-completes continuation cases.",
+    "severity": "major",
+    "title": "All defuse read failures are swallowed into an exit-zero sweep"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe widened exception boundaries generally preserve the intended per-object continuation and masking, but the defuse read paths do not preserve the shared systemic-failure precedence. Both collection and mutation-boundary revalidation can now catch arbitrary failures for every candidate while returning an empty/healthy-looking outcome, so the sweep exits zero after doing no defuse work. The added tests cover head-of-line continuation and masking but omit the all-failed case that exposes this vacuity.",
+  "verdict": "request_changes"
+ }
+}
