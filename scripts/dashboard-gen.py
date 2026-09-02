@@ -1196,6 +1196,88 @@ def _js_code_count(text, needle):
     return hits
 
 
+def _css_rules(text):
+    """`(prelude, body)` for every TOP-LEVEL block of a stylesheet, comments removed.
+
+    Issue #2218. `dashboard/app.js` is asserted by EXECUTION, but the stylesheet it renders into was
+    asserted by nothing at all — which is how two `.obs-truncation-note` paragraphs shipped with no
+    rule to match them. A substring search for the selector would be satisfiable by a comment, so
+    the sheet is PARSED instead. Anything it cannot account for — an unbalanced block, trailing
+    junk outside every rule — raises rather than being dropped silently."""
+    stripped = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    rules, index = [], 0
+    while True:
+        brace = stripped.find("{", index)
+        if brace < 0:
+            break
+        depth, cursor = 0, brace
+        while cursor < len(stripped):
+            if stripped[cursor] == "{":
+                depth += 1
+            elif stripped[cursor] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            cursor += 1
+        if depth != 0:
+            raise DashboardError("stylesheet has an unbalanced rule block — refusing to resolve it")
+        rules.append((" ".join(stripped[index:brace].split()), stripped[brace + 1:cursor]))
+        index = cursor + 1
+    if stripped[index:].strip():
+        raise DashboardError(
+            f"stylesheet has content outside every rule ({stripped[index:].strip()[:40]!r}) — "
+            "refusing to resolve it")
+    return rules
+
+
+_CSS_SIMPLE_SELECTOR = re.compile(r"^(?P<tag>[a-z][a-z0-9-]*)?(?P<classes>(?:\.[A-Za-z0-9_-]+)+)$")
+
+
+def _css_applied(text, tag, classes):
+    """The declarations a stylesheet applies to a `<tag class="...">` element, by real cascade order.
+
+    Issue #2218. Only tag/class simple selectors are modelled, which is the whole of the region
+    under test — but a selector or an at-rule this reader cannot resolve that MENTIONS one of the
+    classes asked about is a REFUSAL, never a skip: reporting "no colour applies" because the rule
+    that supplies it was silently unparseable is the same false pass the missing rule was. Later
+    rules win only at equal specificity, so a `td.bad` cannot be reported as beating a `.a.b`."""
+    wanted, applied = set(classes), {}
+    for order, (prelude, body) in enumerate(_css_rules(text)):
+        if prelude.startswith("@"):
+            mentions = sorted(name for name in wanted
+                              if re.search(rf"\.{re.escape(name)}\b", prelude + body))
+            if mentions:
+                raise DashboardError(
+                    f"at-rule `{prelude}` reaches {mentions} — this reader models only "
+                    "top-level rules, so it refuses rather than report a cascade it did not resolve")
+            continue
+        for selector in prelude.split(","):
+            selector = selector.strip()
+            match = _CSS_SIMPLE_SELECTOR.match(selector)
+            if match is None:
+                if any(re.search(rf"\.{re.escape(name)}\b", selector) for name in wanted):
+                    raise DashboardError(
+                        f"selector `{selector}` reaches {sorted(wanted)} through a form this "
+                        "reader cannot resolve — refusing")
+                continue
+            names = set(match.group("classes").lstrip(".").split("."))
+            if not names <= wanted or (match.group("tag") or tag) != tag:
+                continue
+            weight = (len(names), 1 if match.group("tag") else 0, order)
+            for declaration in body.split(";"):
+                prop, separator, value = declaration.partition(":")
+                if not separator:
+                    if declaration.strip():
+                        raise DashboardError(
+                            f"unreadable declaration {declaration.strip()!r} in `{prelude}` — "
+                            "refusing")
+                    continue
+                prop = prop.strip()
+                if prop not in applied or applied[prop][0] < weight:
+                    applied[prop] = (weight, " ".join(value.split()))
+    return {prop: value for prop, (_, value) in applied.items()}
+
+
 def _node_json(script, payload):
     """Run `script` under `node` with `payload` on stdin and parse its stdout as JSON, or raise.
 
@@ -9256,6 +9338,85 @@ esac
               "fabricated note — a page reaching this through JavaScript's own `> 0` coercion "
               "states a count it never read",
               ci_loss(f"hostile-{label}"), ([], [], None))
+    # ---- [#2218] ...AND THE STYLESHEET MUST HAVE A RULE TO DRAW IT WITH. --------------------
+    # Both notes above exist so an operator can tell an empty panel from an unreadable one, and both
+    # shipped against a `.obs-truncation-note` class with NO rule in dashboard/styles.css: default
+    # paragraph size, default colour, the `bad` tone dropped — louder and less legible than the
+    # #1868 truncation note beside them, which is the opposite of what a page renders a loss as. The
+    # class string is READ OUT OF app.js rather than typed here (pre-flight item 2c), so a rename on
+    # the page side reds this row instead of quietly unstyling the notes again, and the sheet is
+    # PARSED, never grepped — a substring search for the selector is satisfiable by a comment.
+    try:
+        note_classes = re.findall(
+            r'node\("p",\s*"(obs-truncation-note[^"]*)"',
+            _js_function_body(_repo_file("dashboard", "app.js"), "obsFlowCard"))
+    except DashboardError as error:                 # crash-after-partial-run guard, as above
+        note_classes = [str(error)]
+    check("[#2218] both unreadable-row notes are drawn by obsFlowCard with ONE class string — so "
+          "the rules resolved below are resolved for exactly what the page sets, and a rename on "
+          "the page side reds this suite rather than quietly unstyling the notes again",
+          (sorted(set(note_classes)), len(note_classes)), (["obs-truncation-note bad"], 2))
+    try:
+        styles_css = _repo_file("dashboard", "styles.css")
+        # A regex that matched nothing above already reded its own row; falling back to the shipped
+        # class keeps every row below EXECUTING rather than aborting the run on an IndexError.
+        note_rule = _css_applied(
+            styles_css, "p", (note_classes or ["obs-truncation-note bad"])[0].split())
+        # The sibling display-cap note the loss notes sit next to, and the `bad` tone the congestion
+        # count beside them already renders: both READ OUT OF the sheet, so "as quiet as its
+        # neighbour, in the fleet's own loss colour" is compared against the neighbours themselves
+        # and not against a second copy of the same literals typed into this file.
+        truncated_rule = _css_applied(styles_css, "p", ["obs-truncated"])
+        count_rule = _css_applied(styles_css, "span", ["obs-reason-count", "bad"])
+        bare_bad_rule = _css_applied(styles_css, "p", ["bad"])
+        root_vars = sorted({declaration.split(":")[0].strip()
+                            for prelude, body in _css_rules(styles_css) if prelude == ":root"
+                            for declaration in body.split(";")
+                            if declaration.strip().startswith("--")})
+    except DashboardError as error:                 # same crash-after-partial-run guard as above
+        note_rule = truncated_rule = count_rule = bare_bad_rule = {"refused": str(error)}
+        root_vars = [str(error)]
+    check("[#2218] the loss notes render in the fleet's OWN bad tone — the same one the congested "
+          "queue count beside them uses — and that custom property is really declared, so the "
+          "colour is not a `var()` naming nothing",
+          (note_rule.get("color"), count_rule.get("color"), "--bad" in root_vars),
+          ("var(--bad)", "var(--bad)", True))
+    check("[#2218] ...and they are as quiet as the #1868 truncation note they sit beside: same "
+          "margin, same .68rem, same tabular numerals, rather than the default paragraph the "
+          "missing rule left them as",
+          ((note_rule.get("margin"), note_rule.get("font-size"),
+            note_rule.get("font-variant-numeric")),
+           (truncated_rule.get("margin"), truncated_rule.get("font-size"),
+            truncated_rule.get("font-variant-numeric"))),
+          (("4px 0 12px", ".68rem", "tabular-nums"), ("4px 0 12px", ".68rem", "tabular-nums")))
+    check("[#2218] the tone stays QUALIFIED by the note's own class: a bare `.bad` rule would tint "
+          "every element the page marks bad, which is a change to a shared class and not this fix",
+          bare_bad_rule, {})
+    # The reader itself, in both directions — a resolver that returned `{}` for everything would
+    # make the three rows above pass on an empty stylesheet the day someone deleted the rule.
+    _CSS_FIXTURE = (".obs-truncation-note { margin: 4px 0 12px; font-size: .68rem; }\n"
+                    ".obs-truncation-note.bad { color: var(--bad); }\n")
+    check("[#2218] the stylesheet reader is not a rubber stamp: it reports the tone only for an "
+          "element that carries `bad`, and reports NOTHING once the rules are gone",
+          (_css_applied(_CSS_FIXTURE, "p", ["obs-truncation-note", "bad"]),
+           _css_applied(_CSS_FIXTURE, "p", ["obs-truncation-note"]),
+           _css_applied("", "p", ["obs-truncation-note", "bad"])),
+          ({"margin": "4px 0 12px", "font-size": ".68rem", "color": "var(--bad)"},
+           {"margin": "4px 0 12px", "font-size": ".68rem"}, {}))
+    for label, hostile in (
+            ("an at-rule", "@media (max-width: 620px) { .obs-truncation-note { color: red; } }"),
+            ("a descendant selector", ".obs-card .obs-truncation-note { color: red; }"),
+            ("an unreadable declaration", ".obs-truncation-note { color red }"),
+            ("an unbalanced block", ".obs-truncation-note { color: red;"),
+            ("a dangling selector outside every rule",
+             ".obs-truncation-note { color: red; }\n.obs-truncation-note.bad")):
+        try:
+            unresolved = _css_applied(hostile, "p", ["obs-truncation-note", "bad"])
+        except DashboardError:
+            unresolved = "refused"
+        check(f"[#2218] ...and {label} carrying the note's class is a REFUSAL — reporting 'no rule "
+              "applies' for a rule it could not read is the same false pass as the missing rule",
+              unresolved, "refused")
     try:
         with_observability = build_dashboard(
             issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)

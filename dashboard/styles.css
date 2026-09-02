@@ -247,6 +247,14 @@ td.obs-unmeasured { color: var(--muted); }
 /* Issue #1868: the display-cap affordance — `showing 12 of 50`, muted, sitting with the rows it
    accounts for. Before it, an array four times its cap rendered exactly like one at it. */
 .obs-truncated { margin: 4px 0 12px; color: var(--muted); font-size: .68rem; font-variant-numeric: tabular-nums; }
+/* Issue #2218: the unreadable-row notes — the queue card's (#1896) and the target-CI one (#2173) —
+   answer the same question as the truncation note above and sit beside it, so they share its
+   metrics; the tone is what differs, because a row the generator could NOT read is a loss, not a
+   display cap. Without this rule both rendered as default-size, default-colour paragraphs: louder
+   than the note they sit next to, and with the `bad` tone dropped entirely. Kept qualified by
+   `.bad` rather than added to the bare class, so nothing else on the page picks the colour up. */
+.obs-truncation-note { margin: 4px 0 12px; font-size: .68rem; font-variant-numeric: tabular-nums; }
+.obs-truncation-note.bad { color: var(--bad); }
 .obs-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .obs-chip { padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .68rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
