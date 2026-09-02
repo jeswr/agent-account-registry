@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2193,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8fbaae7abdb570ac9d06f1acecfb9fff75097394",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`summary_length` is produced by Python `len(text)` and the summary is sliced with `text[:240]`, both measured in Unicode code points. Here `summaryText.length` is JavaScript UTF-16 code units. Those quantities diverge for printable astral characters such as emoji. For example, a 241-emoji sanitized summary is published as 240 emoji with `summary_length: 241`, but the browser computes `summaryText.length === 480`; `obsTruncated(480, 241)` is false, so no cut marker appears even though one character was withheld. Mixed BMP/astral text can likewise produce an incorrect hidden count. The executed-page tests cover only ASCII, so they do not detect the cross-runtime mismatch.",
+    "file": "dashboard/app.js",
+    "fix_hint": "Use the same counting unit on both sides. For the current Python contract, compute the displayed code-point count in JavaScript (for example `Array.from(summaryText).length`) for both the predicate and hidden-count subtraction, and add an end-to-end producer-plus-page test with astral printable characters that proves a genuinely capped summary renders the correct marker and hidden count. Alternatively, explicitly redefine and implement a common counting/slicing unit in both runtimes.",
+    "severity": "major",
+    "title": "UTF-16 length comparison hides real truncation for astral Unicode"
+   }
+  ],
+  "progress": null,
+  "summary": "The new affordance is sound for BMP-only text, and its tests exercise the producer and rendered page without relying only on lexical assertions. However, the producer and consumer do not agree on what a character count means. Python publishes code-point counts and slices by code point, while JavaScript uses UTF-16 code-unit length. Consequently, valid printable summaries containing astral Unicode can be genuinely cut by the generator yet draw no ellipsis, preserving the silent-truncation defect this PR is meant to close. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
