@@ -1,36 +1,6 @@
 {
  "leases": [
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "82b1fa530e5c42779cabcbb645b87b1f",
-   "holder": "review:sparq-org/sparq#6198@33612606866.1",
-   "package": "ci",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1788340220,
-   "expires_at": 1788344420
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "19dab22110d34e2eafcf8f8514d61a42",
-   "holder": "review:sparq-org/sparq#6225@33612670736.1",
-   "package": "ci",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1788340265,
-   "expires_at": 1788344465
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "0b7f739f8d604ca98129f19226449306",
-   "holder": "review:sparq-org/sparq#6228@33612690727.1",
-   "package": "ci",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1788340280,
-   "expires_at": 1788344480
-  },
-  {
    "account": "f79434c3ffba014f",
    "claim_id": "e850a4935b0a4c469b546b6d7f2f6b37",
    "holder": "fix:sparq-org/sparq#6127@33616348785.1",
