@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6283,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ff7f5d0a91c9c8887b4d98cc8a7d64db20d6b6cc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly adds an independent SCOPE-DOC invariant on top of the existing whole-file workflow/golden pin. The checker applies the new validation on the live --root path, and the negative fixture removes the scope block from both workflow and golden so that the byte pin remains clean while SCOPE-DOC alone must fail; this makes the test non-vacuous. The workflow and generated golden remain byte-consistent, and both the self-test and live guard pass. No correctness, security, or test-validity defect was found.",
+  "verdict": "approve"
+ }
+}
