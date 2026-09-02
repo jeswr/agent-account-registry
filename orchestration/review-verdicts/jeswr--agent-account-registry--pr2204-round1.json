@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2204,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "dd5aaf0234026a1eaacaaf5033365cade856f9e9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new predicate is conservative in the action-authorizing direction: it restores only when the latest relevant state transition is a provably machine-authored removal of a strictly older, provably human-authored application. Malformed timelines, missing actors, failed human probes, ambiguous timestamp ties, mixed or unattributable latest actors, absent applications, and later reapplications all resolve to no action. Machine identity is positively established, human identity takes precedence for removals, label filtering and parsed timestamp ordering reuse the module's existing strict timeline normalization, and the tests exercise both positive and substantial negative/fail-closed paths with independent fixture values. No security weakening, vacuous assertion, or reviewer-directed prompt injection is present in the diff.",
+  "verdict": "approve"
+ }
+}
