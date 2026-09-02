@@ -25,6 +25,13 @@
 # merge ref from. That is read here from git, from inside the run, which is the ONLY place it is
 # observable; no API field reports it.
 #
+# ⚠️ AND "THE GRADED TREE IS HEAD^1 OF THE MERGE REF" IS NOT SPELLED HERE (registry #1429). That one
+# literal fact had two independent definitions — this module's and compose-gate.py's — each with its
+# own git argv, its own `parents[1]` and its own parent-count refusal, so a repoint had to be made in
+# both at once or the two gates would silently read different commits. It now lives ONCE, in
+# `scripts/graded_base.py`, which this module IMPORTS. What stays here is this module's own
+# FAIL-CLOSED SHAPE (`unprovable`, annotated, exit 0), which is deliberately not compose-gate's.
+#
 # HOW THE READING IS DERIVED, and the two operands it needs from pr-gate.yml's checkout:
 #   * `fetch-depth: 0` — without it only the merge ref is fetched and `refs/remotes/origin/<base>`
 #     does not exist, so there is nothing to compare against;
@@ -63,6 +70,14 @@ import re
 import shlex
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# THE graded-base derivation, IMPORTED and never re-declared (registry #1429). Bound as a MODULE,
+# not as `from ... import graded_base`: the self-test below probes the delegation by swapping the
+# attribute, and a from-import would have captured the function and made a private copy
+# indistinguishable from this one.
+import graded_base as _graded_base  # noqa: E402 — the sys.path arm above has to run first
 
 FRESH = "fresh"
 STALE = "stale"
@@ -121,17 +136,17 @@ def freshness(head_sha, base_ref, cwd, git=_git):
         result["reason"] = f"the base ref {str(base_ref)[:64]!r} is not a plain branch name"
         return result
     try:
-        parents = git(["rev-list", "--parents", "-n", "1", "HEAD"], cwd).split()
+        parents = git(list(_graded_base.GRADED_BASE_ARGV), cwd)
     except GitError as exc:
         result["reason"] = f"the checked-out commit is unreadable ({str(exc)[:120]})"
         return result
-    if len(parents) != 3:
-        result["reason"] = (
-            f"the checked-out commit has {max(len(parents) - 1, 0)} parent(s), so it is not the "
-            "two-parent refs/pull/N/merge commit this gate is supposed to grade — no base tip can "
-            "be attributed to it")
+    # The ONE owner of "which parent is the graded base", argv included (#1429). Its refusal is
+    # already the sentence an operator needs, and it hands back NO shas when it refuses — so this
+    # module's `unprovable` cannot be built on a tip the derivation declined to attribute.
+    tested_base, composed_head, refusal = _graded_base.graded_base(parents)
+    if refusal:
+        result["reason"] = refusal
         return result
-    tested_base, composed_head = parents[1], parents[2]
     if composed_head != head_sha:
         result["reason"] = (f"the checked-out merge composes {composed_head} as its head, which is "
                             f"not this pull request's head {head_sha}")
@@ -499,6 +514,35 @@ def _self_test():
         os.mkdir(outside)
         chk("a working directory that is not a repository is unprovable, not fresh",
             freshness(sha["H"], "master", outside)["state"], UNPROVABLE)
+
+        # ---- [#1429] THE SHARED-CODE LEG. Every parent-count row above is satisfied just as well
+        # by the PRIVATE copy of the derivation this module used to carry, so long as the copy
+        # agrees today — which is precisely the #958 shape #1429 removed, and #945 measured why it
+        # survives (two copies of one rule make each copy INDIVIDUALLY unkillable, because removing
+        # either alone leaves the suite green). So the delegation itself is probed: swap the shared
+        # owner's members for sentinels and require this module's verdict to follow them. Only
+        # shared code can. Restored in a `finally`, and the restoration is its own row — a leaked
+        # sentinel would silently poison every row below.
+        _real_reader, _real_argv = _graded_base.graded_base, _graded_base.GRADED_BASE_ARGV
+        try:
+            _graded_base.graded_base = lambda _line: ("", "", "SENTINEL-REFUSAL")
+            _sentinel = freshness(sha["H"], "master", repo)
+            chk("the graded-base reading DELEGATES to graded_base.graded_base (a re-inlined "
+                "private copy would not follow this sentinel)",
+                (_sentinel["state"], _sentinel["reason"]), (UNPROVABLE, "SENTINEL-REFUSAL"))
+        finally:
+            _graded_base.graded_base = _real_reader
+        try:
+            # ...and so does the git ARGV. Sharing the parser while keeping a private invocation
+            # leaves the repoint half-done, and this mutant is what shows it: `rev-parse HEAD`
+            # prints ONE token, so the shared parser refuses with a parent count of 0.
+            _graded_base.GRADED_BASE_ARGV = ("rev-parse", "HEAD")
+            chk("...and so does the git ARGV (a private invocation would still read three tokens)",
+                "0 parent(s)" in freshness(sha["H"], "master", repo)["reason"], True)
+        finally:
+            _graded_base.GRADED_BASE_ARGV = _real_argv
+        chk("...and BOTH sentinels are UNDONE, so every row below reads the real shared owner",
+            freshness(sha["H"], "master", repo)["state"], STALE)
 
         # The distance is the one NICE-TO-HAVE operand: if `rev-list --count` fails, the verdict
         # must still be STALE with the distance reported as unknown — never fresh, and never a
