@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6149,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d481ac2b3dddb36f69115527a4882806573e2232",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 confirms the round-2 approval. The diff remains fail-closed: the optimization is available only when the merge base resolves, both blobs are readable, non-comment lines match verbatim, and PyYAML parses both documents to equal values; dependency/setup, parsing, Git, and proof failures retain the existing full-run trigger. The conjunction covers the relevant YAML hazards: textual equality rejects source rewrites that PyYAML may normalize differently from GitHub Actions, while structural equality rejects edits to comment-looking or blank content inside block scalars. The selector wiring preserves independent crate and full-run triggers, and the tests exercise both proof halves, the real merge-base/blob path, dependency absence, malformed and missing inputs, decline auditing, eligibility, memoization, summary output, and mixed-path selection. No correctness, soundness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
