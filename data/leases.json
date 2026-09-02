@@ -23,12 +23,12 @@
   {
    "account": "c0ac92ebee2c590e",
    "claim_id": "8fd7bdf0eb5c4eea84efd1ab8b2e895b",
-   "holder": "sparq-org/sparq#2746@dispatch-33578720333.1",
+   "holder": "sparq-org/sparq#2746@33579193167.1",
    "package": "sparq-lws-core",
    "role": "research",
    "model": "opus5",
-   "issued_at": 1788312193,
-   "expires_at": 1788318493
+   "issued_at": 1788312235,
+   "expires_at": 1788318535
   },
   {
    "account": "c0ac92ebee2c590e",
