@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-02T13:45:00Z",
+  "generated_at": "2026-09-02T13:58:52Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -10,36 +10,36 @@
       "prs_open": 162,
       "prs_draft": 129,
       "prs_opened_1h": 1,
-      "prs_closed_1h": 1,
+      "prs_closed_1h": 0,
       "prs_merged_1h": 0,
       "prs_merged_24h": 0,
-      "review_changes_backlog": 33,
+      "review_changes_backlog": 32,
       "needs_user_parked": 16,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 12,
-      "worker_attempts_1h": 2,
+      "review_lane_runs_1h": 8,
+      "worker_attempts_1h": 1,
       "worker_success_rate_1h": 0.0,
       "pr_open_rate": 1.0,
-      "pr_close_rate": 1.0,
-      "net_pr_flow": 0.0
+      "pr_close_rate": 0.0,
+      "net_pr_flow": 1.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 1027,
+      "issues_open": 1029,
       "issues_ready": 679,
-      "issues_closed_1h": 2,
-      "issues_closed_24h": 33,
+      "issues_closed_1h": 0,
+      "issues_closed_24h": 31,
       "prs_open": 46,
-      "prs_draft": 31,
+      "prs_draft": 30,
       "prs_opened_1h": 2,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
       "prs_merged_24h": 29,
-      "review_changes_backlog": 7,
+      "review_changes_backlog": 6,
       "needs_user_parked": 17,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 3,
-      "worker_attempts_1h": 5,
-      "worker_success_rate_1h": 0.4,
+      "review_lane_runs_1h": 5,
+      "worker_attempts_1h": 3,
+      "worker_success_rate_1h": 0.6667,
       "pr_open_rate": 2.0,
       "pr_close_rate": 0.0,
       "net_pr_flow": 2.0
@@ -66,16 +66,6 @@
         "net_pr_flow": 2.0,
         "pr_open_rate": 2.0,
         "pr_close_rate": 0.0
-      }
-    },
-    {
-      "target": "jeswr/agent-account-registry",
-      "classification": "worker-failing",
-      "fire": true,
-      "summary": "worker success rate 40% < 50% floor over 2 snapshots (5 attempts this hour)",
-      "metrics": {
-        "worker_success_rate_1h": 0.4,
-        "worker_attempts_1h": 5
       }
     }
   ]
