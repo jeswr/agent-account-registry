@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2187,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "63d9553537e6ba20713474ffdf0f161a55459266",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe refactor is correct and complete within the diff's scope. The premium registry now binds each alias to its own probe flag and quota-window prefix, and the eligibility call site consumes that pair without weakening the existing whole-account checks or the fail-closed behavior for missing/failed premium observations. The added self-tests independently exercise helper argument wiring, production call-site wiring, whole-account precedence, preservation of Fable behavior, global restoration, and exact registry membership; their opposing Fable/second-alias fixtures make the formerly hard-coded implementation fail rather than pass vacuously. The account-usage changes are documentation-only and accurately point to the renamed helper/mapping. No reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
