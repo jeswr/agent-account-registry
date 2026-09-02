@@ -104,7 +104,17 @@ OBS_QUEUE_CLASS_RE = re.compile(r"[1-4][a-z]?")   # the #243 queue classes (1, 2
 OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#%-]{1,220}")
 # [#2039] The `flow.target_ci_queue` row key, hoisted beside its sibling shapes so the seam that
 # drops a row can name WHICH guard refused it rather than testing three things in one condition.
-OBS_TARGET_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
+# [#2174] ...and BOUNDED, which it was not: every other collector-controlled string this panel
+# publishes is length-capped before it reaches `site/data.json` (a trigger `summary` at 240 via
+# `_obs_text_capped`, a `rule`/defer `reason` at 64 via OBS_TOKEN_RE, a queue `class` at 2 via
+# OBS_QUEUE_CLASS_RE, a lease `label` at 16 via OBS_SALTED_LABEL_RE), but this pattern's two `*`
+# quantifiers were unbounded. The character set already made it non-injectable; it did not make it
+# legible, and the snapshot is written on the PUBLIC `ledger` branch by a collector this build does
+# not own (AGENTS.md pre-flight item 5), so a megabyte-long "repository" would have published
+# straight into data.json and the `CI queue · <repo>` metric label that renders it. The bounds are
+# GitHub's own — 39 characters for an owner, 100 for a repository name — so nothing nameable on
+# GitHub is refused, and the `{0,N}` form keeps the FIRST character's own charset guard intact.
+OBS_TARGET_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
                       "queue_age_clamp_minutes", "merge_stall_minutes"}
 # [#1557] THE CACHE GROUP HAS NO PRODUCER, and the file the docs named as its source never had one
@@ -8896,6 +8906,30 @@ esac
         check(f"[#2039] a {case} repository is not echoed into the build log that diagnoses it",
               obs_ci_drops([{"repository": repository, "depth": 1}]),
               ([], [_CI_DROP.format(f"row `repository` {quoted} is not an owner/name repository")]))
+    # [#2174] ...and the PUBLISHED value is bounded too, which the build-log cap above cannot reach:
+    # a repository that PARSES is echoed into `site/data.json` and the `CI queue · <repo>` metric
+    # label at whatever length the collector chose. Both sides of each bound, one row each: the
+    # just-over rows red for any widening (measured: reverting to `*` and widening to `{0,999}` each
+    # red them), the at-maximum row reds for any narrowing, and the megabyte row is the one that
+    # also reds a guard made CONDITIONALLY inert (`if len(repository) < 500 and ...`) — the #938
+    # shape a straight deletion cannot see. Every length here is a written literal, NOT derived from
+    # OBS_TARGET_REPO_RE: deriving the input from the constant the code reads is the #941 tautology
+    # that left 76/76 green while the cap itself was mutated to 999.
+    _MAX_OWNER, _MAX_NAME = "a" * 39, "b" * 100
+    check("[#2174] a repository at GitHub's own maximum — a 39-character owner and a 100-character "
+          "name — is PUBLISHED silently, so the bound refuses nothing that exists on GitHub",
+          obs_ci_drops([{"repository": f"{_MAX_OWNER}/{_MAX_NAME}", "depth": 3}]),
+          ([{"repository": f"{_MAX_OWNER}/{_MAX_NAME}", "depth": 3}], []))
+    for case, repository in (
+        ("a 40-character owner", f"{'a' * 40}/sparq"),
+        ("a 101-character name", f"sparq-org/{'b' * 101}"),
+        ("a megabyte-long name", f"sparq-org/{'b' * 1000000}"),
+    ):
+        check(f"[#2174] {case} is REFUSED — charset-safe is not the same as bounded, and an "
+              "unbounded name publishes straight into data.json and the metric label rendering it",
+              obs_ci_drops([{"repository": repository, "depth": 1}]),
+              ([], [_CI_DROP.format(
+                  f"row `repository` {repository[:64]!r} is not an owner/name repository")]))
     # `flow.target_ci_queue` is UNBOUNDED on the way IN — `_obs_capped` truncates it at 12 on the way
     # OUT, after every row has been walked — so nothing but this seam's own `_ObsDropLog` limits the
     # emission: the #1570 flood, exactly. The 21st row still publishes, because capping a WARNING
