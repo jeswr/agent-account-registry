@@ -11,16 +11,6 @@
    "expires_at": 1788360853
   },
   {
-   "account": "f79434c3ffba014f",
-   "claim_id": "8e33aa7dd0ee420da4a14a23075fa66e",
-   "holder": "jeswr/agent-account-registry#1566@33634453853.1",
-   "package": "workflows",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1788354835,
-   "expires_at": 1788358773
-  },
-  {
    "account": "dc2d751954080e13",
    "claim_id": "a8ced4dc2df0470cb83c0e1785e2aec7",
    "holder": "review:jeswr/agent-account-registry#2224@33634508952.1",
