@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5891,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "56bcc9b6def7a39d30e7c7981331e1940185a5f9",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security defect. The implementation still fails closed for successful-looking legs with missing, absent, or incomplete recorded outcomes; completeness is measured against the adjacent planned mutants list; completed sweeps with surviving mutants remain valid; and ratchet regressions remain separately red. The workflow captures both suppressed exits, uploads the status record under always(), and the report consumes those records. The focused integration-shaped suite exercises the truncated-artifact path on real files, compares its counts with mutants-gate.py, and includes completed-sweep and surviving-mutant negative controls. Relative to round 3, the findings remain empty, so progress is stagnant by the required scale.",
+  "verdict": "approve"
+ }
+}
