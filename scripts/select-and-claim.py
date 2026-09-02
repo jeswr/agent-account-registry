@@ -424,16 +424,23 @@ SAFETY_MARGIN = 0.10  # default fraction of each window that must remain free to
 # remaining headroom. Set margin >= a typical worker's per-window burn to actually prevent half-finishes.
 # Per-repo overridable via policy `usage_safety_margin`. Projected-burn admission is tracked as follow-up.
 
-# [FABLE-5] Models whose OWN weekly sub-quota (the account-usage `fable_7d_oi_*` window) must ALSO have
-# headroom before a worker starts — routing one of these to an account with low WHOLE-account usage but an
-# exhausted premium bucket fails mid-run and burns credits. account-usage.py only ever emits the fable
-# sub-quota fields for the claude-fable-5 alias; keep this in sync with any alias that maps to that bucket.
-# opus5 (claude-opus-5, the primary anthropic tier since 2026-07-24) is DELIBERATELY not listed yet:
-# its rate-limit bucket mapping is unobserved, and wiring it to the fable probe would gate opus5
-# admissions on ANOTHER model's headers. Revisit once account-usage observes claude-opus-5 headers
-# (add the alias here + emit its sub-quota fields there in the same change).
-PREMIUM_MODELS = frozenset({"fable"})
-FABLE_WINDOW = "fable_7d_oi"  # prefix of the fable sub-quota util/reset keys in the usage map
+# [SPARQ agent] PREMIUM ALIASES — models whose OWN weekly sub-quota (a per-model window emitted by
+# account-usage.py, e.g. fable's `fable_7d_oi_*` fields) must ALSO have headroom before a worker starts.
+# Routing one of these to an account with low WHOLE-account usage but an exhausted premium bucket fails
+# mid-run and burns credits.
+#
+# The shape is `alias -> (probe-ok flag, window prefix)`, NOT a bare set of aliases. A set only ever
+# worked because it had exactly one member: the headroom test read fable's ok-flag and fable's window as
+# LITERALS, so a second alias appended to the set would have been gated on FABLE's headers — and since
+# the fable probe is retired (`scripts/deprecated_models.py`) that flag is never set, so the new alias
+# would fail closed on EVERY account (registry #1645; `research/720-opus5-premium-quota-gating.md` §2.4).
+# Each alias now carries its own pair; an alias absent from this mapping is simply not premium-gated.
+#
+# opus5 (claude-opus-5, the primary anthropic tier since 2026-07-24) is DELIBERATELY absent: its
+# rate-limit bucket mapping is unobserved. Adding an alias here REQUIRES account-usage.py to emit that
+# alias's ok-flag and window fields in the SAME change — an entry whose fields no producer writes gates
+# the alias on data that never arrives, which for a sole-tier alias is fleet-wide starvation.
+PREMIUM_MODELS = {"fable": ("fable_ok", "fable_7d_oi")}
 
 # --- EXEMPTION IS NOT REACHABILITY (registry #639) -------------------------------------------------
 # The probe exemption (issue #29) answers ONE question: this provider publishes no usage headers, so
@@ -485,20 +492,23 @@ def _usage_window(u, prefix):
     return _usage_num(u.get(prefix + "_util")), _usage_num(u.get(prefix + "_reset"))
 
 
-def _fable_eligible(u, margin):
-    """[FABLE-5] Fail-closed headroom test for the FABLE weekly sub-quota. Requires the account-usage
-    fable probe to have SUCCEEDED (fable_ok) AND the 7d_oi window to have >= margin headroom. Unknown or
-    unprobed -> ineligible, so a fable route never lands on an account with an exhausted (or unobserved)
-    Fable bucket."""
-    if not isinstance(u, dict) or not u.get("fable_ok"):
+def _premium_eligible(u, margin, ok_flag, window):
+    """Fail-closed headroom test for ONE premium alias's own weekly sub-quota. `ok_flag` and `window`
+    are that alias's PREMIUM_MODELS entry — never literals — so every alias is gated on the probe and
+    the bucket account-usage.py actually emits FOR IT (registry #1645). Requires the alias's probe to
+    have SUCCEEDED (`u[ok_flag]`) AND its window to have >= margin headroom. Unknown or unprobed ->
+    ineligible, so a premium route never lands on an account whose premium bucket is exhausted (or
+    unobserved)."""
+    if not isinstance(u, dict) or not u.get(ok_flag):
         return False
-    util, _ = _usage_window(u, FABLE_WINDOW)
+    util, _ = _usage_window(u, window)
     return util is not None and (1.0 - util) >= margin
 
 
 def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
     """Fail-closed admission test for STARTING a worker (of `model`) on an account. Beyond the whole-account
-    5h/7d headroom, a PREMIUM_MODELS route (fable) additionally requires FABLE sub-quota headroom.
+    5h/7d headroom, a route whose alias is in PREMIUM_MODELS additionally requires headroom in THAT
+    alias's own sub-quota — the ok-flag and window prefix carried by its mapping entry, not fable's.
 
     PROBE-EXEMPT providers (openai/codex — maintainer decision 2026-07-17, registry issue #29): their
     usage is not observable via any API, so the fail-closed require-usage arm does NOT apply to them —
@@ -548,8 +558,9 @@ def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
         # Require a finite fraction in [0,1]; anything else is fail-closed ineligible.
         if util is None or not (0.0 <= util <= 1.0) or (1.0 - util) < margin:
             return False                              # unknown, malformed, or too little headroom
-    if model in PREMIUM_MODELS and not _fable_eligible(u, margin):
-        return False                                  # [FABLE-5] whole-account fine, but Fable bucket isn't
+    premium = PREMIUM_MODELS.get(model)               # (ok_flag, window) for THIS alias, or None
+    if premium is not None and not _premium_eligible(u, margin, *premium):
+        return False                                  # whole-account fine, but the alias's own bucket isn't
     return True
 
 
@@ -3684,6 +3695,52 @@ def _self_test():
           usage_eligible({**fresh, "fable_ok": False}, model="fable"), False)
     check("fable ineligible: 7d_oi window unknown",
           usage_eligible({**fresh, "fable_ok": True}, model="fable"), False)
+
+    # ---- [#1645] PREMIUM_MODELS is a MAPPING: alias -> (probe-ok flag, window prefix) ----
+    # The `zz_*` keys below are spelled ONLY here, so no row can be satisfied by the fable fields the
+    # same fixtures carry. Every row pairs a HEALTHY fable bucket with an unhealthy alias bucket (or the
+    # reverse), so a helper — or a call site — that re-hardcodes `fable_ok`/`fable_7d_oi` (the shape this
+    # refactor removes) reads the OPPOSITE verdict and goes red rather than passing on fable's data.
+    zz_healthy = {"zz_probe_ok": True, "zz_7d_win_util": 0.1, "zz_7d_win_reset": 9000}
+    fable_full = {"fable_ok": True, "fable_7d_oi_util": 0.99, "fable_7d_oi_reset": 3000}
+    fable_free = {"fable_ok": True, "fable_7d_oi_util": 0.1, "fable_7d_oi_reset": 9000}
+    check("premium helper takes its WINDOW from the argument (alias free, fable exhausted)",
+          _premium_eligible({**zz_healthy, **fable_full}, 0.10, "zz_probe_ok", "zz_7d_win"), True)
+    check("premium helper takes its OK-FLAG from the argument (alias unprobed, fable healthy)",
+          _premium_eligible({**zz_healthy, **fable_free, "zz_probe_ok": False}, 0.10,
+                            "zz_probe_ok", "zz_7d_win"), False)
+    check("premium helper fails closed on the ALIAS's exhausted window",
+          _premium_eligible({**zz_healthy, **fable_free, "zz_7d_win_util": 0.95}, 0.10,
+                            "zz_probe_ok", "zz_7d_win"), False)
+    check("premium helper fails closed when the ALIAS's window is absent",
+          _premium_eligible({"zz_probe_ok": True, **fable_free}, 0.10, "zz_probe_ok", "zz_7d_win"),
+          False)
+    check("premium helper fails closed on non-dict usage",
+          _premium_eligible(None, 0.10, "zz_probe_ok", "zz_7d_win"), False)
+    # Call site: register a SECOND premium alias and prove usage_eligible gates on THAT alias's entry.
+    # A call site still passing fable's pair (or the wrong tuple element) inverts every verdict below.
+    saved_premium = globals()["PREMIUM_MODELS"]
+    globals()["PREMIUM_MODELS"] = {**saved_premium, "zzalias": ("zz_probe_ok", "zz_7d_win")}
+    try:
+        check("premium gate admits on the alias's OWN bucket (fable exhausted, alias free)",
+              usage_eligible({**fresh, **zz_healthy, **fable_full}, model="zzalias"), True)
+        check("premium gate refuses on the alias's OWN exhausted bucket (fable free)",
+              usage_eligible({**fresh, **fable_free, **zz_healthy, "zz_7d_win_util": 0.95},
+                             model="zzalias"), False)
+        check("premium gate refuses when the alias was never probed (fable free)",
+              usage_eligible({**fresh, **fable_free}, model="zzalias"), False)
+        check("a registered premium alias still requires WHOLE-account headroom",
+              usage_eligible({**fresh, "7d_util": 0.99, **zz_healthy}, model="zzalias"), False)
+        check("fable keeps its OWN entry while a second alias is registered",
+              usage_eligible({**fresh, **fable_full, **zz_healthy}, model="fable"), False)
+    finally:
+        globals()["PREMIUM_MODELS"] = saved_premium
+    check("premium registry restored after the call-site rows", "zzalias" in PREMIUM_MODELS, False)
+    # Membership is PINNED: an alias added here without account-usage.py emitting its ok-flag and window
+    # fields in the same change gates that route on data that never arrives (see the constant's comment).
+    check("fable is the only premium alias, carrying its own flag+window",
+          dict(PREMIUM_MODELS), {"fable": ("fable_ok", "fable_7d_oi")})
+
     # choose_account: fable route skips a fable-exhausted account, picks the healthy one.
     F = [{"handle": "fa", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "fb", "models": ["fable"], "max_concurrent_workers": 1, "available": True}]

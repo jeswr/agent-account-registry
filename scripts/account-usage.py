@@ -267,7 +267,7 @@ def _retired_aliases(path=None):
 
     FAIL DIRECTION: an unreadable or broken register reads as "the fable alias IS retired", i.e.
     skip the probe. Skipping only ever WITHDRAWS a signal — the sub-quota fields are then absent and
-    select-and-claim._fable_eligible fail-closes FABLE routing, exactly as a rejected probe already
+    select-and-claim._premium_eligible fail-closes FABLE routing, exactly as a rejected probe already
     did — whereas raising out of here kills the whole sweep, the workflow writes '{}', and EVERY
     account in the fleet fail-closes. Fail toward the smaller blast radius. `path` is injectable for
     the self-test ONLY, which is what executes the except branch."""
@@ -293,7 +293,7 @@ def _retired_aliases(path=None):
 #
 # STRICTLY OBSERVATION-ONLY, and that bound is the whole point of this change (#720 §4). No field
 # emitted here is read by ANY consumer, and there is deliberately NO `opus5_ok` flag paralleling
-# `fable_ok`: `fable_ok` is an ELIGIBILITY input (select-and-claim._fable_eligible), fable was one
+# `fable_ok`: `fable_ok` is an ELIGIBILITY input (select-and-claim.PREMIUM_MODELS["fable"]), fable was one
 # rung of a multi-rung chain, and opus5 is the SOLE remaining anthropic tier. A premium gate armed
 # before every account is KNOWN to probe successfully would read as `effective_cap == 0` fleet-wide
 # and machine-park every escalate-tier issue at once — indistinguishable from the exhaustion it was
