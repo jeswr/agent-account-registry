@@ -517,6 +517,27 @@ def _is_proven_human(login, via_app, probe):
     return bool(login) and not login.endswith("[bot]") and not via_app and probe(login)
 
 
+def _is_proven_machine(login, via_app, machine_logins):
+    """POSITIVE proof that an event was performed by AUTOMATION: an App-driven event
+    (`performed_via_github_app` non-null), a `[bot]`-suffixed login, or a login the caller named
+    as its own automation in `machine_logins` (case-insensitive, the `bot_login` convention every
+    other reader in this module already uses).
+
+    Deliberately NOT the negation of `_is_proven_human`. Everywhere the boolean ownership
+    projection is consulted the answer authorises a DELETE, so "not provably human" is the safe
+    reading. `human_hold_deleted_by_machine` asks the opposite-facing question — it authorises
+    RE-APPLYING a hold — and there "not provably human" would let an actor whose collaborator
+    probe merely FAILED stand in for the bot, so a maintainer's own removal could be undone. An
+    unverifiable actor is neither human nor machine here; both proofs are positive and an actor
+    that satisfies neither yields no action at all."""
+    if via_app:
+        return True
+    login = str(login or "")
+    if not login:
+        return False
+    return login.endswith("[bot]") or login.casefold() in machine_logins
+
+
 def human_unpark_veto(events, label, is_human=None):
     """(veto, detail) for applying park `label` given the issue/PR timeline `events`.
 
@@ -1137,6 +1158,94 @@ def label_application_machine_owned(repo, number, label, fetch_events, is_human=
     return label_application_ownership(
         repo, number, label, fetch_events, is_human=is_human, log=log
     ) == LABEL_OWNER_MACHINE
+
+
+# --- [registry #976] THE RESIDUAL AN OWNERSHIP PROOF CANNOT CLOSE ----------------------------
+#
+# `label_application_machine_owned` authorises DELETING a hold, and the careful writers re-prove
+# it immediately BEFORE the delete and again immediately AFTER, putting the label back when a
+# human application landed inside the window (adjudicate-stuck's check -> delete -> re-check ->
+# restore protocol, registry #965). That closes the race as far as the GitHub API allows: labels
+# have no compare-and-swap and a label carries no per-application identity, so a maintainer
+# re-asserting a hold between the proof and the DELETE leaves NOTHING in the live label set.
+#
+# One residual is irreducible inside a single sweep. If the process DIES between the delete and
+# the restore — runner eviction, token expiry, OOM — nobody re-reads: the human's `labeled` event
+# survives only in the TIMELINE, the live label set shows nothing, and no later sweep enumerates
+# the surface at all, because the listing query filters on the very label that is gone. The
+# gesture is lost silently.
+#
+# It stays DETECTABLE because an `unlabeled` event never erases the `labeled` one it removed.
+# This predicate is that reading and nothing else — pure, one timeline, no I/O — so a reconciler
+# enumerating over some OTHER durable handle (the adjudication receipt, not the hold) can ask the
+# question without re-deriving it. It lives here rather than in the sweep for the reason stated
+# at the top of AGENTS.md: a rule with two definitions drifts, and this one is read by the sweep
+# that must not re-delete a restored hold AND by any reconciler that would restore one.
+
+
+def human_hold_deleted_by_machine(events, label, machine_logins=(), is_human=None):
+    """(lost, detail) — did AUTOMATION delete a PROVEN HUMAN's application of `label`, with
+    nothing since putting it back? `events` is one issue/PR label timeline; nothing else is read.
+
+    True requires ALL of these, each a POSITIVE proof:
+      - the newest event for `label` is an `unlabeled` (so the label is gone, not live);
+      - every removal at that newest instant is provably automation (`_is_proven_machine`) and
+        none of them is a proven human — a human removing a hold is a human gesture, not a loss;
+      - the newest `labeled` event is STRICTLY older than that removal and every application at
+        that instant is a proven human — the gesture that was destroyed must be attributable.
+
+    EVERY other reading returns ``(False, ...)``, because the only action this answer authorises
+    is RE-APPLYING a hold, and a hold no human asked for is exactly the harm the sticky-unpark
+    invariant (module header, invariant 2) exists to prevent. So a malformed timeline, an
+    unattributable actor on either side, an instant tie, a `labeled` at or after the removal
+    (something already restored or re-asserted it), and a removal with no application before it
+    at all all fail to no action. A FETCH failure fails the same way and stays the caller's: this
+    function never reads GitHub, and an unreadable timeline reaches it as no timeline at all.
+
+    ⚠️ This is HALF of the detection. The other half is durable and lives on the surface: a
+    restore posts adjudicate-stuck's sticky `hold-restored` receipt, and the restore re-applies
+    the label AS THE BOT — so a repaired hold looks machine-owned to every ownership probe, and
+    the receipt, not the timeline, is what keeps it from being drained again. A caller acting on
+    ``True`` must therefore check that receipt too, and must post it when it restores; the
+    timeline alone cannot distinguish a hold that was already repaired from one that was not."""
+    try:
+        rows = _event_rows(events, label)
+    except MalformedTimelineError as exc:
+        # Both fail directions of this question point the same way — never restore on unprovable
+        # data — so the absorption is HERE rather than in a wrapper each caller could get wrong.
+        return False, f"timeline unreadable: {exc}"
+    probe = _human_probe(is_human)
+    # No empty-login filter here on purpose: `_is_proven_machine` already refuses an empty login,
+    # and a second copy of that floor would make each copy individually unkillable (AGENTS.md
+    # pre-flight 4, mutually-masking duplicates). One guard, in the function that owns the proof.
+    known = {str(login).casefold() for login in (machine_logins or [])}
+    applications, removals = [], []
+    for created, kind, login, via_app in rows:
+        # parse_ts cannot raise here: _event_rows already proved every returned row's created_at
+        # against valid_timestamp, which is parse_ts itself.
+        bucket = applications if kind == "labeled" else removals
+        bucket.append((parse_ts(created), created, login, via_app))
+    if not removals:
+        return False, ""
+    newest_removal = max(instant for instant, _stamp, _login, _app in removals)
+    if any(instant >= newest_removal for instant, _stamp, _login, _app in applications):
+        return False, ""
+    latest_removals = [row for row in removals if row[0] == newest_removal]
+    if any(_is_proven_human(login, via_app, probe)
+           for _instant, _stamp, login, via_app in latest_removals):
+        return False, ""
+    if not all(_is_proven_machine(login, via_app, known)
+               for _instant, _stamp, login, via_app in latest_removals):
+        return False, ""
+    if not applications:
+        return False, ""
+    newest_application = max(instant for instant, _stamp, _login, _app in applications)
+    latest_applications = [row for row in applications if row[0] == newest_application]
+    if not all(_is_proven_human(login, via_app, probe)
+               for _instant, _stamp, login, via_app in latest_applications):
+        return False, ""
+    return True, (f"machine unlabeled {label} at {latest_removals[0][1]}, deleting the human "
+                  f"application at {latest_applications[0][1]}")
 
 
 def migration_residual_holds(pr_labels, issue_labels, clearing=()):
@@ -3236,6 +3345,145 @@ def _self_test():
           park_vetoed("o/r", 5, "needs:user",
                       lambda _r, _n: [bot_park], is_human=trusted, log=logs.append), False)
     check("no veto stays quiet", logs, [])
+
+    # ---- [registry #976] human_hold_deleted_by_machine: the crash-between-delete-and-restore
+    # residual. The literal label, logins and stamps below are written OUT rather than derived
+    # from the module's own constants: the predicate takes its label as an argument and reads no
+    # constant, so a fixture built from HUMAN_PR_PARK_LABEL would only prove the constant equals
+    # itself (AGENTS.md pre-flight 2b/2c). The two directions are both pinned — the True rows
+    # kill an always-False body, the bot-deletes-bot / restored / unattributable rows kill an
+    # always-True one, and the machine_logins pair differs ONLY in that argument.
+    lost_bot = "sparq-orchestrator[bot]"
+    held = event("labeled", "review:needs-user", "2026-07-28T10:00:00Z", "jeswr")
+    drained = event("unlabeled", "review:needs-user", "2026-07-28T10:00:05Z", lost_bot)
+    check("human application deleted by the bot, never restored => LOST",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, drained], "review:needs-user", is_human=trusted)),
+          (True, "machine unlabeled review:needs-user at 2026-07-28T10:00:05Z, deleting the "
+                 "human application at 2026-07-28T10:00:00Z"))
+    # The acceptance's named negative: the sweep deleting its OWN application is the normal,
+    # correct drain and must never mint a restore.
+    check("bot applied, bot deleted => NOT lost (the ordinary drain)",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [event("labeled", "review:needs-user", "2026-07-28T10:00:00Z", lost_bot), drained],
+              "review:needs-user", is_human=trusted)),
+          (False, ""))
+    check("a later re-application (the in-sweep restore) => NOT lost",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, drained,
+               event("labeled", "review:needs-user", "2026-07-28T10:00:09Z", lost_bot)],
+              "review:needs-user", is_human=trusted)),
+          (False, ""))
+    # The re-application rows below are deliberately HUMAN. A bot re-application is
+    # VALUE-IDENTICAL under both mutants of this guard (the human-application guard further down
+    # answers (False, "") for it anyway, so relaxing `>=` to `>` or deleting the guard outright
+    # changes nothing) — measured, both survived. A human re-assertion is the shape that
+    # discriminates: without this guard the predicate reports a hold that is LIVE RIGHT NOW as
+    # lost, and a reconciler would re-apply a label the maintainer is already holding.
+    check("a HUMAN re-application at the SAME instant as the removal is ambiguous => NOT lost",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, drained,
+               event("labeled", "review:needs-user", "2026-07-28T10:00:05Z", "jeswr")],
+              "review:needs-user", is_human=trusted)),
+          (False, ""))
+    check("the human re-applying the hold themselves => NOT lost (it is live again)",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, drained,
+               event("labeled", "review:needs-user", "2026-07-28T10:00:09Z", "jeswr")],
+              "review:needs-user", is_human=trusted)),
+          (False, ""))
+    # The live shape, and the one that pins LATEST-event selection on both axes: the bot parked
+    # it, a maintainer re-asserted the hold on top, the bot drained it. Reading the OLDEST
+    # application (a bot) or the OLDEST removal instead of the newest flips every one of these.
+    bot_park_first = event("labeled", "review:needs-user", "2026-07-28T09:30:00Z", lost_bot)
+    check("bot park, human re-assertion ON TOP, bot drain => LOST (newest application wins)",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [bot_park_first, held, drained], "review:needs-user", is_human=trusted))[0],
+          True)
+    check("an EARLIER bot removal does not displace the newest one",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [event("unlabeled", "review:needs-user", "2026-07-28T09:00:00Z", lost_bot),
+               held, drained], "review:needs-user", is_human=trusted))[0],
+          True)
+    check("an EARLIER HUMAN removal does not excuse the newest bot one",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [event("unlabeled", "review:needs-user", "2026-07-28T09:00:00Z", "jeswr"),
+               bot_park_first, held, drained], "review:needs-user", is_human=trusted))[0],
+          True)
+    check("the human removing their OWN hold is a gesture, not a loss",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, event("unlabeled", "review:needs-user", "2026-07-28T10:00:05Z", "jeswr")],
+              "review:needs-user", is_human=trusted)),
+          (False, ""))
+    check("a removal with NO application before it proves nothing => NOT lost",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [drained], "review:needs-user", is_human=trusted)),
+          (False, ""))
+    check("a hold that is still LIVE (no removal at all) => NOT lost",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held], "review:needs-user", is_human=trusted)),
+          (False, ""))
+    check("an application by a NON-maintainer is not a human gesture => NOT lost",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [event("labeled", "review:needs-user", "2026-07-28T10:00:00Z", "drive-by"), drained],
+              "review:needs-user", is_human=trusted)),
+          (False, ""))
+    # The deleter must be provably automation, NOT merely "not provably human" — otherwise a
+    # maintainer whose collaborator probe simply FAILED has their removal silently undone.
+    outsider_drain = event("unlabeled", "review:needs-user", "2026-07-28T10:00:05Z", "drive-by")
+    check("an UNATTRIBUTABLE deleter => NOT lost (no machine proof, no restore)",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, outsider_drain], "review:needs-user", is_human=trusted)),
+          (False, ""))
+    ghost_drain = {"event": "unlabeled", "label": {"name": "review:needs-user"},
+                   "created_at": "2026-07-28T10:00:05Z", "actor": None}
+    check("a removal with NO actor at all is neither human nor machine => NOT lost",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, ghost_drain], "review:needs-user",
+              machine_logins=(lost_bot,), is_human=trusted)),
+          (False, ""))
+    check("an EMPTY machine_logins entry cannot launder a missing actor into automation",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, ghost_drain], "review:needs-user",
+              machine_logins=("",), is_human=trusted)),
+          (False, ""))
+    check("...the SAME deleter named in machine_logins IS proven automation => LOST",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, outsider_drain], "review:needs-user",
+              machine_logins=("Drive-By",), is_human=trusted))[0],
+          True)
+    check("a machine_logins entry that ALSO passes the human probe stays a human gesture",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, event("unlabeled", "review:needs-user", "2026-07-28T10:00:05Z", "jeswr")],
+              "review:needs-user", machine_logins=("jeswr",), is_human=trusted)),
+          (False, ""))
+    check("an App-driven removal is proven automation without any machine_logins",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, event("unlabeled", "review:needs-user", "2026-07-28T10:00:05Z", "jeswr",
+                           via_app={"id": 7, "slug": "registry-app"})],
+              "review:needs-user", is_human=trusted))[0],
+          True)
+    check("events for OTHER labels never mint a loss",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [event("labeled", "needs:user", "2026-07-28T10:00:00Z", "jeswr"), drained],
+              "review:needs-user", is_human=trusted)),
+          (False, ""))
+    # Fail-closed on unprovable data: an unreadable timeline is ABSORBED to no action here (both
+    # of this question's fail directions point the same way), never raised into a caller that
+    # might read a spurious restore out of it.
+    check("a malformed timeline => NOT lost (never restore on unprovable data)",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, "garbage-page-entry", drained], "review:needs-user", is_human=trusted))[0],
+          False)
+    check("...and it says WHY, so a caller can log the difference",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, "garbage-page-entry", drained],
+              "review:needs-user", is_human=trusted))[1].split(":")[0],
+          "timeline unreadable")
+    check("an unverifiable PROBE cannot prove the deleted application was human",
+          attempt(lambda: human_hold_deleted_by_machine(
+              [held, drained], "review:needs-user", is_human=raising_probe)),
+          (False, ""))
 
     # ---- latest_human_unlabel / readmission_cutoff (the budget readmission window,
     # sparq#2804/PR#3442): a proven-human unlabel opens the window; bot / unverifiable /
