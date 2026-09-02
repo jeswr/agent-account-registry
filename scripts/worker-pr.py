@@ -12324,8 +12324,18 @@ def _self_test():
                any(c.startswith("pr merge") for c in raa_calls)),
               (True, True, False))
         lag_err = "GraphQL: Draft pull requests cannot be merged (enablePullRequestAutoMerge)"
+        # [registry #939] `run_raa`'s HALF of the lockstep clear, at its own site — the #869 row
+        # above reads `raa_kwargs[-1]`, so a run that parks NOTHING must leave the list EMPTY or
+        # that row can pass off the PREVIOUS run's park. The undo-failed run above is the only
+        # `run_raa` that parks, so it is the required non-empty precondition, and
+        # `raa_parked_before` asserts it stayed that way. (MEASURED: with only the fix runner's row
+        # in the outcome block, dropping `raa_kwargs.clear()` here left all 1202 checks green.)
+        raa_parked_before = bool(raa_kwargs)
         run_raa(merge_script=[(1, lag_err), (0, "")])
         latches = raa_latches()
+        check("[#939] SITE run_raa: a run that parks nothing leaves NO stale park kwargs behind "
+              "(this runner's clear is load-bearing)",
+              (raa_parked_before, raa_kwargs, "needs-user" in raa_calls), (True, [], False))
         check("a transient non-clean refusal RETRIES the latch with backoff (never `pr merge`)",
               (len(latches), all(LATCH_MUTATION in c for c in latches),
                any(c.startswith("sleep:") for c in raa_calls),
@@ -13384,22 +13394,42 @@ def _self_test():
         check("[#869] SITE review_outcome/injection: parks QUESTION with cause=injection",
               (oc_kwargs[-1].get("park_class"), oc_kwargs[-1].get("park_cause"))
               if oc_kwargs else None, ("question", "injection"))
-        # [registry #869] THE LOCKSTEP CLEAR'S OWN RED TEST. Every row here reads `oc_kwargs[-1]`,
-        # so a run that parks NOTHING must leave the list EMPTY — otherwise `[-1]` silently
-        # returns the PREVIOUS run's park and the row passes for the wrong reason. This runs
-        # immediately after a park, so the list is non-empty going in and only the clear can empty
-        # it. #903 reshaped `run_fix_outcome`'s signature underneath this PR, and a take-theirs
-        # resolution would have dropped exactly that clear; without this row nothing would have
-        # noticed (MEASURED: removing both clears left the whole suite green).
-        run_fix_outcome()                          # a re-review outcome — it parks nothing
-        check("[#869] a run that parks nothing leaves NO stale park kwargs behind "
-              "(the oc_reasons/oc_kwargs lockstep clear is load-bearing)",
-              (oc_calls, oc_kwargs), (["state:needs"], []))
+        # [registry #869/#939] THE LOCKSTEP CLEAR'S OWN RED TEST — ONE ROW PER RUNNER. Every row in
+        # this block reads `oc_kwargs[-1]`, so a run that parks NOTHING must leave the list EMPTY —
+        # otherwise `[-1]` silently returns the PREVIOUS run's park and the row passes for the
+        # wrong reason. #903 reshaped `run_fix_outcome`'s signature underneath #886, and a
+        # take-theirs resolution would have dropped exactly that clear.
+        #   ORDERING IS LOAD-BEARING, so each row asserts it: a no-park run only exercises the
+        # clear when the list was NON-EMPTY going in, so `parked_before` is captured off the
+        # preceding park and checked here. An edit that strands one of these rows behind another
+        # no-park run then goes RED, instead of hollowing it out into a row that would pass against
+        # a tree with no clear at all.
+        #   [registry #939] MEASURED before the per-runner rows existed: #886 covered both clears
+        # with ONE assertion after `run_fix_outcome`, and mutating them one at a time gave 1/2
+        # coverage — dropping `oc_kwargs.clear()` from `run_review_outcome` (like dropping
+        # `raa_kwargs.clear()` from `run_raa`, which now has its own row at its own site) left all
+        # 1202 checks green. A mechanism shared by N call sites needs a named check per site; one
+        # suite-wide assertion covers whichever site happens to run first.
+        #   Each row reads BOTH halves of the lockstep pair for its own runner: `oc_reasons` is the
+        # list `oc_kwargs` is kept in step with, the injection-prose captures above read it by
+        # `[-1]` too, and dropping ITS clear from either runner was a survivor by the same 1-of-N
+        # arithmetic. Same run, same row — one more conjunct.
+        parked_before = bool(oc_kwargs and oc_reasons)
+        run_review_outcome("request_changes")      # an unheld review outcome — it parks nothing
+        check("[#939] SITE run_review_outcome: a run that parks nothing leaves NO stale park "
+              "kwargs/reasons behind (this runner's lockstep clear is load-bearing)",
+              (parked_before, oc_calls, oc_kwargs, oc_reasons),
+              (True, ["post-findings", "state:changes"], [], []))
         run_fix_outcome(injection="true")
         emitted_injection_prose["fix"] = oc_reasons[-1] if oc_reasons else ""
         check("[#869] SITE fix_outcome/injection: parks QUESTION with cause=injection",
               (oc_kwargs[-1].get("park_class"), oc_kwargs[-1].get("park_cause"))
               if oc_kwargs else None, ("question", "injection"))
+        parked_before = bool(oc_kwargs and oc_reasons)
+        run_fix_outcome()                          # a re-review outcome — it parks nothing
+        check("[#869] SITE run_fix_outcome: a run that parks nothing leaves NO stale park "
+              "kwargs/reasons behind (the oc_reasons/oc_kwargs lockstep clear is load-bearing)",
+              (parked_before, oc_calls, oc_kwargs, oc_reasons), (True, ["state:needs"], [], []))
         # ...and the #657 self-attested approve — the OTHER in-process question stop — states
         # `human-arm` rather than inheriting the budget cause.
         run_review_outcome("approve", draft=False, self_attested=True)
