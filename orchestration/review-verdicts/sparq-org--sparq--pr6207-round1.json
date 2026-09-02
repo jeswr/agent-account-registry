@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6207,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cdbad6c5d74b19953b9890a5ab8bc1262fec06e9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In promote_one(), only the first --remove-label write is checked. Every triage delta edit and the promotion comment ignores returncode, after which the function logs and returns \"promoted\". If adding status:ready (or another required triage label) fails after trust:untrusted has been removed, the issue has crossed the trust boundary but is left partially triaged; poll() reports success, main() exits 0, and later cron runs cannot retry because fetch_quarantined() no longer selects it. The test only covers failure of the first write, so it cannot catch this partial-commit path.",
+    "file": "scripts/promote-poll.py",
+    "fix_hint": "Check every required post-removal gh write and propagate failure. Since removing quarantine makes the issue disappear from future polls, implement a fail-closed recovery/rollback strategy (for example, restore trust:untrusted if any required triage edit fails, and report failure) and add a self-test that injects failure into a post-unquarantine label edit, asserting a nonzero outcome and a recoverable/quarantined final state. Handle comment failure according to an explicit policy, without claiming full success if the notice is required.",
+    "severity": "major",
+    "title": "Post-unquarantine write failures are silently treated as successful promotion"
+   }
+  ],
+  "progress": null,
+  "summary": "The paginated fetch and revision-bound approval checks are well covered, but the extracted driver still reports a promotion as successful after only the quarantine-label removal succeeds. Because all subsequent triage-label and comment writes discard their return codes, a transient failure can permanently leave an issue outside quarantine without the required trusted triage state, while the cron exits green and will never retry that issue. This is a major correctness and trust-workflow gap, and the self-test does not exercise it.",
+  "verdict": "request_changes"
+ }
+}
