@@ -248,14 +248,6 @@
    "why_no_diff": "other"
   },
   {
-   "ts": 1788274535,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "33521333959.1"
-  },
-  {
    "ts": 1788274641,
    "provider": "openai",
    "account": "dc2d751954080e13",
@@ -1876,6 +1868,14 @@
    "model_alias": "",
    "exit_class": "success",
    "run_id": "33583174093.1"
+  },
+  {
+   "ts": 1788316512,
+   "provider": "anthropic",
+   "account": "c0ac92ebee2c590e",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "33582879976.1"
   }
  ]
 }
