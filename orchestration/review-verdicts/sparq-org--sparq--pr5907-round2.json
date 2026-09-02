@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5907,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "511ed029d44cbd12fc7a00b6676363275c55044d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Both job- and step-level checks still use assertNotEqual(value, True). A workflow edit such as continue-on-error: ${{ true }} is parsed as a string by PyYAML and therefore passes these assertions while enabling failure swallowing in GitHub Actions. This is materially the same robustness gap reported in round 1; the current ci.yml itself remains correctly gating.",
+    "file": "scripts/tests/test_fmt_gate_posture.py",
+    "fix_hint": "Require each continue-on-error value to be absent or exactly false, for example assertIn(value, (None, False)), at both the job and fmt-step levels.",
+    "severity": "minor",
+    "title": "continue-on-error guard still accepts non-boolean enabling forms"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The rustfmt gate remains correctly enabled and the workspace-wide changes are overwhelmingly mechanical formatting; the only behavioral refactor in sparq-acbench preserves the same request/model/oracle ordering. The round-1 robustness finding remains unfixed: the structural test still compares continue-on-error only against boolean True, so expression/string forms that GitHub Actions can interpret as enabling failure swallowing evade the guard. This is a minor test-hardening gap rather than a defect in the checked-in workflow, which has no continue-on-error setting, so approval remains appropriate. Progress is stagnant because the same minor finding remains at the same severity.",
+  "verdict": "approve"
+ }
+}
