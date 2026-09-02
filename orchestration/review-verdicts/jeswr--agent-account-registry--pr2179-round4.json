@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2179,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "891e07d9735ad2d1fd6561a0f58e7616be83b467",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change remains correct and complete under the trust-plane review lens. Terminal reaping now requires the union of the existing fresh open-pull walk and a separately keyed, single-page ref/head corroboration for each candidate. Full or malformed responses and request failures defer only the affected claim; successful results are merged before the existing App-author, same-repository, worker-marker identity gate is applied. Exact request paths, issue-prefix isolation, multi-head accumulation, positive retention, negative release, outsider rejection, full-page refusal, and scoped failure behavior are exercised non-vacuously. The documented deleted-head plus concurrent walk-skip residual is explicit and is not worsened by this patch. No reviewer-directed instruction was detected in the diff. Round 3 also had no findings, so progress is stagnant rather than improving under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
