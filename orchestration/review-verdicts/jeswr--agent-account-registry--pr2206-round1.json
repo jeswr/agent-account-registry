@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2206,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e579ad6215f1d3518a3d4f63f8d58309f5c24a38",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe added tests correctly exercise both previously uncovered fail-closed guards. The direct helper checks distinguish skipped repair/non-dict ledger entries from ordinary implementation leases and convert exceptions into asserted values, while the sweep-level identity-drift scenario verifies scoped retention, the named refusal, and continued reclamation of an independent valid candidate. The paired real-issue case prevents blanket-retention behavior from satisfying the test. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
