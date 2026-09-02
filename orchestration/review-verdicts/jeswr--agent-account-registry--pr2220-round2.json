@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2220,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "044b17584bb88eaf95662cdc80b02eebd2c23df2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_via_app_proof` accepts every non-boolean Python integer as an App identity. Thus `performed_via_github_app: {\"id\": 0}` and `{\"id\": -1}` return true even when no usable slug exists. Neither value can identify a real GitHub App, but `label_owner_from_events` consequently returns `LABEL_OWNER_MACHINE`, and the boolean projection authorizes deletion. This is the same trust-direction defect as round 1 in a narrower shape: malformed metadata is still accepted as positive automation proof. The new malformed-object table omits both boundary values, so it cannot catch this permissive predicate.",
+    "file": "scripts/park_policy.py",
+    "fix_hint": "Require an integer App id to be strictly positive (while continuing to exclude booleans), unless a separately valid non-blank slug supplies the identity. Add red tests for objects containing only `id: 0` and only a negative id through both the pure ownership walk and the absorbing/clearability wrapper; they must raise or resolve conservatively, never produce MACHINE. Retain positive-id and slug-only acceptance tests.",
+    "severity": "blocker",
+    "title": "Non-positive App IDs still mint machine ownership"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-1 failure is narrowed but not closed. The new helper rejects many malformed App-marker shapes and the added tests exercise those cases, but its integer-id branch still treats zero and negative integers as attributable GitHub App identities. Those values cannot identify a real App, yet they produce MACHINE and therefore permission to delete a hold. Because the same positive-proof boundary remains fail-open for malformed metadata, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
