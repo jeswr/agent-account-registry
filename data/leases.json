@@ -42,16 +42,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "eb51dad65aac4816a2d712830c506645",
-   "holder": "review:sparq-org/sparq#6215@33682122113.1",
-   "package": "ci",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1788382537,
-   "expires_at": 1788386737
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "8925204fadb94fbfbe24e417b26ce5cb",
    "holder": "review:sparq-org/sparq#6223@33682154165.1",
    "package": "gui",
