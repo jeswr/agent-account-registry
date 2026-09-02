@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6070,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9bc90fe8e29243d2ab42ae5c5bb2a02b4ec62706",
+  "round": 8
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 8 finds no correctness, soundness, test-validity, or security defect. The changes are documentation/comment-only and accurately replace stale implementation-status statements: PUT authorization precedes conditional and existence checks, the WAC implementation is present, orphan reconciliation and multipart-range encoding exist, and the verifier dependency and lockfile resolve the stated current revision. The new triage record carefully limits its conclusions to functionality observed in this checkout, retains HOLD/UNVERIFIED for the unseen upstream branch deltas, identifies existing relevant tests without claiming new coverage, and preserves the documented non-disclosure limitations. No text in the diff attempts to instruct the reviewer. With no findings in rounds 7 or 8, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
