@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2195,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c03818e8d4d17ec27700ffc7d654d44d5087dae1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-two diff remains correct and complete. Both consumers obtain the exact git argv and the two-parent, full-SHA derivation from the shared pure module, preserve their distinct fail-closed verdict policies, and retain their consumer-specific live-tip/head checks. The tests independently pin command selection, parent orientation, malformed-output refusal, no-SHA-on-refusal behavior, real-git checkout shapes, consumer delegation of both parser and argv, sentinel restoration, and entry-point behavior; the new module is enrolled in the protected self-test manifest. I found no correctness, soundness, security, or material test-validity defect, and no reviewer-directed instruction in the diff.",
+  "verdict": "approve"
+ }
+}
