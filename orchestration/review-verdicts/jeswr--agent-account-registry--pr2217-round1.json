@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2217,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "36b9159fc556ce295a77e53e58e99ae707972b4b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly carries the target-CI parser's own uncapped refusal count into the normalized flow document and renders a validated, positive count on the Queue & flow card, including when the metric grid is empty. The new self-tests are non-vacuous and cover whole-input loss, partial loss, zero sealing, field absence, seam mix-ups, warning-budget floods, singular/plural rendering, legacy documents, hostile value types, surviving CI cells, and the empty-grid placement. Expected values are independently literal, and the executed-page harness exercises the actual renderer rather than relying on lexical assertions. I found no correctness, soundness, fail-closed, privacy, or workflow-security regression in the diff.",
+  "verdict": "approve"
+ }
+}
