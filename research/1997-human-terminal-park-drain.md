@@ -25,10 +25,16 @@
 > **re-anchors every strictly-after ordering rule to drain time**, is the AGENTS.md pre-flight
 > item 11 answer and the two most likely ways this lands as a no-op.
 >
-> ⚠️ **Two of this record's own first-draft claims were false and are published as corrections
-> rather than quietly fixed** — §2 (a containment claim that a single clause of the code it cited
-> refutes) and §5 (the actor of the drain's own label write). Both were found by asking a named
-> question of the draft, not by re-reading it.
+> ⚠️ **Three of this record's own claims were wrong and are published as corrections rather than
+> quietly fixed** — §2 (a containment claim that a single clause of the code it cited refutes), §5
+> (the actor of the drain's own label write), and **§4/§6 (review round 1)**: the record specified
+> receipt-first ordering *and* a marker-keyed one-shot refusal while specifying **no convergence
+> branch**, which is the only thing that makes that ordering safe — so a drain interrupted between
+> its receipt and its label writes was stranded **permanently**, with a public receipt promising a
+> transition that row 0 then refused to finish. The correction is **§4.1**. The first two were
+> found by asking a named question of the draft; **the third was found by an external reviewer, not
+> by this author**, and is recorded that way because §7 asks the reader to price this record's
+> unverified claims — a defect the author walked past is the best available evidence on how.
 >
 > ⚠️ **Nothing here is measured against the live board.** This container has no network, no `gh`
 > and no token. Every count in this document is either read out of the repository tree (and the
@@ -171,14 +177,116 @@ it is already enforced, so the drain's implementation is a citation rather than 
 
 | rule | statement | where it already lives |
 |---|---|---|
-| **Receipt-first ordering** | The audit comment is POSTed **before** any label write, so a crash leaves an *explained* PR rather than a silently-moved one. Never label-then-receipt. | `reconcile-park-misescalation.py:308-312`; the same ordering the `auto-mint` branch demands of its caller (`park_policy.py:1582-1588`), and #610's original rule. |
-| **Consume-exactly-once** | A durable, bot-authored, uniquely-named marker; a second run must be a **no-op**, not a second conversion. Read from the **bot's own** comments only — a third party must not be able to key it. | `already_reconciled` (`reconcile-park-misescalation.py:72-85`); marker declared in `park_policy` so writer and reader cannot drift (`:934`). **The drain declares a new one.** |
+| **Receipt-first ordering** | The audit comment is POSTed **before** any label write, so a crash leaves an *explained* PR rather than a silently-moved one. Never label-then-receipt. ⚠️ **This is only HALF the rule.** Receipt-first is safe **because a convergence branch finishes the interrupted write**; the ordering copied without the branch converts a silent strand into an *explained* one, which is worse only in that it also looks handled. **§4.1 is not optional.** | `reconcile-park-misescalation.py:308-312`; the same ordering the `auto-mint` branch demands of its caller (`park_policy.py:1582-1588`) — whose very next clause is the convergence branch that redeems it (`:1573-1587`) — and #610's original rule. |
+| **Consume-exactly-once** | A durable, bot-authored, uniquely-named marker; a second run is never a second **conversion**. ⚠️ Not *"a no-op"*: §4.1 splits the marker-present case in two — **no-op** when the recorded transition is proven complete on a fresh read, **converge** when any authorised write is still outstanding. Read from the **bot's own** comments only — a third party must not be able to key it. | `already_reconciled` (`reconcile-park-misescalation.py:72-85`); marker declared in `park_policy` so writer and reader cannot drift (`:934`). **The drain declares a new one**, and it carries a plan (§4.1). |
 | **The cap, and whose cap it is** | The drain must **not** spend `AUTO_READMISSION_MAX`. #1309 created a separate `RECEIPTLESS_VOID_MAX = 1` for exactly this, on the stated grounds that *"routing one mechanism's receipts through another's cap makes the two consume each other"*. The drain gets its own one-shot ceiling plus a per-run `--limit`. | `park_policy.py:212`, `:2796`; `research/767-human-applied-machine-park-exit.md` §8.2. |
 | **Dry run is the default** | `--apply` is required to write anything; without it the run mutates nothing and prints the same per-PR verdicts. | `reconcile-park-misescalation.py:45`, `:231-232`. |
 | **Ownership fails closed** | `unknown` (no `labeled` event at all) and `unattributable` (newest applier is neither proven human nor proven automation, #1849) are **both** refusals. Absence of evidence is not proof of machine ownership. | `park_policy.py:1198-1206`, `:1228-1236`. |
 | **Re-prove ownership around the delete** | Labels have no compare-and-swap. The careful writers re-prove machine ownership immediately **before** the delete and again immediately **after**, restoring the label if a human application landed inside the window (#965's check → delete → re-check → restore). | `park_policy.py:1265-1272` and the adjudicate-stuck protocol it names. |
 | **Deny is unconditional and order-independent** | An injection / human-arm signal **anywhere** in the bot's own history refuses, whatever came after it. Read through `legacy_deny_signal`, never over the prose table, because the bot's history includes **republished model verdict text** (#814). | `reconcile-park-misescalation.py:120-128`. |
 | **Residual holds** | Refuse if any hold would survive the conversion — *"refusing to move a park into a state it could not leave"*. | `migration_residual_holds`, `reconcile-park-misescalation.py:141-148`. |
+
+### 4.1 The convergence branch — the half of receipt-first this record first omitted
+
+**The defect, stated plainly.** §4 requires the receipt before any label write; §6 row 0 originally
+refused any PR carrying the drain's marker. Together those two say: *if the process dies after the
+POST and before the delete/add, the rerun refuses.* The PR then holds a public receipt asserting a
+transition that never happened, its human-owned hold is still live, and **no later run will ever
+finish it** — the drain's own one-shot key is what forbids the completion. That is not a small gap:
+it converts every transient on the label write into a permanent strand, on the exact population the
+drain exists to un-strand, and it does so while reporting the PR as corrected.
+
+**The estate already solved this, twice, and says so in the docstring §4 cites.** `auto-mint`'s
+receipt-first instruction is one clause; the next names its redeemer — *"dying receipt-then-label is
+recoverable — the `auto-receipt` branch above converges it — while label-then-receipt would erase
+the re-admission from every proof surface"* (`park_policy.py:1582-1588`). `auto-receipt`
+(`:1573-1587`) and `void-receipt` (`:1588-1594`) are that branch, and the latter's comment states
+the drain's failure mode in advance: it is *"NOT optional — the void is one-shot, so without this
+branch a crash between the receipt and the label write would leave a PR holding a spent budget and
+a live park, i.e. it would reproduce the permanent strand this exit exists to remove."* **The drain
+is one-shot for the same reason and inherits that sentence unchanged.**
+
+The protocol, in six rules. Each is a transcription of a mechanism already in this tree.
+
+1. **The receipt is an INTENT receipt: it encodes the exact authorised transition.** Its marker
+   carries the **disposition** (`reclassify` / `retire`) and the **label plan for each surface** —
+   PR and source issue — drawn from a closed set of named plans. Prior art:
+   `RECEIPTLESS_VOID_PLANS` (`park_policy.py:2941`) and `receiptless_void_comment`, which derives
+   its destination sentence *from* `evidence["plan"]` and says nothing at all for an unknown plan
+   (`:3096-3113`). Without this a rerun cannot know **which** transition it is finishing — and
+   `reclassify` and `retire` have different write sets (§5), so guessing means performing a
+   conversion the first run never authorised. An intent receipt whose plan is unreadable is a
+   **refusal**, never a re-derivation from scratch.
+2. **A rerun that finds its own marker CONVERGES; it refuses only when the plan is COMPLETE.** Row 0
+   becomes two outcomes, decided against a **fresh read**: every planned write observed landed →
+   `already-drained`, a true no-op; any planned write outstanding → `converge`, which performs only
+   the outstanding ones. Completion is thereby **derived from live state, never asserted by a second
+   comment** — a completion marker would need its own write, and a crash before *it* would
+   reproduce this same strand one step later. That is the `auto-receipt` shape exactly: the branch
+   asserts nothing new — it recognises the **existing** receipt as already newer than every park
+   application (`park_policy.py:1843-1852`) and is reached only for a PR the sweep still enumerates
+   as parked, so *"a consumed receipt with the label STILL LIVE completes the interrupted unlabel —
+   no second receipt, no new evidence"* (`groom.py:11565-11587`).
+3. **Convergence RE-PROVES; it never replays — and the recorded plan BOUNDS a write, it never
+   AUTHORISES one.** ⚠️ This is the rule that decides whether §4.1 is a fix or a new fail-open, and
+   the tempting weak form is *"re-derive the label plan and finish"*. That is wrong: between the
+   crash and the rerun a human may have re-applied the hold, an injection signal may have been
+   posted, or a new residual hold may have appeared — and a converge that re-derived only the
+   **plan** would complete a transition the ladder now refuses, using the first run's stale proof
+   as its authority. So **convergence re-runs the FULL §6 ladder (rows 1–5) against a fresh read**,
+   exactly as the first run did. The recorded plan then *intersects* that result: a write happens
+   only where the ladder still admits it **and** the plan authorised it. Rows 6–7 are not re-derived
+   but **compared** — the disposition the receipt recorded is what the public comment promised, so a
+   live state now implying the other disposition is a **disagreement, not an upgrade**. Every
+   disagreement is a logged **stand-down**, never a write. This is
+   `void_receiptless_park`, which re-derives via `receiptless_void_label_plan` on a live read and
+   returns `"plan-changed"` / `"refused"` rather than writing (`worker-pr.py:2358-2385`), under the
+   rule its own predicate states — *"a hand-copied second rule at the writer is exactly how the
+   gate and the write come to disagree about what is deterministic"* (`park_policy.py:2955-2958`;
+   the writer restates it at `worker-pr.py:2366-2368`). §4's **re-prove-around-the-delete** row
+   applies to the convergence write **exactly as to the first one**: without it,
+   convergence is a blind replay that would re-strip a hold a human re-applied in the crash window,
+   which is the incident invariant 3 was written after.
+4. **Convergence is COUNTED APART and spends NO budget.** It is a retry of an already-authorised
+   write, not a new conversion, so it must consume neither the one-shot ceiling nor `--limit`, and
+   it gets its own census row. `groom`'s convergence test asserts precisely this pair —
+   `age_unparked=0` **alongside** `age_converged=1`, annotated *"grants stay at 0 however many times
+   the tick replays"* (`groom.py:11576-11587`). Without the split, N crashes read as N conversions
+   and one PR silently spends the whole run's cap.
+5. **The write that leaves the enumeration goes LAST — this is the source-issue half.** The drain
+   enumerates open PRs carrying a live human-owned hold (`reconcile-park-misescalation.py:241-246`).
+   That query **cannot see** a PR whose PR half completed and whose source-issue half did not: the
+   hold is gone, so the PR is no longer enumerable, and the issue is stranded on `needs:user`
+   forever. So the drain writes **the source-issue transition before the PR label write**, inverting
+   the reference's order (`:308-318` then `:319-335`), which makes every interrupted state still
+   carry the live hold and therefore still be re-enumerated. **This is the one place the reference
+   implementation must not be copied blind** — its ordering is safe only because it has no
+   convergence branch to be enumerated *by*. ⚠️ **The trade is named, not hidden**: the inverted
+   order means a crash in the gap leaves the *issue* on `status:parked` while the PR still holds
+   `review:needs-user`, a transiently inconsistent pair. That is accepted deliberately, because it
+   is **convergent** (rule 2 finishes it on the next run) whereas the reference's order produces an
+   **unenumerable** pair that nothing finishes. A visible inconsistency that converges beats a
+   consistent-looking state that strands — the same preference `_migrate_legacy_park`'s harm gate
+   and §5's over-cap split already encode.
+6. **Plus a marker-keyed sweep, because ordering alone cannot cover `retire`.** `retire`'s last step
+   closes the PR (`worker-pr.py:3915`), which drops it out of `state=open`; and a third party
+   clearing the hold mid-drain drops any PR out regardless. A `--converge` pass over PRs carrying
+   the drain's marker — **including closed ones**, or `retire`'s partials are invisible — with the
+   same re-proof of rule 3, is the cheapest complete cover. For the retirement steps themselves the
+   drain inherits rather than invents: `_retire_worker_pr` is already *"IDEMPOTENT end to end —
+   every step is a no-op when it has already happened … because a retirement that could only be
+   applied once would strand half of itself on the first transient"*, and it already names the
+   durable receipt the caller posted first as the authoritative record it is re-driven from
+   (`worker-pr.py:3909-3933`). **The drain's gap was never the retirement; it was row 0 refusing
+   before that re-drive could be reached.**
+
+⚠️ **The failure this section prevents is invisible to a census that counts intent.** A drain that
+counts a PR corrected because it posted the receipt reports the same success whether the labels
+moved or not — the shape `dispatch-claim` guards with *"the write is REPORTED, never assumed … a
+census that counts intent rather than effect is how it comes to read healthy over an untouched
+population"*, censusing the failed write under its own refusal code and declining to count it as a
+re-admission (`dispatch-claim.py:6121-6139`). The drain counts **effect**, and an outstanding plan
+is a census row, not a correction.
 
 ## 5. Answer 3 — what the exit DELIVERS INTO (AGENTS.md pre-flight item 11)
 
@@ -278,7 +386,7 @@ most absolute first; every row is a **refusal**, and the PR stays exactly where 
 
 | # | refuses when | shared predicate |
 |---|---|---|
-| 0 | this script already corrected this PR — keyed on its own marker, filtered to **the actor that ran the script** (see the note below) | new drain marker + `already_reconciled` shape |
+| 0 | this script already **completed** this PR's recorded transition — keyed on its own marker, filtered to **the actor that ran the script** (see the notes below), and **proven complete against a fresh read**. ⚠️ Marker present with any authorised write still **outstanding** is NOT this row: it is §4.1's `converge` branch, which *finishes* the recorded transition. A bare marker-present refusal here is the review-round-1 defect — it strands every PR the drain crashes on. | new drain marker + `already_reconciled` shape + §4.1's plan re-derivation |
 | 1 | no live human-owned hold to drain | `human_owned_holds` |
 | 2 | **any** live hold's newest application is not `machine` — `human`, `unknown`, or `unattributable` | `label_application_ownership` (per label, all of them) |
 | 3 | no well-formed bot park-reason receipt, or **any** receipt anywhere is non-capacity | `human_park_capacity_proof` |
@@ -287,9 +395,12 @@ most absolute first; every row is a **refusal**, and the PR stays exactly where 
 | 6 | the automatic re-admission budget is already spent → `retire` **or** refuse (§5), never a bare reclassify | `auto_readmission_marker_count` vs `AUTO_READMISSION_MAX` |
 | 7 | the per-run `--limit` / one-shot ceiling is reached | own constant, never `AUTO_READMISSION_MAX` |
 
-Rows 2 and 3 together are the candidate definition; rows 0, 4, 5, 6, 7 are inherited unchanged from
-#614/#797/#764. **Nothing in this ladder is new policy.** That is the point: a drain that needs a
-new permissive rule is a drain for a different population.
+Rows 2 and 3 together are the candidate definition; rows 4, 5, 6, 7 are inherited unchanged from
+#614/#797/#764. **Row 0 is inherited in its KEY but not in its OUTCOME**: the marker still decides,
+but it selects between *no-op* and *converge* (§4.1) rather than refusing outright — and that is a
+**stricter** rule, not a looser one, because it is the branch that stops a crashed run from
+counting as a completed one. **Nothing in this ladder is new permissive policy.** That is the
+point: a drain that needs a new permissive rule is a drain for a different population.
 
 ⚠️ **Row 0's author filter is the one place the reference implementation should not be copied
 blind.** `already_reconciled` documents itself as reading a *"bot-authored marker only"* and
@@ -324,11 +435,16 @@ about its operational token that cannot be settled offline; it is filed rather t
   the mechanism applies to it too; whether its `reclassify` members actually re-admitted after
   their correction is a live-board question, and the answer changes whether the drain's §5 trade
   is proven or merely plausible. It is filed as follow-up rather than asserted either way.
-* **Two of this record's own claims were wrong and are corrected in place** rather than deleted —
-  §2's containment claim and §5's actor claim. Both survived a re-read of the draft and fell to a
-  named question (AGENTS.md pre-flight items 2 and 12). A reader should price the remaining
-  unverified claims accordingly: the ones with a line citation were mechanically checked against
-  the tree, and the ones without are reasoning.
+* **Three of this record's own claims were wrong and are corrected in place** rather than deleted —
+  §2's containment claim, §5's actor claim, and §4/§6's receipt-first-without-convergence
+  specification (corrected in §4.1). The first two survived a re-read of the draft and fell to a
+  named question (AGENTS.md pre-flight items 2 and 12); **the third survived both, and fell to an
+  external reviewer in round 1.** A reader should price the remaining unverified claims accordingly,
+  and price them *lower* than the first two corrections alone would suggest: the ones with a line
+  citation were mechanically checked against the tree, the ones without are reasoning, and this
+  record has now demonstrated that its reasoning can restate an ordering rule while dropping the
+  companion rule that made it safe — in a section (§4) whose stated purpose was to transcribe those
+  rules rather than re-derive them.
 * **The settling commands**, for whoever has a token: enumerate open PRs carrying a live
   `needs:*` / `review:needs-user`; for each, resolve `label_application_ownership` for **every**
   such live label and read whether any bot park-reason receipt exists and what class it carries;
@@ -346,8 +462,10 @@ In order. Do not start at 2.
 2. **If the count is zero, stop.** #1997 says so, and it is the correct outcome, not a failure.
    Record the count and close it.
 3. **If it is non-zero, the drain is a new script** with its own `--self-test`, its own marker
-   constant declared in `park_policy`, `--apply`-gated, `--limit`-capped, receipt-first, and its
-   refusal ladder from §6 imported wholesale.
+   constant declared in `park_policy`, `--apply`-gated, `--limit`-capped, receipt-first **and
+   crash-convergent per §4.1** (intent receipt carrying the plan, `converge` branch, enumeration-
+   leaving write last, marker-keyed `--converge` sweep), with its refusal ladder from §6 imported
+   wholesale.
 4. **Register the marker in `PARK_RECONCILE_ATTESTATIONS` in the SAME change** (§5). It is one
    line and it is the difference between a drain and a no-op; the tuple's own comment already
    warns that an unregistered converter *"does not bind an instance … its PRs stay parked"*
@@ -360,10 +478,28 @@ In order. Do not start at 2.
    assertion that cannot go red is vacuous. In particular, the `unknown` and `unattributable`
    ownership values need their own red rows; they are the two that silently read as permission if
    the boolean projection is used by mistake.
-6. **Its dispositions must be censused** in `PARK_REFUSAL_CODES` / `PARK_REFUSAL_HUMAN_TERMINAL`
-   alongside every existing one, so a drained PR and a refused one are both counted rather than
-   disappearing from the taxonomy the moment this script touches them.
-7. **The `retire` half of §5 is not optional.** Shipping only `reclassify` converts a visible stall
+6. **An INTERRUPTION test after every external write** — the §4.1 obligation, and the one whose
+   absence the record itself demonstrates is easy to walk past. The apply path performs, in order,
+   the receipt POST, the source-issue delete and add, the PR delete and add, and (for `retire`) the
+   retirement steps; the self-test drives a fixture that **stops after each one in turn** and
+   asserts the rerun **converges to the intended final state** — or stands down, loudly and without
+   writing, when the live state no longer matches the recorded plan. Neither an interrupted run nor
+   its rerun may report the PR corrected. Two assertions carry the weight and both must be able to
+   go **red**: deleting the `converge` branch must red the after-receipt case (it reverts to the
+   permanent strand), and **narrowing §4.1 rule 3's re-proof from the full ladder down to the plan
+   alone** must red — which needs a row per hazard the ladder owns, because they fail differently:
+   a human re-applies the hold inside the crash window (row 2), a deny signal is posted inside it
+   (row 4), and a new residual hold appears inside it (row 5). Each asserts the converge run
+   **stood down and wrote nothing**. A convergence test that passes with the branch
+   removed is measuring nothing — `groom`'s states its own kill condition, *"Delete the
+   `if consumed:` block and this reds"* (`groom.py:11568-11569`), and this one must too. The
+   convergence rows must also assert the §4.1 rule 4 counter split (`converged=1` **with**
+   `corrected=0`), or a replay silently reads as a second conversion.
+7. **Its dispositions must be censused** in `PARK_REFUSAL_CODES` / `PARK_REFUSAL_HUMAN_TERMINAL`
+   alongside every existing one — **`converge` and the outstanding-plan stand-down included**, so a
+   drained PR, a refused one and a half-written one are all counted rather than disappearing from
+   the taxonomy the moment this script touches them.
+8. **The `retire` half of §5 is not optional.** Shipping only `reclassify` converts a visible stall
    into a silent one for its over-cap members.
 
 Related: #1292 (the census this is blocked on), #797 (`reconcile-park-misescalation.py`, the
