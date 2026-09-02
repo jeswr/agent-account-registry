@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6234,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3ae9efac3ae6fad043a5abb23cb3f98ed57fda90",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, security, or test-validity defect. The budget is threaded through both the variable-graph authorization SELECT and the real update evaluation, with authorization exhaustion returned before mutation and apply exhaustion retaining the engine's explicitly documented multi-operation non-atomicity. The WAC, ACP, and MCP tests contain authorized positive controls and store-state checks, so the abort assertions are not vacuous. Public documentation consistently and honestly excludes CLEAR, DROP, and LOAD from the evaluation budget and explains the caller-side limits required for those operations. No instruction-like prompt injection appears in the diff. Since round 3 also had no findings and this round introduces none, progress remains stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
