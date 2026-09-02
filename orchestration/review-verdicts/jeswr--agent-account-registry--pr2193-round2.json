@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2193,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a17620c02da179493e17a1e05adb24b885cff3cd",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 cross-runtime defect is corrected at both the implementation and evidence paths. The page now measures rendered summaries with Array.from(...).length, matching Python's code-point len()/slice contract, and uses that same count for the truncation predicate and hidden-count subtraction. The new end-to-end executed-page coverage passes real producer output containing all-astral and mixed astral/BMP summaries through the renderer, pinning both previously silent false-negative cases and the incorrect-subtraction case. Producer tests independently pin sanitized pre-cap counts, exact slicing, unconditional zero/quiet emissions, and refusal semantics; malformed and legacy totals remain fail-closed through the existing integer predicate. No new correctness, security, or non-vacuity issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
