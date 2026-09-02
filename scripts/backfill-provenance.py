@@ -386,6 +386,21 @@ def _load_worker_pr():
     return _load_script_module("worker-pr.py", "registry_worker_pr")
 
 
+@functools.lru_cache(maxsize=None)
+def _load_workflow_if():
+    """[#2184] THE shared workflow-`if:` reader and the canonical default-branch guard text —
+    IMPORTED, never re-declared. The `(declared, condition)` derivation and the guard's spelling
+    used to be a private four lines plus a private constant in EACH of this reader,
+    mint-provenance and auto-mint-provenance; #945 measured what that costs (two copies of one
+    guard make each copy individually unkillable).
+
+    CACHED, unlike the loaders above, for two reasons: the seam report is re-derived once per
+    mutant and re-executing a module per call is waste, and the self-test's SHARED-CODE probe
+    (swap `if_condition` for a sentinel, require this reader's finding to follow) can only observe
+    delegation if every caller sees the same module object."""
+    return _load_script_module("workflow_if.py", "registry_workflow_if")
+
+
 def _load_dispatch_claim():
     """The review loop's OWN admission schema (dispatch-claim.provenance_admission_error) —
     IMPORTED, never replicated (same posture as groom), so backfill's "already recorded"
@@ -1121,24 +1136,6 @@ def _workflow(name):
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
-def _if_condition(node):
-    """`(declared, exact_text)` for one workflow node's `if:` — presence AND value, never a
-    containment probe over the value (issue #1619, AGENTS.md pre-flight 6).
-
-    The two are DIFFERENT failures and must not collapse into one finding. A **missing** job `if:`
-    runs the secret-reading job from ANY ref — the arbitrary-ref class the guard exists for, and
-    the fail-OPEN direction. `if: false`, or the shipped guard with `&& false` appended, keeps a
-    guard that reads as hardened while disabling the lane entirely — the fail-CLOSED-forever
-    direction, indistinguishable from a drained population (sparq #4743 shipped exactly that).
-    A containment probe (`"github.ref ==" in guard`) is blind to the second: `<the real guard> &&
-    false` satisfies every substring it looks for.
-
-    `str()` on the declared value, NOT `value or ""`: PyYAML parses `if: false` to the boolean
-    `False`, so `or ""` would report a neutered job identically to one with no guard at all."""
-    node = node or {}
-    return ("if" in node, str(node["if"]) if "if" in node else "")
-
-
 def worker_yaml_shape_report():
     """Findings about the LIVE worker.yml, each asserted by the self-test."""
     jobs = _workflow("worker.yml")["jobs"]
@@ -1210,8 +1207,11 @@ def backfill_workflow_seam_report(workflow=None):
     steps = job.get("steps") or []
     step = next((s for s in steps if "backfill-provenance.py" in str(s.get("run") or "")), None)
     run = str((step or {}).get("run") or "")
-    job_if_declared, guard = _if_condition(job)
-    targets_if_declared, targets_guard = _if_condition(targets_job)
+    # [#2184] The SHARED reader (`workflow_if.if_condition`), not a private copy: presence AND
+    # whitespace-normalised value, for both jobs.
+    if_condition = _load_workflow_if().if_condition
+    job_if_declared, guard = if_condition(job)
+    targets_if_declared, targets_guard = if_condition(targets_job)
     self_at = run.find("backfill-provenance.py --self-test")
     invoke_at = run.find('backfill-provenance.py "${args[@]}"')
     # The WRONG-INPUT seam: `NO_DRAFT_CONVERT: ${{ inputs.apply }}` is valid YAML, lints clean, and
@@ -1253,6 +1253,9 @@ def backfill_workflow_seam_report(workflow=None):
         # `<the real guard> && false`: that skips every scheduled run while reading as a hardened
         # ref check (AGENTS.md pre-flight 6; sparq #4743 shipped that mutant). Paired with the
         # `*_if_declared` presence findings so a DELETED guard and a NEUTERED one are distinct.
+        # [#2184] Whitespace-normalised (the shared reader's contract), and ONLY whitespace: a YAML
+        # reflow of these plain scalars into a folded one is not a security event, while every
+        # token and its order stay pinned exactly.
         "job_if": guard,
         "targets_job_if_declared": targets_if_declared,
         "targets_job_if": targets_guard,
@@ -1719,8 +1722,10 @@ def _self_test():
     # containment probe over the guard TEXT accepts `<guard> && false` — which is why neither job
     # is asserted that way any more (#1619). Both jobs carry the same guard and both must be
     # exact — `targets` is `needs:`-upstream, so skipping it alone takes the whole matrix with it.
-    _REF_GUARD = ("${{ github.ref == format('refs/heads/{0}', "
-                  "github.event.repository.default_branch) }}")
+    # [#2184] The expected text is the SHARED constant, still hand-transcribed from the workflows
+    # and still nothing this reader produces (AGENTS.md pre-flight 2b holds), but now transcribed
+    # ONCE for the three provenance readers instead of three times.
+    _REF_GUARD = _load_workflow_if().DEFAULT_BRANCH_REF_GUARD
     check("the targets job DECLARES a job-level `if:` (none at all => it runs from any ref)",
           seam["targets_job_if_declared"], True)
     check("the backfill job's guard is EXACTLY the default-branch check (no appended `&& false`)",
@@ -1770,6 +1775,36 @@ def _self_test():
     ):
         check(f"MUTANT moves `{_key}` off its expected value: {_label}",
               _seam_mutant(_edit)[_key] != _expected, True)
+    # [#2184] ...and the OTHER direction, which is what adopting the shared reader changed here:
+    # the condition is whitespace-NORMALISED (this reader used to return the raw parsed text, which
+    # was adequate only because both guards are plain single-line scalars). A reflow of either into
+    # the folded form auto-mint-provenance.yml uses — whose line breaks PyYAML may render as a
+    # newline — is not a security event and must NOT red, while every mutant above still does.
+    # Without the normalisation this row fails, so it is the executed proof that the shared
+    # reader's contract is the one in force here.
+    _REFLOWED = _REF_GUARD.replace("format(", "\n          format(")
+    check("...while a REFLOWED (folded) rendering of the same guard still reads as the shipped one",
+          _seam_mutant(lambda d: _mut_job(d, "backfill").update(**{"if": _REFLOWED}))["job_if"],
+          _REF_GUARD)
+    # [#2184] THE SHARED-CODE LEG. Every row above is satisfied just as well by a PRIVATE copy of
+    # the four lines this reader used to carry, so long as the copy agrees today — which is the
+    # #958 shape this issue removed, and #945 measured why it survives (two copies of one rule make
+    # each copy individually unkillable). So the delegation itself is probed: swap the shared
+    # reader for a sentinel and require BOTH of this file's findings to follow it. Only shared code
+    # can. Restored in a `finally`, and the restoration is its own row — a leaked sentinel would
+    # otherwise silently poison every seam row after this one.
+    _wif = _load_workflow_if()
+    _real_if_condition = _wif.if_condition
+    try:
+        _wif.if_condition = lambda node: (True, "SENTINEL")
+        check("both guard findings DELEGATE to workflow_if.if_condition (a re-inlined private copy "
+              "would not follow this sentinel)",
+              (lambda r: (r["job_if"], r["targets_job_if"]))(backfill_workflow_seam_report()),
+              ("SENTINEL", "SENTINEL"))
+    finally:
+        _wif.if_condition = _real_if_condition
+    check("...and the sentinel is UNDONE, so every row below reads the real shared reader",
+          backfill_workflow_seam_report()["job_if"], _REF_GUARD)
     # --- the PRODUCER side of the same claim [#1544, round-1 review] ----------------------------
     # Everything above this point pins the CONSUMER: it proves `backfill` reads a matrix from an
     # output named `repos`. It does NOT reach the job that computes that output, so both of the

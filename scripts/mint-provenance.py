@@ -177,6 +177,15 @@ def _load_policy_resolve():
     return _load_script_module("policy-resolve.py", "registry_policy_resolve")
 
 
+def _load_workflow_if():
+    """[#2184] THE shared workflow-`if:` reader and the canonical default-branch guard text —
+    IMPORTED, never re-declared. The `(declared, condition)` derivation and the guard's spelling
+    used to be a private four lines plus a private constant in EACH of this reader,
+    backfill-provenance and auto-mint-provenance; #945 measured what that costs (two copies of one
+    guard make each copy individually unkillable)."""
+    return _load_script_module("workflow_if.py", "registry_workflow_if")
+
+
 def _load_lease_schema():
     """THE canonical `area:*` -> package reduction (lease_schema.plan_package). Imported for the
     same reason review-fix.yml's resolve step imports it: a second derivation is how a claim the
@@ -1018,8 +1027,15 @@ def _workflow(name):
 # never derived from the reader under test (AGENTS.md pre-flight 2b): an expected value read back
 # out of the code that produces it is a tautology that cannot fail. Whitespace-normalised, which is
 # what `job_if` reports, so the `${{ }}` may be re-wrapped or folded without a spurious red.
-MINT_REF_GUARD = ("${{ github.ref == format('refs/heads/{0}', "
-                  "github.event.repository.default_branch) }}")
+#
+# [#2184] That transcription now lives ONCE, in `workflow_if`, for the three provenance readers
+# that each carried their own copy of it — but it is still this file that declares WHICH guard
+# THIS workflow's job must carry, because the expectation is workflow-specific: the sweep's is the
+# same expression with a `schedule` carve-out disjoined in front, and collapsing the two would
+# silently accept either guard on either job. `workflow_if` reads no workflow and produces no
+# `if:`, so pre-flight 2b still holds — the comparison is still between two independent
+# derivations.
+MINT_REF_GUARD = _load_workflow_if().DEFAULT_BRANCH_REF_GUARD
 
 
 def mint_workflow_seam_report(workflow=None):
@@ -1048,8 +1064,9 @@ def mint_workflow_seam_report(workflow=None):
     # [#223 — sol-audit arbitrary-ref] PRESENCE and VALUE are separate facts, and `str(job["if"])`
     # rather than `str(job.get("if") or "")`: PyYAML parses `if: false` to the boolean False, so
     # the `or ""` form reported a NEUTERED job identically to one carrying no guard at all.
-    guard_declared = "if" in job
-    guard = str(job["if"]) if guard_declared else ""
+    # [#2184] Both facts come from the SHARED reader now (`workflow_if.if_condition`), which also
+    # owns the whitespace normalisation `job_if` used to apply on its own line below.
+    guard_declared, guard = _load_workflow_if().if_condition(job)
     self_at = run.find("mint-provenance.py --self-test")
     invoke_at = run.find('mint-provenance.py "${args[@]}"')
     census_at = run.find("mint-provenance.py --census")
@@ -1068,7 +1085,8 @@ def mint_workflow_seam_report(workflow=None):
         # first of those, not the second — so this guard is load-bearing on its own).
         #
         # [#223 — sol-audit arbitrary-ref] TWO findings, the #1619 shape backfill-provenance
-        # already carries (`_if_condition`), applied to the last containment probes of this class.
+        # already carried, applied to the last containment probes of this class — and, since
+        # #2184, read through the ONE owner of that shape (`workflow_if.if_condition`).
         # The form this replaces — `"github.ref ==" in guard and "default_branch" in guard` — is
         # blind in BOTH directions that matter: `<the shipped guard> && false` keeps every
         # substring it looks for while disabling the lane forever (fail-closed-and-silent), and
@@ -1076,11 +1094,12 @@ def mint_workflow_seam_report(workflow=None):
         # arbitrary-ref hole the guard exists to close. A missing `if:` is the third, separate
         # failure and is why presence is its own finding.
         #
-        # Whitespace is normalised, and only whitespace: GitHub's expression evaluation does not
-        # depend on it, so a YAML reflow (a `>-` fold, a re-wrap) is not a security event and must
-        # not red — while every TOKEN and its ORDER stay pinned exactly.
+        # Whitespace is normalised, and only whitespace (in `workflow_if.if_condition`): GitHub's
+        # expression evaluation does not depend on it, so a YAML reflow (a `>-` fold, a re-wrap) is
+        # not a security event and must not red — while every TOKEN and its ORDER stay pinned
+        # exactly.
         "job_if_declared": guard_declared,
-        "job_if": " ".join(guard.split()),
+        "job_if": guard,
         "job_environment": job.get("environment"),
         "contents_write": (job.get("permissions") or {}).get("contents"),
         # The identity source is the live API. This job must NOT be able to read run logs — that
@@ -1968,6 +1987,24 @@ def _self_test():                                                       # noqa: 
           seam["job_if_declared"], True)
     check("the mint job's guard is EXACTLY the default-branch check (no `&& false`, no widening)",
           seam["job_if"], MINT_REF_GUARD)
+    # [#2184] THE SHARED-CODE LEG. The two rows above are satisfied just as well by a PRIVATE copy
+    # of the four lines this reader used to carry, so long as the copy agrees today — which is the
+    # #958 shape this issue removed, and #945 measured why it survives (two copies of one rule make
+    # each copy individually unkillable). So the delegation itself is probed: swap the shared
+    # reader for a sentinel and require this file's finding to follow it. Only shared code can.
+    # Restored in a `finally`, and the restoration is its own row — a leaked sentinel would
+    # otherwise silently poison every seam row after this one.
+    _wif = _load_workflow_if()
+    _real_if_condition = _wif.if_condition
+    try:
+        _wif.if_condition = lambda node: (True, "SENTINEL")
+        check("the guard finding DELEGATES to workflow_if.if_condition (a re-inlined private copy "
+              "would not follow this sentinel)",
+              mint_workflow_seam_report()["job_if"], "SENTINEL")
+    finally:
+        _wif.if_condition = _real_if_condition
+    check("...and the sentinel is UNDONE, so every row below reads the real shared reader",
+          mint_workflow_seam_report()["job_if"], MINT_REF_GUARD)
     check("the mint job takes the secret-scoped environment", seam["job_environment"],
           "dispatch-secrets")
     check("the mint job may write ledger contents", seam["contents_write"], "write")
