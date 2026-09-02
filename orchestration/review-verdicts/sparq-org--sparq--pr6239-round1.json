@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6239,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e6bcd7e55213c9a67fc8b370bf168f6506b98733",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The allowlist additions correctly classify the reactive flow-on engine and rule table as orchestration-only while preserving normal crate narrowing for mixed changes. The existing inertness test covers both new entries against the enumerated Rust-CI workflows, and flow-on-gates independently runs the engine's focused test suite without a ci-select guard. The new classification tests exercise both the all-orchestration and mixed-change paths and pass alongside the inertness checks.",
+  "verdict": "approve"
+ }
+}
