@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6249,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bbf572f65057701f6abb0e23ee857d5bab252948",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently pins contributor-facing wasm-pack installation guidance to the exact v0.15.0 version used by both gating workflows. The new test derives the expected version from the workflow pins, checks all three documented hint locations, includes anti-vacuity coverage, and mutation-tests unversioned, caret-range, mismatched, unterminated, and wrapped-Markdown cases. The focused test suite passes all 13 tests, and no correctness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
