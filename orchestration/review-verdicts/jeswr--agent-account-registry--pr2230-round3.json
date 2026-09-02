@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2230,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6d93df2c2709e149d89631ff8fc595de10968299",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 closes the prior major finding. `_apt_packages_in_line` now recognizes `apt-get`/`apt` only in shell command position, so `RUN echo apt-get install -y jq python3-yaml` no longer fabricates installed packages. The regression is exercised through the actual `_assert_container_selftest_deps` verdict path, with a real-install positive control; quoted argument data is separately rejected, and post-quote command-position recovery is covered. The remaining documented limitation concerns shell reachability/control-flow evaluation rather than the prior argument-data masquerade, and the changed Dockerfile contains a direct, reachable install. I found no blocker or major correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
