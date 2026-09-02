@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2172,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1c19a0240aed89e05024d53eb8d41235e4d9ecf1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes each malformed flow.target_ci_queue container or row visible through a bounded, independently budgeted diagnostic while preserving the existing tolerant row-drop behavior and surviving valid rows. Repository text is sanitized and capped before logging, type-only diagnostics do not expose collector values, and the hoisted regex preserves the prior accepted shape. The self-tests use literal inputs and expectations, exercise container, row, repository, depth, sanitization, suppression, independence, valid, absent, and mixed-row paths, and retain full diagnostic ordering so the assertions are non-vacuous. No trust check is weakened and no default-allow path is introduced.",
+  "verdict": "approve"
+ }
+}
