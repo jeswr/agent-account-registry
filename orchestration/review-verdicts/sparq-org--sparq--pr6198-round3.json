@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6198,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "14da135610aba3bb453be678855b4762fbcd7080",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The release gui-bundle matrix installs exactly pinned wasm-pack 0.15.0 through a SHA-pinned, architecture-aware prebuilt installer. The guardrail remains job-scoped, ignores comments, verifies an ARM runner and unified exact versions, and its mutation cases meaningfully detect both prohibited regressions. The focused 17-test suite passes. No correctness, soundness, test-validity, or security issue was found.",
+  "verdict": "approve"
+ }
+}
