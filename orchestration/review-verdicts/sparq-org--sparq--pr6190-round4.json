@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6190,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9f6141efbf5db1f87e6670e6a907e86bcb819838",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections L2 and 5.1 assume that DELETE DATA for a masked or absent quad produces no UpdateEffect because the quad is absent from the fork. That is false for the surveyed API: update_in_place_capturing applies the requested DeleteData batch and record_delta records that non-empty request regardless of whether any triple existed. DELETE/INSERT templates can likewise emit requested deletions that do not change state. Step 6 will consequently inspect the masked quad, find it outside Wdel (which is intersected with R), and DENY. This violates the promised absent-vs-masked indistinguishability, the equivalence in section 4, and the acceptance test in section 5.3 item 2.",
+    "file": "research/pattern-scoped-update-enforcement-2026-09.md",
+    "fix_hint": "Revise W-E so authorization receives the actual pre/post state delta, not the requested effect log. For example, compute effective deletions by testing each candidate against the pre-operation masked fork before mutation, or add/use a capture primitive that reports only triples whose membership changed while preserving per-operation ordering. Then update the algorithm, parity argument, and tests to pin DELETE DATA and constructed-template deletion of both absent and masked triples as successful no-ops. If the intended policy instead denies named masked deletes, revise L2/L7/the equivalence consistently and acknowledge the resulting oracle rather than claiming masked-world equivalence.",
+    "severity": "major",
+    "title": "Captured deletes are not concrete state deltas, breaking L2 silent masking"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is candid about scope and known uncertainties, but the chosen W-E mechanism contradicts its load-bearing L2 semantics. The engine's capture API records requested delete batches, not only triples that actually existed and were removed. Therefore a DELETE DATA naming a masked/absent triple still reaches step 6 and is denied, rather than succeeding as the required indistinguishable no-op. The design must resolve this before it can be accepted as the implementation plan.",
+  "verdict": "request_changes"
+ }
+}
