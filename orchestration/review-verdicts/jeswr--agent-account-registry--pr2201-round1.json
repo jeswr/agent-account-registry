@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2201,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a64225e424c8fd6324f86b877747a30e942cd10e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added helper safely converts non-AssertionError escapes into observable self-test values, preventing a malformed mutant from aborting the remaining checks and being misclassified as a kill. Its control rows exercise both the escape-reporting path and the normal refusal/accept paths. The two new seam mutants independently reach and pin the previously uncovered first-line and shlex-tokenisation refusal branches using branch-unique message fragments. The changes are confined to self-test support, preserve the production fail-closed assertions, and introduce no apparent security or trust-check weakening.",
+  "verdict": "approve"
+ }
+}
