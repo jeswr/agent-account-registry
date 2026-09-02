@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2155,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "52f5a1128270451f12111c9f463aa29c8f12bc3d",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The cron-map extraction is correct and complete. The new module preserves the single cron-field expander and derived schedule map, rejects malformed cron atoms, workflow YAML, schedule containers, and schedule entries rather than silently omitting minutes, and supplies non-vacuous hermetic plus live-tree tests. ci-latency-alert binds the shared objects while retaining its AlarmError adapter for its live reporting contract; dispatch-tick-floor and regate-sweep point to the new owner and their workflow sparse-checkouts include it exactly. The watchdog sparse checkout and self-test suite are also updated, so no consumer is left with an unavailable import or an unenrolled test. I found no trust-check weakening, permissive fallback, workflow permission expansion, secret exposure, or reviewer-directed injection in the diff.",
+  "verdict": "approve"
+ }
+}
