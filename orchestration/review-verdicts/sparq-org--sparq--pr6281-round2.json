@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6281,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "504374094646ae563485d348d77790cd16df9f90",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`NotifyState` is now generic, its public constructor takes `Arc<LdpState<S>>`, and all three public handler signatures changed. The repository maintenance rule requires the matching `skills/<surface>/SKILL.md` to be updated in the same change. This round adds no skill file to the diff, so the prior source-compatibility/documentation finding remains unresolved.",
+    "file": "crates/sparq-lws-core/src/notifications/ws.rs",
+    "fix_hint": "Update `skills/solid-lws-server/SKILL.md` and any referenced examples that construct `NotifyState` or invoke these handlers, or keep these implementation details non-public if they are not a supported consumer surface.",
+    "severity": "major",
+    "title": "Public API changes still lack the required usage-skill update"
+   },
+   {
+    "body": "`receive_authorized_bound_web_id_reaches_the_upgrade` still asserts only that the response is neither 401 nor 403. An unrelated 400, 404, or 500 arising before or during authorization would pass, so the test does not prove that token validation and WAC succeeded and that the supplied `WebSocketUpgradeRejection` response was actually surfaced. The subscriber-count assertion also cannot distinguish those paths because every non-upgrade path leaves it at zero.",
+    "file": "crates/sparq-lws-core/src/notifications/ws.rs",
+    "fix_hint": "Compute the expected response/status from the same `upgrade_rejection()` value before passing it to the handler and assert exact equality, or perform a genuine WebSocket upgrade and assert successful upgrade/registration for an authorized bound WebID.",
+    "severity": "major",
+    "title": "Authorized receive-path test remains vacuous for the claimed outcome"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: both prior major findings remain. The WAC implementation itself is coherently fail-closed, uses the shared LDP authorizer/state, validates canonical same-server topics, and rechecks the token-bound WebID before upgrade. However, the diff still changes public notification APIs without updating the required usage skill, and the authorized receive-path test still accepts any response other than 401/403 rather than proving that the WebSocket extractor's specific rejection was reached.",
+  "verdict": "request_changes"
+ }
+}
