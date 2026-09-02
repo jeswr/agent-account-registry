@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2220,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4f41f21763c6ac1a8558464d4e85c76de4c04e39",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 adds the missing groom call-site regression without weakening the implementation approved in round 3. The new fixture supplies an earlier proven-bot application and a later actor that is neither proven automation nor a proven maintainer, then checks both the no-write outcome and the explicit `not provably machine-applied` refusal. This makes the newest-applier/consumer wiring load-bearing and distinguishes the target behavior from mere absence of any bot event. The shared ownership implementation remains fail-closed: only positive bot/App/caller-declared automation proof yields MACHINE; malformed App metadata is UNKNOWN through the I/O wrapper and raises through the pure path; human, unknown, and unattributable applications cannot authorize deletion. I found no new correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
