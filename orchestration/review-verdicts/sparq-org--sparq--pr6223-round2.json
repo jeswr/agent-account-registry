@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6223,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8bb325af40b58d42848eb81bac210e2f6033738d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The implementation now derives `drained` from the cursor's exact pre-pull `rowCount` when a bound is reached, so an exact-size bound and a bound crossed by the final partial batch correctly report that no rows remain. The focused tests cover both cases, distinguish them from a genuinely truncated pull, and the randomized differential checks `drained` against whether all result rows were delivered. The bounded GUI consumer remains result-equivalent to the unbounded consumer for kept rows, total count, and truncation, while cursor cleanup is exercised on bounded completion and callback failure. No correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
