@@ -139,6 +139,15 @@ always fatal (decision 22): a `flow.leases[].label` that is not the salted accou
 raises, trigger `evidence` links are pinned to `https://github.com/`, and the existing
 `_assert_private` raw-handle sweep runs over the finished document.
 
+**Issue #2174: every collector-controlled string that reaches `site/data.json` is LENGTH-bounded,
+not just charset-pinned.** `flow.target_ci_queue[].repository` was the last one that was not: its
+`owner/name` pattern pinned the character set — so nothing injectable ever survived — but both
+halves were unbounded, and a repository that PARSES is published verbatim into the page and the
+`CI queue · <repo>` metric label that renders it. The bound is GitHub's own — **39** characters for
+the owner, **100** for the name — so nothing nameable on GitHub is refused, and anything longer is
+dropped LOUDLY by the same named `repository` diagnostic as any other malformed row. This is an
+INPUT-side pin, unlike the display caps above: the row is refused, never silently shortened.
+
 **The label is the CANONICAL account fingerprint — `sha256(handle + ":" + salt)[:16]`, 16 lowercase
 hex (locked decision 22a; issue #375).** It is the same value `model-health.account_hash` /
 `worker-pr.account_hash` produce and the same one `data/leases.json`, the provenance records and
