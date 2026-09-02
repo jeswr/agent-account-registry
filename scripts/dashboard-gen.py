@@ -5582,16 +5582,19 @@ case "${endpoint}" in
     jq -r "${filter}" < "${STUB_DIR}/artifacts.json"
     ;;
   *"/runs?per_page=30")
-    if [ "${STUB_LIVE_FAIL}" = 1 ]; then
-      printf 'gh-stub: live-run read failed\n' >&2
-      exit 1
+    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
+    if [[ "${filter}" == *'status != "completed"'* ]]; then
+      if [ "${STUB_LIVE_FAIL}" = 1 ]; then
+        printf 'gh-stub: live-run read failed\n' >&2
+        exit 1
+      fi
+      jq -r "${filter}" < "${STUB_DIR}/live-${wf}.json"
+    elif [[ "${filter}" == *'action_required'* ]]; then
+      jq -r "${filter}" < "${STUB_DIR}/runs-${wf}.json"
+    else
+      printf 'gh-stub: unexpected argv: %s\n' "$*" >&2
+      exit 64
     fi
-    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
-    jq -r "${filter}" < "${STUB_DIR}/live-${wf}.json"
-    ;;
-  *"/runs?per_page=1")
-    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
-    jq -r "${filter}" < "${STUB_DIR}/runs-${wf}.json"
     ;;
   *)
     printf 'gh-stub: unexpected argv: %s\n' "$*" >&2
@@ -5604,8 +5607,9 @@ esac
     def _ka_stamp(age):
         return _utc_iso(keepalive_now - age)
 
-    def _ka_run(age, status="completed"):
-        return {"id": 1, "status": status, "conclusion": "success", "created_at": _ka_stamp(age)}
+    def _ka_run(age, status="completed", conclusion="success"):
+        return {"id": 1, "status": status, "conclusion": conclusion,
+                "created_at": _ka_stamp(age)}
 
     def run_keepalive_leg(script, specs, *, artifacts=(), runs=None, live=None,
                           artifacts_fail=False, live_fail=False):
@@ -5639,12 +5643,18 @@ esac
                 env=dict(os.environ,
                          PATH=f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
                          GITHUB_REPOSITORY="o/r", GH_TOKEN="stub",
+                         METRICS_RESULT="failure",
                          STUB_DIR=str(stubs), STUB_CALLS=str(calls),
                          STUB_ARTIFACTS_FAIL="1" if artifacts_fail else "0",
                          STUB_LIVE_FAIL="1" if live_fail else "0"))
             dispatched = sorted(line for line in calls.read_text(encoding="utf-8").split("\n")
                                 if "/dispatches" in line)
-        return completed.returncode, dispatched, completed.stdout + completed.stderr
+        log = completed.stdout + completed.stderr
+        # The production reads deliberately fail open with `|| true`; without carrying the stub's
+        # refusal out-of-band, an unmodelled read can therefore look exactly like an empty stale
+        # anchor and satisfy the outcome rows. Preserve the stub's promised loud exit instead.
+        code = 64 if "gh-stub: unexpected argv:" in log else completed.returncode
+        return code, dispatched, log
 
     def run_keepalive_step(**fixtures):
         """The REGISTRY leg, subject of the #922 rows. -> (exit code, [workflows kicked], log)."""
@@ -5765,6 +5775,41 @@ esac
     keepalive_check(
         "[#922] the run-anchored legs still key on run age, and only the stale one is kicked",
         (code, kicked), (0, ["groom-core.yml"]), log)
+    # #1375: GitHub creates one-second `action_required` runs when it refuses to ingest a
+    # workflow. Their timestamps are evidence of rejection, not execution. Put a fresh rejected
+    # run ahead of an old accepted run so selecting the newest row without filtering stays green
+    # and fails this outcome; then supply only rejected runs to cover the visible refusal path.
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(60)],
+        runs={"metrics.yml": [_ka_run(60, conclusion="action_required"), _ka_run(9_999)]})
+    keepalive_check(
+        "[#1375] a fresh action_required run cannot hide the newest accepted run's stale age",
+        (code, kicked), (0, ["metrics.yml"]), log)
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(60)],
+        runs={"metrics.yml": [_ka_run(60, conclusion="action_required")]})
+    keepalive_check(
+        "[#1375] a pure rejected-run stream is stale AND emits an explicit workflow error",
+        (code, kicked, "::error::keepalive: metrics.yml has no accepted run" in log),
+        (0, ["metrics.yml"], True), log)
+    metrics_dispatch = ("api -X POST "
+                        "repos/o/r/actions/workflows/dashboard.yml/dispatches -f ref=master")
+    code, dispatched, log = run_keepalive_leg(
+        metrics_keepalive_script, metrics_specs,
+        runs={"dashboard.yml": [_ka_run(60, conclusion="action_required"), _ka_run(9_999)]})
+    keepalive_check(
+        "[#1375] metrics.yml's third mesh leg also skips a fresh rejected dashboard run and "
+        "dispatches from the stale accepted run behind it",
+        (code, dispatched), (0, [metrics_dispatch]), log)
+    code, dispatched, log = run_keepalive_leg(
+        metrics_keepalive_script, metrics_specs,
+        runs={"dashboard.yml": [_ka_run(60, conclusion="action_required")]})
+    keepalive_check(
+        "[#1375] a pure rejected dashboard stream in the third mesh leg is stale AND visible as "
+        "a workflow error",
+        (code, dispatched,
+         "::error::keepalive: dashboard.yml has no accepted run" in log),
+        (0, [metrics_dispatch], True), log)
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)])
     keepalive_check(
         "[#922] control: a fleet that is fresh on BOTH anchors is kicked not at all",
@@ -5860,6 +5905,21 @@ esac
     keepalive_check(
         "[#559] control: a sweeper that ran inside its threshold is not kicked at all — the leg is "
         "not simply dispatching on every fire", (code, dispatched), (0, []), log)
+    code, dispatched, log = run_keepalive_leg(
+        sparq_script, sparq_specs,
+        runs={sparq_target: [_ka_run(60, conclusion="action_required"),
+                            _ka_run(sparq_limit + 600)]})
+    keepalive_check(
+        "[#1375] the cross-repo run anchor also skips a fresh rejected run and sees the stale "
+        "accepted run behind it", (code, dispatched), (0, [sparq_dispatch]), log)
+    code, dispatched, log = run_keepalive_leg(
+        sparq_script, sparq_specs,
+        runs={sparq_target: [_ka_run(60, conclusion="action_required")]})
+    keepalive_check(
+        "[#1375] a pure rejected cross-repo stream is stale AND visible as a workflow error",
+        (code, dispatched,
+         "::error::keepalive: sparq-org/sparq rearm-sweeper.yml has no accepted run" in log),
+        (0, [sparq_dispatch], True), log)
 
     # --- #935: the SEAM around that leg, which no amount of executing the body can reach. The rows
     # above drive the script directly; production reaches it only through a step-level `if:`, and

@@ -298,8 +298,12 @@ jobs:
               echo "keepalive: ${wf} has ${live} queued/in-progress run(s) — live, skipping kick"
               continue
             fi
-            last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
-                   --jq '.workflow_runs[0].created_at // empty' || true)
+            last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=30" \
+                   --jq '[.workflow_runs[] | select(.conclusion != "action_required")
+                          | .created_at] | max // empty' || true)
+            if [ -z "$last" ]; then
+              echo "::error::keepalive: ${wf} has no accepted run among its newest 30; action_required runs are not liveness evidence"
+            fi
             prev=0
             [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
             age=$(( now - prev ))
