@@ -306,27 +306,24 @@ def human_ever_applied(timeline, label, is_human):
     return False
 
 
-def machine_applied(timeline, label):
+def machine_applied(timeline, label, is_human=None):
     """POSITIVE proof that the newest application of `label` was made by an automation identity:
-    the actor login ends in `[bot]`, or the event was performed via a GitHub App.
+    an App-driven event, or an actor login ending in `[bot]`.
 
-    This is the quantifier the safe direction needs. `label_application_machine_owned` answers
-    "the newest applier was not a PROVEN human", so an actor nobody could classify reads as
-    permission to delete. Requiring a positively-identified machine actor turns "no human was
-    proven" into "a machine was proven", and the caller requires BOTH.
+    THE DEFINITION IS NO LONGER HERE (registry #1849). This program kept a private walk because
+    `label_application_machine_owned` answered only "the newest applier was not a PROVEN human",
+    so an actor nobody could classify read as permission to delete — and every consumer of that
+    answer had to remember to compensate locally, which is the #958 shape. park_policy owns the
+    quantifier now: MACHINE is a positive proof and an unattributable actor answers
+    LABEL_OWNER_UNATTRIBUTABLE, so this is a THIN projection of the shared walk rather than a
+    second definition of it (AGENTS.md pre-flight 4 — a guard written twice is unkillable in
+    either copy).
 
-    Raises on an unreadable/malformed timeline; the caller fails closed."""
-    newest, newest_machine = None, False
-    for created, kind, login, via_app in park_policy._event_rows(timeline, label):  # noqa: SLF001
-        if kind != "labeled":
-            continue
-        instant = park_policy.parse_ts(created)
-        machine = bool(via_app) or str(login or "").endswith("[bot]")
-        if newest is None or instant > newest:
-            newest, newest_machine = instant, machine
-        elif instant == newest and not machine:
-            newest_machine = False      # an instant tie resolves AWAY from machine ownership
-    return newest is not None and newest_machine
+    It stays a named function for ONE reason the shared BOOLEAN cannot serve: it RAISES on an
+    unreadable/malformed timeline instead of absorbing it into False, and `reconcile_repo` needs
+    that to file a broken read as `read-failed` rather than as a human-terminal verdict."""
+    return park_policy.label_owner_from_events(
+        timeline, label, is_human=is_human) == park_policy.LABEL_OWNER_MACHINE
 
 
 def verdict(*, pr_labels, issue_labels, live_head, live_mergeable, heads, escalated,
@@ -567,18 +564,19 @@ def reconcile_repo(client, repo, bot_login, maintainer, apply, max_clears, recon
             lane_match = LANE_HEAD_RE.match(str(((pull or {}).get("head") or {}).get("ref", "")))
             lane_visible = bool(lane_match)
             issue_labels = client.issue_labels(repo, lane_match.group(1)) if lane_match else []
-            # FAIL CLOSED on ownership: BOTH the shared newest-wins rule and the stricter
-            # ever-applied rule must clear it, AND a machine actor must be positively identified.
+            # FAIL CLOSED on ownership: BOTH the shared newest-wins rule — which since registry
+            # #1849 must POSITIVELY prove a machine applied the park, so an actor nobody can
+            # attribute is not permission — and the stricter ever-applied rule must clear it.
             # Anything unreadable raises and lands in `read-failed`, never in permission.
+            # ONE walk per rule: the positive-machine proof used to be a second, local definition
+            # here (`machine_applied`'s own walk) ANDed onto the shared answer, and once park_policy
+            # owns the quantifier a second copy would only make each copy unkillable (AGENTS.md
+            # pre-flight 4).
             def _is_human(login, _m=maintainer):
                 return str(login or "").casefold() == str(_m).casefold()
-            applied_by_human = not (
-                park_policy.label_application_machine_owned(
-                    repo, number, park_policy.HUMAN_PARK_LABEL,
-                    lambda _repo, _num: timeline, is_human=_is_human,
-                    log=lambda *_a, **_k: None)
-                and machine_applied(timeline, park_policy.HUMAN_PARK_LABEL)
-            ) or human_ever_applied(timeline, park_policy.HUMAN_PARK_LABEL, _is_human)
+            applied_by_human = (
+                not machine_applied(timeline, park_policy.HUMAN_PARK_LABEL, is_human=_is_human)
+                or human_ever_applied(timeline, park_policy.HUMAN_PARK_LABEL, _is_human))
             receipts, receipt_count = clear_receipts(comments, bot_login)
             # [#941 INTERACTION] The generation of the NEWEST grace-window park #941 recorded, read
             # through ITS OWN trust-filtered reader so the two programs cannot disagree about what
@@ -923,6 +921,20 @@ def _self_test():
            machine_applied([stranger], "needs:user"),
            machine_applied([], "needs:user")),
           (True, False, False))
+    # [#1849] THE SEAM, stated as a state and not merely as this program's boolean: the positive
+    # machine proof is park_policy's now, so if that answer ever goes back to "not proven human"
+    # this row reds HERE — in the consumer that would silently start deleting human parks — rather
+    # than only in the owning module's own suite.
+    check("the shared ownership answer names the unattributable applier as such, so the boolean "
+          "projection this program deletes on cannot read it as permission",
+          (park_policy.label_owner_from_events([stranger], "needs:user", is_human=is_jeswr),
+           park_policy.label_owner_from_events([bot_park], "needs:user", is_human=is_jeswr),
+           park_policy.label_owner_from_events([human_park], "needs:user", is_human=is_jeswr),
+           park_policy.label_application_machine_owned(
+               "o/r", 1, "needs:user", lambda *_a: [stranger],
+               is_human=is_jeswr, log=lambda *_a, **_k: None)),
+          (park_policy.LABEL_OWNER_UNATTRIBUTABLE, park_policy.LABEL_OWNER_MACHINE,
+           park_policy.LABEL_OWNER_HUMAN, False))
     check("a human application ANYWHERE in the history refuses, even when a LATER bot "
           "re-application would make newest-wins read machine-owned",
           (human_ever_applied([human_park, bot_park], "needs:user", is_jeswr),
@@ -1139,14 +1151,31 @@ def _self_test():
         }
 
     # THE TWO OWNERSHIP RULES DISAGREE HERE, and each fixture exists to make exactly ONE of the
-    # call site's conjuncts load-bearing. Without them both rules agree on every row and either
-    # conjunct could be deleted with the suite still green — the 1/N call-site shape.
+    # call site's two rules load-bearing. Without them both rules agree on every row and either
+    # could be deleted with the suite still green — the 1/N call-site shape.
+    #
+    # [#1849] The first row is now a CROSS-MODULE pin. The positive-machine proof was a local
+    # conjunct here and is park_policy's answer since #1849, so this fixture reds if that answer
+    # regresses to "not proven human" — in the program that would then delete a park nobody can
+    # attribute, which is the only place the harm is visible.
     unknown_actor = FakeGh({20: fake_row(20, timeline=[
         event("labeled", "needs:user", "2026-07-28T01:00:00Z", "some-service")])})
     reconcile_repo(unknown_actor, "o/r", "bot", "jeswr", True, 5, RECONCILE_MAX, [])
     check("[CALL SITE][GENUINE] an UNIDENTIFIABLE applier is not a machine: `not proven human` "
-          "alone must not authorise the delete (the positive-machine-proof conjunct)",
+          "alone must not authorise the delete (the positive-machine proof)",
           unknown_actor.labels_removed, [])
+    # [#1849] ...and the ownership read must still RAISE on a malformed timeline rather than
+    # absorbing it into "not machine". Both answers refuse the release, so only the CENSUS can
+    # tell them apart: swapping this call for park_policy's absorbing wrapper would file a broken
+    # read as a genuine human decision — a permanently mis-classified terminal, silently.
+    broken_timeline = FakeGh({24: fake_row(24, timeline=[
+        {"event": "labeled", "label": 7, "created_at": "2026-07-28T01:00:00Z"}])})
+    rows_broken = []
+    reconcile_repo(broken_timeline, "o/r", "bot", "jeswr", True, 5, RECONCILE_MAX, rows_broken)
+    check("[CALL SITE] a MALFORMED park timeline is a read failure, not a human-terminal verdict",
+          (broken_timeline.labels_removed,
+           [(row["number"], row["code"]) for row in rows_broken]),
+          ([], [(24, "read-failed")]))
     # [#941 INTERACTION] The call-site fixture is built by #941's OWN `stuck_receipt`, so it is the
     # real wire bytes rather than my restatement of them. Over-cap generation => refused.
     over_cap = FakeGh({22: fake_row(22)})

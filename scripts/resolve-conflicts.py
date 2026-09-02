@@ -2263,6 +2263,31 @@ def _self_test():
         ([], 1, [], 1, 1, 1, VERDICT_INERT),
     )
 
+    # (a3b) [#1849] THE SAME THIRD STATE, reached by the shape that used to read as PERMISSION.
+    # The hold here HAS a `labeled` event; its actor is simply nobody this program can classify —
+    # not this bot, and not a maintainer (the collaborator probe answers `none` for them). Until
+    # park_policy owned the attributability quantifier that combination answered MACHINE, and (a2)
+    # says machine alone is admission: this PR was REBASED under a hold nobody can attribute, at
+    # rc=0 and in silence. It is now the same fail-closed, loud no-exit as (a3).
+    stranger_api = FakeAPI([pull(19, "1" * 40, labels=("needs:user",))],
+                           timelines={19: labelled_by("some-service", "needs:user")})
+    stranger_rebaser = FakeRebaser()
+    stranger_resolver = ConflictResolver(
+        stranger_api, snapshot, claim, [repo], bot_login, True, 5, stranger_rebaser)
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        stranger_rc = stranger_resolver.run()
+    stranger_row = stranger_resolver.census[0]
+    check(
+        "[#1849] a hold applied by an actor who is NEITHER this bot NOR a maintainer is not "
+        "permission either: the PR is not rebased, and the run reds as a no-exit instead of "
+        "passing quietly",
+        (stranger_rebaser.calls, stranger_rc, stranger_api.labels_added,
+         stranger_row["skipped"].get("hold-ownership-unreadable"),
+         stranger_row["unowned"], stranger_row["no_exit"],
+         _aggregate_census(stranger_resolver.census)["verdict"]),
+        ([], 1, [], 1, 1, 1, VERDICT_INERT),
+    )
+
     # (a4) THE OTHER SURFACE. The PR's own `needs:user` is bot-applied — machine-owned, and (a2)
     # says that alone is admission — but a PROVEN HUMAN applied the same label to the SOURCE ISSUE
     # the PR body closes. A question a person asked on the issue is not answered by a bot

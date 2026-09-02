@@ -523,13 +523,15 @@ def _is_proven_machine(login, via_app, machine_logins):
     as its own automation in `machine_logins` (case-insensitive, the `bot_login` convention every
     other reader in this module already uses).
 
-    Deliberately NOT the negation of `_is_proven_human`. Everywhere the boolean ownership
-    projection is consulted the answer authorises a DELETE, so "not provably human" is the safe
-    reading. `human_hold_deleted_by_machine` asks the opposite-facing question — it authorises
-    RE-APPLYING a hold — and there "not provably human" would let an actor whose collaborator
-    probe merely FAILED stand in for the bot, so a maintainer's own removal could be undone. An
-    unverifiable actor is neither human nor machine here; both proofs are positive and an actor
-    that satisfies neither yields no action at all."""
+    Deliberately NOT the negation of `_is_proven_human`, in EITHER direction. An unverifiable
+    actor is neither human nor machine: both proofs are positive, and an actor that satisfies
+    neither yields no action at all.
+
+    `human_hold_deleted_by_machine` authorises RE-APPLYING a hold, and there "not provably human"
+    would let an actor whose collaborator probe merely FAILED stand in for the bot, so a
+    maintainer's own removal could be undone. `label_owner_from_events` authorises the opposite —
+    DELETING a hold — and there "not provably human" read absence of an attributable actor as
+    permission (registry #1849). Both directions need the positive proof, so both read it here."""
     if via_app:
         return True
     login = str(login or "")
@@ -1082,7 +1084,7 @@ def retirement_handback(issue_labels):
             "second reroute, which would loop")
 
 
-# --- THE THREE-STATE OWNERSHIP ANSWER --------------------------------------------------------
+# --- THE FOUR-STATE OWNERSHIP ANSWER ---------------------------------------------------------
 #
 # `label_application_machine_owned` answers a BOOLEAN, and its False conflates two states with
 # different correct handling: "a human applied this" and "nobody can tell who applied this".
@@ -1094,51 +1096,112 @@ def retirement_handback(issue_labels):
 LABEL_OWNER_HUMAN = "human"
 LABEL_OWNER_MACHINE = "machine"
 LABEL_OWNER_UNKNOWN = "unknown"
+# [registry #1849] THE FOURTH STATE, and the one that closes a fail-OPEN. MACHINE used to mean
+# only "the newest applier was not a PROVEN human", so every actor nobody could classify answered
+# MACHINE — and MACHINE is what every consumer reads as PERMISSION TO DELETE the hold. Absence of
+# an attributable actor therefore read as permission, starting with the missing/unreadable actor
+# `_event_rows` deliberately preserves as login "". No `is_human` probe could close it:
+# `_is_proven_human` short-circuits on `bool(login)` BEFORE the probe runs.
+#
+# MACHINE is now the POSITIVE proof `_is_proven_machine` already spells out for the
+# opposite-facing question (an App-driven event, a `[bot]` login, or a caller-declared automation
+# login), and an application that HAS evidence but no attributable actor on either side is
+# UNATTRIBUTABLE. Both of the new answers are `!= LABEL_OWNER_MACHINE`, so every consumer of the
+# boolean projection fails CLOSED without changing a line; keeping UNATTRIBUTABLE distinct from
+# UNKNOWN is what lets a caller report "evidence exists and it names nobody" rather than "no
+# evidence at all" — the same reason UNKNOWN was split out from HUMAN for #1191.
+#
+# Every careful caller used to compensate LOCALLY over its own copy of this walk
+# (reconcile-conflict-park's `machine_applied`, and one private walk per caller that remembered).
+# That is the #958 shape — one rule, several definitions, no shared owner, and the caller that
+# forgets is silently fail-open. The quantifier lives HERE now and the local copies delegate.
+LABEL_OWNER_UNATTRIBUTABLE = "unattributable"
+
+# An EXACT-INSTANT tie between two applications resolves to the STRICTEST answer present — the one
+# that refuses the most. HUMAN outranks everything (a tie has always resolved toward human
+# ownership) and UNATTRIBUTABLE outranks MACHINE, so a tie can only ever move AWAY from permission.
+_LABEL_OWNER_STRICTNESS = (LABEL_OWNER_MACHINE, LABEL_OWNER_UNATTRIBUTABLE, LABEL_OWNER_HUMAN)
 
 
-def label_application_ownership(repo, number, label, fetch_events, is_human=None, log=print):
-    """Who applied the newest `labeled` event for THIS EXACT `label` on `repo#number`:
-    ``LABEL_OWNER_HUMAN``, ``LABEL_OWNER_MACHINE``, or ``LABEL_OWNER_UNKNOWN``.
+def label_owner_from_events(events, label, machine_logins=(), is_human=None):
+    """PURE — who applied the newest `labeled` event for THIS EXACT `label` in ONE already-fetched
+    timeline: ``LABEL_OWNER_HUMAN``, ``LABEL_OWNER_MACHINE``, ``LABEL_OWNER_UNATTRIBUTABLE``, or
+    ``LABEL_OWNER_UNKNOWN`` when no `labeled` event for `label` exists at all. Reads nothing else
+    and performs no I/O.
 
-    UNKNOWN covers every ambiguity — an unreadable timeline, a malformed event shape, and the
-    case that matters most, a label with NO `labeled` event at all. Absence of evidence is
-    neither proof of machine ownership nor proof of human ownership.
+    Both proofs are POSITIVE and each has one owner: `_is_proven_human` (a present, non-`[bot]`,
+    non-App login the maintainer probe confirms) and `_is_proven_machine` (App-driven, `[bot]`, or
+    a login the caller names in `machine_logins`). An actor that satisfies NEITHER is
+    UNATTRIBUTABLE — never machine, because machine is permission.
+
+    RAISES MalformedTimelineError on a malformed relevant shape rather than absorbing it: a caller
+    holding its own timeline usually has to tell a BROKEN READ from an answer (reconcile-conflict-
+    park files one as `read-failed` and the other as a verdict). `label_application_ownership` is
+    the I/O wrapper that absorbs both the fetch failure and the malformed shape into UNKNOWN."""
+    probe = _human_probe(is_human)
+    known = {str(login).casefold() for login in (machine_logins or [])}
+    newest, newest_owner = None, LABEL_OWNER_UNKNOWN
+    for created, kind, login, via_app in _event_rows(events, label):
+        if kind != "labeled":
+            continue
+        instant = parse_ts(created)
+        if _is_proven_human(login, via_app, probe):
+            owner = LABEL_OWNER_HUMAN
+        elif _is_proven_machine(login, via_app, known):
+            owner = LABEL_OWNER_MACHINE
+        else:
+            owner = LABEL_OWNER_UNATTRIBUTABLE
+        if newest is None or instant > newest:
+            newest, newest_owner = instant, owner
+        elif instant == newest and (_LABEL_OWNER_STRICTNESS.index(owner)
+                                    > _LABEL_OWNER_STRICTNESS.index(newest_owner)):
+            newest_owner = owner        # an instant tie resolves toward the STRICTEST answer
+    return newest_owner if newest is not None else LABEL_OWNER_UNKNOWN
+
+
+def label_application_ownership(repo, number, label, fetch_events, is_human=None, log=print,
+                                machine_logins=()):
+    """Who applied the newest `labeled` event for THIS EXACT `label` on `repo#number` — the I/O
+    wrapper around `label_owner_from_events`, and the only definition of that question in the repo.
+
+    UNKNOWN covers the ambiguities where nothing at all could be read — an unreadable timeline, a
+    malformed event shape, and the case that matters most, a label with NO `labeled` event at all.
+    UNATTRIBUTABLE is the ambiguity that DOES have evidence: a newest application whose actor is
+    neither a proven human nor proven automation. Neither is proof of machine ownership, and both
+    are LOGGED, because a hold with no attributable owner is a state with no forward edge.
 
     `label_application_machine_owned` is the boolean projection of this walk (MACHINE, and
     nothing else, is permission), so the two can never disagree about who applied a label."""
-    probe = _human_probe(is_human)
     try:
         events = fetch_events(repo, number)
     except Exception as exc:  # noqa: BLE001 — an unreadable timeline proves nothing
         log(f"label ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
         return LABEL_OWNER_UNKNOWN
-    newest, newest_human = None, False
     try:
-        for created, kind, login, via_app in _event_rows(events, label):
-            if kind != "labeled":
-                continue
-            instant = parse_ts(created)
-            human = _is_proven_human(login, via_app, probe)
-            if newest is None or instant > newest:
-                newest, newest_human = instant, human
-            elif instant == newest and human:
-                newest_human = True     # an instant tie resolves toward HUMAN-owned
+        owner = label_owner_from_events(events, label, machine_logins=machine_logins,
+                                        is_human=is_human)
     except Exception as exc:  # noqa: BLE001 — malformed shape proves nothing
         log(f"label ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
         return LABEL_OWNER_UNKNOWN
-    if newest is None:
+    if owner == LABEL_OWNER_UNKNOWN:
         log(f"label ownership unknown for {repo}#{number} {label!r}: no `labeled` event exists, "
             "so nothing proves a machine applied it; not clearable")
-        return LABEL_OWNER_UNKNOWN
-    return LABEL_OWNER_HUMAN if newest_human else LABEL_OWNER_MACHINE
+    elif owner == LABEL_OWNER_UNATTRIBUTABLE:
+        log(f"label ownership unattributable for {repo}#{number} {label!r}: the newest `labeled` "
+            "event names no actor that is provably a human maintainer or provably automation; "
+            "not clearable")
+    return owner
 
 
-def label_application_machine_owned(repo, number, label, fetch_events, is_human=None, log=print):
+def label_application_machine_owned(repo, number, label, fetch_events, is_human=None, log=print,
+                                    machine_logins=()):
     """Whether the newest `labeled` event for THIS EXACT `label` on `repo#number` was applied by
-    something other than a proven human — i.e. whether an automated path may clear it.
+    PROVEN automation — i.e. whether an automated path may clear it.
 
-    Returns False for every ambiguity, including the one that matters most: a label with NO
-    `labeled` event at all. Absence of evidence is NOT proof of machine ownership.
+    Returns False for every ambiguity, including the two that matter most: a label with NO
+    `labeled` event at all (UNKNOWN), and one whose newest applier is neither a proven human nor
+    proven automation (UNATTRIBUTABLE, registry #1849). Absence of evidence — and absence of an
+    attributable ACTOR — is NOT proof of machine ownership.
 
     WHY THIS IS NOT park_applications (blocking review finding, #690). park_applications answers
     "when was the newest park applied across READMISSION_LABELS, and was that human" — a question
@@ -1156,7 +1219,8 @@ def label_application_machine_owned(repo, number, label, fetch_events, is_human=
     sq-qhy4 external accredited-cryptographer audit gate, whose silent deletion is the worst
     single outcome available on this path."""
     return label_application_ownership(
-        repo, number, label, fetch_events, is_human=is_human, log=log
+        repo, number, label, fetch_events, is_human=is_human, log=log,
+        machine_logins=machine_logins,
     ) == LABEL_OWNER_MACHINE
 
 
@@ -3484,6 +3548,144 @@ def _self_test():
           attempt(lambda: human_hold_deleted_by_machine(
               [held, drained], "review:needs-user", is_human=raising_probe)),
           (False, ""))
+
+    # ---- [registry #1849] THE OWNERSHIP ANSWER ITSELF, and the UNATTRIBUTABLE actor it used to
+    # answer MACHINE for. Every consumer reads MACHINE as PERMISSION TO DELETE the hold, so the
+    # direction under test is: which applications does this walk refuse to call machine? The label
+    # and the logins are LITERALS, not module constants — the walk takes its label as an argument
+    # and reads no constant, so a fixture derived from one would only prove the constant equals
+    # itself (AGENTS.md pre-flight 2b/2c). BOTH directions are pinned: the MACHINE rows kill a body
+    # that never answers machine (under which nothing is ever clearable and the drain stops), and
+    # the UNATTRIBUTABLE / HUMAN / UNKNOWN rows kill the pre-#1849 body, which answered MACHINE —
+    # permission — for every one of them.
+    audit = "needs:external-audit"     # the live sparq-org/sparq hold whose silent deletion is the
+    own_bot = "registry-app[bot]"      # worst single outcome available on this path
+    own_logs = []
+    own_timelines = {}
+
+    def own_fetch(_repo, number):
+        events = own_timelines.get(number)
+        if events is None:
+            raise RuntimeError("timeline unavailable")
+        return events
+
+    def owner_of(number, **kwargs):
+        return attempt(lambda: label_application_ownership(
+            "o/r", number, audit, own_fetch, is_human=trusted, log=own_logs.append, **kwargs))
+
+    def clearable(number, **kwargs):
+        return attempt(lambda: label_application_machine_owned(
+            "o/r", number, audit, own_fetch, is_human=trusted, log=own_logs.append, **kwargs))
+
+    ghost_apply = {"event": "labeled", "label": {"name": audit},
+                   "created_at": "2026-07-28T10:00:00Z", "actor": None}
+    own_timelines[1] = [event("labeled", audit, "2026-07-28T10:00:00Z", own_bot)]
+    own_timelines[2] = [event("labeled", audit, "2026-07-28T10:00:00Z", "jeswr")]
+    own_timelines[3] = [ghost_apply]
+    own_timelines[4] = [event("labeled", audit, "2026-07-28T10:00:00Z", "some-service")]
+    own_timelines[5] = [{"event": "labeled", "label": {"name": audit},
+                         "created_at": "2026-07-28T10:00:00Z", "actor": None,
+                         "performed_via_github_app": {"id": 7, "slug": "registry-app"}}]
+    own_timelines[6] = [event("unlabeled", audit, "2026-07-28T10:00:00Z", own_bot)]
+    own_timelines[8] = [event("labeled", audit, "2026-07-28T10:00:00Z", own_bot),
+                        {"event": "labeled", "label": 7, "created_at": "2026-07-28T11:00:00Z"}]
+    check("a `[bot]` application is PROVEN automation => MACHINE, and clearable",
+          (owner_of(1), clearable(1)), (LABEL_OWNER_MACHINE, True))
+    check("a proven-maintainer application => HUMAN, never clearable",
+          (owner_of(2), clearable(2)), (LABEL_OWNER_HUMAN, False))
+    # THE #1849 ROW. `_event_rows` deliberately preserves a missing/unreadable actor as login "",
+    # and `_is_proven_human` short-circuits on `bool(login)` BEFORE the probe — so no is_human
+    # probe can reach this case. Pre-#1849 it answered MACHINE, i.e. permission to delete a hold
+    # nobody can attribute.
+    check("an application with NO ATTRIBUTABLE ACTOR is UNATTRIBUTABLE, never machine, and NOT "
+          "clearable",
+          (owner_of(3), clearable(3)), (LABEL_OWNER_UNATTRIBUTABLE, False))
+    check("a login that is neither a proven maintainer nor automation is UNATTRIBUTABLE too",
+          (owner_of(4), clearable(4)), (LABEL_OWNER_UNATTRIBUTABLE, False))
+    # The machine_logins escape hatch, isolated to that ONE argument: the same fixture, the same
+    # probe, differing only in whether the caller declares that login as its own automation.
+    check("...and the SAME login DECLARED as the caller's automation is proven machine",
+          (owner_of(4, machine_logins=("Some-Service",)),
+           clearable(4, machine_logins=("Some-Service",))),
+          (LABEL_OWNER_MACHINE, True))
+    check("an empty machine_logins entry cannot launder a missing actor into automation",
+          owner_of(3, machine_logins=("",)), LABEL_OWNER_UNATTRIBUTABLE)
+    # The App path is where the fix could plausibly have broken the drain: an App-driven event
+    # carries NO actor login at all, so it is exactly the shape the #1849 row refuses — and it must
+    # still read MACHINE, through performed_via_github_app.
+    check("an App-driven application with no actor login is still PROVEN automation => MACHINE",
+          (owner_of(5), clearable(5)), (LABEL_OWNER_MACHINE, True))
+    check("a label with only an `unlabeled` event has no application to own => UNKNOWN",
+          (owner_of(6), clearable(6)), (LABEL_OWNER_UNKNOWN, False))
+    check("an unreadable timeline proves nothing => UNKNOWN",     # 7 has no fixture: own_fetch
+          (owner_of(7), clearable(7)), (LABEL_OWNER_UNKNOWN, False))   # raises for an absent one
+    check("a malformed relevant event is absorbed to UNKNOWN by the I/O wrapper...",
+          (owner_of(8), clearable(8)), (LABEL_OWNER_UNKNOWN, False))
+    # ...but NOT by the pure predicate, because reconcile-conflict-park files a broken read as
+    # `read-failed` and an answer as a verdict, and it cannot tell them apart from a return value.
+    check("...and RAISES out of the pure walk, so a caller can still tell a broken read from an "
+          "answer",
+          attempt(lambda: label_owner_from_events(own_timelines[8], audit, is_human=trusted))[:2],
+          ("raised", "MalformedTimelineError"))
+    # NEWEST-WINS is unchanged, and it is what makes the fail-open reachable in production: one
+    # unattributable application on top of the bot's own park flips the answer away from
+    # permission, and only the newest event decides.
+    own_timelines[9] = [event("labeled", audit, "2026-07-28T09:00:00Z", own_bot), ghost_apply]
+    own_timelines[10] = [ghost_apply,
+                         event("labeled", audit, "2026-07-28T11:00:00Z", own_bot)]
+    check("an unattributable application ON TOP of the bot's own is the newest, and refuses",
+          (owner_of(9), clearable(9)), (LABEL_OWNER_UNATTRIBUTABLE, False))
+    check("...while a bot re-application on top of it is the newest, and clears",
+          (owner_of(10), clearable(10)), (LABEL_OWNER_MACHINE, True))
+    # EXACT-INSTANT ties resolve to the STRICTEST answer present, across both spellings of the
+    # same instant (parse_ts, never the raw string) AND in BOTH event orders. The order axis is
+    # load-bearing rather than thoroughness: with only the machine-first order, relaxing the
+    # newest-wins `>` to `>=` — under which the LAST event at a tied instant simply overwrites the
+    # answer and the strictness resolution never runs at all — survived every row (measured).
+    tie_rows = []
+    for bot_when, other_when in (("2026-07-28T10:00:00Z", "2026-07-28T10:00:00Z"),
+                                 ("2026-07-28T10:00:00Z", "2026-07-28T10:00:00+00:00"),
+                                 ("2026-07-28T10:00:00+00:00", "2026-07-28T10:00:00Z")):
+        bot_row = event("labeled", audit, bot_when, own_bot)
+        for other in (event("labeled", audit, other_when, "jeswr"),
+                      {"event": "labeled", "label": {"name": audit},
+                       "created_at": other_when, "actor": None}):
+            for ordering in ([bot_row, other], [other, bot_row]):
+                own_timelines[11] = ordering
+                tie_rows.append(owner_of(11))
+    check("an exact-instant tie resolves toward the STRICTEST owner — HUMAN over machine, and "
+          "UNATTRIBUTABLE over machine (a tie never mints permission) — whichever order the "
+          "timeline lists the two applications in",
+          tie_rows,
+          [LABEL_OWNER_HUMAN, LABEL_OWNER_HUMAN,
+           LABEL_OWNER_UNATTRIBUTABLE, LABEL_OWNER_UNATTRIBUTABLE] * 3)
+    # A FAILING probe cannot answer "machine" either. Pre-#1849 a maintainer's own hold became
+    # clearable the moment the collaborator probe broke.
+    check("a raising maintainer probe yields UNATTRIBUTABLE, not permission",
+          attempt(lambda: label_application_ownership(
+              "o/r", 2, audit, own_fetch, is_human=raising_probe, log=own_logs.append)),
+          LABEL_OWNER_UNATTRIBUTABLE)
+    # The four states must stay four DISTINCT values: aliasing UNATTRIBUTABLE to MACHINE would
+    # restore the fail-open silently, and every consumer compares against these constants.
+    check("the ownership states are four distinct values, and UNATTRIBUTABLE is not MACHINE",
+          (len({LABEL_OWNER_HUMAN, LABEL_OWNER_MACHINE, LABEL_OWNER_UNKNOWN,
+                LABEL_OWNER_UNATTRIBUTABLE}),
+           LABEL_OWNER_UNATTRIBUTABLE == LABEL_OWNER_MACHINE),
+          (4, False))
+    # A refusal nobody can attribute is a state with NO FORWARD EDGE, so it must be LOUD.
+    own_logs.clear()
+    owner_of(3)
+    unattributable_logs = list(own_logs)
+    own_logs.clear()
+    owner_of(1)
+    # Indexed NOWHERE and TOTAL by construction: a mutant that emits no line at all must red this
+    # row and let the suite continue, not raise an IndexError that reads as a kill while ~430
+    # checks below it never run (AGENTS.md pre-flight 4, crash-after-partial-run).
+    check("the UNATTRIBUTABLE refusal is REPORTED and names the label, while a clean MACHINE "
+          "answer stays quiet",
+          ([audit in line and "unattributable" in line for line in unattributable_logs],
+           own_logs),
+          ([True], []))
 
     # ---- latest_human_unlabel / readmission_cutoff (the budget readmission window,
     # sparq#2804/PR#3442): a proven-human unlabel opens the window; bot / unverifiable /
