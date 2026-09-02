@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2179,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "891e07d9735ad2d1fd6561a0f58e7616be83b467",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change closes the page-walk absence gap conservatively: each terminal-reap candidate receives a separately keyed, single-page ref/head corroboration, full or malformed responses defer instead of authorizing release, and the resulting pulls are passed through the existing worker-identity gate. The shared pull validator avoids duplicated trust checks, query inputs are bounded/encoded, and failures are scoped to the affected claim. The tests exercise exact request paths, multi-head accumulation, malformed/full-page refusals, identity filtering, positive retention, negative release, and per-claim deferral without relying on exceptions as kills. The documented deleted-head-plus-walk-skip residual is not introduced by this patch and the union strictly narrows the unsafe absence case. No diff-embedded reviewer-directed instruction was detected.",
+  "verdict": "approve"
+ }
+}
