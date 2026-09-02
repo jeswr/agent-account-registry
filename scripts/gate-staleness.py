@@ -25,6 +25,19 @@
 # merge ref from. That is read here from git, from inside the run, which is the ONLY place it is
 # observable; no API field reports it.
 #
+# ⚠️ AND `base.sha` NAMES TWO DIFFERENT OBJECTS — THE PARAGRAPH ABOVE SPEAKS FOR ONE OF THEM ONLY
+# (registry #1431). What #920 measured is the WORKFLOW EVENT PAYLOAD's field,
+# `github.event.pull_request.base.sha`. A DIFFERENT object, spelled the same way in prose, is the
+# CHECK-RUN's `pull_requests[].base.sha` — and that one is the BINDING clause of the arm-side
+# staleness refusal (`dispatch-claim.gate_freshness`, #940, landed as #950: "this is not a proxy
+# for the question, it IS the question"). Read as claims about "`base.sha`" in general those two
+# sentences contradict each other and one of them gates arming; read as claims about their own
+# objects they are simply about different fields, and #920's "5 of 7" says NOTHING about the
+# check-run field. How THAT field sits relative to the graded tree is MEASURED, not assumed, by
+# `scripts/gate-base-lead.py` (#1238), which crosstabs it against this module's receipt and reports
+# lags / equal / leads / diverged. So: never restate either number as a fact about "`base.sha`" —
+# name the object, and the receipt below now carries the event field so that half is a grep too.
+#
 # ⚠️ AND "THE GRADED TREE IS HEAD^1 OF THE MERGE REF" IS NOT SPELLED HERE (registry #1429). That one
 # literal fact had two independent definitions — this module's and compose-gate.py's — each with its
 # own git argv, its own `parents[1]` and its own parent-count refusal, so a repoint had to be made in
@@ -49,8 +62,13 @@
 # the exit code.
 #
 # THE RECEIPT. Every run prints one machine-readable line — `gate-staleness: state=... base_ref=...
-# tested_base=... live_tip=... behind=...`. #920's 40-run crosstab had to be reconstructed by hand
-# from `Merge X into Y` checkout banners; with the receipt the same measurement is one grep.
+# tested_base=... live_tip=... behind=... event_base=...`. #920's 40-run crosstab had to be
+# reconstructed by hand from `Merge X into Y` checkout banners; with the receipt the same
+# measurement is one grep. `event_base` is the EVENT-payload field named above, carried as a pure
+# OBSERVATION (#1431): it never enters the verdict, and printing it beside `tested_base` from the
+# SAME run is what turns "does the event field track the graded tree?" into that same grep instead
+# of #920's hand reconstruction. It is APPENDED to the grammar, never spliced into it — see
+# RECEIPT_TAIL_KEYS for why every receipt already sitting in a run log has to keep parsing.
 #
 # RESIDUALS, NAMED. (a) `refs/remotes/origin/<base>` is fetched when the job starts, so a base move
 # DURING the run reads fresh — the reading is a lower bound on staleness, never an over-report.
@@ -90,12 +108,22 @@ INVOCATION = "scripts/gate-staleness.py"
 CHECKOUT_ACTION = "actions/checkout@"
 HEAD_SHA_ENV = "PR_HEAD_SHA"
 BASE_REF_ENV = "PR_BASE_REF"
+BASE_SHA_ENV = "PR_BASE_SHA"
 HEAD_SHA_EXPR = "${{ github.event.pull_request.head.sha }}"
 BASE_REF_EXPR = "${{ github.event.pull_request.base.ref }}"
+BASE_SHA_EXPR = "${{ github.event.pull_request.base.sha }}"
 
 # THE RECEIPT GRAMMAR, declared ONCE and shared by the renderer and the parser below (#1238).
 RECEIPT_MARKER = "gate-staleness:"
 RECEIPT_KEYS = ("state", "base_ref", "tested_base", "live_tip", "behind")
+# APPENDED LATER, AND THEREFORE OPTIONAL WHEN READING (#1431). The only retrospective reading of
+# the merge-ref base tip is this line in a run log (see `parse_receipt`), and gate-base-lead.py's
+# whole sweep is a mine over that history — so a field spliced into the MIDDLE of the grammar, or
+# appended and then REQUIRED, would retire every receipt already written and silently blind that
+# sweep. New fields therefore go at the END, and the reader accepts the core alone or the core
+# followed by the WHOLE tail. Never a partial tail, never a reordering: this is one optional
+# suffix, not a licence to parse loosely.
+RECEIPT_TAIL_KEYS = ("event_base",)
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Deliberately narrower than git's own ref grammar. The base ref reaches this script from the event
@@ -173,18 +201,30 @@ def freshness(head_sha, base_ref, cwd, git=_git):
     return result
 
 
-def receipt(result, base_ref):
-    """PURE: the one machine-readable line every run prints, stale or not (#920's crosstab)."""
+def receipt(result, base_ref, event_base=""):
+    """PURE: the one machine-readable line every run prints, stale or not (#920's crosstab).
+
+    `event_base` is the EVENT payload's `base.sha` (#1431) — an OBSERVATION printed beside the
+    graded tip, never an operand of `result["state"]`; see this file's header for why the two
+    objects called `base.sha` have to be kept apart.
+
+    IT IS VALIDATED BEFORE IT IS RENDERED, and that is grammar-critical rather than cosmetic: the
+    receipt is whitespace-delimited, so a value carrying a space would add a WORD and make the whole
+    line unparseable for every consumer. Anything that is not a 40-hex commit id renders as `-`,
+    exactly like an operand this run could not establish — absent and malformed are deliberately the
+    same mark, because both mean "this run does not state it" and neither may read as a sha."""
     values = {"state": result["state"],
               "base_ref": base_ref if valid_base_ref(base_ref) else "-",
               "tested_base": result["tested_base"] or "-",
               "live_tip": result["live_tip"] or "-",
-              "behind": "-" if result["behind"] is None else result["behind"]}
-    return RECEIPT_MARKER + " " + " ".join(f"{key}={values[key]}" for key in RECEIPT_KEYS)
+              "behind": "-" if result["behind"] is None else result["behind"],
+              "event_base": event_base if SHA_RE.fullmatch(event_base or "") else "-"}
+    return RECEIPT_MARKER + " " + " ".join(f"{key}={values[key]}"
+                                           for key in RECEIPT_KEYS + RECEIPT_TAIL_KEYS)
 
 
 def parse_receipt(line):
-    """PURE: the five fields of one receipt line as strings, or None when it is not a receipt.
+    """PURE: the fields of one receipt line as strings, or None when it is not a receipt.
 
     The exact INVERSE of `receipt()`, and it lives BESIDE it deliberately (issue #1238): the only
     retrospective reading of the merge-ref base tip is this line in a run log, so a consumer that
@@ -193,19 +233,31 @@ def parse_receipt(line):
 
     STRICT, AND THE KEY SEQUENCE IS PINNED EXACTLY rather than searched for. `gh run view --log`
     prefixes every line with `<job>\\t<step>\\t<timestamp> `, so the marker is FOUND rather than
-    anchored at column 0 — but everything after it must be exactly the documented five
-    `key=value` words in the documented order. A line carrying four of them, six of them, a
-    renamed field or the same five reordered is not a receipt this parser will speak for."""
+    anchored at column 0 — but everything after it must be exactly the documented `key=value`
+    words in the documented order. A line carrying too few of them, too many of them, a renamed
+    field or the same words reordered is not a receipt this parser will speak for.
+
+    THE TAIL IS OPTIONAL AND ALL-OR-NOTHING (#1431), which is the ONE loosening — a receipt written
+    before a tail field existed is still a receipt, and refusing the history would blind
+    gate-base-lead.py's sweep over exactly that history (see RECEIPT_TAIL_KEYS). An absent tail
+    field reads `""`, deliberately distinguishable from the `-` a run prints when it HAD the field
+    and could not state a value. ⚠️ Neither is a sha and `-` is TRUTHY, so a consumer must decide
+    on the sha grammar and never on truthiness — the same trap gate-base-lead.py already names for
+    the `-` this module prints for an unestablished `tested_base`."""
     if not isinstance(line, str):
         return None
     marker = line.find(RECEIPT_MARKER)
     if marker < 0:
         return None
     words = line[marker + len(RECEIPT_MARKER):].split()
-    if len(words) != len(RECEIPT_KEYS):
+    if len(words) == len(RECEIPT_KEYS):
+        expected = RECEIPT_KEYS
+    elif len(words) == len(RECEIPT_KEYS) + len(RECEIPT_TAIL_KEYS):
+        expected = RECEIPT_KEYS + RECEIPT_TAIL_KEYS
+    else:
         return None
-    fields = {}
-    for key, word in zip(RECEIPT_KEYS, words):
+    fields = {key: "" for key in RECEIPT_TAIL_KEYS}
+    for key, word in zip(expected, words):
         if not word.startswith(key + "="):
             return None
         fields[key] = word[len(key) + 1:]
@@ -318,7 +370,7 @@ def assert_report_seam(job):
     except ValueError as exc:
         raise AssertionError(f"the step's invocation line does not tokenise as shell words ({exc})")
     want = ["python3", INVOCATION, "--head-sha", f"${HEAD_SHA_ENV}", "--base-ref",
-            f"${BASE_REF_ENV}"]
+            f"${BASE_REF_ENV}", "--event-base-sha", f"${BASE_SHA_ENV}"]
     if tokens != want:
         raise AssertionError(
             f"the step's invocation line tokenises to {tokens}, want exactly {want} — the whole "
@@ -327,10 +379,21 @@ def assert_report_seam(job):
     env = step.get("env")
     if not isinstance(env, dict):
         raise AssertionError("the step declares no `env:` block")
-    for name, expression in ((HEAD_SHA_ENV, HEAD_SHA_EXPR), (BASE_REF_ENV, BASE_REF_EXPR)):
+    # Each env carries its OWN reason: the three are checked in one loop, so a shared message would
+    # let a refusal about one field be banked as evidence that another is pinned (AGENTS.md
+    # pre-flight item 4, "false kill").
+    for name, expression, why in (
+            (HEAD_SHA_ENV, HEAD_SHA_EXPR,
+             "this report is about THIS pull request's head, and a merge ref composing any other "
+             "head is `unprovable` rather than a verdict"),
+            (BASE_REF_ENV, BASE_REF_EXPR,
+             "the merge-ref base tip is not `base.sha` (issue #920)"),
+            (BASE_SHA_ENV, BASE_SHA_EXPR,
+             "the event-payload observation IS `base.sha` and nothing else (issue #1431) — fed "
+             "anything else it renders `-` on every run and the crosstab it exists for is "
+             "silently empty while the step still looks present")):
         if env.get(name) != expression:
-            raise AssertionError(f"env {name} is {env.get(name)!r}, want {expression!r} — the "
-                                 "merge-ref base tip is not `base.sha` (issue #920)")
+            raise AssertionError(f"env {name} is {env.get(name)!r}, want {expression!r} — {why}")
     return True
 
 
@@ -419,9 +482,11 @@ def _seam_fixture():
          "uses": CHECKOUT_ACTION + "0" * 40,
          "with": {"persist-credentials": False, "fetch-depth": 0}},
         {"name": "Report staleness",
-         "env": {HEAD_SHA_ENV: HEAD_SHA_EXPR, BASE_REF_ENV: BASE_REF_EXPR},
+         "env": {HEAD_SHA_ENV: HEAD_SHA_EXPR, BASE_REF_ENV: BASE_REF_EXPR,
+                 BASE_SHA_ENV: BASE_SHA_EXPR},
          "run": ("set -euo pipefail\n"
-                 f'python3 {INVOCATION} --head-sha "${HEAD_SHA_ENV}" --base-ref "${BASE_REF_ENV}"\n')},
+                 f'python3 {INVOCATION} --head-sha "${HEAD_SHA_ENV}" --base-ref "${BASE_REF_ENV}"'
+                 f' --event-base-sha "${BASE_SHA_ENV}"\n')},
     ]}
 
 
@@ -592,31 +657,110 @@ def _self_test():
         chk("the receipt states the verdict and both tips machine-readably",
             receipt(stale, "master"),
             f"gate-staleness: state=stale base_ref=master tested_base={sha['A']} "
-            f"live_tip={sha['B2']} behind=2")
+            f"live_tip={sha['B2']} behind=2 event_base=-")
         chk("the receipt of an unresolved reading has no shas to claim",
             receipt(unprovable, "master"),
-            "gate-staleness: state=unprovable base_ref=master tested_base=- live_tip=- behind=-")
+            "gate-staleness: state=unprovable base_ref=master tested_base=- live_tip=- behind=- "
+            "event_base=-")
+
+        # ---- [#1431] THE EVENT-PAYLOAD OBSERVATION. `base.sha` names TWO objects (this file's
+        # header): the EVENT field carried here, and the CHECK-RUN's `pull_requests[].base.sha`
+        # that dispatch-claim's arm-side refusal binds on. Printing the event field beside the
+        # graded tip from the SAME run is what makes "does the event field track the tree that was
+        # graded?" a grep instead of #920's hand reconstruction — so the load-bearing row is the one
+        # where the two DIFFER, which is #920's own measured shape: the payload named the moving tip
+        # while the merge ref had composed an ancestor of it. Both expected values are fixture shas
+        # read out of the git repository, never a constant this module also writes from.
+        def _field(line, key):
+            """One parsed receipt field, or a readable sentinel — NEVER a raise.
+
+            A row that writes `parse_receipt(...)[key]` directly turns a regression into an
+            exception that aborts this harness with every row below it unrun and no roll-up
+            printed: that records as a kill while measuring nothing (AGENTS.md pre-flight item 4,
+            "crash-after-partial-run"). Measured on this change's own mutants — a mandatory tail,
+            an omitted tail key, and an emptied RECEIPT_TAIL_KEYS each did exactly that until the
+            reads below went through here."""
+            fields = parse_receipt(line)
+            if not isinstance(fields, dict):
+                return f"<not a receipt: {fields!r}>"
+            if key not in fields:
+                return f"<no {key} field, only {sorted(fields)}>"
+            return fields[key]
+
+        crosstab = receipt(stale, "master", sha["B2"])
+        chk("the receipt carries the event field ALONGSIDE the graded tip, so the two are "
+            "separable in one line",
+            (f"tested_base={sha['A']} " in crosstab, crosstab.endswith(f"event_base={sha['B2']}"),
+             sha["A"] == sha["B2"]),
+            (True, True, False))
+        # ...and it is an OBSERVATION: nothing else in the line may move because it was supplied.
+        chk("supplying the event field changes NOTHING but its own word",
+            crosstab.replace(f"event_base={sha['B2']}", "event_base=-"), receipt(stale, "master"))
+        chk("...and it never becomes the graded tip: the crosstab reads back as two DIFFERENT "
+            "shas, with the verdict still taken from the merge ref",
+            (_field(crosstab, "state"), _field(crosstab, "tested_base"),
+             _field(crosstab, "event_base")),
+            (STALE, sha["A"], sha["B2"]))
+        # The reject direction of the renderer's own validator. The space row is the grammar-
+        # critical one: an unvalidated value there would add a WORD and make the whole line
+        # unparseable for every consumer, so it is checked by WORD COUNT, not just by content.
+        # The count is a LITERAL: derived as `len(RECEIPT_KEYS) + len(RECEIPT_TAIL_KEYS)` it would
+        # be read from the same constants under test, and emptying the tail would satisfy it
+        # vacuously (AGENTS.md pre-flight item 2c).
+        want_words = 7  # the marker, the five core fields, the one tail field
+        for label, supplied in (("absent", ""), ("None", None),
+                                ("one hex digit short", sha["A"][:39]),
+                                ("two shas separated by a space", f"{sha['A']} {sha['B2']}"),
+                                ("upper-case hex", sha["A"].upper()),
+                                ("a branch name", "master"),
+                                ("an abbreviated sha", sha["A"][:12])):
+            rendered = receipt(stale, "master", supplied)
+            chk(f"an event base that is {label} renders `-`, and adds no word",
+                (rendered.endswith(" event_base=-"), len(rendered.split()), sha["A"] in rendered),
+                (True, want_words, True))
 
         # ---- THE PARSER, the inverse of the two rows above (#1238). It is DRIVEN by the
         # producer's own output — a parser must speak for what `receipt()` actually emits, not for
         # a hand-written approximation of it — while every EXPECTED value is a fixture sha read out
         # of the git repository, so the round trip cannot be satisfied tautologically.
         chk("the receipt parses back to the fields it was rendered from",
-            parse_receipt(receipt(stale, "master")),
+            parse_receipt(receipt(stale, "master", sha["B2"])),
             {"state": STALE, "base_ref": "master", "tested_base": sha["A"],
-             "live_tip": sha["B2"], "behind": "2"})
+             "live_tip": sha["B2"], "behind": "2", "event_base": sha["B2"]})
         chk("a receipt carried on a `gh run view --log` line still parses, tip included",
             parse_receipt("gate\tReport staleness\t2026-08-01T00:00:00.0000000Z "
                           + receipt(fresh, "master")),
             {"state": FRESH, "base_ref": "master", "tested_base": sha["A"],
-             "live_tip": sha["A"], "behind": "0"})
+             "live_tip": sha["A"], "behind": "0", "event_base": "-"})
         chk("an unresolved receipt parses to the dashes it claims, never to a sha",
             parse_receipt(receipt(unprovable, "master")),
             {"state": UNPROVABLE, "base_ref": "master", "tested_base": "-", "live_tip": "-",
-             "behind": "-"})
+             "behind": "-", "event_base": "-"})
+        # ---- [#1431] AND THE HISTORY STILL PARSES. gate-base-lead.py's whole sweep mines receipts
+        # out of run logs written before this field existed; a tail that retired them would blind
+        # the measurement it exists to feed, in the direction that reports NO evidence. This line is
+        # spelled out literally rather than built by `receipt()` on purpose — the producer can no
+        # longer emit it, and what a log actually holds is the only thing worth asserting here.
+        chk("a receipt written BEFORE the tail existed is still a receipt, with the tail empty",
+            parse_receipt(f"{RECEIPT_MARKER} state=stale base_ref=master tested_base={sha['A']} "
+                          f"live_tip={sha['B2']} behind=2"),
+            {"state": STALE, "base_ref": "master", "tested_base": sha["A"],
+             "live_tip": sha["B2"], "behind": "2", "event_base": ""})
+        # The two absences stay TELLABLE APART, and neither is a sha. `-` is truthy, so this row
+        # also pins that a consumer cannot decide on truthiness — the trap gate-base-lead.py
+        # already names for the `-` this module prints for an unestablished `tested_base`.
+        _predates = _field(f"{RECEIPT_MARKER} state=fresh base_ref=master "
+                           f"tested_base={sha['A']} live_tip={sha['A']} behind=0", "event_base")
+        _unstated = _field(receipt(fresh, "master"), "event_base")
+        chk("`` (the receipt predates the field) and `-` (the run stated no value) stay "
+            "distinguishable, and NEITHER is a sha even though `-` is truthy",
+            (_predates, _unstated, bool(_unstated),
+             bool(SHA_RE.fullmatch(_predates)), bool(SHA_RE.fullmatch(_unstated))),
+            ("", "-", True, False, False))
         # The reject direction. Each of these is a line a log realistically carries, and every one
         # of them would hand a crosstab a WRONG tested_base if the parser searched instead of
-        # pinning the exact word sequence.
+        # pinning the exact word sequence. The last four are the tail's own reject direction: it is
+        # ONE optional suffix, not a licence to parse loosely.
         for label, line in (
                 ("a log line with no marker at all", "gate\tstep\t2026-08-01 nothing here"),
                 ("a truncated receipt", f"{RECEIPT_MARKER} state=stale base_ref=master"),
@@ -625,6 +769,17 @@ def _self_test():
                  f"{RECEIPT_MARKER} base_ref=master state=stale tested_base=- live_tip=- behind=-"),
                 ("a receipt with a renamed field",
                  f"{RECEIPT_MARKER} state=stale base_ref=master base=- live_tip=- behind=-"),
+                ("a receipt whose TAIL field is renamed",
+                 f"{RECEIPT_MARKER} state=stale base_ref=master tested_base=- live_tip=- "
+                 "behind=- base_sha=-"),
+                ("a receipt whose tail repeats a core field instead",
+                 f"{RECEIPT_MARKER} state=stale base_ref=master tested_base=- live_tip=- "
+                 "behind=- live_tip=-"),
+                ("a receipt carrying the tail but a reordered core",
+                 f"{RECEIPT_MARKER} base_ref=master state=stale tested_base=- live_tip=- "
+                 "behind=- event_base=-"),
+                ("a receipt carrying the tail with a core field dropped",
+                 f"{RECEIPT_MARKER} state=stale base_ref=master live_tip=- behind=- event_base=-"),
                 ("a non-string line", None)):
             chk(f"{label} is NOT a receipt", parse_receipt(line), None)
         chk("the summary line of a stale run says so, and a fresh one does not",
@@ -695,12 +850,36 @@ def _self_test():
         chk("a missing operand is a usage error (exit 2), never a verdict",
             (run_cli()[0], run_cli("--head-sha", sha["H"])[0],
              run_cli("--base-ref", "master")[0]), (2, 2, 2))
+        # ---- [#1431] and the event observation, end to end. `main` is where a flag can be parsed
+        # and then never rendered. `sha["B2"]` is the moving tip while the merge ref composed
+        # `sha["A"]`, so this run's own line is the #920 shape and the two fields must NOT collide.
+        rc, out = run_cli("--head-sha", sha["H"], "--base-ref", "master",
+                          "--event-base-sha", sha["B2"])
+        chk("CLI: the event base reaches the receipt, beside a DIFFERENT graded tip",
+            (rc, f"tested_base={sha['A']}" in out, f"event_base={sha['B2']}" in out),
+            (0, True, True))
+        # ...and it is optional: an absent observation is a `-`, never a usage error. A required
+        # flag here would turn a missing payload field into a hard red on a REQUIRED gate.
+        rc, out = run_cli("--head-sha", sha["H"], "--base-ref", "master")
+        chk("CLI: an ABSENT event base still reports, exits 0, and states `-`",
+            (rc, "event_base=-" in out, "state=stale" in out), (0, True, True))
 
     # ---- the YAML seam, as parsed shapes. Every mutant is a live wiring regression that would
     # leave the step present and the report silent.
     good = _seam_fixture()
     chk("the documented wiring is accepted", _refused(assert_report_seam, good), "")
     chk("the documented checkout is accepted", _refused(assert_merge_ref_inputs, good), "")
+    # The three payload expressions, SPELLED OUT. Every seam row below compares the fixture against
+    # these CONSTANTS, so repointing one would move the fixture and the check together and pass
+    # vacuously (AGENTS.md pre-flight item 2c); the LIVE workflow row at the end of this harness is
+    # the only other thing that would catch it, and it needs PyYAML. `base.ref` and `base.sha` are
+    # four characters apart and mean different things (issues #920 and #1431) — this is the row that
+    # says which is which without reading either of them out of the code under test.
+    chk("the pinned payload expressions are the documented event fields, `.ref` and `.sha` apart",
+        (HEAD_SHA_EXPR, BASE_REF_EXPR, BASE_SHA_EXPR),
+        ("${{ github.event.pull_request.head.sha }}",
+         "${{ github.event.pull_request.base.ref }}",
+         "${{ github.event.pull_request.base.sha }}"))
 
     def mutate(fn):
         job = copy.deepcopy(good)
@@ -736,6 +915,21 @@ def _self_test():
         yield ("the value is fed from base.sha instead of base.ref",
                lambda j: j["steps"][1]["env"].update(
                    {BASE_REF_ENV: "${{ github.event.pull_request.base.sha }}"}))
+        # [#1431] The observation's own wiring. Dropping either half leaves every receipt reading
+        # `event_base=-` — a step that still runs, still passes, and measures nothing.
+        yield ("the event-base FLAG is dropped",
+               lambda j: j["steps"][1].update(
+                   {"run": j["steps"][1]["run"].replace(
+                       f' --event-base-sha "${BASE_SHA_ENV}"', "")}))
+        yield ("the event-base ENV is dropped", lambda j: j["steps"][1]["env"].pop(BASE_SHA_ENV))
+        # The right flag, the wrong variable: the argv still CONTAINS `--event-base-sha`, spelled
+        # correctly and in position, so only an exact match on the whole token sequence refuses it
+        # (AGENTS.md pre-flight item 6). `$PR_BASE_REF` is a branch name, which the renderer would
+        # dutifully turn into `event_base=-` on every single run.
+        yield ("the event-base flag is fed the base-REF variable",
+               lambda j: j["steps"][1].update(
+                   {"run": j["steps"][1]["run"].replace(f'--event-base-sha "${BASE_SHA_ENV}"',
+                                                        f'--event-base-sha "${BASE_REF_ENV}"')}))
         yield ("the env block is dropped", lambda j: j["steps"][1].pop("env"))
         yield ("the event field is interpolated straight into `run:`",
                lambda j: j["steps"][1].update(
@@ -745,6 +939,21 @@ def _self_test():
     for name, mutation in report_mutants():
         chk(f"the seam check REFUSES when {name}",
             bool(_refused(assert_report_seam, mutate(mutation))), True)
+
+    # ---- EACH env is pinned to ITS OWN expression, and the refusal has to NAME that env. All
+    # three are checked in one loop, so a row asserting only "something refused" would let the
+    # wrong branch's message be banked as the kill (AGENTS.md pre-flight item 4, "false kill") —
+    # and the swap rows below are the shape that matters: `base.ref` and `base.sha` are both real
+    # payload fields, so feeding one where the other belongs is a live edit, not a typo.
+    for env_name, expression, label in (
+            (HEAD_SHA_ENV, BASE_SHA_EXPR, "head.sha fed from base.sha"),
+            (BASE_REF_ENV, BASE_SHA_EXPR, "base.ref fed from base.sha"),
+            (BASE_SHA_ENV, BASE_REF_EXPR, "base.sha fed from base.ref"),
+            (BASE_SHA_ENV, HEAD_SHA_EXPR, "base.sha fed from head.sha")):
+        refusal = _refused(assert_report_seam, mutate(
+            lambda j, n=env_name, e=expression: j["steps"][1]["env"].update({n: e})))
+        chk(f"the seam check REFUSES {label}, and names {env_name}",
+            (bool(refusal), refusal.startswith(f"env {env_name} is")), (True, True))
 
     # ---- SHELL-LEVEL INERTNESS is a SEPARATE experiment from the YAML `if: false` above, and the
     # one this seam exists for. Each mutant below leaves the step present, unconditional, without
@@ -885,6 +1094,14 @@ def main(argv=None):
                         help="the pull request's head sha (github.event.pull_request.head.sha)")
     parser.add_argument("--base-ref", default="",
                         help="the base BRANCH name (github.event.pull_request.base.ref)")
+    # OPTIONAL ON PURPOSE (#1431), unlike the two operands above. It is an observation, not an
+    # operand: a report-only step inside a REQUIRED gate must not turn a missing payload field into
+    # a hard red, and an absent value already has a truthful rendering (`-`). What guarantees
+    # pr-gate actually supplies it is the YAML seam, not this exit code — the same structural guard
+    # the rest of this module relies on (see "THE FAIL DIRECTION" in the header).
+    parser.add_argument("--event-base-sha", default="",
+                        help="the EVENT payload's base.sha (github.event.pull_request.base.sha), "
+                             "recorded in the receipt as an observation and never an operand")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     if args.self_test:
@@ -893,7 +1110,7 @@ def main(argv=None):
         print("error: --head-sha and --base-ref are both required", file=sys.stderr)
         return 2
     result = freshness(args.head_sha, args.base_ref, os.getcwd())
-    print(receipt(result, args.base_ref))
+    print(receipt(result, args.base_ref, args.event_base_sha))
     note = annotation(result, args.base_ref)
     if note:
         print(note)
