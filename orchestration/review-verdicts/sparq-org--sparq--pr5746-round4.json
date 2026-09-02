@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5746,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b8b4df6556e5e56074923bf37ce32a3df43863c9",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The change gives ownership-map safe verdicts the same first-match semantics in change classification that closure selection already uses, while preserving the earlier precedence of full-run triggers and crates/** ownership. Map discovery and parsing degrade conservatively to the pre-change classifier, and all three workflow consumers recognize the new inert token consistently. The focused tests exercise the real select/classify and classify-only paths, protected ZK anchors, trigger and crate exclusions, mixed classifications, malformed or unavailable maps, default and explicit map discovery, workflow-token drift, and a mutation check. The implementation remains consistent with research/change-based-test-selection.md's SAFE-map and fail-closed rules. No correctness, soundness, security, test-vacuity, or prompt-injection issue is present in the supplied diff.",
+  "verdict": "approve"
+ }
+}
