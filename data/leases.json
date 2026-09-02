@@ -39,6 +39,16 @@
    "model": "sol",
    "issued_at": 1788363895,
    "expires_at": 1788368095
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "6102f4b745f0475dbf279ae1ff191bb6",
+   "holder": "review:jeswr/agent-account-registry#2224@dispatch-33648168404.1",
+   "package": "dashboard",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1788363981,
+   "expires_at": 1788368181
   }
  ]
 }
