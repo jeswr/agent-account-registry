@@ -411,10 +411,31 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+          # [issue #855] TWO populations of .github YAML, not one. This loop swept
+          # .github/workflows/ only, so a syntax error in .github/ISSUE_TEMPLATE/account.yml or
+          # set-up-account.yml merged green and surfaced later as a silently broken "New issue"
+          # form: actionlint reads workflows and nothing else, and the one check that looks at an
+          # issue form at all (scripts/grant-account.py --self-test) reads it as TEXT, which catches
+          # shape regressions but not malformed YAML.
+          # Each pass COUNTS what it parsed and refuses at zero. That guard is not ceremony here:
+          # `nullglob` means a glob matching nothing contributes nothing, so a renamed or moved
+          # directory would otherwise leave a step that still prints rows and still exits 0 with an
+          # entire population unparsed forever -- #1035's class, one seam over.
+          n_wf=0
           for f in .github/workflows/*.yml .github/workflows/*.yaml; do
             echo "== yaml-parse $f =="
             python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$f"
+            ((n_wf += 1))
           done
+          [[ "$n_wf" -gt 0 ]] || { echo "::error::yaml-parse swept no .github/workflows/*.yml"; exit 1; }
+          n_it=0
+          for f in .github/ISSUE_TEMPLATE/*.yml .github/ISSUE_TEMPLATE/*.yaml; do
+            echo "== yaml-parse $f =="
+            python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$f"
+            ((n_it += 1))
+          done
+          [[ "$n_it" -gt 0 ]] || { echo "::error::yaml-parse swept no .github/ISSUE_TEMPLATE/*.yml"; exit 1; }
+          echo "yaml-parsed $n_wf workflow(s) and $n_it issue template(s)"
           echo "== actionlint =="
           actionlint -color
 
