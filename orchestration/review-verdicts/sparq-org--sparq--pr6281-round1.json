@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6281,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bcaa83b1c22d9e1f72394f069577f33fe9ab26cf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "This diff makes `NotifyState` generic, replaces its public constructor arguments with `Arc<LdpState<S>>`, and changes all three public handler signatures. AGENTS.md requires every public API change to update the matching `skills/<surface>/SKILL.md` in the same change. No skill file appears in the diff, so downstream usage documentation can remain source-incompatible even though the crate README was updated.",
+    "file": "crates/sparq-lws-core/src/notifications/ws.rs",
+    "fix_hint": "Update `skills/solid-lws-server/SKILL.md` (and any referenced example that constructs `NotifyState` or directly invokes these handlers) in this PR, or avoid exposing/changing these implementation details as public API if they are not intended for consumers.",
+    "severity": "major",
+    "title": "Public API changes are not reflected in the matching usage skill"
+   },
+   {
+    "body": "`receive_authorized_bound_web_id_reaches_the_upgrade` claims the WebSocket extractor's rejection is the witness that token and WAC authorization passed, but it only asserts that the status is neither 401 nor 403. An unrelated 400, 404, or 500 produced before or during authorization would satisfy the test, so the positive path is not pinned to the real extractor outcome and regressions can pass vacuously.",
+    "file": "crates/sparq-lws-core/src/notifications/ws.rs",
+    "fix_hint": "Capture the exact status returned by `upgrade_rejection()` for the current Axum version and assert equality with that response, or exercise the router with a real WebSocket upgrade and assert successful upgrade/registration for an authorized bound WebID.",
+    "severity": "major",
+    "title": "Authorized receive-path test accepts unrelated error responses"
+   }
+  ],
+  "progress": null,
+  "summary": "The WAC checks appear coherently wired to the shared LDP state and are exercised on the denial path, but the change is incomplete under the repository's public-surface maintenance rule, and the authorized receive-path test does not pin the claimed outcome tightly enough to catch unrelated failures.",
+  "verdict": "request_changes"
+ }
+}
