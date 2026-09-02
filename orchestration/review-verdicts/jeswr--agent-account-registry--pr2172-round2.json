@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2172,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1c19a0240aed89e05024d53eb8d41235e4d9ecf1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 change remains correct and complete. Malformed `flow.target_ci_queue` containers and rows are diagnosed through a dedicated bounded drop log without changing tolerant row-drop behavior or suppressing valid neighboring rows. Repository text is sanitized and capped before logging; all other collector-controlled values are represented only by type. The hoisted repository regex is equivalent to the prior inline validation. The self-tests use independent literal inputs and expected messages and cover container, row, repository, depth, sanitization, suppression, budget independence, absent-key, valid-row, and mixed-row paths while preserving complete diagnostic ordering. No trust check, audit binding, or fail-closed behavior is weakened. With no findings in either round, progress is stagnant under the required scale rather than improving.",
+  "verdict": "approve"
+ }
+}
