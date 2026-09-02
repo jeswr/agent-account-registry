@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5763,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9cfe1f3231ab1e984f4326a16d8d9b35823d1232",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete. The helper neutralizes every run of three or more backticks at both Markdown-fence emission points while preserving one- and two-backtick content. The regression self-test exercises the real parser, issue-body builder, and artifact writer with three- and four-backtick payloads, verifies fence counts, preservation, and idempotence, and the docs-quality workflow now invokes it on pull requests. The self-test passes at the PR head; no correctness, soundness, test-validity, or security issue was found.",
+  "verdict": "approve"
+ }
+}
