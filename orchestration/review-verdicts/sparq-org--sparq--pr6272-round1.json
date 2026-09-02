@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6272,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "896f1591719c6261796a3a0d59e02a9dca362a4d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow change is correct and complete as scoped. ARCHIVE_FEATURES is consistently shared by archive construction, doctests, and the new nextest-list non-vacuity guard. The guard selects sparq-vectors' simd::tests with the same workspace/all-target/features configuration and fails if the feature-gated module disappears. The bulk-shard preflight correctly requires x86_64 plus both AVX2 and FMA, matching active_kernel's dispatch predicate; the existing CI-armed test independently verifies the real dispatcher path, so the /proc/cpuinfo check is not treated as sole evidence. Heavy shards do not run SIMD tests, while the three bulk partitions cover the non-heavy suite. No hostile reviewer-directed instruction was present in the diff.",
+  "verdict": "approve"
+ }
+}
