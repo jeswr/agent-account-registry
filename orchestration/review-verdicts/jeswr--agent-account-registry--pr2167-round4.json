@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2167,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b52297808ae2b5857c1ebef2b79eed62f62fa90e",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Carrying round 3's residual finding forward, but DOWNGRADED to nit after re-analysis.\n\nThe two new rows at 1506-1511 inject a `refuse` callable, so they never take the `require is None` branch at 100-102. Round 3 called that an uncaught-mutant gap; on the evidence it is not. `_load_workflow_yaml()` is called unconditionally at module scope (line 108), so a mutant that removes `from yaml_dependency import require_yaml` leaves `require` as None, `require(...)` raises TypeError at IMPORT time, and the script dies before any self-test row runs. The mutant is killed \u2014 loudly, in every lane.\n\nWhat genuinely remains is only a failure-SHAPE wart: `except (ImportError, RuntimeError)` does not include TypeError, so that death is an unhandled traceback rather than the structured `(None, exc)` path the docstring advertises the loader preserves. The live consumers at 477 and 1088 are unaffected either way \u2014 both raise AlarmError when `yaml is None`, so there is no fail-open here and nothing gate-relevant.\n\nNot blocking; recording it so the next reader does not re-derive it.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Optional. Either widen the tuple to `except (ImportError, RuntimeError, TypeError) as exc:` so an un-set `require` also lands on the structured path, or add one row that drives the real default branch by making the genuine import fail:\n\n    import sys as _sys\n    _saved = _sys.modules.pop(\"yaml_dependency\", None)\n    _sys.modules[\"yaml_dependency\"] = None  # forces ImportError on `from ... import`\n    try:\n        default_path = _load_workflow_yaml()\n    finally:\n        _sys.modules.pop(\"yaml_dependency\", None)\n        if _saved is not None:\n            _sys.modules[\"yaml_dependency\"] = _saved\n    chk(\"yaml loader takes the structured path when the helper module itself cannot be imported\",\n        default_path[0] is None and isinstance(default_path[1], ImportError))",
+    "severity": "nit",
+    "title": "TypeError is outside the loader's except tuple, so the `require is None` default path fails with an opaque traceback rather than the structured detector path"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3's blocker is fixed and the nit is gone; only a nit-level residual remains, so this is approvable.\n\nBLOCKER RESOLVED. scripts/yaml_dependency.py:87 now spells the entrypoint `if len(sys.argv) == 2 and sys.argv[1] == \"--self-test\":`. I re-ran the exact discovery ERE from worker-live.sh:1043 against the file and it matches (third alternative: `sys\\.argv\\[[^]]+\\][[:space:]]*==[[:space:]]*\"--self-test\"`, with the `^[[:space:]]*[^#].*` prefix satisfied by the leading `if`). So `_derive_full_selftest_suite` adds it to `suite`, the enrolled-entry arm at 1053-1057 is satisfied (selftest-suite.txt:65), the reverse advertising-but-unenrolled arm at 1059-1063 is satisfied, and pr-gate.yml's `print-selftest-suite` step no longer aborts. The redundant `import sys` in the `__main__` block is also gone.\n\nRe-verified the rest independently rather than trusting round 3:\n- Sparse-checkout audit is complete. All 10 sparse-checkout blocks (metrics.yml:192, backfill-provenance.yml:69, groom-sweep.yml:396/483/580/664/758, regate-sweep.yml:69, dispatch.yml:109/1582) \u2014 every block whose job executes a converted consumer gained `scripts/yaml_dependency.py`. dispatch.yml:1582 correctly omits it: that job runs only dispatch-secrets-guard.py, which reads worker-pr.py via `ast` (dispatch-claim/guard:1419) and worker-live.sh as text, never importing either. backfill-provenance.yml:69 is the `resolve` job (tomllib heredoc); `backfill-provenance.py --self-test` runs at line 174 under the FULL checkout at line 123. Every other converted consumer's self-test runs under a full checkout.\n- REQUIRED_FILES additions line up one-for-one with the corresponding sparse-checkouts (the assertions are `REQUIRED_FILES \u2286 sparse_lines`, e.g. ci-latency-alert.py:2929-2931), so no side reds.\n- Fail-closed preserved everywhere. `require_yaml` converts ONLY `ModuleNotFoundError` with `exc.name == \"yaml\"`; a broken nested package re-raises unchanged. ci-latency-alert's `yaml is None` sit\u2026 [truncated 1436 chars]",
+  "verdict": "approve"
+ }
+}
