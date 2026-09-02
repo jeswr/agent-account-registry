@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6220,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "23f9fd2abb5687c5178a85cb432f8a08b4460318",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_keys_by_step` uses `shared-key` or `key` and `test_every_rust_cache_step_names_its_key` accepts either as proving there is no anonymous, rename-fragile job component. Swatinem/rust-cache defines these differently: `shared-key` replaces the automatic job-based key, whereas `key` is an additional component alongside it. The coverage-engine-run and coverage-engine-merge steps use `key`, so they still depend on their job IDs and, because those job IDs differ, the merge step does not actually address the run step's cache despite using `coverage-engine-run-1`. Thus the new test goes green without establishing the PR's stated invariant.",
+    "file": "scripts/tests/test_mergequeue_cache_posture.py",
+    "fix_hint": "Model the two inputs separately. Require `shared-key` wherever the invariant is elimination of the automatic job-ID component, and change the coverage-engine run/merge steps to matching `shared-key` values (or explicitly exclude/document them and narrow the claim). Add a test that rejects a rust-cache step having only `key:` when asserting job-ID independence, and pin the intended run/merge shared-key relationship.",
+    "severity": "major",
+    "title": "The hygiene check incorrectly accepts `key` as a replacement for the job-derived key"
+   }
+  ],
+  "progress": null,
+  "summary": "The cache-key hygiene test does not enforce the property claimed by the PR. It treats rust-cache's `key` input as interchangeable with `shared-key`, although `key` is appended alongside the automatic job-based component while `shared-key` replaces that component. Consequently the two existing coverage-engine steps pass the new test while remaining job-ID-keyed and rename-fragile; moreover, coverage-engine-merge cannot reuse coverage-engine-run's cache merely by supplying the same `key` because their automatic job components differ. The focused tests pass, but this load-bearing assertion is semantically insufficient.",
+  "verdict": "request_changes"
+ }
+}
