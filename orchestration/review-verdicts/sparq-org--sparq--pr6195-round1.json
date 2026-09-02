@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6195,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6de9df866e2809ee3bbf6fa579b5b5e213005ba9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces job-scoped `key` inputs with an identical `shared-key` in both coverage-engine jobs, matching the pinned rust-cache action's cross-job key semantics. The structural tests are non-vacuous: they locate each named job, require exactly one rust-cache step, require both shared-key values to match, and reject a misleading simultaneous `key`. The run and merge jobs use the same toolchain setup, RUSTFLAGS, package, and feature set, while matrix partition selection remains an execution argument rather than a cache-key concern. No correctness, security, or test-validity issues were found.",
+  "verdict": "approve"
+ }
+}
