@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2190,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b91f8760b9e89e232fa4afc202f1402919dda49a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added self-test rows are sound, site-specific red tests for the three runner reset seams. Each establishes a non-empty stale-value precondition from the immediately preceding parking run, invokes a path that parks nothing, and then asserts both the relevant recorded values and the runner's expected calls. Consequently, deleting any individual clear from run_raa, run_review_outcome, or run_fix_outcome makes its own row fail rather than being masked by another runner. The changes are confined to the self-test, preserve existing trust checks, and introduce no security or fail-open behavior.",
+  "verdict": "approve"
+ }
+}
