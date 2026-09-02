@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6244,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "746214bd02c5b526ea1c12d853414c3fcf15813f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The design explicitly defines a workflow as non-inert when any selector-gated step reads it, but `test_o3_no_rust_ci_workflow_references_an_inert_workflow` only searches the YAML text for each inert file's literal basename. It misses a denylisted workflow invoking a script that reads that workflow, and it misses directory/glob-based reads such as `.github/workflows/*.yml`. Therefore the test does not establish the stated O3 obligation, and the inert-by-default policy can silently skip relevant CI when such an input exists or is introduced later.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Make dependency discovery cover step inputs transitively, including invoked repository scripts and directory/glob reads, or narrow the policy so inertness is allowlisted where dependencies can be audited. Add a negative fixture in which a denylisted workflow invokes a helper that reads an otherwise-inert workflow (and another using a workflow-directory glob), and require the gate to fail or classify that workflow as Rust-CI-relevant.",
+    "severity": "major",
+    "title": "O3 does not cover indirect or non-literal workflow inputs"
+   }
+  ],
+  "progress": null,
+  "summary": "The inversion is not yet backed by the proof claimed in the change. O3 checks only literal workflow filenames appearing directly in denylisted workflow YAML, but selector-gated jobs can read workflow files indirectly through invoked scripts or via directory/glob inputs. Such a dependency would remain invisible and an affected workflow would be classified inert, allowing the Rust matrix to be skipped after one of its inputs changes.",
+  "verdict": "request_changes"
+ }
+}
