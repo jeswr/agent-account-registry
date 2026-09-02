@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2232,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5da11bcef0628ce800e8c779c3bd3f5b0ef46af5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is correct and complete within the diff's scope. Refused non-printable trigger summaries remain excluded from the published document, are reported without echoing attacker-controlled content, and use an independently bounded drop-log seam so field failures cannot consume row or evidence warning budgets. The revised three-value helper contract has no stale callers. The self-tests cover quiet accept paths, truncation versus refusal, stripped/code-point counts, log-forgery resistance, cap and total behavior, seam independence, retained rows, and the guard ordering that prevents duplicate diagnostics; their expected values and flood sizes are test-side literals rather than values derived from production constants. No trust check, workflow permission, or security route is weakened.",
+  "verdict": "approve"
+ }
+}
