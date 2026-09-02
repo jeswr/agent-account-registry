@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6198,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "14da135610aba3bb453be678855b4762fbcd7080",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The release gui-bundle matrix replaces the source build with a SHA-pinned, architecture-aware prebuilt wasm-pack 0.15.0 installer, preserving the exact version used by the other wasm-pack lanes. The guardrail is job-scoped, strips comments, confirms an ARM64 matrix row, rejects both source compilation and the x86-only installer, and includes meaningful mutation checks for both regressions. The focused 17-test suite passes. No correctness, soundness, test-validity, or security issue was found.",
+  "verdict": "approve"
+ }
+}
