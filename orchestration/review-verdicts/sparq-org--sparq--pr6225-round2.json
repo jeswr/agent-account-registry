@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6225,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6515ea51d19c38827af8f0d9e45fab768315e3e1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "W1 exempts every `|| true` site solely when the parsed head is in OBSERVATIONAL_COMMANDS. Those programs are not intrinsically observational: `grep required output || true`, `find ... -exec failing-validator ... || true`, `cat required-generated-artifact || true`, or even a wrapper/function named `true` can be load-bearing. Thus a future two-character gate neutralization using one of these heads passes without a waiver, contradicting the stated ratchet and fail-closed objective. The self-test for grep explicitly codifies the overly broad exemption rather than proving that the particular invocation is non-gating.",
+    "file": "scripts/check-workflow-run-swallow.py",
+    "fix_hint": "Do not grant blanket exemptions by executable name. Require every statement-level swallow in a gating job to have a narrowly bound waiver, or implement syntax-specific exemptions that prove the complete invocation is a passive diagnostic/data probe and add negative tests such as `grep expected result || true` and `find ... -exec validator ... || true`.",
+    "severity": "major",
+    "title": "Command-name exemptions allow swallowed assertions to bypass W1"
+   },
+   {
+    "body": "find_unread_set_plus_e considers a whole `set +e` region safe if `$?` appears anywhere in it. It does not establish that the status read immediately follows each potentially failing command or that the captured value is acted on. For example, `set +e; ./gate; echo diagnostic; rc=$?; set -e` passes W2 while capturing `echo`'s status and completely swallowing `./gate`; `echo $?` also passes without enforcing anything. This directly violates the code and documentation claim that the tolerated failure is captured and acted on.",
+    "file": "scripts/check-workflow-run-swallow.py",
+    "fix_hint": "Track commands within each `set +e` region and require an immediate status capture for each non-observational command, followed by a demonstrable propagation/branch (or a narrowly scoped waiver). At minimum reject intervening commands and bare/non-enforcing `$?` reads, with self-tests for overwritten status and `echo $?`.",
+    "severity": "major",
+    "title": "W2 accepts unrelated or overwritten exit-status reads"
+   }
+  ],
+  "progress": null,
+  "summary": "The new gate is not fail-closed as claimed. Two broad classifier shortcuts let future gating commands swallow real failures without a waiver: command-name-only observational exemptions and a set +e check that merely looks for any subsequent read of $?. The self-tests pin these unsafe behaviors instead of testing the load-bearing distinction. Because this checker is intended to protect CI gate integrity, both are major correctness/security issues.",
+  "verdict": "request_changes"
+ }
+}
