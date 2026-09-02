@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2155,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "52f5a1128270451f12111c9f463aa29c8f12bc3d",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The extraction remains correct and complete. The shared cron_map module preserves the single field expander and derived schedule map, now refuses malformed workflow and schedule shapes without silently dropping lanes, and carries non-vacuous hermetic and live-tree tests. ci-latency-alert binds the shared objects while adapting CronMapError into its existing AlarmError reporting contract; dispatch-tick-floor and regate-sweep point to the new owner, and every affected sparse checkout includes that owner. The module is enrolled in the self-test suite, required-file seams are updated, and the workflow comments consistently name the new source. I found no trust-check weakening, permissive fallback, workflow permission expansion, secret exposure, or reviewer-directed injection. Round 6 also had no findings, so the result is materially unchanged.",
+  "verdict": "approve"
+ }
+}
