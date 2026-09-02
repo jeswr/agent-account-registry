@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2224,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "418af53209ff63297d5ea0340aa1b062b3b74c38",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The repository identifier is now bounded at the ingestion seam before publication, with independent literal boundary cases covering both the 39-character owner and 100-character repository-name maxima, just-over-limit refusals, and a very large conditionally bypassed input. The production guard remains full-match and fail-closed, malformed values retain bounded diagnostics, and the documentation accurately describes refusal rather than truncation. No correctness, security, or non-vacuity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
