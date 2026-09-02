@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2183,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a06d0523183e5fc1876cc082abfcb393ff3230af",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces permissive substring probes with independent, whitespace-normalized exact-value assertions for both secret-bearing workflow job guards. It separately records guard presence, preserves PyYAML boolean false rather than collapsing it with absence, and adds positive controls plus non-crashing widening/neutering mutants that exercise the production seam readers. The hand-transcribed expected guards are independent of the workflow values under test, the live workflow forms match them, and the new checks fail on missing, false, widened, or permanently disabled guards. No trust check is weakened and no security or correctness defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
