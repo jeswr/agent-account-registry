@@ -2114,6 +2114,20 @@ def _obs_flow(flow):
     # published a load-balance figure derived from the other half, and a wrong number reads as a
     # measurement where an empty panel at least reads as nothing.
     #
+    # [#2040] ...and the CONTAINER is announced too, for the reason `_obs_drop_queue` makes the same
+    # check on `flow.queue`: a collector sending `flow.leases` as a mapping (account -> utilization,
+    # the natural shape for the value being aggregated) is a dict, which loses every row before the
+    # loop even starts. #1869 scoped itself to the non-object ROW — the case that SKEWS the published
+    # number — and this is the case that hides it entirely: `"leases" in flow` is still true, so
+    # precedence stays rows-first, the collector's `lease_utilization_1h` is not consulted, and the
+    # panel stat publishes None with the loss visible nowhere.
+    #
+    # Keyed on the KEY's presence, exactly as `flow.queue`/`flow.target_ci_queue` are: an ABSENT
+    # `leases` key is the row-free #841 contract, not a mismatch, and keying this on the VALUE
+    # instead would write one warning per build against every collector that already satisfies it.
+    # Decision 22 again bounds the message to a type name this build computed: the container's KEYS
+    # can themselves be account identities, so nothing out of the value is named.
+    #
     # A row is subtracted from that sample TWO ways, and both are announced: the row is not an
     # object at all, or it is a well-formed row whose `utilization_1h` this build cannot read. The
     # second is the likelier producer/consumer mismatch — a collector reporting a percentage, a
@@ -2131,7 +2145,11 @@ def _obs_flow(flow):
     # named by TYPE for the same reason, since a collector controls that value too.
     lease_drops = _ObsDropLog("observability lease rows")
     lease_utilizations = []
-    for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
+    raw_leases = flow.get("leases")
+    if "leases" in flow and not isinstance(raw_leases, list):
+        lease_drops.drop("observability lease input (`flow.leases` "
+                         f"(type {type(raw_leases).__name__}) is not a list of rows)")
+    for item in raw_leases if isinstance(raw_leases, list) else []:
         if not isinstance(item, dict):
             lease_drops.drop("observability lease input "
                              f"(the row (type {type(item).__name__}) is not an object)")
@@ -8080,16 +8098,25 @@ esac
     _LEASE_ROWS = "observability lease rows"
     _KEPT_LEASE = {"label": "ab12cd340a5f9e71", "provider": "anthropic", "utilization_1h": 0.8}
 
-    def obs_lease_drops(rows, queue_rows=None):
+    def obs_lease_drops(rows, queue_rows=None, present=True, aggregate=None):
         """(published `flow.lease_utilization_1h`, EVERY `dashboard-gen:` line printed).
 
         The FIXTURE is quietened rather than the capture (as `obs_drops` does above): the golden
         snapshot's unknown queue class, retired cache keys, malformed target-CI row (#2039) and
         unsafe trigger rule each announce themselves from a different seam, and filtering them out
         of the capture would also hide a lease line mislabelled as one of them.
+
+        [#2040] `present=False` deletes the `leases` key outright (the row-free #841 contract, which
+        is the silent direction of the container check) and `aggregate` supplies the collector's
+        `flow.lease_utilization_1h`, which the fixture does not carry.
         """
         fixture = copy.deepcopy(obs_fixture)
-        fixture["flow"]["leases"] = rows
+        if present:
+            fixture["flow"]["leases"] = rows
+        else:
+            del fixture["flow"]["leases"]
+        if aggregate is not None:
+            fixture["flow"]["lease_utilization_1h"] = aggregate
         fixture["flow"]["queue"] = ([{"class": "2a", "depth": 1}]
                                     if queue_rows is None else queue_rows)
         fixture["flow"]["target_ci_queue"] = []
@@ -8234,6 +8261,77 @@ esac
           [_INT_CLASS]
           + [_LEASE_DROP.format("the row (type NoneType) is not an object")] * 12
           + [_SUPPRESSED.format(8, _LEASE_ROWS, 20)])
+    # ---- [#2040] ...AND SO MUST THE CONTAINER HOLDING THEM. #1869 above scoped itself to the
+    # non-object ROW — the case that SKEWS the published mean — and left the container it arrives in
+    # checked inline and silently. That is the `flow.queue` failure #982 announced, arriving one
+    # seam over and reading WORSE than #1869's: a collector sending `flow.leases` as a mapping
+    # (account -> utilization, the natural shape for the value being aggregated) loses every row
+    # before the loop starts, `"leases" in flow` is still true so precedence stays rows-first and
+    # the collector's own aggregate is never consulted, and the panel stat simply HIDES on a green
+    # build with the loss visible nowhere. Every expected string below is a test-side literal
+    # (pre-flight 2(b)) and every input is a literal (2(c)); the capture is the same ordered,
+    # unfiltered one the rows above use, so a line printed to the wrong seam, or once per KEY
+    # instead of once per container, reds.
+    _LEASE_CONTAINER = "`flow.leases` (type {}) is not a list of rows"
+    # THE REGRESSION, in the shape the issue names. The mapping carries TWO keys on purpose: a guard
+    # that announced per key (or that fell through into a loop over the keys) prints two lines here.
+    check("[#2040] a lease mapping keyed BY account loses EVERY row before the loop starts — the "
+          "container announces itself ONCE and the stat still hides, instead of a green build "
+          "publishing nothing where a load-balance figure belongs",
+          obs_lease_drops({"ab12cd340a5f9e71": 0.8, "ef56ab78b3c2d104": 0.4}),
+          (None, [_LEASE_DROP.format(_LEASE_CONTAINER.format("dict"))]))
+    # ONE LINE PER CONTAINER TYPE, walked by TYPE because a guard narrowed to one of them
+    # (`isinstance(raw, dict)`) survives a suite that only ever sends a mapping, and because null is
+    # the likeliest thing a JSON producer emits for a field it has stopped filling (pre-flight item
+    # 3's #938 shape: a guard made inert for exactly the null input).
+    for case, container, type_name in (
+        ("an explicitly null container", None, "NoneType"),
+        ("a string container", "ab12cd340a5f9e71=0.8", "str"),
+        ("a bare-scalar container", 0.8, "float"),
+    ):
+        check(f"[#2040] {case} names its type and nothing else, and the stat hides",
+              obs_lease_drops(container),
+              (None, [_LEASE_DROP.format(_LEASE_CONTAINER.format(type_name))]))
+    # THE SILENT DIRECTION, and the row that makes the guard's key the KEY's presence rather than
+    # the value's shape: an absent `leases` key is the row-free #841 contract every collector on the
+    # new contract satisfies. Rewrite the guard as `not isinstance(flow.get("leases"), list)` — the
+    # tempting one-line form — and this row reds with one warning per build, on every healthy fleet.
+    check("[#2040] an ABSENT `leases` key announces NOTHING and still consults the collector's "
+          "aggregate: a field the row-free contract deliberately omits is not a shape mismatch",
+          obs_lease_drops(None, present=False, aggregate={"mean": 0.31, "max": 0.77}),
+          ({"mean": 0.31, "max": 0.77}, []))
+    # ...and an EMPTY list is a well-formed container that measured nothing, not a mismatch either:
+    # a container check rewritten on truthiness (`not raw_leases`) announces this one and reds here.
+    check("[#2040] an EMPTY lease list is a well-formed container — it publishes null for want of a "
+          "sample, and announces nothing",
+          obs_lease_drops([]), (None, []))
+    # PRECEDENCE IS UNTOUCHED by the announcement: #841's rows-first rule keys on the legacy KEY, so
+    # a container this build cannot read must still refuse to fall back to the aggregate. Announcing
+    # the container and then consulting `lease_utilization_1h` would publish {0.99, 0.99} here — the
+    # silent override #841 forbids, dressed up as a fix.
+    check("[#2040] a non-list container does not hand the panel over to the collector's aggregate: "
+          "the stat hides and SAYS WHY, rather than silently publishing a figure the legacy key it "
+          "was sent alongside is supposed to outrank",
+          obs_lease_drops({"ab12cd340a5f9e71": 0.8}, aggregate={"mean": 0.99, "max": 0.99}),
+          (None, [_LEASE_DROP.format(_LEASE_CONTAINER.format("dict"))]))
+    # DECISION 22 bounds the container line exactly as it bounds #1869's row line, and it binds
+    # HARDER here: a mapping's KEYS are the account identities #374/#841 removed from the published
+    # page, so an `_obs_text` form of the container would republish a whole fleet's fingerprints —
+    # or a raw handle — into the build log diagnosing it. The type name is all that may be said.
+    _leaky_container = obs_lease_drops({handle: 0.5, "ab12cd340a5f9e71": 0.8})
+    check("[#2040] decision 22: a dropped lease container names its TYPE and nothing out of the "
+          "value — neither a raw handle nor a salted fingerprint keyed inside it reaches the log",
+          (_leaky_container[0], _leaky_container[1],
+           [text for text in (handle, "ab12cd340a5f9e71")
+            if text in "\n".join(_leaky_container[1])]),
+          (None, [_LEASE_DROP.format(_LEASE_CONTAINER.format("dict"))], []))
+    # ...and the container drop is counted into the LEASE seam, not a neighbour's: the queue seam's
+    # own bad row still names itself and the ordering is fixed (the queue loop closes first), so a
+    # container line emitted from the wrong `_ObsDropLog` reds on both text and position.
+    check("[#2040] the container drop belongs to the lease seam and leaves the queue seam's budget "
+          "and diagnostics untouched",
+          obs_lease_drops({"ab12cd340a5f9e71": 0.8}, queue_rows=[{"class": 1, "depth": 4}])[1],
+          [_INT_CLASS, _LEASE_DROP.format(_LEASE_CONTAINER.format("dict"))])
     # ---- [#2039] A DROPPED TARGET-CI ROW MUST NAME ITSELF. This is #982's `flow.queue` failure one
     # seam over, and it EMPTIES rather than skews: an empty target-CI panel is exactly what a fleet
     # with NO congested targets renders as, so a collector handing over the natural congestion
