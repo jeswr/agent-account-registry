@@ -8783,20 +8783,37 @@ CHANNEL
   # go red and nothing goes falsely green -- the same ENV-BLOCKED class the preflight below refuses
   # under, not a new failure mode.
   # The expected block below is typed here, NOT derived from pr-gate.yml, so it cannot compare the
-  # file against itself. It is deliberately a FROZEN literal: widening the sweep (#855 adds a
-  # `.github/ISSUE_TEMPLATE/` pass and an `[[ "$n" -gt 0 ]]` fail-closed guard, neither of which is
-  # on master yet) reds this row until the widened block is written here too -- that is the control
-  # working, not a conflict to route around. ----
+  # file against itself. It is deliberately a FROZEN literal: any widening of the sweep reds this
+  # row until the widened block is written here too -- that is the control working, not a conflict
+  # to route around. It has already fired once as designed: #855 added the
+  # `.github/ISSUE_TEMPLATE/` pass and the two `-gt 0` fail-closed count guards now typed below,
+  # and could not land until they were mirrored here. ----
   local yaml_sweep_name='actionlint + yaml-parse every workflow'
   local sw_set='set -euo pipefail'
   local sw_nullglob='shopt -s nullglob'
-  local sw_for='for f in .github/workflows/*.yml .github/workflows/*.yaml; do'
   local sw_echo='echo "== yaml-parse $f =="'
   local sw_parse='python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f"'
   local sw_done='done'
   local sw_lintecho='echo "== actionlint =="'
   local sw_lint='actionlint -color'
-  local -a sw_body=("$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" "$sw_parse" "$sw_done" \
+  # [issue #855] TWO passes over TWO populations, each counting what it parsed and refusing at
+  # zero. Both the second population and the guards are pinned the same way the first glob is: the
+  # comparison is whole-object, so a dropped pass or a dropped guard cannot leave a step that still
+  # prints rows, still exits 0, and reads as unchanged here.
+  local sw_wf_n='n_wf=0'
+  local sw_for='for f in .github/workflows/*.yml .github/workflows/*.yaml; do'
+  local sw_wf_inc='((n_wf += 1))'
+  local sw_wf_guard='[[ "$n_wf" -gt 0 ]] || { echo "::error::yaml-parse swept no .github/workflows/*.yml"; exit 1; }'
+  local sw_it_n='n_it=0'
+  local sw_it_for='for f in .github/ISSUE_TEMPLATE/*.yml .github/ISSUE_TEMPLATE/*.yaml; do'
+  local sw_it_inc='((n_it += 1))'
+  local sw_it_guard='[[ "$n_it" -gt 0 ]] || { echo "::error::yaml-parse swept no .github/ISSUE_TEMPLATE/*.yml"; exit 1; }'
+  local sw_count='echo "yaml-parsed $n_wf workflow(s) and $n_it issue template(s)"'
+  local -a sw_wf_pass=("$sw_wf_n" "$sw_for" "$sw_echo" "$sw_parse" "$sw_wf_inc" "$sw_done" \
+    "$sw_wf_guard")
+  local -a sw_it_pass=("$sw_it_n" "$sw_it_for" "$sw_echo" "$sw_parse" "$sw_it_inc" "$sw_done" \
+    "$sw_it_guard")
+  local -a sw_body=("$sw_set" "$sw_nullglob" "${sw_wf_pass[@]}" "${sw_it_pass[@]}" "$sw_count" \
     "$sw_lintecho" "$sw_lint")
   local expected_yaml_sweep
   expected_yaml_sweep=$(printf '%s\n' "- name: $yaml_sweep_name" 'run: |' "${sw_body[@]}" \
@@ -8828,19 +8845,34 @@ CHANNEL
   }
   # The one weakening every masking fixture below carries, named once: the `*.yaml` glob dropped --
   # #1035's own mutant, a step that still parses files, still prints rows and still exits 0.
-  local -a sw_body_weak=("$sw_set" "$sw_nullglob" 'for f in .github/workflows/*.yml; do' \
-    "$sw_echo" "$sw_parse" "$sw_done" "$sw_lintecho" "$sw_lint")
+  local -a sw_wf_pass_weak=("$sw_wf_n" 'for f in .github/workflows/*.yml; do' "$sw_echo" \
+    "$sw_parse" "$sw_wf_inc" "$sw_done" "$sw_wf_guard")
+  local -a sw_body_weak=("$sw_set" "$sw_nullglob" "${sw_wf_pass_weak[@]}" "${sw_it_pass[@]}" \
+    "$sw_count" "$sw_lintecho" "$sw_lint")
   _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}" | _yaml_sweep_wf "$loopfix/yaml-faithful.yml"
   _yaml_sweep_step "$yaml_sweep_name" "${sw_body_weak[@]}" \
     | _yaml_sweep_wf "$loopfix/yaml-glob-dropped.yml"
-  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" \
-    "$sw_parse || true" "$sw_done" "$sw_lintecho" "$sw_lint" \
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_wf_n" "$sw_for" "$sw_echo" \
+    "$sw_parse || true" "$sw_wf_inc" "$sw_done" "$sw_wf_guard" "${sw_it_pass[@]}" "$sw_count" \
+    "$sw_lintecho" "$sw_lint" \
     | _yaml_sweep_wf "$loopfix/yaml-parse-or-true.yml"
-  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" \
-    'if false; then' "$sw_parse" 'fi' "$sw_done" "$sw_lintecho" "$sw_lint" \
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_wf_n" "$sw_for" "$sw_echo" \
+    'if false; then' "$sw_parse" 'fi' "$sw_wf_inc" "$sw_done" "$sw_wf_guard" "${sw_it_pass[@]}" \
+    "$sw_count" "$sw_lintecho" "$sw_lint" \
     | _yaml_sweep_wf "$loopfix/yaml-parse-if-false.yml"
-  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" "$sw_parse" \
-    "$sw_done" "$sw_lintecho" "$sw_lint || true" | _yaml_sweep_wf "$loopfix/yaml-lint-or-true.yml"
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "${sw_wf_pass[@]}" \
+    "${sw_it_pass[@]}" "$sw_count" "$sw_lintecho" "$sw_lint || true" \
+    | _yaml_sweep_wf "$loopfix/yaml-lint-or-true.yml"
+  # [issue #855] THE NEW PASS'S OWN MUTANTS, both of which are coherent, runnable steps that still
+  # parse every workflow and still exit 0 -- exactly the quiet shape #1035 named. The first is the
+  # PRE-#855 step: the issue-form population simply not swept. The second keeps the sweep but drops
+  # its fail-closed count guard, so under `nullglob` a renamed .github/ISSUE_TEMPLATE/ reports
+  # success over zero files. Neither is reachable by mutating the workflows glob alone.
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "${sw_wf_pass[@]}" \
+    "$sw_lintecho" "$sw_lint" | _yaml_sweep_wf "$loopfix/yaml-it-pass-dropped.yml"
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "${sw_wf_pass[@]}" "$sw_it_n" \
+    "$sw_it_for" "$sw_echo" "$sw_parse" "$sw_it_inc" "$sw_done" "$sw_count" "$sw_lintecho" \
+    "$sw_lint" | _yaml_sweep_wf "$loopfix/yaml-it-guard-dropped.yml"
   # THE MUTUALLY-MASKING DUPLICATE (pre-flight item 4). An EXACT copy of the sweep parked earlier in
   # an inert context -- here an uncalled shell function inside an unrelated step -- is what a
   # content-anchored extractor would lock onto, leaving the real guard free to be weakened or
@@ -8908,7 +8940,7 @@ CHANNEL
   # refusals: a doc, a job or a `steps:` that is not what the schema requires cannot be read as
   # "no sweep step was weakened".
   _yaml_sweep_step "$yaml_sweep_name" "$sw_set" '# a comment the pin normalises away' \
-    "$sw_nullglob" "$sw_for" "$sw_echo" "$sw_parse" "$sw_done" '' "$sw_lintecho" "$sw_lint" \
+    "$sw_nullglob" "${sw_wf_pass[@]}" "${sw_it_pass[@]}" "$sw_count" '' "$sw_lintecho" "$sw_lint" \
     | _yaml_sweep_wf "$loopfix/yaml-commented.yml"
   { _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}"
     printf '%s\n' '  reusable:' '    uses: ./.github/workflows/other.yml'; } \
@@ -8962,6 +8994,12 @@ CHANNEL
        && printf missed || printf caught)" "caught"
   chk "yaml-sweep check is NON-VACUOUS: an '|| true' on actionlint no longer matches" \
     "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-lint-or-true.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: a DROPPED .github/ISSUE_TEMPLATE pass no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-it-pass-dropped.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: a DROPPED fail-closed count guard no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-it-guard-dropped.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
        && printf missed || printf caught)" "caught"
   chk "yaml-sweep check is NON-VACUOUS: a step-level 'if: false' no longer matches" \
     "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-step-if-false.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
