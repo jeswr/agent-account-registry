@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5746,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b8b4df6556e5e56074923bf37ce32a3df43863c9",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 5 remains correct and complete, with no material change from the approved round 4 findings. Ownership-map safe verdicts now use the same first-match semantics in change classification as in closure selection, while full-run triggers and crates/** paths retain precedence. Missing, unreadable, or malformed maps degrade conservatively to the prior classifier. All three workflow consumers recognize the new map-safe inert token, and the focused tests cover the real select/classify and classify-only paths, protected ZK anchors, trigger and crate exclusions, mixed classifications, map discovery and failures, workflow-token drift, and a mutation check. The change is consistent with the documented audited-safe and fail-closed model; no correctness, soundness, security, test-vacuity, or prompt-injection issue is present in the supplied diff.",
+  "verdict": "approve"
+ }
+}
