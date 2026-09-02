@@ -452,8 +452,11 @@ def valid_timestamp(value):
 
 def _via_app_proof(event, kind, label):
     """Is this timeline event PROVABLY App-driven? True only for a `performed_via_github_app`
-    that carries an ATTRIBUTABLE GitHub App identity — an integer `id` or a non-blank `slug`, the
-    two fields the REST timeline always ships on a real App object.
+    that carries an ATTRIBUTABLE GitHub App identity — a STRICTLY POSITIVE integer `id` or a
+    non-blank `slug`, the two fields the REST timeline always ships on a real App object. App ids
+    are 1-based serial keys, so `0` and every negative id name no App that can exist (round-2
+    finding: a bare `isinstance(int)` test made `{"id": 0}`/`{"id": -1}` mint MACHINE — the same
+    "malformed metadata read as positive automation proof" direction in a narrower shape).
 
     Absent/`null` is the ordinary "not an App" answer and returns False. ANY OTHER value —
     `false`, a bare scalar, a list, `{}`, an object with neither an id nor a slug — RAISES
@@ -472,7 +475,7 @@ def _via_app_proof(event, kind, label):
             f"{kind} event for {label} has a non-object performed_via_github_app")
     app_id = raw.get("id")
     slug = raw.get("slug")
-    if not ((isinstance(app_id, int) and not isinstance(app_id, bool))
+    if not ((isinstance(app_id, int) and not isinstance(app_id, bool) and app_id > 0)
             or (isinstance(slug, str) and slug.strip())):
         raise MalformedTimelineError(
             f"{kind} event for {label} has a performed_via_github_app naming no App id or slug")
@@ -3411,8 +3414,9 @@ def _self_test():
     # MAINTAINER's own removal read as App-driven, the removal stopped being human, and the park
     # went ahead over a live human veto. The well-formed App object above (row 8) still denies the
     # veto without raising, so this loop cannot be satisfied by ignoring the field.
+    # `{"id": 0}` / a negative id are the round-2 rows: an int that no real App can carry.
     for bad_app in (False, 0, "registry-app", [], {}, {"id": None, "slug": None},
-                    {"id": True, "slug": "  "}):
+                    {"id": True, "slug": "  "}, {"id": 0}, {"id": -1}):
         try:
             human_unpark_veto(
                 [bot_park, event("unlabeled", "needs:user", "2026-07-18T11:00:00Z", "jeswr",
@@ -3687,9 +3691,13 @@ def _self_test():
     # let every value below — a plain `false` included — answer MACHINE for an application no one
     # can attribute, i.e. permission to delete the hold. Each must be absorbed to UNKNOWN by the
     # I/O wrapper (never clearable) and RAISE out of the pure walk, like any malformed shape.
+    # The last two are the round-2 rows: a NON-POSITIVE `id` is an integer, but no App has id 0 or
+    # a negative one, so accepting it minted MACHINE (= permission to delete the hold) from an
+    # object naming no App that can exist. `{"id": 7}` above is the accept side that keeps this
+    # from being satisfied by rejecting every id.
     bad_app_rows = []
     for bad_app in (False, 0, 1, "registry-app", [], {}, {"id": None, "slug": None},
-                    {"id": True, "slug": "  "}):
+                    {"id": True, "slug": "  "}, {"id": 0}, {"id": -1}):
         own_timelines[13] = [{"event": "labeled", "label": {"name": audit},
                               "created_at": "2026-07-28T10:00:00Z", "actor": None,
                               "performed_via_github_app": bad_app}]
@@ -3700,7 +3708,7 @@ def _self_test():
     check("an App marker naming NO App id or slug is never machine proof and never clearable — "
           "it is a malformed read, in every non-null shape",
           bad_app_rows,
-          [(LABEL_OWNER_UNKNOWN, False, "MalformedTimelineError")] * 8)
+          [(LABEL_OWNER_UNKNOWN, False, "MalformedTimelineError")] * 10)
     # The same refusal must not be reachable by simply losing the field: a bot login still owns
     # its own application when performed_via_github_app is absent entirely.
     own_timelines[14] = [{"event": "labeled", "label": {"name": audit},
