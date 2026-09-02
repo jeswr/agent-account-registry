@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6215,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "077cb9e2bbfc68a46e8ef320bf5d3d2aac63faa6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "CARGO_INSTALL_ALLOWLIST is keyed only by filename, and test_no_source_compile_outside_allowlist subtracts that filename regardless of how many matches it contains or which job contains them. test_allowlist_is_not_stale merely checks that release.yml has at least one match. Thus a new `cargo install wasm-pack` in any other release.yml job\u2014or a duplicate in gui-bundle\u2014passes, despite the comments and docs-quality label claiming exactly one allowlisted site. This leaves a material hole in the repo-wide regression gate the PR introduces.",
+    "file": "scripts/tests/test_js_wasm_pack_install.py",
+    "fix_hint": "Represent the exemption at site granularity (for example workflow + job id, or an exact expected step identity) and assert exactly one matching source-install step in release.yml, located in gui-bundle. Add a mutation test with a second source-install step in another release job and verify that it fails.",
+    "severity": "major",
+    "title": "The release exemption allowlists an entire workflow instead of one install site"
+   }
+  ],
+  "progress": null,
+  "summary": "The workflow conversions themselves are consistent and the new test suite passes, but the repo-wide guard does not enforce the exemption it claims: it allowlists all of release.yml rather than the single gui-bundle install site. Consequently, another source-compiled wasm-pack step can be added anywhere in release.yml without failing the gate. The allowlist needs site-level matching and cardinality enforcement before this is a complete regression guard.",
+  "verdict": "request_changes"
+ }
+}
