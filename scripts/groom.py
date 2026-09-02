@@ -7037,6 +7037,97 @@ def _self_test() -> int:
               terminal_issue, {"owner/repo": backed_pull}, [base], "app[bot]"),
           set())
 
+    # ---- #1768 (a): the repair-holder / non-dict skip in _terminal_non_pr_claims -------------
+    #
+    # This `continue` had never executed under the whole suite (`>>>>>>` in the trace report), and
+    # an unexecuted guard is the shape that fails open: deleting it, or making it conditionally
+    # inert, could not red anything.
+    #
+    # It is the FUNCTION'S OWN totality contract, not a branch either live call site reaches —
+    # run_sweep filters repair holders out of `leases` before both of them, so a mutant that
+    # removes this guard is an equivalent survivor *in production today* (AGENTS.md item 4:
+    # declared, and shown unreachable, rather than claimed as a live hole). What it pins is that
+    # `_terminal_non_pr_claims` is total over the ledger's FULL holder vocabulary, so the day a
+    # third caller — or a change to that pre-filter — hands it the raw lease list, a `review:`/
+    # `fix:` holder is skipped instead of reaching `parse_holder` on the next line, whose grammar
+    # has no `:` and rejects it outright. Both live call sites are UNWRAPPED in run_sweep, so that
+    # rejection is a whole-sweep abort before `_release_claims` — the #647 head-of-line shape.
+    #
+    # Removing the guard — deleting it, or making the `continue` a `pass` — therefore kills by
+    # RAISING from the next line, which the TOTAL wrapper turns into a VALUE (AGENTS.md item 4)
+    # so it cannot abort the suite below and score itself a kill; both mutants leave the check
+    # COUNT unchanged. The last leg of each check is the accept direction, with the skipped
+    # holders removed: the SAME harness still reaps, so the retention is a property of the
+    # holders under test and not of a fixture that never reaps anything. (Widening the guard to
+    # skip every lease reds every leg here and 17 pre-existing #509/#1121/#1745/#649 checks.)
+    repair_reap_lease = {**base, "claim_id": "e" * 32, "holder": "review:owner/repo#7"}
+    fix_reap_lease = {**base, "claim_id": "f" * 32, "holder": "fix:owner/repo#7@dispatch-9.1"}
+
+    def _reap_set(reap_leases: list[Any]) -> Any:
+        # `{"owner/repo": {}}` is the ORPHAN shape: issue #7 is absent from a complete listing,
+        # so every lease that reaches `parse_holder` here is a confirmed reap candidate. A holder
+        # that is skipped is therefore skipped BEFORE that, which is the only thing under test.
+        try:
+            return _terminal_non_pr_claims(
+                {"owner/repo": {}}, {"owner/repo": {}}, reap_leases, "app[bot]")
+        except Exception as exc:  # noqa: BLE001 — TOTAL: report, never abort the suite
+            return f"raised {type(exc).__name__}"
+
+    check(
+        "#1768: `review:`/`fix:` repair leases on an ORPHANED target are SKIPPED (never reaped, "
+        "never parsed), while the impl lease on the SAME target beside them is still reaped",
+        (_reap_set([base, repair_reap_lease, fix_reap_lease]),
+         _reap_set([repair_reap_lease, fix_reap_lease]),
+         _reap_set([base])),
+        ({"a" * 32}, set(), {"a" * 32}),
+    )
+    check(
+        "#1768: a non-dict ledger entry is SKIPPED without raising and does not suppress the "
+        "reap of the real lease beside it",
+        (_reap_set(["owner/repo#7@dispatch-123.1", base]),
+         _reap_set(["owner/repo#7@dispatch-123.1"])),
+        ({"a" * 32}, set()),
+    )
+
+    # ---- #1768 (b): _fresh_issue's identity-change raise -------------------------------------
+    #
+    # `>>>>>>` too, and this one IS on the live release path: #509's boundary confirms a claim
+    # release off this DIRECT per-issue read (`groom.py` reap loop), and `/issues/<n>` is a
+    # namespace SHARED with pull requests — the same number can come back as a PR. Returning that
+    # payload instead of refusing hands the boundary a labelled object that is not the issue it
+    # planned against, and `_terminal_non_pr_claims` reads a `needs:*` label on it as "terminally
+    # parked": a CONFIRMED release derived from the wrong object. A malformed (non-dict) payload
+    # is the same failure with no labels at all. The end-to-end leg through run_sweep is with the
+    # #509 sweep fixtures below; these pin the reader's own two directions.
+    class _IdentityAPI:
+        def __init__(self, payload: Any) -> None:
+            self.payload = payload
+
+        def request(self, _method, _path, _body=None, allow_404=False, **_kwargs):
+            return self.payload
+
+    def _fresh(payload: Any) -> Any:
+        try:
+            return _fresh_issue(_IdentityAPI(payload), "owner/repo", 7)
+        except GroomError as exc:
+            return f"refused: {exc}"
+        except Exception as exc:  # noqa: BLE001 — TOTAL, as above
+            return f"raised {type(exc).__name__}"
+
+    identity_issue = {"number": 7, "state": "open", "labels": [{"name": "needs:user"}]}
+    check(
+        "#1768: `/issues/<n>` answering with a PULL REQUEST, or with a malformed payload, "
+        "REFUSES by name — while a real issue payload is returned UNCHANGED and a 404 is None",
+        (_fresh({**identity_issue, "pull_request": {"url": "https://example.invalid/pulls/7"}}),
+         _fresh([identity_issue]),
+         _fresh(identity_issue) is identity_issue,
+         _fresh(None)),
+        ("refused: target issue identity changed for owner/repo#7",
+         "refused: target issue identity changed for owner/repo#7",
+         True,
+         None),
+    )
+
     # ---- #1745: _worker_pulls_for_issue, the KEYED PR-half read ------------------------------
     # The reap boundary's end-to-end legs live with the sweep fixtures below; these pin the
     # reader's own refusals and its one filter, none of which the sweep can reach.
@@ -8922,8 +9013,14 @@ def _self_test() -> int:
             "labels": [{"name": "area:crate-a"}, {"name": "status:in-progress"}],
         }
 
-        def _skipped_by_page_walk(fresh: dict[int, Any]) -> tuple[int, list[set[str]]]:
-            terminal_sweep_leases[:] = [dict(skipped_lease)]
+        def _skipped_by_page_walk(
+            fresh: dict[int, Any], extra: tuple[dict[str, Any], ...] = (),
+        ) -> tuple[Any, list[set[str]]]:
+            # `extra` (#1768) is the `_pr_half` companion pattern: a scenario in which the ONE
+            # candidate defers needs a second candidate that revalidates cleanly, or run_sweep's
+            # "every revalidation failed" precedence raises and the assertion can no longer tell
+            # a SCOPED retention from a systemic abort. Existing callers pass none.
+            terminal_sweep_leases[:] = [dict(skipped_lease), *(dict(x) for x in extra)]
             terminal_sweep_env.update(planned_issues=[], fresh_issues=fresh, writes=[])
             terminal_sweep_releases.clear()
             # TOTAL: any exception is reported as a value, so a mutant that makes the sweep blow
@@ -8942,6 +9039,60 @@ def _self_test() -> int:
              _skipped_by_page_walk({}),
              _skipped_by_page_walk({7: {**live_issue, "state": "closed"}})),
             ((0, [set()]), (1, [{race_claim}]), (1, [{race_claim}])),
+        )
+
+        # ---- #1768: the fresh per-issue read whose IDENTITY drifted --------------------------
+        #
+        # `_fresh_issue`'s `target issue identity changed` raise had never executed anywhere in
+        # this suite. It guards the very read #1121 pins above, on the same release side of
+        # #509's boundary: `/issues/<n>` is a namespace SHARED with pull requests, so the number
+        # the sweep planned against can come back as a PR — a different object, wearing labels of
+        # its own. Without the raise that payload flows straight into `fresh_reap_issues` and
+        # `_terminal_non_pr_claims` reads its `needs:user` as "terminally parked", so the
+        # boundary CONFIRMS a release off an object it never planned against. An un-executed
+        # `raise` is exactly the shape that fails open.
+        #
+        # A MINIMAL PAIR: one lease, one empty listing, the same open `needs:user` payload,
+        # differing ONLY in the presence of the `pull_request` key.
+        #   (a) drifted -> RETAIN, with the refusal NAMED in the deferral ALERT (the reap loop's
+        #       fail direction, not record-and-continue).
+        #   (b) the identical payload as a real ISSUE -> RELEASE, so (a)'s retention is the raise
+        #       firing and not a blanket refusal to reap a labelled issue.
+        # Both mutants of AGENTS.md item 3 turn (a) into (b)'s answer and red this check: DELETE
+        # (the raise is the whole `if` body, so the guard goes with it) and CONDITIONALLY INERT
+        # (`if number < -424242: raise ...` — non-crashing, falls through to `return item`, and
+        # -424242 appears nowhere in this harness). Neither changes the suite's check COUNT, so
+        # neither is a crash-after-partial-run scoring itself a kill.
+        drifted_identity = {
+            **parked_issue, "pull_request": {"url": "https://example.invalid/pulls/7"}
+        }
+        # The companion candidate: a different issue, absent from every listing and from
+        # `fresh_issues`, so it revalidates cleanly and reclaims in BOTH legs. Its presence is
+        # what makes (a) a scoped deferral rather than a whole-sweep abort (see `extra` above).
+        drift_companion_claim = "7" * 32
+        drift_companion_lease = {
+            **base, "claim_id": drift_companion_claim, "holder": "owner/repo#8@778.1",
+            "issued_at": 1, "expires_at": 2,
+        }
+
+        def _identity_drift(fresh: dict[int, Any]) -> tuple[Any, ...]:
+            drift_log = io.StringIO()
+            saved_drift_stdout = sys.stdout
+            sys.stdout = drift_log
+            try:
+                outcome = _skipped_by_page_walk(fresh, (drift_companion_lease,))
+            finally:
+                sys.stdout = saved_drift_stdout
+            return (*outcome,
+                    "target issue identity changed for owner/repo#7" in drift_log.getvalue())
+
+        check(
+            "#1768: a reap candidate whose fresh per-issue read comes back as a PULL REQUEST "
+            "RETAINS its claim and names the refusal — while the otherwise identical payload "
+            "WITHOUT `pull_request` is reaped, and the companion candidate reclaims either way",
+            (_identity_drift({7: drifted_identity}), _identity_drift({7: parked_issue})),
+            ((1, [{drift_companion_claim}], True),
+             (2, [{race_claim, drift_companion_claim}], False)),
         )
 
         # The refusal envelope every scenario below builds its GroomError from — GitHub's own

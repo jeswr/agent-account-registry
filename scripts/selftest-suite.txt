@@ -5,6 +5,7 @@ broker-refresh.py
 chain_preference.py
 ci-latency-alert.py
 compose-gate.py
+cron_map.py
 cross-resolver-agreement.py
 curate-frontier.py
 dashboard-gen.py

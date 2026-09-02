@@ -1515,6 +1515,166 @@ def declared_options(parser):
     return {option for action in parser._actions for option in action.option_strings}  # noqa: SLF001
 
 
+# ---------------------------------------------------------------------------------------------------
+# [#1325] AN ACTIONS-EXPRESSION EVALUATOR FOR THE CONCURRENCY SEAM.
+#
+# `concurrency.group` / `concurrency.cancel-in-progress` are now EXPRESSIONS, and AGENTS.md
+# pre-flight 6 is explicit that the YAML seam is where the vacuity lives: a string pin over an
+# expression cannot tell a correct policy from an inverted one, because the next author updates the
+# expected string in the same edit. So the self-test RESOLVES the workflow's own expression text the
+# way the runner resolves it, over each of the workflow's own trigger types, and asserts the
+# resulting GROUP and CANCELLATION per event — an inverted branch, an `unlabeled` folded into the
+# shared group, or a reverted `cancel-in-progress` reds a row that names the policy.
+#
+# The grammar is RESTRICTED ON PURPOSE and every departure from it RAISES, exactly as
+# dispatch-tick-floor's `_eval_job_if` refuses an unmodelled job gate: a concurrency key this
+# harness cannot evaluate is an UNCHECKED policy on a surface no runtime check reaches, so it must
+# be a refusal and never a silent pass. Widen it deliberately, or keep the seam in this grammar.
+class WorkflowExpressionError(RuntimeError):
+    """An Actions expression outside the grammar this harness models."""
+
+
+_GHA_TOKEN = re.compile(r"""
+      (?P<str>'(?:[^']|'')*')
+    | (?P<name>[A-Za-z_][A-Za-z0-9_.]*)
+    | (?P<op>==|!=|&&|\|\||\(|\)|,)
+""", re.X)
+
+# GitHub's falsy set for `&&` / `||`, which return an OPERAND rather than a boolean.
+_GHA_FALSY = (False, 0, "", None)
+
+
+def _gha_truthy(value):
+    return not any(value is falsy or (type(value) is type(falsy) and value == falsy)
+                   for falsy in _GHA_FALSY)
+
+
+def evaluate_workflow_expression(text, context):
+    """Resolve ONE `${{ ... }}` Actions expression against `context` -> the value the runner yields.
+
+    Modelled grammar: string literals, `true`/`false`, dotted context paths, `format()`, `==`/`!=`,
+    and `&&`/`||` with GitHub's operand-returning semantics (`a && b || c` is the ternary this
+    repository's workflows use). ANYTHING else — another function, an operator, a bare scalar that
+    is not wrapped in `${{ }}` (i.e. a seam reverted to a plain YAML literal), or a context path the
+    caller did not model — raises WorkflowExpressionError.
+    """
+    if not isinstance(text, str):
+        raise WorkflowExpressionError(f"not an expression: {text!r}")
+    body = text.strip()
+    if not (body.startswith("${{") and body.endswith("}}")):
+        raise WorkflowExpressionError(
+            f"{text!r} is not a `${{{{ ... }}}}` expression — a seam reverted to a plain literal is "
+            "a policy this harness cannot evaluate, so it refuses rather than assuming one")
+    tokens, pos = [], 0
+    inner = body[3:-2]
+    while pos < len(inner):
+        if inner[pos].isspace():
+            pos += 1
+            continue
+        match = _GHA_TOKEN.match(inner, pos)
+        if not match:
+            raise WorkflowExpressionError(f"unlexable Actions expression at {inner[pos:]!r}")
+        pos = match.end()
+        if match.lastgroup == "str":
+            tokens.append(("str", match.group(0)[1:-1].replace("''", "'")))
+        else:
+            tokens.append((match.lastgroup, match.group(0)))
+
+    cursor = 0
+
+    def peek():
+        return tokens[cursor] if cursor < len(tokens) else (None, None)
+
+    def advance():
+        nonlocal cursor
+        token = peek()
+        # CLAMPED at the end deliberately. Running the cursor past the token list made an
+        # expression that ended PREMATURELY report "trailing tokens" instead of the guard it
+        # actually tripped, so the specific refusal branches became mutually masking (pre-flight 4)
+        # — swallowing one of them still raised, from the wrong place, and the mutant survived.
+        if cursor < len(tokens):
+            cursor += 1
+        return token
+
+    def lookup(path):
+        node = context
+        for part in path.split("."):
+            if not isinstance(node, dict) or part not in node:
+                raise WorkflowExpressionError(
+                    f"context path {path!r} is not modelled by this harness — an expression reading "
+                    "state the caller never supplied cannot be resolved")
+            node = node[part]
+        return node
+
+    def primary():
+        kind, value = advance()
+        if kind == "str":
+            return value
+        if kind == "op" and value == "(":
+            inner_value = disjunction()
+            if advance() != ("op", ")"):
+                raise WorkflowExpressionError("unbalanced parentheses in Actions expression")
+            return inner_value
+        if kind != "name":
+            raise WorkflowExpressionError(f"unexpected token {value!r} in Actions expression")
+        if value in ("true", "false"):
+            return value == "true"
+        if peek() != ("op", "("):
+            return lookup(value)
+        # A CALL. Its arguments are consumed BEFORE the callee is judged, so an unmodelled function
+        # trips its OWN branch with no tokens left over. Judging the name first left this refusal
+        # MASKED by the trailing-token guard below — swallowing it still raised, from somewhere
+        # else, and the mutant survived (pre-flight 4's mutually-masking pair, measured here).
+        advance()
+        arguments = [] if peek() == ("op", ")") else [disjunction()]
+        while peek() == ("op", ","):
+            advance()
+            arguments.append(disjunction())
+        if advance() != ("op", ")"):
+            raise WorkflowExpressionError(f"unbalanced `{value}(` in Actions expression")
+        if value != "format":
+            raise WorkflowExpressionError(
+                f"function {value!r} is outside the grammar this harness models — widen it "
+                "deliberately rather than leaving the concurrency policy unchecked")
+        if not arguments:
+            raise WorkflowExpressionError("`format()` was called with no format string")
+        rendered = str(arguments[0])
+        for index, argument in enumerate(arguments[1:]):
+            rendered = rendered.replace("{%d}" % index, str(argument))
+        return rendered
+
+    def comparison():
+        left = primary()
+        kind, value = peek()
+        if kind == "op" and value in ("==", "!="):
+            advance()
+            right = primary()
+            return (left == right) if value == "==" else (left != right)
+        return left
+
+    def conjunction():
+        left = comparison()
+        while peek() == ("op", "&&"):
+            advance()
+            right = comparison()
+            left = right if _gha_truthy(left) else left
+        return left
+
+    def disjunction():
+        left = conjunction()
+        while peek() == ("op", "||"):
+            advance()
+            right = conjunction()
+            left = left if _gha_truthy(left) else right
+        return left
+
+    result = disjunction()
+    if cursor != len(tokens):
+        raise WorkflowExpressionError(
+            f"trailing tokens in Actions expression: {tokens[cursor:]!r}")
+    return result
+
+
 def _self_test():
     ok = True
 
@@ -2473,6 +2633,124 @@ def _self_test():
     chk("[#607] the classifier step is gated by TRUST ALONE (no event-type condition), so it DOES "
         "run on labeled/unlabeled",
         step_if(wf_step("Static triage (trusted author)")), "steps.trust.outputs.trusted == '1'")
+
+    # -----------------------------------------------------------------------------------------------
+    # [#1325] THE CROSS-ISSUE DEBOUNCE — EVALUATED PER EVENT TYPE, NEVER PATTERN-MATCHED.
+    #
+    # #607 widened the trigger to the label events; #1325 measured what that costs in bulk. A
+    # relabel of 37 issues opened 37 DISTINCT per-issue concurrency groups, so ~47 triage runs
+    # EXECUTED at once against the installation's shared hourly github.token budget, exhausted it,
+    # and the dispatcher's GUARD job failed closed for the rest of the hour. So `labeled` now
+    # collapses into ONE repo-wide group with `cancel-in-progress: false` (GitHub keeps one run in
+    # progress plus one PENDING and cancels the rest before they spend anything), while every other
+    # trigger type keeps its own per-issue group.
+    #
+    # `unlabeled` STAYING PER-ISSUE IS A TRUST CHECK, not a style choice: it is the event that
+    # carries a `trust:untrusted` strip, and the quarantine restore above is what stops a
+    # triage-role actor clearing the hard gate. The retriage sweep cannot stand in for it (its
+    # lanes only SKIP an untrusted author — they never re-quarantine), so a burst must never be
+    # able to cancel that run. That is what the per-event rows below assert.
+    #
+    # THE EXPECTED VALUES ARE WRITTEN HERE AND THE INPUTS COME FROM THE WORKFLOW (pre-flight 2b/2c):
+    # the event types are `trigger_types`, read out of the file's own `types:` list above, so a
+    # widened trigger with no debounce decision reds the second row instead of silently inheriting
+    # one. An expression the evaluator cannot resolve — including the seam reverted to a plain YAML
+    # literal — becomes an `UNEVALUATABLE:` value rather than an exception, so it reds ONE row
+    # instead of aborting the suite (pre-flight 4's crash-after-partial-run).
+    concurrency_block = re.search(r"\nconcurrency:\n((?:  \S[^\n]*\n)+)", wf_body)
+
+    def concurrency_expr(key):
+        found = re.search(rf"(?m)^  {re.escape(key)}: (.+)$", concurrency_block.group(1)
+                          if concurrency_block else "")
+        return found.group(1).strip() if found else f"<no `{key}:` in the concurrency block>"
+
+    def resolved(action, number=90210):
+        """(group, cancel-in-progress) as the runner would resolve them for one issues event."""
+        context = {"github": {"event": {"action": action, "issue": {"number": number}}}}
+        out = []
+        for key in ("group", "cancel-in-progress"):
+            try:
+                out.append(evaluate_workflow_expression(concurrency_expr(key), context))
+            except WorkflowExpressionError as exc:
+                out.append(f"UNEVALUATABLE: {exc}")
+        return tuple(out)
+
+    chk("[#1325] EVALUATED: a `labeled` event resolves to the ONE repo-wide debounce group and "
+        "does NOT cancel in progress (so a bulk relabel executes ~2 runs, not one per issue)",
+        resolved("labeled"), ("triage-label-fanout", False))
+    chk("[#1325] EVALUATED: every OTHER trigger type — the `unlabeled` quarantine-strip above "
+        "included — keeps its own per-issue group and its own run",
+        {action: resolved(action) for action in trigger_types if action != "labeled"},
+        {"edited": ("triage-90210", True), "opened": ("triage-90210", True),
+         "reopened": ("triage-90210", True), "unlabeled": ("triage-90210", True)})
+    # NON-VACUITY OF THE PAIR ABOVE. Both rows are satisfied by a shipped expression AND by a
+    # broken evaluator that answered the same way for everything, so drive the SAME evaluator over
+    # the two regressions this section exists to stop and require it to report them differently.
+    # These mutants are expression TEXT the workflow does not contain, so neither row can be
+    # passing on the evaluator's own defaults.
+    collapse_all = "${{ 'triage-label-fanout' }}"
+    collapse_unlabeled_too = ("${{ (github.event.action == 'labeled' || github.event.action == "
+                              "'unlabeled') && 'triage-label-fanout' "
+                              "|| format('triage-{0}', github.event.issue.number) }}")
+    unlabeled_context = {"github": {"event": {"action": "unlabeled",
+                                             "issue": {"number": 90210}}}}
+    chk("[#1325] NON-VACUITY: the same evaluator DOES fold `unlabeled` into the shared group for "
+        "both regression shapes — so the row above discriminates the workflow's expression",
+        (evaluate_workflow_expression(collapse_all, unlabeled_context),
+         evaluate_workflow_expression(collapse_unlabeled_too, unlabeled_context)),
+        ("triage-label-fanout", "triage-label-fanout"))
+    chk("[#1325] NON-VACUITY: and it reports the PRE-#1325 shape — every event in its own group — "
+        "for a `labeled` event, which is the amplification that took the dispatcher down",
+        evaluate_workflow_expression(
+            "${{ format('triage-{0}', github.event.issue.number) }}",
+            {"github": {"event": {"action": "labeled", "issue": {"number": 90210}}}}),
+        "triage-90210")
+    chk("[#1325] NON-VACUITY: a `cancel-in-progress` reverted to an unconditional truth resolves "
+        "True on a `labeled` event, so the False above is read from the workflow, not assumed",
+        evaluate_workflow_expression("${{ true }}", unlabeled_context), True)
+    # THE EVALUATOR REFUSES WHAT IT CANNOT MODEL (dispatch-tick-floor's `_eval_job_if` rule): an
+    # unevaluatable concurrency key is an unchecked policy, so it must raise rather than resolve to
+    # something plausible. Both departures are driven: an unmodelled FUNCTION, and the seam reverted
+    # to the plain YAML literal `true` that this change replaced.
+    def refuses(text):
+        try:
+            evaluate_workflow_expression(text, unlabeled_context)
+        except WorkflowExpressionError:
+            return True
+        return False
+
+    # EVERY refusal branch is DRIVEN, not merely declared. Line coverage of this evaluator showed
+    # all eight of its raises never executed (pre-flight 1: an entry point's unexecuted refusal path
+    # is exactly where a fabricating bug survives — a `pass` in any one of them turns a malformed
+    # concurrency expression into a plausible resolved value and the rows above go quietly vacuous).
+    # The last row is the POSITIVE control: a well-formed expression must still resolve, so a
+    # refuse-everything evaluator cannot satisfy this check either.
+    chk("[#1325] the evaluator REFUSES every departure from its grammar rather than guessing",
+        {name: refuses(text) for name, text in (
+            ("unmodelled function", "${{ startsWith(github.event.action, 'label') }}"),
+            ("seam reverted to a plain YAML literal", "true"),
+            ("unmodelled context path", "${{ github.event.issue.title }}"),
+            ("not a string at all", None),
+            ("unlexable operator", "${{ github.event.action ^ 'labeled' }}"),
+            ("unbalanced parentheses", "${{ ('labeled' }}"),
+            ("expression opening on an operator", "${{ == 'labeled' }}"),
+            # ...and the same departure with NOTHING after it. The row above is refused by the
+            # trailing-token guard too, so on its own it cannot tell whether the `unexpected token`
+            # branch still exists; this one leaves no trailing token for the other guard to catch.
+            ("an expression that is ONLY an operator", "${{ == }}"),
+            ("`format` used as a bare name", "${{ format 'triage' }}"),
+            ("unbalanced format(", "${{ format('triage-{0}', 'x' }}"),
+            ("format() with no format string", "${{ format() }}"),
+            ("trailing tokens", "${{ 'labeled' 'labeled' }}"),
+            ("POSITIVE CONTROL: a well-formed expression", "${{ 'labeled' }}"))},
+        {"unmodelled function": True, "seam reverted to a plain YAML literal": True,
+         "unmodelled context path": True, "not a string at all": True,
+         "unlexable operator": True, "unbalanced parentheses": True,
+         "expression opening on an operator": True, "an expression that is ONLY an operator": True,
+         "`format` used as a bare name": True,
+         "unbalanced format(": True, "format() with no format string": True,
+         "trailing tokens": True,
+         "POSITIVE CONTROL: a well-formed expression": False})
     # -----------------------------------------------------------------------------------------------
     # [#1741] THE PROSE COPIES OF THAT SAME SET ARE PINNED HERE TOO — the #958 shape applied to
     # prose. Two sibling modules RESTATE this trigger set in their own comments/docstrings

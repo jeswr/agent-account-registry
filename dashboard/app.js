@@ -1044,15 +1044,22 @@ function obsRenderTriggers(fires, total) {
       meta.append(node("span", "obs-chip", `heal task ${fire.enqueued_task}`));
     }
     const links = Array.isArray(fire.evidence) ? fire.evidence : [];
+    // [#2162] The label counts ANCHORS DRAWN, not entries in `fire.evidence`: numbering by array
+    // index made a refused link leave a hole in the sequence — a hand-edited data.json whose second
+    // link is not a github.com URL rendered `evidence 1  evidence 3`, numbering a link the reader
+    // cannot reach and cannot even see was withheld. `shown` is incremented BEFORE the label is
+    // composed so the one counter drives both affordances on this row: #2009 already made the
+    // `+N more` below count what rendered, and the two disagreeing about what they count is the
+    // whole defect — `evidence 1  evidence 3` beside `+2 more` describes five links out of four.
     let shown = 0;
-    links.forEach((href, index) => {
-      if (typeof href !== "string" || !href.startsWith("https://github.com/")) return;
-      const anchor = node("a", "obs-evidence", `evidence ${index + 1}`);
+    for (const href of links) {
+      if (typeof href !== "string" || !href.startsWith("https://github.com/")) continue;
+      shown += 1;
+      const anchor = node("a", "obs-evidence", `evidence ${shown}`);
       anchor.href = href;
       anchor.rel = "noopener";
       meta.append(anchor);
-      shown += 1;
-    });
+    }
     // [#2009] The generator publishes 5 links per fire out of however many it read, so an alarm
     // with 12 pieces of evidence rendered exactly like one with 5. `shown` counts the anchors this
     // row actually drew, not `links.length`: a hand-edited data.json can carry a link the pin above

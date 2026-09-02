@@ -432,8 +432,8 @@ jobs:
   # 15-min slots; curate/conflict-resolver intermittent). This job piggybacks on dashboard's
   # PROVEN */15 schedule and re-dispatches a listed workflow ONLY when its liveness anchor is
   # older than its own cadence + slack (no-op when the native schedule works — self-retiring).
-  # That anchor is the newest RUN for most legs and, for dispatch.yml, the newest EXECUTED TICK
-  # (#922 — see the step body: a run there no longer implies a tick).
+  # That anchor is the newest ACCEPTED RUN for most legs and, for dispatch.yml, the newest
+  # EXECUTED TICK (#922 — see the step body: a run there no longer implies a tick).
   # No secrets, no environment; actions:write scoped to this job for the dispatch POST only.
   cron-keepalive:
     name: Re-dispatch stale scheduled workflows (cron-delivery fallback)
@@ -458,9 +458,13 @@ jobs:
           now=$(date -u +%s)
           # workflow-file:stale-threshold-seconds[:executed-marker-artifact] (cadence + slack)
           #
-          # THE ANCHOR (#922). With no third field the liveness signal is the newest RUN's
-          # created_at. That is a valid proxy only where a run IMPLIES the workflow did its work,
-          # and dispatch.yml is the one listed workflow where it does not: since the #819 tick
+          # THE ANCHOR (#922, #1375). With no third field the liveness signal is the newest
+          # non-action_required RUN's created_at. The #559 live-run guard first protects queued or
+          # in-progress environment-approval waits; unlike ci-latency-alert.py's M4 fingerprint,
+          # this recovery loop does not query jobs to distinguish settled approval-gated runs.
+          # That run anchor is a valid proxy only where an accepted run IMPLIES the workflow did
+          # its work, and dispatch.yml is the one listed workflow where it does not: since the
+          # #819 tick
           # floor, a within-floor ring concludes `success` in ~30s having executed NOTHING, and
           # #79's registry-internal ring sources make those no-op runs the NORMAL case (dispatch is
           # rung roughly every <=7 min). Anchored on runs, this leg therefore reads a dispatcher
@@ -478,6 +482,8 @@ jobs:
           # This leg is NOT retired in favour of that watchdog: dispatch-stall-alert PAGES A HUMAN,
           # the keepalive RE-DISPATCHES. Losing it would turn every cron-delivery gap on the
           # busiest workflow in the fleet into a manual recovery.
+          # On a pure ingestion-rejected stream a kick is knowingly non-curative; the error
+          # annotation is the payload, with ci-latency-alert.py's M4 alarm owning human recovery.
           for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200:dispatch-tick groom-core.yml:1800 retriage.yml:3600; do
             wf="${spec%%:*}"; rest="${spec#*:}"; limit="${rest%%:*}"
             if [ "$rest" != "$limit" ]; then marker="${rest#*:}"; else marker=""; fi
@@ -507,8 +513,12 @@ jobs:
                             | .created_at] | max // empty' || true)
             else
               anchor="ran"
-              last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
-                     --jq '.workflow_runs[0].created_at // empty' || true)
+              last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=30" \
+                     --jq '[.workflow_runs[] | select(.conclusion != "action_required")
+                            | .created_at] | max // empty' || true)
+              if [ -z "$last" ]; then
+                echo "::error::keepalive: ${wf} has no accepted run among its newest 30; action_required runs are not liveness evidence"
+              fi
             fi
             prev=0
             [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
@@ -563,8 +573,12 @@ jobs:
               echo "keepalive: sparq-org/sparq ${wf} has ${live} queued/in-progress run(s) — live, skipping kick"
               continue
             fi
-            last=$(gh api "repos/sparq-org/sparq/actions/workflows/${wf}/runs?per_page=1" \
-                   --jq '.workflow_runs[0].created_at // empty' || true)
+            last=$(gh api "repos/sparq-org/sparq/actions/workflows/${wf}/runs?per_page=30" \
+                   --jq '[.workflow_runs[] | select(.conclusion != "action_required")
+                          | .created_at] | max // empty' || true)
+            if [ -z "$last" ]; then
+              echo "::error::keepalive: sparq-org/sparq ${wf} has no accepted run among its newest 30; action_required runs are not liveness evidence"
+            fi
             prev=0
             [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
             age=$(( now - prev ))

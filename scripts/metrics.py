@@ -1994,10 +1994,21 @@ esac
 # $STUB_CALLS so the test can assert WHICH workflow was kicked and with which marker.
 _PUBLISH_KICK_GH_STUB = r'''#!/usr/bin/env bash
 printf '%s\n' "$*" >> "${STUB_CALLS}"
+filter=""
+want=0
+for a in "$@"; do
+  if [ "$want" = 1 ]; then filter="$a"; want=0; fi
+  if [ "$a" = "--jq" ]; then want=1; fi
+done
 case "$*" in
   *"/dispatches"*)  : ;;
-  *"runs?per_page=30"*) printf '0\n' ;;
-  *"runs?per_page=1"*)  printf '%s\n' "${STUB_LAST_RUN_AT}" ;;
+  *"runs?per_page=30"*'status != "completed"'*)
+    printf '%s\n' '{"workflow_runs": []}' | jq -r "$filter"
+    ;;
+  *"runs?per_page=30"*'action_required'*)
+    printf '{"workflow_runs":[{"conclusion":"success","created_at":"%s"}]}\n' \
+      "${STUB_LAST_RUN_AT}" | jq -r "$filter"
+    ;;
   *) printf 'gh-stub: unexpected argv: %s\n' "$*" >&2; exit 64 ;;
 esac
 '''

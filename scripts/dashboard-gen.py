@@ -5582,16 +5582,19 @@ case "${endpoint}" in
     jq -r "${filter}" < "${STUB_DIR}/artifacts.json"
     ;;
   *"/runs?per_page=30")
-    if [ "${STUB_LIVE_FAIL}" = 1 ]; then
-      printf 'gh-stub: live-run read failed\n' >&2
-      exit 1
+    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
+    if [[ "${filter}" == *'status != "completed"'* ]]; then
+      if [ "${STUB_LIVE_FAIL}" = 1 ]; then
+        printf 'gh-stub: live-run read failed\n' >&2
+        exit 1
+      fi
+      jq -r "${filter}" < "${STUB_DIR}/live-${wf}.json"
+    elif [[ "${filter}" == *'action_required'* ]]; then
+      jq -r "${filter}" < "${STUB_DIR}/runs-${wf}.json"
+    else
+      printf 'gh-stub: unexpected argv: %s\n' "$*" >&2
+      exit 64
     fi
-    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
-    jq -r "${filter}" < "${STUB_DIR}/live-${wf}.json"
-    ;;
-  *"/runs?per_page=1")
-    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
-    jq -r "${filter}" < "${STUB_DIR}/runs-${wf}.json"
     ;;
   *)
     printf 'gh-stub: unexpected argv: %s\n' "$*" >&2
@@ -5604,8 +5607,9 @@ esac
     def _ka_stamp(age):
         return _utc_iso(keepalive_now - age)
 
-    def _ka_run(age, status="completed"):
-        return {"id": 1, "status": status, "conclusion": "success", "created_at": _ka_stamp(age)}
+    def _ka_run(age, status="completed", conclusion="success"):
+        return {"id": 1, "status": status, "conclusion": conclusion,
+                "created_at": _ka_stamp(age)}
 
     def run_keepalive_leg(script, specs, *, artifacts=(), runs=None, live=None,
                           artifacts_fail=False, live_fail=False):
@@ -5639,12 +5643,18 @@ esac
                 env=dict(os.environ,
                          PATH=f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
                          GITHUB_REPOSITORY="o/r", GH_TOKEN="stub",
+                         METRICS_RESULT="failure",
                          STUB_DIR=str(stubs), STUB_CALLS=str(calls),
                          STUB_ARTIFACTS_FAIL="1" if artifacts_fail else "0",
                          STUB_LIVE_FAIL="1" if live_fail else "0"))
             dispatched = sorted(line for line in calls.read_text(encoding="utf-8").split("\n")
                                 if "/dispatches" in line)
-        return completed.returncode, dispatched, completed.stdout + completed.stderr
+        log = completed.stdout + completed.stderr
+        # The production reads deliberately fail open with `|| true`; without carrying the stub's
+        # refusal out-of-band, an unmodelled read can therefore look exactly like an empty stale
+        # anchor and satisfy the outcome rows. Preserve the stub's promised loud exit instead.
+        code = 64 if "gh-stub: unexpected argv:" in log else completed.returncode
+        return code, dispatched, log
 
     def run_keepalive_step(**fixtures):
         """The REGISTRY leg, subject of the #922 rows. -> (exit code, [workflows kicked], log)."""
@@ -5765,6 +5775,41 @@ esac
     keepalive_check(
         "[#922] the run-anchored legs still key on run age, and only the stale one is kicked",
         (code, kicked), (0, ["groom-core.yml"]), log)
+    # #1375: GitHub creates one-second `action_required` runs when it refuses to ingest a
+    # workflow. Their timestamps are evidence of rejection, not execution. Put a fresh rejected
+    # run ahead of an old accepted run so selecting the newest row without filtering stays green
+    # and fails this outcome; then supply only rejected runs to cover the visible refusal path.
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(60)],
+        runs={"metrics.yml": [_ka_run(60, conclusion="action_required"), _ka_run(9_999)]})
+    keepalive_check(
+        "[#1375] a fresh action_required run cannot hide the newest accepted run's stale age",
+        (code, kicked), (0, ["metrics.yml"]), log)
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(60)],
+        runs={"metrics.yml": [_ka_run(60, conclusion="action_required")]})
+    keepalive_check(
+        "[#1375] a pure rejected-run stream is stale AND emits an explicit workflow error",
+        (code, kicked, "::error::keepalive: metrics.yml has no accepted run" in log),
+        (0, ["metrics.yml"], True), log)
+    metrics_dispatch = ("api -X POST "
+                        "repos/o/r/actions/workflows/dashboard.yml/dispatches -f ref=master")
+    code, dispatched, log = run_keepalive_leg(
+        metrics_keepalive_script, metrics_specs,
+        runs={"dashboard.yml": [_ka_run(60, conclusion="action_required"), _ka_run(9_999)]})
+    keepalive_check(
+        "[#1375] metrics.yml's third mesh leg also skips a fresh rejected dashboard run and "
+        "dispatches from the stale accepted run behind it",
+        (code, dispatched), (0, [metrics_dispatch]), log)
+    code, dispatched, log = run_keepalive_leg(
+        metrics_keepalive_script, metrics_specs,
+        runs={"dashboard.yml": [_ka_run(60, conclusion="action_required")]})
+    keepalive_check(
+        "[#1375] a pure rejected dashboard stream in the third mesh leg is stale AND visible as "
+        "a workflow error",
+        (code, dispatched,
+         "::error::keepalive: dashboard.yml has no accepted run" in log),
+        (0, [metrics_dispatch], True), log)
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)])
     keepalive_check(
         "[#922] control: a fleet that is fresh on BOTH anchors is kicked not at all",
@@ -5860,6 +5905,21 @@ esac
     keepalive_check(
         "[#559] control: a sweeper that ran inside its threshold is not kicked at all — the leg is "
         "not simply dispatching on every fire", (code, dispatched), (0, []), log)
+    code, dispatched, log = run_keepalive_leg(
+        sparq_script, sparq_specs,
+        runs={sparq_target: [_ka_run(60, conclusion="action_required"),
+                            _ka_run(sparq_limit + 600)]})
+    keepalive_check(
+        "[#1375] the cross-repo run anchor also skips a fresh rejected run and sees the stale "
+        "accepted run behind it", (code, dispatched), (0, [sparq_dispatch]), log)
+    code, dispatched, log = run_keepalive_leg(
+        sparq_script, sparq_specs,
+        runs={sparq_target: [_ka_run(60, conclusion="action_required")]})
+    keepalive_check(
+        "[#1375] a pure rejected cross-repo stream is stale AND visible as a workflow error",
+        (code, dispatched,
+         "::error::keepalive: sparq-org/sparq rearm-sweeper.yml has no accepted run" in log),
+        (0, [sparq_dispatch], True), log)
 
     # --- #935: the SEAM around that leg, which no amount of executing the body can reach. The rows
     # above drive the script directly; production reaches it only through a step-level `if:`, and
@@ -7732,11 +7792,38 @@ esac
     # ...beside a card-level total that matches the fires, so the empty `panel` control below is
     # asserting the per-row affordance and not merely inheriting the three-fire total copied above.
     unreachable_evidence_doc["trigger_fires_total"] = 2
+    # [#2162] ...and the ANCHOR LABELS are the other half of that same decision, left disagreeing
+    # with the note by #2009. Numbered by ARRAY index a refused link leaves a HOLE in the sequence —
+    # `evidence 1  evidence 3` numbers a link the reader cannot reach and does not say it was
+    # withheld, and beside a `+N more` that counts what rendered the row describes more links than
+    # its own total holds. Same document class as `unreachable` above and equally unproducible by
+    # this generator, but the refusal must sit in the MIDDLE and at the FRONT: a trailing refusal
+    # renumbers nothing, so a fixture with only that one is an equivalent-survivor harness
+    # (pre-flight item 4). The `evidence_total`s are chosen so labels and note read as ONE sequence:
+    # every row's last label plus its `+N` equals its total.
+    gap_evidence_doc = copy.deepcopy(evidence_page_doc)
+    gap_evidence_doc["trigger_fires"] = [
+        # A hole in the middle: array-index labels read `evidence 1  evidence 3` here.
+        {"rule": "interior-gap-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+         "evidence": [_RUN.format(1), "https://evil.example/exfil", _RUN.format(2)],
+         "evidence_total": 3, "enqueued_task": None},
+        # A hole at the FRONT: array-index labels start the sequence at `evidence 3`, so a fix that
+        # merely closes interior gaps (numbering from the first accepted entry) still reds here.
+        {"rule": "leading-gap-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+         "evidence": ["https://evil.example/exfil", "https://evil.example/two", _RUN.format(3)],
+         "evidence_total": 3, "enqueued_task": None},
+        # The ACCEPT direction on the same stack: with nothing refused the labels are unchanged, so
+        # a mutant that renumbers from zero or labels every anchor alike cannot hide here either.
+        {"rule": "no-gap-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+         "evidence": [_RUN.format(4), _RUN.format(5)], "evidence_total": 2,
+         "enqueued_task": None}]
+    gap_evidence_doc["trigger_fires_total"] = 3
     evidence_page = _executed_page(
         _page_harness("renderObservability", _OBS_EVIDENCE_PAGE_BODY),
         {"documents": {"capped": copy.deepcopy(evidence_page_doc),
                        "hostile": hostile_evidence_doc,
-                       "unreachable": unreachable_evidence_doc}})
+                       "unreachable": unreachable_evidence_doc,
+                       "gaps": gap_evidence_doc}})
 
     def obs_evidence_page(name):
         rendered = evidence_page.get(name)
@@ -7766,6 +7853,17 @@ esac
           obs_evidence_page("unreachable"),
           ([[["evidence 1"], [evidence_note(2)]],
             [["evidence 1"], [evidence_note(1, " is")]]], [], None))
+    check("[#2162] EXECUTED page script: the anchor LABELS count what rendered too, so a refused "
+          "link leaves no HOLE in the sequence — a github.com link, a refusal and a second "
+          "github.com link number `evidence 1  evidence 2`, never the `evidence 1  evidence 3` of "
+          "an array index; two leading refusals still number the one reachable link `evidence 1`, "
+          "never `evidence 3`; and a row with nothing refused is numbered exactly as before. Each "
+          "row's last label plus its `+N more` is its total, which is what the two affordances "
+          "disagreed about",
+          obs_evidence_page("gaps"),
+          ([[["evidence 1", "evidence 2"], [evidence_note(1, " is")]],
+            [["evidence 1"], [evidence_note(2)]],
+            [["evidence 1", "evidence 2"], []]], [], None))
     # ---- [#2161] THE FIRE `summary` IS A DISPLAY CUT TOO — THE LAST SILENT ONE ON THIS PANEL, AND
     # THE ONE NEITHER #1868 NOR #2009 COULD REACH, because it is not an array. A 900-character alarm
     # summary published as 240 characters with NO affordance at all: no marker, no title, and
