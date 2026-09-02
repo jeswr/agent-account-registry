@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2239,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "56ce57bec3c1b89e48692c77a3e819da8106a76e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is correct and complete for the diff-scoped issue. The new qualified CSS rules give both existing unreadable-row notes the intended compact metrics and bad tone without changing the shared `.bad` class. The self-test reads the class string from the page, parses actual stylesheet rule blocks rather than accepting comments, checks the relevant cascade and custom-property definition, verifies qualification, exercises positive and deletion cases, and fails closed on stylesheet forms it cannot model. No trust-plane control, workflow permission, secret handling, or untrusted-text execution path is weakened or expanded.",
+  "verdict": "approve"
+ }
+}
