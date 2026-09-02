@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2230,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "203957d8274f15ebd2d47ab38c9d7e50c88470ad",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_apt_packages_in_line` starts collecting whenever it encounters bare tokens `apt-get install`, regardless of their shell-command position. For example, `RUN echo apt-get install -y jq python3-yaml` installs nothing\u2014the words are only arguments to `echo`\u2014but the extractor emits both packages and `_assert_container_selftest_deps` reports `satisfied`. Restricting extraction to RUN instructions and truncating comments fixes the round-1 examples, but does not establish the claimed fail-closed invariant for RUN shell syntax. The existing positive and negative fixtures do not exercise a non-apt command whose arguments contain the exact bare token sequence.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Make the check reject or correctly parse apt invocations that are arguments/data rather than commands, and add a negative self-test driven through `_assert_container_selftest_deps` using `RUN echo apt-get install -y jq python3-yaml`, alongside the existing real-install positive control. If sound static shell analysis is intentionally out of scope, replace this lexical proof with an evidence path that actually verifies the built image provides every declared dependency.",
+    "severity": "major",
+    "title": "RUN arguments can still masquerade as an executed apt install"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 correctly closes the reported shell-comment and non-RUN-instruction seams and adds non-vacuous regression rows for both. However, the gate still treats any bare `apt-get install` token sequence anywhere in a RUN command as an executed installation. A harmless command can therefore satisfy the dependency check without installing anything. Because the marquee assertion remains fail-open, the change is not ready to approve.",
+  "verdict": "request_changes"
+ }
+}
