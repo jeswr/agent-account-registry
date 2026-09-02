@@ -2287,8 +2287,13 @@ jobs:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
-          # Privacy routing (locked decision 22c): maintainer-set ALERT_REPO sends the
-          # account-enumerating ops alert to a private repo; unset falls back to the registry.
+          # Privacy routing (locked decision 22c), as HARDENED by #436/#1020 — setting these names
+          # is CONFIGURATION, not verification, so read the contract from worker-pr._alert_route:
+          # the alert issue goes to ALERT_REPO only when ALERT_TOKEN is set too, ALERT_REPO is not
+          # this registry, AND a live GET /repos under ALERT_TOKEN confirms it PRIVATE. Every other
+          # shape (including a set-but-public ALERT_REPO) falls back to this PUBLIC registry, and
+          # _ops_alert redacts the body there — these bodies are not account-enumerating (accounts
+          # cross as the salted hash), and the redaction keeps it that way for future bodies.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
@@ -2547,8 +2552,10 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
-          # Privacy routing (locked decision 22c): maintainer-set ALERT_REPO sends the ops alert
-          # to a private repo; unset falls back to the registry.
+          # Privacy routing (locked decision 22c), as HARDENED by #436/#1020: ALERT_REPO takes the
+          # ops alert only when ALERT_TOKEN is set too, it is not this registry, and a live
+          # GET /repos confirms it PRIVATE; every other shape falls back to this PUBLIC registry
+          # with the body redacted. Setting the names is configuration, not verification.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
