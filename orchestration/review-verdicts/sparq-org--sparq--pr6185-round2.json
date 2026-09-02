@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6185,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6bb20c60c4f8a12ddb8a7325a0b8d5e05999cc69",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior findings. The authenticated comparison is now conservatively annotated with secx:SemiHonest, so malicious-security selection excludes it alongside every other annotated MPC protocol. The replacement headline test pins that fail-closed exclusion, while the accompanying ontology comments and public guidance explicitly identify the second-operand adoption weakness and require an end-to-end adversarial witness before the classification may be strengthened. The positive claims remain Claimed with ExternalSignOffPending, and the crate is consistently described as research-grade and externally unaudited. No new correctness, soundness, test-validity, or security issue is apparent in the changed surface.",
+  "verdict": "approve"
+ }
+}
