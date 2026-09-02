@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2234,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ff96d771f76bc978523a276d8b3433291f13dd1d",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 rule 5(b) replaces the prior delete/add gap with a full-label-set PATCH derived from a read immediately before the write. If a maintainer applies a new `needs:*` or other security-significant label after that read but before the PATCH, the PATCH silently removes it. The proposed re-read/re-prove language does not close this race: `label_application_ownership` only evaluates labels the caller asks about, and `human_hold_deleted_by_machine` requires an exact label and detects only the proven-human-application/machine-removal shape. The record specifies neither how the writer discovers every label introduced after its snapshot nor how it restores each lost label before a crash. Indeed, its claim that a hold-gone/outstanding state is positive evidence of third-party removal is false in this interleaving: the drain itself can erase the newly applied hold while completing every recorded plan write. This violates the human-owned-hold invariant and makes the advertised atomic transition fail-open under concurrency.",
+    "file": "research/1997-human-terminal-park-drain.md",
+    "fix_hint": "Define a write protocol that cannot overwrite unrelated concurrent label changes, or specify a durable, crash-convergent lost-update detector covering every label that may be introduced between read and PATCH. Add an adversarial interruption test where a different human-owned hold and a security-significant non-plan label are applied after the final pre-read but before each full-set PATCH; assert neither is lost, including if the process dies immediately after the PATCH. Do not treat the current exact-label restoration predicate as coverage for labels absent from the snapshot/plan.",
+    "severity": "blocker",
+    "title": "Full-label-set PATCH can erase a concurrent new human hold"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2's delete/add interruption defect is addressed: the revised plan keeps the PR hold as the final write and replaces each surface transition with one full-label-set PATCH. However, that replacement introduces a wider lost-update path that the specified re-proof protocol does not close. A concurrent label application after the pre-write read can be erased by the full-set PATCH, and the proposed post-write checks only establish ownership/restoration for holds already known to the plan. The document acknowledges the clobber but then calls it bounded without specifying a complete detector and restoration protocol for labels absent from the pre-write set. Because this can silently erase a newly applied human/security hold, the design is not yet safe to implement. This is a new blocker, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
