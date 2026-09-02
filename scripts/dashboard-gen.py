@@ -102,6 +102,9 @@ OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{16}")
 OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
 OBS_QUEUE_CLASS_RE = re.compile(r"[1-4][a-z]?")   # the #243 queue classes (1, 2, 2a..2d, 3, 4)
 OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#%-]{1,220}")
+# [#2039] The `flow.target_ci_queue` row key, hoisted beside its sibling shapes so the seam that
+# drops a row can name WHICH guard refused it rather than testing three things in one condition.
+OBS_TARGET_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
                       "queue_age_clamp_minutes", "merge_stall_minutes"}
 # [#1557] THE CACHE GROUP HAS NO PRODUCER, and the file the docs named as its source never had one
@@ -2183,17 +2186,61 @@ def _obs_flow(flow):
     # stays because a fourth stat, or an unbounded one, would make it load-bearing again.
     stat_drops.close()
 
+    # [#2039] Drop-the-row tolerance is unchanged — a malformed target-CI row never fails the build
+    # — but every drop is now ANNOUNCED, in the shape #982/#1867/#1869 set on the queue, trigger-fire
+    # and lease seams. This is the `flow.queue` failure one seam over: a collector handing over the
+    # natural congestion mapping (keyed BY repository, or carrying the integer depths `queue_stats()`
+    # produces) loses every row, and the target-CI panel then renders identically to a fleet with no
+    # congested targets at all. Unlike #1869 this seam EMPTIES rather than skews, so the harm is
+    # #982's rather than #1869's — but it is exactly as invisible, and the non-object `continue` it
+    # replaces had never executed anywhere in this suite (AGENTS.md pre-flight item 1).
+    #
+    # ONE LINE PER DROP REASON, as `flow.queue` and the trigger-fire seam already do. The pre-#2039
+    # guard tested `repository`'s type, its SHAPE and `depth` in a single condition, so a collector
+    # reporting a depth this build cannot read was told the same thing as one whose repository name
+    # is not owner/name — a diagnostic that names the wrong end is barely better than silence.
+    #
+    # The container check is part of it, for the reason `_obs_drop_queue` makes it on `flow.queue`:
+    # a `{repository: depth}` mapping is a dict, which loses every row before the loop starts. Keyed
+    # on the KEY's presence, so a collector that has not shipped the field yet stays silent.
+    #
+    # Only the SHAPE reaches the build log — a type name, a field name, and for the repository the
+    # `_obs_text` sanitized and BOUNDED form, since `repository` is collector-controlled text just
+    # like `flow.queue`'s class — so a malformed snapshot cannot inject lines into the log that is
+    # diagnosing it.
+    #
+    # [#1570] Counted SEPARATELY from the queue/lease/stat/evidence seams (a flood on one must not
+    # silence another's warning on the same document), and its `close()` is load-bearing:
+    # `target_ci_queue` is UNBOUNDED on the way IN — `_obs_capped` truncates it at 12 on the way out,
+    # below — so nothing else limits how many rows can announce themselves.
     ci_queue = []
-    for item in (flow.get("target_ci_queue")
-                 if isinstance(flow.get("target_ci_queue"), list) else []):
+    ci_drops = _ObsDropLog("observability target CI queue rows")
+    raw_ci_queue = flow.get("target_ci_queue")
+    if "target_ci_queue" in flow and not isinstance(raw_ci_queue, list):
+        ci_drops.drop("observability target CI queue input (`flow.target_ci_queue` "
+                      f"(type {type(raw_ci_queue).__name__}) is not a list of rows)")
+    for item in raw_ci_queue if isinstance(raw_ci_queue, list) else []:
         if not isinstance(item, dict):
+            ci_drops.drop("observability target CI queue input "
+                          f"(the row (type {type(item).__name__}) is not an object)")
             continue
         repository = item.get("repository")
+        if not isinstance(repository, str):
+            ci_drops.drop("observability target CI queue input (row `repository` "
+                          f"(type {type(repository).__name__}) is not an owner/name STRING)")
+            continue
+        if OBS_TARGET_REPO_RE.fullmatch(repository) is None:
+            ci_drops.drop("observability target CI queue input (row `repository` "
+                          f"{_obs_text(repository, 64)!r} is not an owner/name repository)")
+            continue
         depth = _obs_count(item.get("depth"))
-        if (not isinstance(repository, str) or depth is None or not re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repository)):
+        if depth is None:
+            ci_drops.drop("observability target CI queue input (row `depth` "
+                          f"(type {type(item.get('depth')).__name__}) is not a non-negative "
+                          "integer)")
             continue
         ci_queue.append({"repository": repository, "depth": depth})
+    ci_drops.close()
 
     # [#1868] Both row arrays publish the pre-cap total of well-formed rows beside themselves, so a
     # 26-class backlog and a 12-class one stop rendering identically. See `_obs_capped`.
@@ -7251,8 +7298,10 @@ esac
         # keys, which makes it announce itself — a line about a different seam entirely. This capture
         # is unfiltered on purpose, so it is the FIXTURE that is quietened here rather than the
         # capture: a silent, publishing cache group, so any line these rows do see belongs to the
-        # queue or evidence seam under test.
+        # queue or evidence seam under test. [#2039] The golden `target_ci_queue` carries a
+        # malformed row too, and since that seam is loud it is emptied here for the same reason.
         fixture["cache"] = {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7}
+        fixture["flow"]["target_ci_queue"] = []
         stream = io.StringIO()
         try:                       # same crash-after-partial-run guard as ObsRefusal above
             with contextlib.redirect_stdout(stream):
@@ -8035,14 +8084,15 @@ esac
         """(published `flow.lease_utilization_1h`, EVERY `dashboard-gen:` line printed).
 
         The FIXTURE is quietened rather than the capture (as `obs_drops` does above): the golden
-        snapshot's unknown queue class, retired cache keys and unsafe trigger rule each announce
-        themselves from a different seam, and filtering them out of the capture would also hide a
-        lease line mislabelled as one of them.
+        snapshot's unknown queue class, retired cache keys, malformed target-CI row (#2039) and
+        unsafe trigger rule each announce themselves from a different seam, and filtering them out
+        of the capture would also hide a lease line mislabelled as one of them.
         """
         fixture = copy.deepcopy(obs_fixture)
         fixture["flow"]["leases"] = rows
         fixture["flow"]["queue"] = ([{"class": "2a", "depth": 1}]
                                     if queue_rows is None else queue_rows)
+        fixture["flow"]["target_ci_queue"] = []
         fixture["cache"] = {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7}
         fixture["trigger_fires"] = []
         stream = io.StringIO()
@@ -8184,6 +8234,163 @@ esac
           [_INT_CLASS]
           + [_LEASE_DROP.format("the row (type NoneType) is not an object")] * 12
           + [_SUPPRESSED.format(8, _LEASE_ROWS, 20)])
+    # ---- [#2039] A DROPPED TARGET-CI ROW MUST NAME ITSELF. This is #982's `flow.queue` failure one
+    # seam over, and it EMPTIES rather than skews: an empty target-CI panel is exactly what a fleet
+    # with NO congested targets renders as, so a collector handing over the natural congestion
+    # mapping published a green build, a green self-test and a panel reading as healthy, with the
+    # loss visible nowhere. The non-object `continue` this replaces had never executed anywhere in
+    # this suite on a `python3 -m trace --count --missing` run (pre-flight item 1), which is why it
+    # is walked explicitly below. Every expected string is a test-side literal (reading the message
+    # back off the module under test is pre-flight 2(b)'s tautology) and every input is a literal
+    # (2(c)); the capture keeps EVERY `dashboard-gen:` line, in order and unfiltered, so a line
+    # printed to the wrong seam, or with the wrong text, reds.
+    _CI_DROP = "dashboard-gen: dropped observability target CI queue input ({})"
+    _CI_ROWS = "observability target CI queue rows"
+    _KEPT_CI = {"repository": "sparq-org/sparq", "depth": 5}
+
+    def obs_ci_drops(rows, present=True, queue_rows=None):
+        """(published `flow.target_ci_queue`, EVERY `dashboard-gen:` line printed).
+
+        The FIXTURE is quietened rather than the capture, for the reason `obs_drops` and
+        `obs_lease_drops` above quieten theirs: the golden snapshot's unknown queue class, retired
+        cache keys and unsafe trigger rule each announce themselves from a DIFFERENT seam, and
+        filtering them out of the capture would also hide a target-CI line mislabelled as one.
+        """
+        fixture = copy.deepcopy(obs_fixture)
+        if present:
+            fixture["flow"]["target_ci_queue"] = rows
+        else:
+            del fixture["flow"]["target_ci_queue"]
+        fixture["flow"]["queue"] = ([{"class": "2a", "depth": 1}]
+                                    if queue_rows is None else queue_rows)
+        fixture["cache"] = {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7}
+        fixture["trigger_fires"] = []
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        except Exception as error:  # noqa: BLE001 — #1880's arm, for #1880's reason: this seam
+            # walks rows it has just declared unreadable, so a guard that ANNOUNCES a row without
+            # skipping it raises out of `item.get(...)` and would abort every check below rather
+            # than red the row that provoked it. Rendered, not swallowed: nothing here equals it.
+            document = ObsRefusal(raised=f"{type(error).__name__}: {error}"[:200])
+        return (document["flow"]["target_ci_queue"],
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen:")])
+
+    # THE REGRESSION, in the two shapes the issue names, and both directions in one row each: the
+    # panel EMPTIES, and the rows that emptied it now name themselves. A congestion mapping keyed BY
+    # repository never reaches the loop at all, so the container check is what catches it; handed
+    # over as (repository, depth) PAIRS it reaches the loop and dies on the never-executed line.
+    check("[#2039] a congestion mapping keyed BY repository loses EVERY row before the loop starts "
+          "— an empty target-CI panel is what a fleet with no congested targets renders as, so the "
+          "container names itself instead of publishing a healthy-looking panel on a green build",
+          obs_ci_drops({"sparq-org/sparq": 5, "jeswr/agent-account-registry": 2}),
+          ([], [_CI_DROP.format(
+              "`flow.target_ci_queue` (type dict) is not a list of rows")]))
+    check("[#2039] a target-CI list handed over as (repository, depth) PAIRS drops every row "
+          "LOUDLY — this is the line a coverage run showed had never executed anywhere",
+          obs_ci_drops([["sparq-org/sparq", 5], ["jeswr/agent-account-registry", 2]]),
+          ([], [_CI_DROP.format("the row (type list) is not an object")] * 2))
+    # ...and the survivors beside a dropped row still publish: this is a drop diagnostic, NOT a new
+    # fatality. Turning the drop into a raise (or into a `flow: None`) reds this row.
+    check("[#2039] an unreadable row does not cost the rows beside it — the readable target still "
+          "publishes its depth and the build stays green",
+          obs_ci_drops([None, copy.deepcopy(_KEPT_CI), {"repository": "not-a-repo", "depth": 2}]),
+          ([{"repository": "sparq-org/sparq", "depth": 5}],
+           [_CI_DROP.format("the row (type NoneType) is not an object"),
+            _CI_DROP.format("row `repository` 'not-a-repo' is not an owner/name repository")]))
+    # The accept path must stay SILENT, or the warning marks nothing: an unconditional drop, or one
+    # hoisted above the guards, publishes these same rows and turns this row red. The zero depth is
+    # deliberate — a guard rewritten on truthiness drops an idle-but-reported target loudly.
+    check("[#2039] a target-CI list whose rows all parse prints NOTHING (the warning marks a real "
+          "drop, so it can never fire on the accept path), including a reported depth of ZERO",
+          obs_ci_drops([copy.deepcopy(_KEPT_CI),
+                        {"repository": "jeswr.agent-account_registry/x.y-z", "depth": 0}]),
+          ([{"repository": "sparq-org/sparq", "depth": 5},
+            {"repository": "jeswr.agent-account_registry/x.y-z", "depth": 0}], []))
+    # ...and the container check is keyed on the KEY's PRESENCE, exactly as `flow.queue`'s is: a
+    # collector that has not shipped the field yet is not a producer/consumer mismatch. Keying it on
+    # the VALUE instead writes one warning per build against every collector alive today.
+    check("[#2039] an ABSENT target-CI key announces nothing — a field a collector has not shipped "
+          "is not a shape mismatch",
+          obs_ci_drops(None, present=False), ([], []))
+    # ONE WARNING PER DROP REASON, each naming the field AND the guard that refused it. The issue's
+    # own point: pre-#2039 a `depth` mismatch, a `repository` that is not a string and a `repository`
+    # that is not owner/name shaped shared ONE silent `continue`, so a single shared message would
+    # still leave a depth mismatch reading as a repository mismatch — every row below reds for it.
+    # The null/missing cases are here because their wrongly-typed siblings do not cover them: a
+    # guard made inert for exactly the null input survives a suite that only ever sends the wrong
+    # TYPE (pre-flight item 3's #938 shape), and null is the likeliest thing a JSON producer emits.
+    for case, rows, detail in (
+        ("a whole non-list container", None,
+         "`flow.target_ci_queue` (type NoneType) is not a list of rows"),
+        ("a string container", "sparq-org/sparq=5",
+         "`flow.target_ci_queue` (type str) is not a list of rows"),
+        ("a null row", [None], "the row (type NoneType) is not an object"),
+        ("a bare-scalar row", [5], "the row (type int) is not an object"),
+        ("a missing repository", [{"depth": 4}],
+         "row `repository` (type NoneType) is not an owner/name STRING"),
+        ("an explicitly null repository", [{"repository": None, "depth": 4}],
+         "row `repository` (type NoneType) is not an owner/name STRING"),
+        ("a non-string repository", [{"repository": 7, "depth": 4}],
+         "row `repository` (type int) is not an owner/name STRING"),
+        ("a bare repository name", [{"repository": "sparq", "depth": 4}],
+         "row `repository` 'sparq' is not an owner/name repository"),
+        ("an owner/name carrying a path segment", [{"repository": "sparq-org/sparq/ci", "depth": 4}],
+         "row `repository` 'sparq-org/sparq/ci' is not an owner/name repository"),
+        ("a missing depth", [{"repository": "sparq-org/sparq"}],
+         "row `depth` (type NoneType) is not a non-negative integer"),
+        ("an explicitly null depth", [{"repository": "sparq-org/sparq", "depth": None}],
+         "row `depth` (type NoneType) is not a non-negative integer"),
+        ("a non-integer depth", [{"repository": "sparq-org/sparq", "depth": "5"}],
+         "row `depth` (type str) is not a non-negative integer"),
+        ("a fractional depth", [{"repository": "sparq-org/sparq", "depth": 2.5}],
+         "row `depth` (type float) is not a non-negative integer"),
+        ("a boolean depth", [{"repository": "sparq-org/sparq", "depth": True}],
+         "row `depth` (type bool) is not a non-negative integer"),
+        ("a negative depth", [{"repository": "sparq-org/sparq", "depth": -1}],
+         "row `depth` (type int) is not a non-negative integer"),
+    ):
+        check(f"[#2039] {case} is dropped LOUDLY, by the REASON that failed — a shared message "
+              "leaves a depth mismatch reading as a repository mismatch",
+              obs_ci_drops(rows), ([], [_CI_DROP.format(detail)]))
+    # ...and the ONE collector value any of these messages quotes is sanitized and BOUNDED on the way
+    # out, as `flow.queue`'s class is. `repository` is collector-controlled text living on a PUBLIC
+    # branch this build does not own (pre-flight item 5): echo it raw instead of through
+    # `_obs_text(repository, 64)` and a hostile — or merely enormous — name writes itself into the
+    # build log that is diagnosing it.
+    for case, repository, quoted in (
+        ("non-printable", "ok\ndashboard-gen: dropped observability target CI queue input (forged)",
+         "''"),
+        ("4000 characters long", "9" * 4000, f"'{'9' * 64}'"),
+    ):
+        check(f"[#2039] a {case} repository is not echoed into the build log that diagnoses it",
+              obs_ci_drops([{"repository": repository, "depth": 1}]),
+              ([], [_CI_DROP.format(f"row `repository` {quoted} is not an owner/name repository")]))
+    # `flow.target_ci_queue` is UNBOUNDED on the way IN — `_obs_capped` truncates it at 12 on the way
+    # OUT, after every row has been walked — so nothing but this seam's own `_ObsDropLog` limits the
+    # emission: the #1570 flood, exactly. The 21st row still publishes, because capping a WARNING
+    # must never cap the DATA. Every size and expected string here is a literal; deriving either
+    # from OBS_DROP_WARN_MAX is the #941 tautology that left 76/76 green.
+    check("[#2039] 20 unreadable target-CI rows print 12 warnings and ONE tail naming the real "
+          "total, and the readable row beside them still publishes its depth",
+          obs_ci_drops([None] * 20 + [copy.deepcopy(_KEPT_CI)]),
+          ([{"repository": "sparq-org/sparq", "depth": 5}],
+           [_CI_DROP.format("the row (type NoneType) is not an object")] * 12
+           + [_SUPPRESSED.format(8, _CI_ROWS, 20)]))
+    # The target-CI seam counts SEPARATELY from the queue seam (#1570's reason for keeping the queue
+    # and evidence seams apart): one shared budget would let a flood of unreadable target rows
+    # silence the queue warning on the same document — trading one invisible loss for another — and
+    # would print a single tail naming the wrong seam. Ordering is fixed: the queue loop closes first.
+    check("[#2039] a flooded target-CI seam does not consume the queue seam's budget: the lone bad "
+          "queue row still names itself, and the tail names the TARGET-CI seam",
+          obs_ci_drops([None] * 20, queue_rows=[{"class": 1, "depth": 4}])[1],
+          [_INT_CLASS]
+          + [_CI_DROP.format("the row (type NoneType) is not an object")] * 12
+          + [_SUPPRESSED.format(8, _CI_ROWS, 20)])
     try:
         with_observability = build_dashboard(
             issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
