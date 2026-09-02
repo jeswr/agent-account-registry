@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2195,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c03818e8d4d17ec27700ffc7d654d44d5087dae1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes the merge-ref graded-base derivation and exact git argv in one pure, fail-closed owner, while preserving each consumer's existing verdict policy. Both consumers delegate through the shared module, refuse malformed or non-two-parent output before using any SHA, and retain their independent head/live-tip checks. The new tests independently pin argv, parent orientation, SHA shape, refusal behavior, consumer delegation, and restoration of test sentinels; the module is also enrolled in the protected self-test manifest. I found no correctness, security, or material test-validity defect in the diff.",
+  "verdict": "approve"
+ }
+}
