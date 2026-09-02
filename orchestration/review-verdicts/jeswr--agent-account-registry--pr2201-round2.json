@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2201,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a64225e424c8fd6324f86b877747a30e942cd10e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and narrowly scoped to self-test coverage. `_refused_cleanly` makes a deleted exception-conversion guard observable as a single failed row instead of allowing a raw `ValueError` to abort the remaining suite, while its control rows pin both exception reporting and unchanged refusal/accept behavior. The two new mutants independently reach the exact first-line and tokenisation refusal branches and assert branch-unique message fragments, so unrelated refusals cannot satisfy them. No production trust check is weakened, no permissive path is introduced, and no hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
