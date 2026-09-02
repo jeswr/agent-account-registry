@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2147,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "93f340bcd5a35d88f125785e7ae949a83e9e271a",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_ESCAPABLE_NESTS` remains `(ast.If, ast.For)`, and `_exits_to_enclosing_list` returns true for a binding that is the sole statement in either nest because there are no trailing statements to reject. Thus `if repo: targets = starvation_park_targets(...); for target in targets: park_starved_partition_holder(...)` still certifies even though the loop can be reached when `repo` is false and the binding did not run. Likewise, a binding inside `for _ in items:` followed by the parking loop still certifies even though `items` may be empty. None of the new `path` or `flow` rows tests either shape: the guarded-binding row adds a trailing `return`, which exercises exit flow only after the arm has been entered, not whether the arm must be entered. Leg 4 therefore also cannot demonstrate detection of the prior counterexamples.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Require proof that every path reaching the later statement list necessarily executes the nested binding; successful exit after an `if` arm or `for` body is insufficient. Add refused rows for a sole binding under a runtime `if` followed by the parking loop and for a sole binding inside a possibly-empty runtime `for` followed by the loop. Add a non-vacuity stand-in/mutation that makes those exact rows certify while unrelated rows keep their expected verdicts.",
+    "severity": "major",
+    "title": "Escapable nests still do not establish universal dominance"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-four dominance defect remains. The pairing still treats an ordinary `if` arm and a possibly-empty `for` body as escapable without proving that every execution reaching the later parking loop entered that arm/body. The newly added rows cover opposite arms, ordering, and an entered guard that returns, but still omit the two exact universal-dominance counterexamples from the prior review. This is materially the same major finding at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
