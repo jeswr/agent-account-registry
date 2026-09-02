@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2198,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "89dfef5658a45db13883785381ac2d49de5724d1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is correct and complete within the diff's scope. Each newly widened per-object boundary preserves the existing fail-closed decision: unreadable snapshots and revalidation evidence exclude mutations or retain leases, while independent objects and repositories continue. Arbitrary exception details are consistently routed through the bounded, single-line credential-shape mask. Defuse collection and mutation-boundary read failures are now carried into the shared phase outcome, so an all-failed phase exits non-zero without preventing downstream lease reclamation; successful revalidation skips remain distinct from failures. The RedraftUnavailable precedence remains intact. The added tests exercise non-GroomError failures at each production call site, both partial-success and all-failed status semantics, masking wiring, lease-retention direction, and the run_sweep collection seam with fixed expectations and non-vacuous controls.",
+  "verdict": "approve"
+ }
+}
