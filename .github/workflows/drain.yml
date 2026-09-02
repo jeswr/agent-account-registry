@@ -1,0 +1,254 @@
+# Orchestrator task-queue DRAIN loop (issue #243 Phase A; research/orchestrator-task-queue.md).
+#
+# The design record replaces push dispatch with a queue the orchestrator drains: lanes ENQUEUE and
+# ONE loop owns ordering, dedup, backoff, and priority. This is that loop's Phase-A form.
+#
+# WHY THIS DOES NOT DISPATCH YET — read before "fixing" it. Phase A adds the substrate and the
+# FIRST enqueuer, and that enqueuer DUAL-WRITES: dispatch.yml's PLAN->CLAIM push edge is still the
+# live executor for review/fix/disarm. The design record's migration rule is "push lanes convert
+# one at a time; each conversion PR removes exactly one push edge and its doorbell". So if this
+# workflow also dispatched those kinds today, every review would run TWICE — two leases, two
+# accounts, two model spends, two reviews on one PR. Instead this loop does all the real work
+# (pick, re-validate, complete/requeue/compact, observability) and RESOLVES the routing decision
+# for each task, and `DRAIN_EXECUTE_KINDS` names the kinds it is allowed to actually launch. It is
+# EMPTY, which is the fail-closed default: unlisted kinds are resolved, logged, and requeued, never
+# launched. A Phase-B conversion PR adds exactly one kind here in the SAME commit that deletes that
+# kind's push edge — so the executor is never ambiguous and never doubled.
+#
+# When a kind IS added here, this workflow becomes secret-bearing (an account + a CAS lease are
+# required to fill review-fix.yml/worker.yml's `account`/`claim_id` inputs). That conversion PR
+# MUST also bind the launching job to the `dispatch-secrets` environment behind `needs:
+# secrets-guard`, exactly as dispatch.yml's CLAIM job is (issue #101/#618). Phase A holds no
+# secrets, so it correctly holds no such binding.
+#
+# THE QUEUE NEVER REPLACES VALIDATION, LEASE, OR TRUST. A queue row is a HINT that work may exist;
+# live state is truth. The re-validation below is a LIVENESS filter that may only DROP a stale row.
+# dispatch-claim.py keeps every validation/lease/provenance/trust role unchanged.
+name: drain
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every 10 minutes, per the design record's "the cron cadence stays as the drain's heartbeat".
+    # Explicit minutes (not */10): GitHub degrades wildcard schedules under load — measured
+    # 2026-07-17, see dispatch.yml. Offset by 7 from dispatch.yml's 3,13,... so a drain reads a
+    # queue the preceding PLAN tick has already dual-written into, instead of racing it.
+    - cron: '7,17,27,37,47,57 * * * *'
+
+permissions: {}
+
+# SINGLE-FLIGHT. Two concurrent drains would each pick a batch; the visibility window in
+# task-queue.py bounds the damage but the whole point of one drain loop is one ordering decision at
+# a time. cancel-in-progress stays FALSE: a cancelled drain can strand picked tasks until their
+# visibility window lapses, and the queue's liveness depends on drains finishing.
+concurrency:
+  group: registry-drain
+  cancel-in-progress: false
+
+env:
+  # The kinds this loop may actually LAUNCH. EMPTY = fail closed (see the header). One kind is
+  # added here by the SAME Phase-B PR that removes that kind's push edge from dispatch.yml.
+  DRAIN_EXECUTE_KINDS: ''
+
+jobs:
+  drain:
+    name: DRAIN (pick, re-validate, route)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # LEAST PRIVILEGE. contents:write is the minimum for the queue's CAS PUT against
+    # data/task-queue.json on the `ledger` data-plane branch (master's required `gate` check
+    # rejects bot PUTs — issue #28). No issues:write, no actions:write, no secrets: this job
+    # launches nothing in Phase A, so it holds no credential that could launch anything.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout registry helpers (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      # The enrolled self-test runs BEFORE the queue is touched: a drain whose pick ordering,
+      # schema validation, or CAS retry is broken must not mutate the queue at all.
+      - name: Self-test the queue substrate (fail closed before any mutation)
+        run: python3 registry/scripts/task-queue.py --self-test
+
+      # Policy owns the drain's tunables (issue #243 item 1/2). The registry is the queue's own
+      # target row; a policy that cannot be resolved fails the tick rather than silently
+      # substituting defaults for a maintainer-set clamp.
+      - name: Resolve drain policy
+        id: policy
+        env:
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/policy-resolve.py \
+            --target-repo "$TARGET_REPO" \
+            --policy-file registry/policy/repos.toml \
+            --target-root registry > "$RUNNER_TEMP/policy.json"
+          python3 - "$RUNNER_TEMP/policy.json" >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+
+          policy = json.load(open(sys.argv[1], encoding="utf-8"))
+          for field in ("drain_batch", "cache_ttl_minutes", "heal_max_wait_minutes"):
+              value = policy[field]
+              if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                  raise SystemExit(f"{field} resolved to a non-positive integer")
+              print(f"{field}={value}")
+          PY
+
+      # Compact FIRST: dead rows must not consume a pick slot, and expired cache warmth must not
+      # keep steering the ordering. Dropped rows are reported (::warning::), never silently lost.
+      - name: Compact the queue (drop dead rows, expire cache warmth)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          CACHE_TTL: ${{ steps.policy.outputs.cache_ttl_minutes }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/task-queue.py --compact \
+            --repo "$REGISTRY_REPO" \
+            --cache-ttl-minutes "$CACHE_TTL"
+
+      - name: Pick a drain batch
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          BATCH: ${{ steps.policy.outputs.drain_batch }}
+          CACHE_TTL: ${{ steps.policy.outputs.cache_ttl_minutes }}
+          HEAL_WAIT: ${{ steps.policy.outputs.heal_max_wait_minutes }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/task-queue.py --pick \
+            --repo "$REGISTRY_REPO" \
+            --limit "$BATCH" \
+            --cache-ttl-minutes "$CACHE_TTL" \
+            --heal-max-wait-minutes "$HEAL_WAIT" > "$RUNNER_TEMP/picked.json"
+          printf 'picked %s task(s)\n' "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$RUNNER_TEMP/picked.json")"
+
+      # RE-VALIDATE EACH PICK AGAINST LIVE STATE. The queue is a hint; live state is truth. A row
+      # whose PR/issue moved on since enqueue is DROPPED with a logged reason and never executed
+      # stale. This is liveness only — it may drop a row, never admit one.
+      - name: Re-validate picks against live state and route
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          PICKED: ${{ runner.temp }}/picked.json
+          EXECUTE_KINDS: ${{ env.DRAIN_EXECUTE_KINDS }}
+        run: |
+          set -euo pipefail
+          python3 - "$PICKED" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          import importlib.util
+
+          spec = importlib.util.spec_from_file_location(
+              "registry_task_queue", "registry/scripts/task-queue.py")
+          tq = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(tq)
+
+          registry = os.environ["REGISTRY_REPO"]
+          execute_kinds = {k for k in os.environ.get("EXECUTE_KINDS", "").split(",") if k.strip()}
+          picked = json.load(open(sys.argv[1], encoding="utf-8"))
+          # The picked rows came back through the queue's own validator, but they crossed a file
+          # boundary since; re-validate before any of their fields reach a subprocess argv.
+          picked = [tq.validate_task(task) for task in picked]
+
+          def live_state(task):
+              """The task's live target record, or None when it cannot be read (fails closed to a
+              drop, never to an assumed-open target)."""
+              endpoint = tq.LIVE_ENDPOINT[task["kind"]]
+              result = subprocess.run(
+                  ["gh", "api", f"repos/{task['repo']}/{endpoint}/{task['ref']}"],
+                  capture_output=True, text=True, check=False)
+              if result.returncode != 0:
+                  return None
+              try:
+                  live = json.loads(result.stdout)
+              except json.JSONDecodeError:
+                  return None
+              return live if isinstance(live, dict) else None
+
+          def queue(*args):
+              subprocess.run(["python3", "registry/scripts/task-queue.py", *args,
+                              "--repo", registry], check=True)
+
+          summary = open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8")
+          summary.write(f"### drain: {len(picked)} task(s) picked\n\n")
+          dropped = routed = held = 0
+          for task in picked:
+              ok, reason = tq.revalidate(task, live_state(task))
+              if not ok:
+                  # Stale: drop it. `complete` is the right verb — the row is finished, not failed,
+                  # so it must not consume a retry budget.
+                  print(f"drop {task['id']}: {reason}")
+                  summary.write(f"- `{task['id']}` dropped: **{reason}**\n")
+                  queue("--complete", task["id"])
+                  dropped += 1
+                  continue
+              if task["kind"] not in execute_kinds:
+                  # Phase A: the push edge still owns this kind. HOLD — not requeue — so the row
+                  # keeps its place instead of being lost or double-executed. A hold hides the row
+                  # for a window WITHOUT touching `attempts`: this task failed nothing, it was
+                  # deliberately not launched, and requeueing it would burn one of `max_attempts`
+                  # per tick until compact deleted a perfectly healthy row as attempts-exhausted.
+                  print(f"hold {task['id']}: kind '{task['kind']}' is still push-dispatched "
+                        "(DRAIN_EXECUTE_KINDS)")
+                  summary.write(f"- `{task['id']}` held: kind `{task['kind']}` still "
+                                "push-dispatched\n")
+                  queue("--hold", task["id"])
+                  held += 1
+                  continue
+              # A converted kind launches through the EXISTING review-fix.yml / worker.yml
+              # workflow_dispatch inputs — the queue decides WHAT and WHEN, never what is allowed.
+              # The conversion PR that adds the kind to DRAIN_EXECUTE_KINDS wires the launch here
+              # together with its lease/account resolution and the dispatch-secrets binding.
+              raise SystemExit(
+                  f"kind '{task['kind']}' is enabled for execution but this workflow has no "
+                  "launch path wired — refusing to silently drop live work (fail closed)")
+          summary.write(f"\ndropped={dropped}, held={held}, routed={routed}\n")
+          summary.close()
+          print(f"drain: dropped={dropped}, held={held}, routed={routed}")
+          PY
+
+      # OBSERVABILITY (issue #243 item 4): per-class depth + oldest age, and a NON-TERMINAL alarm
+      # when class-2 (self-healing) age exceeds the clamp. Non-terminal by contract: a slow queue
+      # must not fail the drain, because failing the drain is what stops the queue being drained.
+      - name: Queue depth, oldest age, and the class-2 clamp alarm
+        # always() so a failed pick/route still reports depth — that is exactly the tick whose
+        # backlog matters. Conditioned on the policy step having produced the clamp, because
+        # without it this step could only fail a second time and bury the real error.
+        if: always() && steps.policy.outputs.heal_max_wait_minutes != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          HEAL_WAIT: ${{ steps.policy.outputs.heal_max_wait_minutes }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/task-queue.py --stats \
+            --repo "$REGISTRY_REPO" \
+            --heal-max-wait-minutes "$HEAL_WAIT" > "$RUNNER_TEMP/stats.json"
+          python3 - "$RUNNER_TEMP/stats.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          lines = ["", "### task queue", "", "| class | depth | oldest age (s) |", "|--|--|--|"]
+          for klass in sorted(report["stats"]):
+              row = report["stats"][klass]
+              lines.append(f"| {klass} | {row['depth']} | {row['oldest_age_seconds']} |")
+          if report["class2_alarm"]:
+              alarm = (f"class-2 (self-healing) oldest age "
+                       f"{report['class2_oldest_age_seconds']}s exceeds the "
+                       f"heal_max_wait_minutes clamp — self-healing work is being starved")
+              print(f"::warning::{alarm}")
+              lines += ["", f"> ⚠️ {alarm}"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("\n".join(lines) + "\n")
+          print(json.dumps(report, sort_keys=True))
+          PY

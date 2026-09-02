@@ -55,6 +55,7 @@ retriage.py
 route-resolve.py
 run_name_grammar.py
 select-and-claim.py
+task-queue.py
 triage-stock-alert.py
 triage.py
 trust-gate.py

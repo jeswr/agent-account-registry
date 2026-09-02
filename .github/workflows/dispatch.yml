@@ -1476,6 +1476,62 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # [issue #243] THE FIRST TASK-QUEUE ENQUEUER (research/orchestrator-task-queue.md, Phase A).
+  # PLAN's review/fix/disarm emissions are DUAL-WRITTEN into data/task-queue.json on the ledger
+  # branch. Dual-write, not conversion: CLAIM below is untouched and remains the live executor for
+  # these kinds, so drain.yml deliberately does not launch them yet (see its header). A Phase-B PR
+  # converts exactly one kind — flipping it on in drain.yml in the same commit that removes its
+  # push edge here.
+  #
+  # WHY A SEPARATE JOB, NOT A STEP IN PLAN. PLAN is the unprivileged, secret-free target half: it
+  # executes hostile target planner code under `contents: read` by design. Enqueueing needs
+  # `contents: write` for the ledger CAS PUT, and granting PLAN that would hand write access to the
+  # data plane to the one job that runs untrusted code. This job takes the PLAN artifact as HOSTILE
+  # DATA instead: before projecting a single row, task-queue.py runs dispatch-claim.py's FULL
+  # `validate_plan` over it — exact top-level/item fields, schema version, deterministic order,
+  # uniqueness, and every emitted item's repo bound to the plan's own `repositories` set — and only
+  # then pins each projected row's character classes and refuses an unclassified state. That is the
+  # SAME validation CLAIM applies to this artifact, so a compromised PLAN producer can no more
+  # enqueue a forged row than it can get one dispatched.
+  #
+  # It holds NO secrets (only the ephemeral github.token), so it is correctly not bound to the
+  # `dispatch-secrets` environment and not gated on secrets-guard: dispatch-secrets-guard.py
+  # derives that gate from actual `secrets.*` reads, and this job has none. It is also NOT in
+  # CLAIM's `needs:`, so a queue write failure can never stall the live push path — it just turns
+  # this job red, which is the honest signal. No continue-on-error (issue #618).
+  enqueue:
+    name: ENQUEUE (dual-write PLAN emissions into the task queue)
+    needs: [plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # write: the task-queue CAS PUT on the `ledger` data-plane branch only
+    steps:
+      - name: Download PLAN artifact (pinned)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dispatch-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: plan
+
+      - name: Checkout registry helpers (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Dual-write the PLAN emissions into the task queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/task-queue.py --self-test
+          python3 registry/scripts/task-queue.py \
+            --enqueue-from-plan plan/plan.json \
+            --repo "$REGISTRY_REPO" \
+            --run-url "$RUN_URL"
+
   # SECRET-EXFIL SETTINGS GUARD (issue #101, review round 1 on the #101 PR). The
   # `dispatch-secrets` environment binding on CLAIM / plan-alert below is enforced by REPO
   # SETTINGS, not by this file — GitHub silently AUTO-CREATES a referenced environment with no
