@@ -22,7 +22,7 @@ script inside a registry Actions run. There is deliberately no operator-supplied
   head_sha_at_open  the head sha the API reports for that PR AT MINT TIME
   impl_account_h    sha256("orchestrator:<live PR author login>" + ':' + PROVENANCE_SALT)[:16]
   impl_provider     DERIVED from the target's protected routing catalog for `--impl-alias`,
-                    and REFUSED unless it is `anthropic` (see ORCHESTRATOR_IMPL_PROVIDER)
+                    and REFUSED unless it is `openai` (see ORCHESTRATOR_IMPL_PROVIDER)
   issue             the operator-named source issue, re-read live and re-validated
   recorded_at_run   `orchestrator:<this run>.<this attempt>`, built from the runner's own
                     GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT — never from an argument
@@ -65,20 +65,20 @@ class MintError(RuntimeError):
 
 
 # ---- WHAT THE RECORD MAY ASSERT ---------------------------------------------------------------
-# The one provider this path will ever record. It is a PIN, not a default, and it is the reason
-# design record §7.4 step 2 ("pin a CONSTANT reviewer side for the class") needs no changes at its
-# five enforcement points: the lane picks the reviewer by INVERTING `impl_provider`
+# [SPARQ agent] The one provider this path will ever record. It is a PIN, not a default, and it is
+# why design record §7.4 step 2 ("pin a CONSTANT reviewer side for the class") needs no changes at
+# its five enforcement points: the lane picks the reviewer by INVERTING `impl_provider`
 # (REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus5"]}), so a record that can only
-# ever say `anthropic` can only ever resolve to the openai review side — at the REVIEW_CHAIN
+# ever say `openai` can only ever resolve to the Opus review side — at the REVIEW_CHAIN
 # subscript, at the `claim_provider == impl_provider` violation, at review-fix.yml's inline chain
 # table and both its re-assertions. Pinning the WRITER is one enforcement point instead of five,
 # and it cannot be half-applied.
 #
-# The pin is also why an openai-harness orchestrator must not use this path: it would be a false
+# The pin is also why an Anthropic-harness orchestrator must not use this path: it would be a false
 # declaration, and the review would be same-provider. `alias_mint_refusal` refuses rather than
 # recording it — design record §3's residual risk is an ADVISORY COMMENT, and this keeps even that
 # from being manufactured by the supported writer.
-ORCHESTRATOR_IMPL_PROVIDER = "anthropic"
+ORCHESTRATOR_IMPL_PROVIDER = "openai"
 
 # The account-hash preimage is domain-separated from the worker lane's `acctNN` handles. The
 # reviewer != implementer assertion at CLAIM hashes a live account handle the same way and
@@ -123,7 +123,7 @@ CENSUS_VERDICTS = (CENSUS_MINTABLE, CENSUS_DEAD, CENSUS_NO_ISSUE, CENSUS_RECORDE
 # The implementing alias both the CLI default and the census decide with. ONE literal: a census
 # that judged a different alias from the one a mint would record would report a population the
 # operator cannot act on.
-DEFAULT_IMPL_ALIAS = "opus5"
+DEFAULT_IMPL_ALIAS = "sol"
 
 
 class MintDecision(NamedTuple):
@@ -1293,9 +1293,9 @@ def _self_test():                                                       # noqa: 
     # ---- the alias -> provider catalog lookup -------------------------------------------------
     routing = {"models": {"opus5": {"provider": "anthropic"}, "sol": {"provider": "openai"},
                           "weird": {"provider": None}}}
-    check("an anthropic catalog alias is recorded", alias_mint_refusal("opus5", routing), None)
-    rejects("an OPENAI catalog alias is refused", "only ever records 'anthropic'",
-            lambda: alias_mint_refusal("sol", routing))
+    check("an OpenAI catalog alias is recorded", alias_mint_refusal("sol", routing), None)
+    rejects("an Anthropic catalog alias is refused", "only ever records 'openai'",
+            lambda: alias_mint_refusal("opus5", routing))
     rejects("an alias absent from the catalog is refused", "not in the target's routing catalog",
             lambda: alias_mint_refusal("fable", routing))
     rejects("an alias with no provider is refused", "not in the target's routing catalog",
@@ -1315,7 +1315,7 @@ def _self_test():                                                       # noqa: 
                          json_type_exact=worker_pr._json_type_exact)
 
     def decide(**over):
-        base = dict(repo=repo, pr_number=41, issue_number=7, impl_alias="opus5",
+        base = dict(repo=repo, pr_number=41, issue_number=7, impl_alias="sol",
                     enrolled_authors=enrolled, routing=routing, stamp="orchestrator:9.1",
                     salt="s", pull=pull(), issue=issue(), existing_body=None)
         base.update(over)
@@ -1325,8 +1325,8 @@ def _self_test():                                                       # noqa: 
     check("a clean case mints", minted.action, ACTION_MINT)
     check("the record binds THIS PR at THIS head, with a pinned provider and a derived hash",
           {k: v for k, v in minted.document.items() if k != "impl_account_h"},
-          {"pr_number": 41, "head_sha_at_open": "a" * 40, "impl_provider": "anthropic",
-           "impl_alias": "opus5", "issue": 7, "recorded_at_run": "orchestrator:9.1"})
+          {"pr_number": 41, "head_sha_at_open": "a" * 40, "impl_provider": "openai",
+           "impl_alias": "sol", "issue": 7, "recorded_at_run": "orchestrator:9.1"})
     check("the account hash is domain-separated from the acctNN namespace",
           minted.document["impl_account_h"], worker_pr.account_hash("orchestrator:jeswr", "s"))
     check("...and is NOT the bare-login hash a future acctNN could collide with",
@@ -1364,7 +1364,7 @@ def _self_test():                                                       # noqa: 
     check("a machine-shaped stamp refuses at the decision, not just at the helper",
           decide(stamp="9.1").action, ACTION_REFUSE)
     check("...and no document escapes a refusal", decide(stamp="9.1").document, None)
-    check("an openai alias refuses at the decision", decide(impl_alias="sol").action,
+    check("an Anthropic alias refuses at the decision", decide(impl_alias="opus5").action,
           ACTION_REFUSE)
     check("a fork head refuses at the decision",
           decide(pull=pull(head={"repo": {"full_name": "attacker/r"}})).action, ACTION_REFUSE)
@@ -1382,7 +1382,7 @@ def _self_test():                                                       # noqa: 
     for label, stored in (
             ("a different head", {**minted.document, "head_sha_at_open": "b" * 40}),
             ("a different issue", {**minted.document, "issue": 8}),
-            ("a different provider", {**minted.document, "impl_provider": "openai"}),
+            ("a different provider", {**minted.document, "impl_provider": "anthropic"}),
             ("a type-confused pr_number", {**minted.document, "pr_number": True}),
             ("a MACHINE-attested record", {**minted.document, "recorded_at_run": "9.1"}),
             ("an unstamped record", {**minted.document, "recorded_at_run": "x"})):
@@ -1416,7 +1416,7 @@ def _self_test():                                                       # noqa: 
                  pull_over=None, issue_over=None, record_reader=None,
                  identity_admits=_identity_admits, shell_admits=_shell_admits):
         written = []
-        decision = mint(repo, 41, 7, "opus5", "reg/istry", routing, enrolled,
+        decision = mint(repo, 41, 7, "sol", "reg/istry", routing, enrolled,
                         apply_changes=apply_changes, allow_global_partition=allow_global,
                         env=env if env is not None else good_env,
                         read_pull=lambda: pull(**(pull_over or {})),
@@ -1655,7 +1655,7 @@ def _self_test():                                                       # noqa: 
             return dispatch_claim.enumerate_review_items(*args, **kwargs)
 
     _spy = _SpyClaim()
-    mint(repo, 41, 7, "opus5", "reg/istry", routing, enrolled, env=good_env,
+    mint(repo, 41, 7, "sol", "reg/istry", routing, enrolled, env=good_env,
          read_pull=lambda: pull(), read_issue=lambda: issue(labels=[{"name": "area:ci"},
                                                                     {"name": "role:impl"}]),
          read_record=lambda: None, write_record=lambda: None,

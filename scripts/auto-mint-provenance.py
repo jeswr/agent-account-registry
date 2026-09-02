@@ -133,13 +133,14 @@ class UnknownRenderedElement(RuntimeError):
 
 
 # ---- WHAT THE SWEEP MAY ASSERT ----------------------------------------------------------------
-# The implementing alias this unattended path will ever record. A PIN, not a default, and there is
-# no CLI argument, workflow input or env binding on this path that can influence it — the seam
-# report below asserts that of the LIVE workflow, not just of this constant. mint-provenance's
-# `alias_mint_refusal` then resolves it through the TARGET's protected routing catalog and refuses
+# [SPARQ agent] The implementing alias this unattended path will ever record. A PIN, not a default,
+# and there is no CLI argument, workflow input or env binding on this path that can influence it.
+# The seam report below asserts that of the LIVE workflow, not just of this constant.
+# `mint-provenance`'s `alias_mint_refusal` then resolves it through the TARGET's protected routing
+# catalog and refuses
 # anything that is not `ORCHESTRATOR_IMPL_PROVIDER`, so the recorded provider is a catalog lookup
 # and the reviewer side (its inverse) is constant. The class cannot choose its own reviewer.
-AUTO_IMPL_ALIAS = "opus5"
+AUTO_IMPL_ALIAS = "sol"
 
 # How many records ONE tick may write. The trust plane drains slowly on purpose: a bounded sweep
 # turns a bad change into a handful of records a human can read, not a ledger-wide rewrite. Stated
@@ -2851,7 +2852,7 @@ def _self_test():                                                       # noqa: 
           mint_provenance.alias_mint_refusal(
               AUTO_IMPL_ALIAS, _live_routing()), None)
     check("...and the shared writer's provider pin is the one the lane inverts",
-          mint_provenance.ORCHESTRATOR_IMPL_PROVIDER, "anthropic")
+          mint_provenance.ORCHESTRATOR_IMPL_PROVIDER, "openai")
 
     check("an enrolled author's open PR is in the population",
           [row["number"] for row in enrolled_class_pulls([pull()], ("jeswr",))], [41])
@@ -3002,7 +3003,7 @@ def _self_test():                                                       # noqa: 
             def read_routing(repo):
                 if routing_boom:
                     raise SweepError("the routing pointer is not a relative repository path")
-                return {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"}}}
+                return {"models": {AUTO_IMPL_ALIAS: {"provider": "openai"}}}
 
             def read_comments(repo, number):
                 self.comment_reads.append(number)
@@ -3068,7 +3069,7 @@ def _self_test():                                                       # noqa: 
           total(lambda: (rec.handed[0]["issue"] or {}).get("number")), 7)
     check("...and the TARGET's own routing catalog, which the pinned alias resolves against",
           total(lambda: rec.handed[0]["routing"]),
-          {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"}}})
+          {"models": {AUTO_IMPL_ALIAS: {"provider": "openai"}}})
     check("...and the derived issue number, not the PR's own",
           total(lambda: (rec.handed[0]["number"], rec.handed[0]["issue_number"])), (41, 7))
     # WHAT THE RENDERER WAS HANDED. `POST /markdown`'s `context` is what makes GitHub mark a
@@ -3372,8 +3373,8 @@ def _self_test():                                                       # noqa: 
     saved = {key: os.environ.get(key) for key in env}
     os.environ.update(env)
     try:
-        routing = {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"},
-                              "sol": {"provider": "openai"}}}
+        routing = {"models": {AUTO_IMPL_ALIAS: {"provider": "openai"},
+                              "opus5": {"provider": "anthropic"}}}
         decision = caller("o/r", 41, 7, routing, ("jeswr",), pull(body="Closes #7"),
                           issue(labels=[]))
         check("the sweep can NEVER accept the serializing __global__ partition",
@@ -3429,8 +3430,8 @@ def _self_test():                                                       # noqa: 
         """One corpus row, all the way to the (stubbed) ledger PUT. Returns (census, writes, posts)."""
         title, body = e2e_rows.get(label, ("t", "no reference"))
         writes, posts = [], []
-        routing = {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"},
-                              "sol": {"provider": "openai"}}}
+        routing = {"models": {AUTO_IMPL_ALIAS: {"provider": "openai"},
+                              "opus5": {"provider": "anthropic"}}}
         # The TARGET is the oracle's own repository, because these rows are real GitHub renderings
         # captured in its numbering — the `issue-link` hrefs the third conjunct reads point there.
         row = total(lambda: sweep(

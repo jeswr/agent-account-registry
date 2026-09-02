@@ -62,10 +62,10 @@ on:
         type: string
       impl_alias:
         description: >-
-          Implementing model alias. Must resolve to provider `anthropic` in the target's routing
+          Implementing model alias. Must resolve to provider `openai` in the target's routing
           catalog — that pin is what keeps the review side constant (the lane inverts the provider).
         required: false
-        default: opus5
+        default: sol
         type: string
       apply:
         description: Write the record (false = dry run)
