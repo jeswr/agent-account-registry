@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2188,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "adda94d1b3190aad672567f9081db78d61831476",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly distinguishes an absent legacy `leases` key from a present non-list container, emits one bounded type-only diagnostic through the existing lease drop seam, and preserves the rows-first precedence contract. The added tests use independent literal inputs and expectations and cover mapping, null, string, scalar, absent, empty-list, aggregate-precedence, privacy, cardinality, and cross-seam ordering cases. No trust check is weakened, no collector-controlled lease value or key is logged, and the diff contains no reviewer-directed instruction.",
+  "verdict": "approve"
+ }
+}
