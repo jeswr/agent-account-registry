@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6185,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a1b7c4f5abf9c4024e0ec227b33289b50071d400",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete on the changed surface. The annotation graph conservatively classifies every MPC protocol, including both IT-MAC-backed protocols, under secx:SemiHonest and secx:HonestMajority; positive Hiding/Soundness rows remain Claimed with ExternalSignOffPending, while only the settled negative NotZK rows are Proven. The feature remains default-off, has an explicit feature-matrix executor, and the public API is documented in the matching MPC skill. The headline test exercises the parsed bundled graph and pins fail-closed exclusion of the entire crate, including auth-comparison-v1, while mutation tests demonstrate that descriptor and assumption guards detect contradictions. No correctness, soundness, test-validity, or security regression is apparent relative to the issue-free prior round.",
+  "verdict": "approve"
+ }
+}
