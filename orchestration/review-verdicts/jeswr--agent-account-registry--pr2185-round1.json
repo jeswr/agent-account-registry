@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2185,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ad23ea713cbf53ae65089378b7aed4f43bdbf941",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly centralizes workflow `if:` presence/value reading and the canonical default-branch expression without weakening the workflow-specific exact-match assertions. The shared reader preserves the important distinction between a missing guard and declared false/None values, normalizes only representation-level whitespace for the guards in scope, and fails closed for malformed nodes. The three consumers retain separate presence and exact-value findings; the sweep-only schedule carve-out remains local and exact. The added tests exercise missing, neutered, malformed, widened, reordered, and reflowed conditions, verify consumer delegation to the shared implementation, restore sentinels with `finally`, cover the entry point, and enroll the new module in the self-test suite. I found no correctness, soundness, test-vacuity, or security blocker in the diff.",
+  "verdict": "approve"
+ }
+}
