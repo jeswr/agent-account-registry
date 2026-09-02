@@ -39,8 +39,41 @@ permissions:
   contents: read
 
 concurrency:
-  group: triage-${{ github.event.issue.number }}
-  cancel-in-progress: true
+  # [#1325] CROSS-ISSUE DEBOUNCE ON THE LABEL FAN-OUT. The per-issue group collapses repeated
+  # events on ONE issue, which is right — and it is NO protection at all against N DISTINCT issues
+  # being touched at once. MEASURED: a bulk relabel of 37 issues (routine work — #1324 asks a lane
+  # to drain the untriaged pool exactly this way) became 37 distinct groups, hence ~47 concurrently
+  # EXECUTING triage runs, each spending from the installation's SHARED HOURLY github.token
+  # request budget. The budget went to zero, dispatch's GUARD job failed closed on it (correctly,
+  # and it refuses to be re-run), and PLAN executed no tick for the rest of the hour. A cheap bulk
+  # write denied service to the whole fleet.
+  #
+  # So `labeled` — the burst-prone event, and the one a bulk relabel emits — collapses into ONE
+  # repo-wide group. `cancel-in-progress: false` on that group is what makes this a BUDGET fix and
+  # not merely a churn fix: GitHub holds at most one run in progress plus ONE pending run per
+  # group and cancels any earlier PENDING run, so a 37-issue relabel EXECUTES at most two runs and
+  # every other one is cancelled before it spends a single API call. Nothing is cancelled mid-write.
+  #
+  # `unlabeled` IS DELIBERATELY NOT COLLAPSED, and that asymmetry is the fail-closed half of this
+  # change. `unlabeled` is the event that carries a `trust:untrusted` STRIP, and the quarantine
+  # step's restore of that label (#607 / PR #998 r1 f1) is the control that stops a triage-role
+  # actor clearing the hard gate ready-issues.py / curate-frontier.py / dispatch-claim.py read on
+  # an issue whose AUTHOR is untrusted. Collapsing it would let an unrelated burst cancel that
+  # restore, and the retriage sweep CANNOT stand in: its lanes only ever SKIP an untrusted author
+  # (`untrusted-author`), they never re-apply quarantine. So the strip event keeps its own
+  # per-issue group and its own run, always — as do opened/edited/reopened, so a human filing or
+  # editing an issue is never queued behind a bulk operation.
+  #
+  # What the collapse costs is per-issue classification for the coalesced `labeled` events. The
+  # retriage sweep (#586, :07/:37) is the fail-closed backstop this file's header already names
+  # for exactly this reason — "a run can be cancelled by the concurrency group below".
+  #
+  # Both expressions are EVALUATED, not pattern-matched, by `scripts/triage.py --self-test`: it
+  # extracts them from this file and resolves them over the workflow's whole `types:` set, so an
+  # inverted branch, a collapsed `unlabeled`, or a reverted `cancel-in-progress` reds a row that
+  # names the policy rather than merely comparing a string to itself.
+  group: ${{ github.event.action == 'labeled' && 'triage-label-fanout' || format('triage-{0}', github.event.issue.number) }}
+  cancel-in-progress: ${{ github.event.action != 'labeled' }}
 
 env:
   # Exact-match trusted logins. The maintainer, plus the registry orchestrator App bot login (an
