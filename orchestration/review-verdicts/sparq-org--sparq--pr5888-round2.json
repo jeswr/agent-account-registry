@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5888,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9d08c11d3bde5a078f99855a664480210ceb6c16",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 found no correctness, soundness, security, or test-validity defects. The event-specific merge-group cap is wired into main, preserves the pull-request configuration, and is pinned against both workflow timeout branches and the documented queue deadline. The zero-pending hold path remains fail-closed by calling the existing verdict renderer and retains the startup floor, saturation extension, late-success, and pending-work hang distinctions. The watchdog change is observational only, selects the head by queue position, declines unanchored ages, and is covered at its boundary and through the real sweep. Focused ci-summary tests passed (14 tests), and the watchdog self-test passed; the standalone watchdog unittest module could not import because PyYAML is unavailable in this environment. No hostile instructions appeared in the diff. Findings remain empty as in round 1, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
