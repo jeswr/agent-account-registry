@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2167,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "af65773336dffb33039b4e776af12f5afb1ec829",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Carried forward from rounds 3/4 at nit severity; re-derived independently and I agree it is not blocking.\n\nThe two new rows at :1426-1440 inject a `refuse` callable, so they never exercise the `require is None` branch at :101-103. That branch is not untested in practice: `_load_workflow_yaml()` is called unconditionally at module scope (:109), so it runs on every single invocation of this watchdog, live and self-test alike. A mutant deleting `from yaml_dependency import require_yaml` leaves `require` as None, `require(...)` raises TypeError at IMPORT time, and the script dies before any assertion runs \u2014 the mutant is killed loudly in every lane.\n\nWhat remains is only a failure-SHAPE wart: `except (ImportError, RuntimeError)` at :105 does not include TypeError, so that particular death is an unhandled traceback rather than the structured `(None, exc)` path the docstring advertises the loader preserves. The live consumer at :1015 is unaffected either way (it raises AlarmError when `yaml is None`), so there is no fail-open here and nothing gate-relevant. Recording it so the next reader does not re-derive it.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Optional, and safe to defer. Either widen the tuple so an un-set `require` also lands on the structured path:\n\n    except (ImportError, RuntimeError, TypeError) as exc:\n\nor add one row that drives the real default branch by making the genuine import fail:\n\n    import sys as _sys\n    _saved = _sys.modules.pop(\"yaml_dependency\", None)\n    _sys.modules[\"yaml_dependency\"] = None  # forces ImportError on `from ... import`\n    try:\n        default_path = _load_workflow_yaml()\n    finally:\n        _sys.modules.pop(\"yaml_dependency\", None)\n        if _saved is not None:\n            _sys.modules[\"yaml_dependency\"] = _saved\n    chk(\"yaml loader takes the structured path when the helper module itself cannot be imported\",\n        default_path[0] is None and isinstance(default_path[1], ImportError))",
+    "severity": "nit",
+    "title": "TypeError is outside the loader's except tuple, so the `require is None` default path would die with an opaque traceback rather than the structured detector path"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Re-verified from scratch rather than inheriting round 4. No blocker or major found; the single carried-forward nit is unchanged, hence \"stagnant\" (same finding, same severity, materially unchanged diff).\n\nWhat I checked and confirmed:\n\n1. SUITE ENROLMENT. yaml_dependency.py:87 spells `if len(sys.argv) == 2 and sys.argv[1] == \"--self-test\":`; worker-live.sh:1043's discovery ERE (third alternative `sys\\.argv\\[[^]]+\\][[:space:]]*==[[:space:]]*\"--self-test\"`, with the `^[[:space:]]*[^#].*` prefix satisfied) matches, and selftest-suite.txt:66 enrols it. Both arms of the manifest cross-check (enrolled-but-entrypointless, advertising-but-unenrolled) are satisfied.\n\n2. SPARSE-CHECKOUT / REQUIRED_FILES, all 13 blocks re-walked. Every job that EXECUTES a converted consumer gained scripts/yaml_dependency.py. The exact-equality assertions hold as sets: dispatch-tick-floor.py:1669, dispatch-stall-alert.py:1152, groom-mint-alert.py:1765, regate-sweep.py:2818 (6 files + 1 dir = 7 sparse lines). The subset-direction ones (ci-latency-alert.py:2847, metrics-alert.py:1075, ratelimit-alert.py:1063) hold too. groom-mint-alert.py:1763's _REQUIRED_READS equality is satisfied because :1751 `_require()`s every REQUIRED_FILES entry. Correct omissions: backfill-provenance.yml:69 is the tomllib `resolve` job (its --self-test runs at :174 under the FULL checkout at :123); dispatch.yml:1583 runs only dispatch-secrets-guard.py, which keeps a bare `import yaml` at :319 and reads worker-pr.py statically; dispatch.yml:2287 and groom-sweep.yml:836 host unconverted scripts.\n\n3. sys.path. Every converted site resolves `yaml_dependency` because the runner invokes `python3 <root>/<script> --self-test` (worker-live.sh:1225), so sys.path[0] is the scripts dir. Only ci-latency-alert.py imports the helper at module scope; nothing imports that file as a module. worker-live.sh's python heredocs (:1462, :2126) correctly KEEP bare `import yaml` \u2014 sys.path[0] there is the repo root, where \u2026 [truncated 1948 chars]",
+  "verdict": "approve"
+ }
+}
