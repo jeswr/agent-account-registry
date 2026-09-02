@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6190,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "63ad3b545aa8b376d614211212b92cb1ae93a251",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 5.3 item 4 requires the deny message for an out-of-scope quad and a nonexistent quad to be byte-identical. But L2 and section 5.1 evaluate DELETE against the masked fork: a nonexistent or masked triple creates no delete effect, so the operation succeeds as a no-op and no deny message exists. Section 4 explicitly confirms that masked DELETE reports success. Thus the mandatory test cannot be implemented as written and conflates the insert scope-boundary rule (L3) with delete nonexistence indistinguishability (L2).",
+    "file": "research/pattern-scoped-update-enforcement-2026-09.md",
+    "fix_hint": "Split the acceptance requirement by operation. For INSERT membership probes, assert identical verdict/store/subsequent-read behavior for masked-present and masked-absent cases (as item 3 already does). For DELETE, assert identical successful no-op behavior for masked-present and absent triples. Reserve byte-identical denial checks for two cases that both actually deny under L3/L8, and state exactly which cases those are. Update L7 wording if it currently implies that nonexistent DELETE is denied.",
+    "severity": "major",
+    "title": "L7 acceptance test requires a denial that the proposed semantics never produce"
+   }
+  ],
+  "progress": null,
+  "summary": "The design is candid about its non-implemented status, the live graph-granularity WHERE leak, and the unresolved blank-node replay question. The masked-replica/delta/replay construction is otherwise coherent with the parent read-scope record and the existing atomic-denial test. However, the stated L7 acceptance test is internally inconsistent with L2 and the proposed algorithm: a nonexistent or masked DELETE produces no captured delta and succeeds, so there is no denial message to compare with an out-of-scope insertion denial. The acceptance bar must specify comparable operations and observable outcomes before this record can serve as an implementation contract.",
+  "verdict": "request_changes"
+ }
+}
