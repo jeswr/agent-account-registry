@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2216,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "91303800474a56c30eba3b22009b7338463a2382",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major is resolved. The manual workflow now requires an explicit, default-free per-PR implementation-alias attestation; the writer resolves that alias through the target's protected routing catalog, admits only providers that the review consumer can invert, binds the record to the live PR head, and preserves create-only behavior. The Opus fallback is covered end to end: it records Anthropic provenance and selects the OpenAI review chain. The unattended sweep remains fail-closed and has lost ledger write permission, so it cannot fabricate Sol provenance from route order. The routing, planner, resolver, claim, workflow-seam, and provenance tests consistently pin the new Sol-first/Opus-fallback policy and its bounded escalation behavior. I found no blocker, major, or diff-supported minor issue.",
+  "verdict": "approve"
+ }
+}
