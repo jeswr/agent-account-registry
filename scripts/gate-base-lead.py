@@ -552,8 +552,12 @@ def _self_test():
            + _log_line(GATE_JOB, _STEP, "some other output"))
     chk("the receipt is mined out of a realistic log, at the graded tip",
         receipt_from_log(log, GATE_JOB, _STEP)[0],
+        # `event_base` is the producer's appended tail (#1431): this module builds its lines through
+        # `_receipt_line`, which states no event base, so it reads `-` here. This sweep binds on the
+        # CHECK-RUN's `pull_requests[].base.sha`, which is a DIFFERENT object from that event field
+        # — see this module's header; the tail is carried, not consumed.
         {"state": "stale", "base_ref": "master", "tested_base": _TESTED, "live_tip": _TIP,
-         "behind": "1"})
+         "behind": "1", "event_base": "-"})
     chk("a receipt REPEATED identically (a retried step) is still one receipt",
         receipt_from_log(log + _receipt_line(_TESTED, _TIP), GATE_JOB, _STEP)[0]["tested_base"],
         _TESTED)

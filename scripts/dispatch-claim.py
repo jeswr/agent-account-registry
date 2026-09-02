@@ -4574,6 +4574,19 @@ def _live_repair_gate(repo, head_sha, draft, fetch=None):
 #       LAGS rather than leads — it errs toward calling a fresh gate stale (refuse: safe), not
 #       toward calling a stale gate fresh.
 #
+#       ⚠️ WHICH `base.sha`, AND WHY THAT IS NOT A PEDANTIC POINT (registry #1431). The field
+#       above is the CHECK-RUN's `pull_requests[].base.sha`. `gate-staleness.py` (#920) states the
+#       opposite-sounding thing — "`base.sha` is NOT the tested tree", measured mispredicting 5 of
+#       7 failures — about a DIFFERENT object with the same spelling: the workflow EVENT PAYLOAD's
+#       `github.event.pull_request.base.sha`. Neither sentence is a general claim about
+#       "`base.sha`", and #920's number says nothing about the field this clause binds on. Read
+#       either as general and they contradict, with THIS one gating arming. Whether the check-run
+#       field tracks the graded tree is therefore MEASURED rather than argued, by
+#       `scripts/gate-base-lead.py` (#1238): it crosstabs this field, read through THIS module's
+#       own `_run_recorded_base_sha`, against gate-staleness's per-run receipt, and reports
+#       lags / equal / leads / diverged. `leads` is the arm-capable outcome and is exactly the
+#       residual named below.
+#
 #   (2) TEMPORAL — a CONTRADICTION DETECTOR, not a lag bound. The deciding run must have STARTED
 #       strictly AFTER the base tip's commit date. This is the backstop for the one way (1) could
 #       go quiet: if GitHub ever recomputed that field live, (1) would become vacuously true and
@@ -4600,6 +4613,15 @@ def _live_repair_gate(repo, head_sha, draft, fetch=None):
 # pusher's local commit date, which may precede the landing instant without bound. Both are why
 # (1) is the BINDING test and (2) only a backstop, and why they are conjunctive: FRESH requires
 # both, so the verdict is never weaker than the stronger of the two.
+#
+# ...AND IT IS STATED HERE FOR ONE DIRECTION ONLY (registry #1431). "Live-recomputing" is the LEAD
+# direction. The field could also simply be stamped from the pull request's CURRENT base while the
+# merge ref it grades was composed from an older one — same hole, no recompute required, and
+# reachable by re-running a workflow after a base move (`gh run rerun` re-tests the same tree; see
+# WHAT THE REFUSAL MUST NOT DO below). Both directions, plus `diverged`, are what
+# `scripts/gate-base-lead.py` (#1238) enumerates and measures; this comment does not assert an
+# answer for either, and neither number quoted above may be restated as a fact about "`base.sha`"
+# without naming which of the two objects it is about.
 #
 # EVERY UNRESOLVABLE OPERAND REFUSES. No base tip sha, no parseable base tip date, no aggregator
 # row, no parseable `started_at`, no recorded base sha for THIS pull request — each yields

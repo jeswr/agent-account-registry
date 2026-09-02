@@ -90,13 +90,23 @@ jobs:
       # the script header); the hard-gate options are repository settings and the maintainer's.
       # The name is QUOTED: an unquoted plain scalar ends at ` #`, so the issue reference would be
       # parsed as a trailing comment and the step would render under a truncated name.
+      #
+      # [issue #1431] `PR_BASE_SHA` is NOT an operand of the verdict — the discriminator is the
+      # merge ref's own base tip, read from git inside the run. It is passed so the receipt can
+      # print the EVENT payload's `base.sha` beside the tree that was actually graded, in the same
+      # line of the same run. "`base.sha`" names two different objects across this repo's comments
+      # (this event field, and the CHECK-RUN's `pull_requests[].base.sha` that the arm-side
+      # staleness refusal binds on); carrying this one makes the event half a grep over run logs
+      # instead of a hand reconstruction. All three env values are read by GitHub from the pull
+      # request object, never from author-controlled text, and none is interpolated into `run:`.
       - name: "Report whether this run graded the tree the PR will land on (#920)"
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          python3 scripts/gate-staleness.py --head-sha "$PR_HEAD_SHA" --base-ref "$PR_BASE_REF"
+          python3 scripts/gate-staleness.py --head-sha "$PR_HEAD_SHA" --base-ref "$PR_BASE_REF" --event-base-sha "$PR_BASE_SHA"
 
       - name: Install PyYAML for the workflow-yaml lint (version + hash locked)
         run: |
