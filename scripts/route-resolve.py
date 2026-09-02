@@ -275,7 +275,7 @@ def _self_test():
         raises(f"[#1397] agent_from_role on {_where} refuses to resolve (PLAN must refuse the "
                "tables CLAIM refuses)", ValueError,
                lambda d=_bad: resolve(["role:impl", "area:usage"], d))
-    # [GPT-5.6] 2026-09-02 protocol: ordinary implementation is Sol-first, with Opus retained as
+    # [SPARQ agent] 2026-09-02 protocol: ordinary implementation is Sol-first, with Opus retained as
     # the continuity fallback for current Anthropic-authored repairs and total Sol unavailability.
     mc, ag, esc = resolve(["role:impl", "area:usage"], doc)
     chk("impl+usage -> SOL-FIRST with Opus continuity fallback", (mc, ag, esc),

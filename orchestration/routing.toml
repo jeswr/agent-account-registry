@@ -194,7 +194,7 @@ agent_from_role = true
 escalate = true
 
 # ---------------------------------------------------------------------------------------------------
-# [GPT-5.6] ROLE ROUTES. The 2026-09-02 maintainer protocol separates authorship from review:
+# [SPARQ agent] ROLE ROUTES. The 2026-09-02 maintainer protocol separates authorship from review:
 # GPT-5.6 Sol is the primary implementation tier, while Opus 5 remains the review/soundness tier
 # and the cross-provider reviewer for Sol-authored PRs. Opus stays behind Sol as a continuity fallback
 # for current Anthropic-authored repairs and total Sol unavailability. `escalate = true` gives
@@ -256,7 +256,7 @@ model_chain = ["sol", "opus5"]
 agent = "registry-impl"
 escalate = true
 
-# [GPT-5.6] CI/infrastructure is implementation and therefore uses the same Sol-first lane. Opus 5
+# [SPARQ agent] CI/infrastructure is implementation and therefore uses the same Sol-first lane. Opus 5
 # reviews the resulting OpenAI-authored PR through the existing cross-provider review chain. Most
 # registry control-plane surfaces still match the security override above, which remains Opus + human arm;
 # this role covers residual CI plumbing and has an explicit bounded capacity exit.

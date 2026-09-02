@@ -186,7 +186,7 @@ def _self_test():
 
     R = ["status:ready"]
 
-    # [GPT-5.6] Ordinary implementation is Sol-first, with Opus retained as a continuity fallback.
+    # [SPARQ agent] Ordinary implementation is Sol-first, with Opus retained as a continuity fallback.
     # The whole chain is asserted because CLAIM compares this planner row for exact equality.
     impl = compute_ready([iss(1, R + ["priority:P1", "role:impl", "area:usage"])])
     p_impl = plan_dispatch(impl, doc)

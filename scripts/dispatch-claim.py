@@ -22909,7 +22909,7 @@ agent = "impl"
     assert escalate_starved(False, {"acct01": {}}, 0) is False
     assert escalate_starved(None, {"acct01": {}}, 0) is False
 
-    # [GPT-5.6] The live Sol-first implementation route has an explicit bounded capacity exit. The
+    # [SPARQ agent] The live Sol-first implementation route has an explicit bounded capacity exit. The
     # composition matters, not only the predicate in isolation: if both frontier providers are
     # unavailable, the route must not defer forever with nobody notified.
     #
