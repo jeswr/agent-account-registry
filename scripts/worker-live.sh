@@ -1812,6 +1812,12 @@ pymodule|yaml|python3-yaml'
 # collection stops at a shell operator so `&& rm -rf /var/lib/apt/lists/*` cannot be read as a
 # package, and a `pkg=<version>` pin is reported under its bare name. `install` counts only after
 # `apt-get`/`apt`, so a `cargo install` elsewhere in the file contributes nothing.
+#
+# [review r1 #2230] A word beginning `#` opens a SHELL comment, so the rest of the logical line is
+# text the RUN never executes: `RUN true # apt-get install -y jq` installs nothing and must yield
+# nothing. Reading it as an install was a soundness hole in the fail-OPEN direction — the check
+# would report the image satisfies a dependency it does not ship. Truncating here can only ever
+# report FEWER packages, which is the direction `_assert_container_selftest_deps` refuses in.
 _apt_packages_in_line() {
   local -a toks=()
   read -r -a toks <<< "$1"
@@ -1827,6 +1833,11 @@ _apt_packages_in_line() {
       apt-get | apt)
         saw_apt=1
         collecting=0
+        ;;
+      '#'*)
+        # Unquoted word starting `#`: comment to end of the logical line. `"#"` / `'#'` keep their
+        # quote as the first character, so a quoted hash is not mistaken for one.
+        break
         ;;
       install)
         [[ $saw_apt -eq 1 ]] && collecting=1
@@ -1852,12 +1863,27 @@ _apt_packages_in_line() {
   return 0
 }
 
+# PURE (self-tested): print the Dockerfile INSTRUCTION keyword (verbatim case) of one logical line,
+# or nothing for a blank line. Leading whitespace is legal before an instruction, so it is stripped
+# first.
+_dockerfile_instruction() {
+  local rest=${1#"${1%%[![:space:]]*}"}
+  printf '%s\n' "${rest%%[[:space:]]*}"
+}
+
 # PURE (self-tested): print, one per line, every package name an `apt-get install` in <dockerfile>
 # provisions. Line continuations are joined first so a multi-line install list is read whole.
 # Emitting the package SET lets the caller assert EXACT membership rather than a substring —
 # AGENTS.md pre-flight item 6: a containment check passes for `jq-DROPPED`.
+#
+# [review r1 #2230] Only a RUN instruction's arguments are shell that the build EXECUTES, so only
+# those are tokenised. A `LABEL note="run apt-get install -y jq ..."` (or any other instruction
+# whose argument merely quotes an install command) provisions nothing and must contribute nothing —
+# the same fail-OPEN hole as the shell comment handled in `_apt_packages_in_line`. Skipping an
+# instruction this does not recognise (`ONBUILD RUN`, JSON exec form) under-reports, which the
+# caller refuses on; the whole-line comment skip below stays for the same reason.
 _dockerfile_apt_packages() {
-  local file=$1 line acc="" logical
+  local file=$1 line acc="" logical instr
   [[ -f "$file" ]] || {
     printf 'worker-live: container definition missing: %s\n' "$file" >&2
     return 1
@@ -1873,9 +1899,14 @@ _dockerfile_apt_packages() {
     acc+="$line"
     logical=$acc
     acc=""
-    _apt_packages_in_line "$logical"
+    instr=$(_dockerfile_instruction "$logical")
+    if [[ "$instr" == [Rr][Uu][Nn] ]]; then
+      _apt_packages_in_line "$logical"
+    fi
   done < "$file"
-  [[ -z "$acc" ]] || _apt_packages_in_line "$acc"
+  if [[ -n "$acc" && "$(_dockerfile_instruction "$acc")" == [Rr][Uu][Nn] ]]; then
+    _apt_packages_in_line "$acc"
+  fi
   return 0
 }
 
@@ -5387,8 +5418,7 @@ tail is not read as one)" \
   chk "a package name that merely CONTAINS the declared one is REFUSED (exact match, not substring)" \
     "$(_assert_container_selftest_deps "$tmp/dep-suffix.Dockerfile" >/dev/null 2>&1 \
       && echo satisfied || echo missing)" "missing"
-  # Prose that NAMES a package is not an instruction that installs one — this is the row that goes
-  # red if the whole-line comment skip is dropped.
+  # Prose that NAMES a package is not an instruction that installs one.
   { printf 'FROM x@sha256:%s\n' "$(printf 'a%.0s' {1..64})"
     printf '# TODO: apt-get install -y python3-yaml\n'
     printf 'RUN apt-get install -y --no-install-recommends jq\n'
@@ -5396,7 +5426,39 @@ tail is not read as one)" \
   chk "a COMMENT naming the package does not satisfy the dependency" \
     "$(_assert_container_selftest_deps "$tmp/dep-comment.Dockerfile" >/dev/null 2>&1 \
       && echo satisfied || echo missing)" "missing"
-  # The positive control for all four rejects: the SAME checker accepts a fixture that really does
+  # [review r1 #2230] The WHOLE-LINE comment above is not the only comment seam: `#` inside a RUN
+  # opens a SHELL comment, so `RUN true # apt-get install -y ...` executes NO install. Reading it as
+  # one made the checker report a satisfied dependency the image does not ship — fail-OPEN, the one
+  # direction that matters here. Asserted through `_assert_container_selftest_deps` (not just the
+  # tokeniser) because that is the verdict the gate consumes; pre-fix this fixture read "satisfied".
+  printf 'FROM x@sha256:%s\nRUN true # apt-get install -y jq python3-yaml\n' \
+    "$(printf 'a%.0s' {1..64})" > "$tmp/dep-shcomment.Dockerfile"
+  chk "packages named after a SHELL comment inside a RUN do not satisfy the dependency" \
+    "$(_assert_container_selftest_deps "$tmp/dep-shcomment.Dockerfile" >/dev/null 2>&1 \
+      && echo satisfied || echo missing)" "missing"
+  # ...and the truncation is at the `#`, not "drop the whole line": everything installed BEFORE the
+  # comment still counts, so the fix cannot regress into rejecting real installs.
+  printf 'RUN apt-get install -y jq # python3-yaml\n' > "$tmp/apt-shcomment.Dockerfile"
+  chk "a RUN with a trailing shell comment yields exactly the packages BEFORE the \`#\`" \
+    "$(_dockerfile_apt_packages "$tmp/apt-shcomment.Dockerfile" | sort | paste -sd' ' -)" "jq"
+  # ...and this is the row that anchors the WHOLE-LINE comment skip: Docker strips a comment line
+  # inside a continuation block before joining. Drop the skip and the comment terminates the
+  # accumulation, the install tail is read as an `&&` instruction rather than a RUN, and this reads
+  # EMPTY instead of both packages.
+  printf 'RUN apt-get update \\\n# pinned deliberately: see the header\n  && apt-get install -y jq python3-yaml\n' \
+    > "$tmp/apt-contcomment.Dockerfile"
+  chk "a comment line INSIDE a continuation is stripped before joining, not treated as line end" \
+    "$(_dockerfile_apt_packages "$tmp/apt-contcomment.Dockerfile" | sort | paste -sd' ' -)" \
+    "jq python3-yaml"
+  # [review r1 #2230] Same fail-OPEN shape one instruction over: only RUN arguments are shell the
+  # build executes, so an install command merely QUOTED in a LABEL (or ENV, or any other
+  # instruction) provisions nothing. Pre-fix this fixture also read "satisfied".
+  printf 'FROM x@sha256:%s\nLABEL note="run apt-get install -y jq python3-yaml here"\n' \
+    "$(printf 'a%.0s' {1..64})" > "$tmp/dep-label.Dockerfile"
+  chk "an install command quoted in a NON-RUN instruction does not satisfy the dependency" \
+    "$(_assert_container_selftest_deps "$tmp/dep-label.Dockerfile" >/dev/null 2>&1 \
+      && echo satisfied || echo missing)" "missing"
+  # The positive control for every reject above: the SAME checker accepts a fixture that really does
   # install both, so "missing" above is a verdict rather than a checker that never accepts.
   printf 'FROM x@sha256:%s\nRUN apt-get install -y --no-install-recommends jq python3-yaml\n' \
     "$(printf 'a%.0s' {1..64})" > "$tmp/dep-ok.Dockerfile"
