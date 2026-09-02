@@ -6598,7 +6598,8 @@ def fix_outcome(args):
 # ---- self-test ------------------------------------------------------------------------------------
 # ---- registry #677: the WORKFLOW seam behind the provenance read ---------------------------------
 def _workflow_yaml(name):
-    import yaml
+    from yaml_dependency import require_yaml
+    yaml = require_yaml(f"{name} for worker-pr workflow-seam checks")
     path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / name
     if not path.is_file():
         raise WorkerPrError(f"{name} not found for the workflow-seam check: {path}")
@@ -6721,7 +6722,8 @@ def _workflow_gh_debug_sites(root=None):
     env key, read off PARSED YAML at all three levels (workflow / job / step). `root` is injectable
     so the self-test can prove the scanner FINDS a pin — an always-empty scanner would satisfy the
     "no pins in the live tree" assertion vacuously."""
-    import yaml
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("workflow GH_DEBUG seam checks")
     sites = set()
     root = Path(root) if root else Path(__file__).resolve().parents[1] / ".github" / "workflows"
     for path in sorted(root.glob("*.yml")) + sorted(root.glob("*.yaml")):

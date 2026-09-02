@@ -4070,7 +4070,8 @@ def _self_test():
     # workflow `if:`/step/call-site, not the Python — so pin the CALL SITE itself. Deleting the
     # invocation, dropping --apply or either machine-exit flag, adding continue-on-error, or
     # appending `|| true` reds one of these two checks.
-    import yaml as workflow_yaml
+    from yaml_dependency import require_yaml
+    workflow_yaml = require_yaml("conflict-resolver workflow-seam self-test")
 
     workflow_path = (
         Path(__file__).resolve().parent.parent / ".github/workflows/conflict-resolver.yml"

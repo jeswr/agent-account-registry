@@ -396,6 +396,7 @@ jobs:
           sparse-checkout: |
             scripts/metrics-alert.py
             scripts/metrics.py
+            scripts/yaml_dependency.py
             .github/workflows/metrics.yml
             .github/workflows/groom-sweep.yml
           sparse-checkout-cone-mode: false
@@ -482,6 +483,7 @@ jobs:
           sparse-checkout: |
             scripts/dispatch-stall-alert.py
             scripts/dispatch-tick-floor.py
+            scripts/yaml_dependency.py
             .github/workflows/dispatch.yml
             .github/workflows/groom-sweep.yml
           sparse-checkout-cone-mode: false
@@ -581,6 +583,7 @@ jobs:
             scripts/ci-latency-alert.py
             scripts/cron_map.py
             scripts/selftest-suite.txt
+            scripts/yaml_dependency.py
             .github/workflows/groom-sweep.yml
             .github/workflows
             policy/repos.toml
@@ -666,6 +669,7 @@ jobs:
             scripts/gh_retry.py
             scripts/plan-snapshot.py
             scripts/selftest-suite.txt
+            scripts/yaml_dependency.py
             .github/workflows/groom-sweep.yml
           sparse-checkout-cone-mode: false
       # PyYAML backs the workflow-parse assertions (regex-over-YAML is how five permissive
@@ -757,6 +761,7 @@ jobs:
           sparse-checkout: |
             scripts/groom-mint-alert.py
             scripts/selftest-suite.txt
+            scripts/yaml_dependency.py
             .github/workflows/groom-sweep.yml
           sparse-checkout-cone-mode: false
 

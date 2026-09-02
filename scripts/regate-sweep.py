@@ -212,6 +212,7 @@ CRON_MAP_SCRIPT = "scripts/cron_map.py"
 # YAML-seam assertions unreachable on the live path while still passing in pr-gate.
 REQUIRED_FILES = (
     "scripts/regate-sweep.py",
+    "scripts/yaml_dependency.py",
     REPAIRS_FILE,
     SUITE_MANIFEST,
     SWEEP_WORKFLOW,
@@ -2615,7 +2616,8 @@ def _test_cron_collisions(chk):
 # the YAML seam
 # ---------------------------------------------------------------------------------------------
 def _load_workflow(path):
-    import yaml  # hard requirement: regex-over-YAML is how permissive misparses get in
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("regate-sweep workflow-seam checks")
     return yaml.safe_load(_require(path))
 
 

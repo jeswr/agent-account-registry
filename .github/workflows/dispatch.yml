@@ -109,6 +109,7 @@ jobs:
           # module since #1280; this job used to check out the whole CI-latency watchdog for it.
           sparse-checkout: |
             scripts/dispatch-tick-floor.py
+            scripts/yaml_dependency.py
             scripts/cron_map.py
             .github/workflows/dispatch.yml
           sparse-checkout-cone-mode: false

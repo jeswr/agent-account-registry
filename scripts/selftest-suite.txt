@@ -63,3 +63,4 @@ worker-issue.py
 worker-live.sh
 worker-pr.py
 workflow_if.py
+yaml_dependency.py

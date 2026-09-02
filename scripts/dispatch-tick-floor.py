@@ -337,6 +337,7 @@ CRON_MINUTES_SCRIPT = "scripts/cron_map.py"
 # this unit exists to close.
 REQUIRED_FILES = (
     "scripts/dispatch-tick-floor.py",
+    "scripts/yaml_dependency.py",
     CRON_MINUTES_SCRIPT,
     DISPATCH_WORKFLOW,
 )
@@ -674,7 +675,8 @@ def _require(path):
 
 
 def _load_workflow(path):
-    import yaml  # hard requirement: regex-over-YAML is how five permissive misparses got in
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("dispatch-tick-floor workflow-seam checks")
     return yaml.safe_load(_require(path))
 
 

@@ -73,6 +73,7 @@ SUITE_FILE = "scripts/selftest-suite.txt"
 # assertions silently unreachable on the live path.
 REQUIRED_FILES = (
     "scripts/ratelimit-alert.py",
+    "scripts/yaml_dependency.py",
     # Every read here runs through the shared bounded-retry layer (#1502): a watchdog that loses a
     # whole tick to one transient 5xx is the failure it exists to report.
     "scripts/gh_retry.py",
@@ -963,14 +964,15 @@ def _test_workflow_seam(chk):
     wiring that decides whether the Python runs at all (AGENTS.md pre-flight item 6). Pinned by
     EXACT match, never containment: `--self-test-DISABLED` contains `--self-test`.
     """
-    import yaml  # lazy: PyYAML is provisioned by the hosting job and by pr-gate
-
     missing = [p for p in REQUIRED_FILES if not (REPO_ROOT / p).exists()]
     if missing:
         # A sparse checkout that dropped an input would make every assertion below silently
         # unreachable on the live path, which is worse than failing here.
         chk(f"seam: REQUIRED_FILES present (missing: {missing})", False, True)
         return
+
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("ratelimit-alert workflow-seam checks")
 
     # ---- CROSS-FILE: the alarm must LEAD the hard stop it warns about ---------------------------
     # plan-snapshot.py STOPS the dispatch snapshot at RATE_LIMIT_RESERVE remaining. An alarm that

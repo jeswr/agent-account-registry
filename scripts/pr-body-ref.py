@@ -449,7 +449,8 @@ def _cmd_check(args, *, enrolled=None):
 def _workflow_document(name="pr-gate.yml"):
     """The parsed live workflow. RAISES if it is missing or unparseable — a seam check that cannot
     read its own workflow must fail the gate, never degrade to "nothing to assert"."""
-    import yaml
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("pr-body-ref delivery workflow-seam checks")
 
     path = SCRIPTS_DIR.parent / ".github" / "workflows" / name
     assert path.is_file(), f"{name} not found for the delivery-seam check: {path}"

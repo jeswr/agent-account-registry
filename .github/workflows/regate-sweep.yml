@@ -71,6 +71,7 @@ jobs:
             scripts/regate-sweep.py
             orchestration/gate-repairs.json
             scripts/selftest-suite.txt
+            scripts/yaml_dependency.py
             scripts/cron_map.py
             .github/workflows/regate-sweep.yml
             .github/workflows

@@ -143,6 +143,7 @@ HOST_JOB = "dispatch-stall"
 # YAML-seam assertions silently unreachable on the live path.
 REQUIRED_FILES = (
     "scripts/dispatch-stall-alert.py",
+    "scripts/yaml_dependency.py",
     "scripts/dispatch-tick-floor.py",
     DISPATCH_WORKFLOW,
     GROOM_WORKFLOW,
@@ -634,7 +635,8 @@ def _require(path):
 
 
 def _load_workflow(path):
-    import yaml  # hard requirement: regex-over-YAML is how permissive misparses get in
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("dispatch-stall-alert workflow-seam checks")
     return yaml.safe_load(_require(path))
 
 

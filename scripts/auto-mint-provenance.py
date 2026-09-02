@@ -1474,7 +1474,8 @@ def _mint_caller(mint_provenance, registry_repo, apply_changes, log, write_recor
 
 # ---- workflow seam (PyYAML-parsed; a `run:` predicate is not a testable predicate) -------------
 def _workflow(name):
-    import yaml
+    from yaml_dependency import require_yaml
+    yaml = require_yaml(f"{name} for the auto-mint workflow-seam checks")
 
     path = SCRIPTS_DIR.parent / ".github" / "workflows" / name
     assert path.is_file(), f"{name} not found for the workflow-seam check: {path}"

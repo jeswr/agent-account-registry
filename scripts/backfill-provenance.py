@@ -1130,7 +1130,8 @@ def _render_job_section(job_name, step):
 
 
 def _workflow(name):
-    import yaml
+    from yaml_dependency import require_yaml
+    yaml = require_yaml("backfill-provenance workflow-seam checks")
     path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / name
     assert path.is_file(), f"{name} not found for the workflow-seam check: {path}"
     return yaml.safe_load(path.read_text(encoding="utf-8"))

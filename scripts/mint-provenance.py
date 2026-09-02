@@ -1016,7 +1016,8 @@ def recorded_pr_numbers(repo, registry_repo, worker_pr, read_tree=None):
 
 # ---- workflow seam (PyYAML-parsed; a `run:` predicate is not a testable predicate) -------------
 def _workflow(name):
-    import yaml
+    from yaml_dependency import require_yaml
+    yaml = require_yaml(f"{name} for the mint-provenance workflow-seam checks")
 
     path = SCRIPTS_DIR.parent / ".github" / "workflows" / name
     assert path.is_file(), f"{name} not found for the workflow-seam check: {path}"
