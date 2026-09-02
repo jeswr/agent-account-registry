@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-02T09:26:04Z",
+  "generated_at": "2026-09-02T09:38:49Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -26,7 +26,7 @@
     "jeswr/agent-account-registry": {
       "issues_open": 1025,
       "issues_ready": 677,
-      "issues_closed_1h": 3,
+      "issues_closed_1h": 2,
       "issues_closed_24h": 28,
       "prs_open": 48,
       "prs_draft": 34,
@@ -54,6 +54,18 @@
       "metrics": {
         "issues_ready": 272,
         "issues_closed_1h": 0
+      }
+    },
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "backlog-growing",
+      "fire": true,
+      "summary": "open PRs 48 > 12 and net PR flow +2.0/hr (open 2.0 > close 0.0) sustained over 2 snapshots",
+      "metrics": {
+        "prs_open": 48,
+        "net_pr_flow": 2.0,
+        "pr_open_rate": 2.0,
+        "pr_close_rate": 0.0
       }
     }
   ]
