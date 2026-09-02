@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2234,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ca20e4459dc2c037b77fd8ab30442597981ca154",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 rule 3 requires every convergence run to rerun rows 1\u20135 of the \u00a76 ladder. The apply sequence and \u00a78 explicitly treat the PR-label delete and add as separate external writes and require recovery after each. If the process dies after deleting `review:needs-user` (or the last other human-owned hold) but before adding `review:parked`, the PR no longer satisfies row 1 (`no live human-owned hold to drain`). The marker-keyed sweep in rule 6 makes the PR discoverable, but it does not make row 1 provable; the mandated full-ladder rerun therefore stands down forever with an outstanding planned add. This contradicts rule 2's promise to finish outstanding writes and \u00a78's requirement that every interruption converge. It is the prior round's permanent-strand defect shifted from the receipt boundary to the PR delete/add boundary.",
+    "file": "research/1997-human-terminal-park-drain.md",
+    "fix_hint": "Specify a transition representation and write protocol that makes every intermediate state both recognizable and safely authorizable. For example, avoid a delete/add gap by using a durable intermediate state whose provenance can be freshly proven, or define phase-specific convergence predicates that prove the completed prefix and independently re-check all hazards still relevant before the next write. Then state how the after-PR-delete case can distinguish this script's completed delete from a human removal without treating stale intent as authority, and require a red interruption test for that exact boundary. Reconcile that protocol explicitly with row 1 instead of simultaneously requiring the unchanged full ladder and guaranteed convergence.",
+    "severity": "blocker",
+    "title": "Full-ladder convergence strands a crash between PR label delete and add"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe revision recognizes the prior receipt-first defect and adds a marker-keyed convergence sweep, but the specified recovery protocol still cannot converge after every external write as it claims. In particular, a crash between deleting the PR's human-owned hold and adding `review:parked` leaves no live human-owned hold. The marker sweep can find that PR, but rule 3 requires rerunning rows 1\u20135 and row 1 refuses precisely because the hold is gone. Thus the prescribed interruption test after the PR delete cannot pass without either violating the full-ladder requirement or silently using stale receipt evidence as authority. The same crash-convergence blocker remains at a later write boundary, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
