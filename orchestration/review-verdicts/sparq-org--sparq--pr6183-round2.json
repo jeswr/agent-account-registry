@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6183,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "89e8b27e4b184de8f44c0b1947f92e3a0e93594b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The inline branch still accepts any non-empty value containing the substring `workflows`. Consequently, `workflow_run: {workflows: []}` passes despite an empty filter, while `workflow_run: {not_workflows: [CI]}` passes without the required key. Quoted scalar content can also create false acceptance. This is materially the same major issue reported in round 1, and `_SELF_TEST_CASES` still does not exercise flow-style mappings.",
+    "file": "scripts/check-workflow-run-filters.py",
+    "fix_hint": "Parse the flow mapping structurally and validate the exact `workflows` key with the same non-empty requirement as block mappings. Add self-test fixtures rejecting `{workflows: []}` and `{not_workflows: [CI]}`, and accepting `{workflows: [CI], types: [completed]}`.",
+    "severity": "major",
+    "title": "Inline workflow_run mappings still bypass structural validation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: the prior major finding remains unchanged. Flow-style `workflow_run` mappings are still validated by a substring search rather than parsed structurally, so empty or similarly named keys bypass the gate, and the self-test table still has no flow-mapping fixtures. The lint therefore does not enforce its stated invariant.",
+  "verdict": "request_changes"
+ }
+}
