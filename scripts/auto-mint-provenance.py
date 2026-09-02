@@ -1472,6 +1472,15 @@ def _workflow(name):
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+# [#223 — sol-audit arbitrary-ref] The sweep job's guard, transcribed from the WORKFLOW by hand and
+# never derived from the reader under test (AGENTS.md pre-flight 2b): an expected value read back
+# out of the code that produces it is a tautology that cannot fail. Whitespace-normalised, which is
+# what `job_if` reports, so the `>-` fold may be re-wrapped without a spurious red.
+SWEEP_REF_GUARD = ("${{ github.event_name == 'schedule' "
+                   "|| github.ref == format('refs/heads/{0}', "
+                   "github.event.repository.default_branch) }}")
+
+
 def sweep_workflow_seam_report(workflow=None):
     """Structural findings about the LIVE auto-mint-provenance.yml, each asserted by --self-test.
 
@@ -1495,7 +1504,11 @@ def sweep_workflow_seam_report(workflow=None):
     step = next((s for s in steps
                  if "auto-mint-provenance.py" in strip(str(s.get("run") or ""))), None)
     run = strip(str((step or {}).get("run") or ""))
-    guard = str(job.get("if") or "")
+    # [#223 — sol-audit arbitrary-ref] PRESENCE and VALUE are separate facts, and `str(job["if"])`
+    # rather than `str(job.get("if") or "")`: PyYAML parses `if: false` to the boolean False, so
+    # the `or ""` form reported a NEUTERED job identically to one carrying no guard at all.
+    guard_declared = "if" in job
+    guard = str(job["if"]) if guard_declared else ""
     self_at = run.find("auto-mint-provenance.py --self-test")
     invoke_at = run.find('auto-mint-provenance.py "${args[@]}"')
     step_env = {key: str(value) for key, value in ((step or {}).get("env") or {}).items()}
@@ -1518,9 +1531,28 @@ def sweep_workflow_seam_report(workflow=None):
         # THE #929 FINDING: this workflow is self-starting, or it is mint-provenance.yml again.
         "schedule_crons": [str((entry or {}).get("cron")) for entry in schedule
                            if isinstance(entry, dict)],
-        # The salt is a secret: a modified branch copy of this workflow must never see it. The
-        # DISPATCH path carries the strict comparison...
-        "job_ref_guarded": "github.ref ==" in guard and "default_branch" in guard,
+        # The salt is a secret: a modified branch copy of this workflow must never see it, and the
+        # same guard is what stops a branch that adds ITSELF to policy/repos.toml from being read
+        # as the enrolment allowlist (the `dispatch-secrets` deployment-branch policy covers the
+        # first of those, not the second). The DISPATCH path carries the strict comparison...
+        #
+        # [#223 — sol-audit arbitrary-ref] TWO findings, the #1619 shape backfill-provenance
+        # already carries (`_if_condition`), applied to the last containment probes of this class.
+        # The form this replaces — `"github.ref ==" in guard and "default_branch" in guard` — is
+        # blind in BOTH directions that matter, and this job's guard is the easiest of the three to
+        # widen unnoticed because it is ALREADY a disjunction: appending one more `||` clause
+        # (`|| github.event_name == 'workflow_dispatch'`, `|| always()`) admits EVERY ref while
+        # every substring the probe looked for is still there, and appending `&& false` skips the
+        # lane forever while still reading as hardened. A missing `if:` is the third, separate
+        # failure — and on THIS job it is the #929 defect's twin rather than a mere fail-open —
+        # which is why presence is its own finding.
+        #
+        # Whitespace is normalised, and only whitespace: GitHub's expression evaluation does not
+        # depend on it, so the `>-` fold this guard is written with — whose line breaks PyYAML may
+        # legitimately render as either a space or a newline — is not a security event and must not
+        # red, while every TOKEN and its ORDER stay pinned exactly.
+        "job_if_declared": guard_declared,
+        "job_if": " ".join(guard.split()),
         # ...and the `schedule` path is carved out ON PURPOSE, because the strict comparison reads
         # `github.event.repository` and a cron tick that silently evaluated it away would skip this
         # job forever with no census — the #929 defect, re-created by its own fix. Asserted so the
@@ -3893,8 +3925,13 @@ def _self_test():                                                       # noqa: 
           bool(seam["schedule_crons"]), True)
     check("...on the explicit-minute cadence this repo uses", seam["schedule_crons"],
           ["13,43 * * * *"])
-    check("the sweep job refuses to run off the default ref on a DISPATCH",
-          seam["job_ref_guarded"], True)
+    # [#223] The guard is pinned EXACTLY, never by containment (AGENTS.md pre-flight 6): on an
+    # already-disjunctive guard one more `||` clause admits every ref, and `&& false` skips the
+    # lane forever — both satisfy every substring the probe this replaced looked for.
+    check("the sweep job DECLARES a job-level `if:` (none at all => it runs from any ref)",
+          seam["job_if_declared"], True)
+    check("the sweep job's guard is EXACTLY the schedule carve-out plus the default-branch check "
+          "(no `&& false`, no extra `||` clause)", seam["job_if"], SWEEP_REF_GUARD)
     check("...while the cron tick is carved out, so the guard can never silently skip it",
           seam["job_schedule_carveout"], True)
     check("the sweep job takes the secret-scoped environment", seam["job_environment"],
@@ -3953,14 +3990,33 @@ def _self_test():                                                       # noqa: 
     def triggers_of(doc):
         return doc.get("on") if "on" in doc else doc.get(True)
 
+    # [#223] POSITIVE CONTROL for the guard rows, and it is not optional: each of them asserts a
+    # finding is NOT its expected value, which ANY broken reader satisfies for free — an empty
+    # parse, a moved file, a renamed key would pass all of them while measuring nothing. This row
+    # runs the SAME harness with a no-op edit and requires the SHIPPED guard back out.
+    check("YAML-seam mutant harness reads the SHIPPED tree (a no-op edit returns the live guard)",
+          mutated(lambda d: None)["job_if"], SWEEP_REF_GUARD)
+
+    def widen_guard(doc, tail):
+        """The mutants the containment probe was blind to: the shipped guard is left spelled out in
+        full — every substring `"github.ref ==" in guard and "default_branch" in guard` looked for
+        is still there, and so is the schedule carve-out — and only its BOOLEAN STRUCTURE
+        changes."""
+        job = doc["jobs"]["sweep"]
+        inner = " ".join(str(job["if"]).split())
+        assert inner.startswith("${{") and inner.endswith("}}"), inner
+        job["if"] = inner[:-2].rstrip() + " " + tail + " }}"
+
     for name, edit, key, want in (
             # THE CALL-SITE/TRIGGER MUTANT this issue exists for.
             ("the schedule is deleted (back to dispatch-only, the #929 defect)",
              lambda d: triggers_of(d).pop("schedule"), "schedule_crons", []),
             ("the job is neutered with if: false",
-             lambda d: d["jobs"]["sweep"].update(**{"if": "false"}), "job_ref_guarded", False),
+             lambda d: d["jobs"]["sweep"].update(**{"if": "false"}), "job_if", "false"),
+            ("...including the BOOLEAN false PyYAML parses `if: false` into",
+             lambda d: d["jobs"]["sweep"].update(**{"if": False}), "job_if", "False"),
             ("the default-ref guard is deleted",
-             lambda d: d["jobs"]["sweep"].pop("if"), "job_ref_guarded", False),
+             lambda d: d["jobs"]["sweep"].pop("if"), "job_if_declared", False),
             ("the schedule carve-out is deleted (the cron can then silently skip)",
              lambda d: d["jobs"]["sweep"].update(**{
                  "if": "${{ github.ref == format('refs/heads/{0}', "
@@ -4034,6 +4090,22 @@ def _self_test():                                                       # noqa: 
             ("set -euo pipefail survives only as a comment",
              lambda d: comment_out_line(d, "set -euo pipefail"), "errexit", False)):
         check(f"YAML-seam mutant reds: {name}", mutated(edit)[key], want)
+    # [#223] THE MUTANTS THE CONTAINMENT PROBE PASSED, measured through the PRODUCTION assertion
+    # rather than through a hand-copied expected string: each leaves the shipped guard spelled out
+    # in full — so `"github.ref ==" in guard and "default_branch" in guard` is still True on all
+    # three — and only changes its boolean structure. `&& false` skips the lane forever while
+    # reading as hardened; the two extra `||` clauses run the salt-reading job from EVERY ref,
+    # which is the sol-audit arbitrary-ref finding itself and is a one-clause edit on a guard that
+    # is already a disjunction. All three must now make `job_if != SWEEP_REF_GUARD`.
+    for _tail, _effect in (
+            ("&& false", "hardened-looking, but permanently skipped"),
+            ("|| always()", "runs from ANY ref, salt in reach"),
+            ("|| github.event_name == 'workflow_dispatch'",
+             "the DISPATCH path the strict comparison exists for, re-admitted from any ref")):
+        check(f"YAML-seam mutant reds: the guard keeps every substring but gains `{_tail}` "
+              f"({_effect})",
+              mutated(lambda d, tail=_tail: widen_guard(d, tail))["job_if"] == SWEEP_REF_GUARD,
+              False)
     # The wrong-input seam needs a value comparison rather than a boolean: rebinding APPLY to a
     # constant is valid YAML, lints clean, and silently turns every manual dry run into a write.
     check("YAML-seam mutant reds: APPLY is rebound to an unconditional true",
