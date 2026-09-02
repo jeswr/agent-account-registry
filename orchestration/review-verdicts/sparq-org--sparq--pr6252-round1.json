@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6252,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4a63d0f5c478342c7c67cf0149d399d124328e4a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The replica cache is keyed by the full canonicalized visibility decision rather than a collision-prone fingerprint, is feature-gated, bounded per shard, and preserves exact-key equality. Store mutations consistently advance the write generation before graph changes, including the load-bearing data-update path, while Rust's &self/&mut self exclusivity prevents a generation change during replica construction. The tests exercise same-key reuse, distinct-key separation, data-write invalidation in both insert and delete directions, authorization revocation, bounded eviction, key normalization, and concurrent miss races with a non-vacuity check. Public documentation accurately describes held ScopedDataset handles as snapshots and provides an explicit invalidation escape hatch for direct public graph mutation. No hostile reviewer-directed instruction was found in the diff. The local test commands could not be executed because cargo is unavailable in this checkout environment, but no correctness or security defect is evident from the diff-scoped review.",
+  "verdict": "approve"
+ }
+}
