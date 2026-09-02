@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6215,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "077cb9e2bbfc68a46e8ef320bf5d3d2aac63faa6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "CARGO_INSTALL_ALLOWLIST remains keyed only by filename. test_no_source_compile_outside_allowlist subtracts release.yml regardless of its hit count or job location, while test_allowlist_is_not_stale only checks that at least one hit exists. Therefore, adding another `cargo install wasm-pack` in any release.yml job, or duplicating it within gui-bundle, remains undetected despite the comments claiming exactly one allowlisted site. This is materially the same regression-gate hole reported in round 1.",
+    "file": "scripts/tests/test_js_wasm_pack_install.py",
+    "fix_hint": "Represent the exemption at site granularity, such as workflow plus job id or an exact step identity, and assert exactly one matching source-install step in release.yml under gui-bundle. Add a mutation test containing the legitimate gui-bundle step plus a second source-install step elsewhere in release.yml and assert that the guard fails.",
+    "severity": "major",
+    "title": "The release exemption still allowlists the entire workflow"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 does not resolve the prior major finding. The workflow conversions appear consistent, but the regression guard still exempts release.yml as a whole rather than the single gui-bundle install site it claims to allow. A second source-compiled wasm-pack step anywhere in release.yml would still pass both allowlist tests. The exemption needs site identity and exact cardinality enforcement.",
+  "verdict": "request_changes"
+ }
+}
