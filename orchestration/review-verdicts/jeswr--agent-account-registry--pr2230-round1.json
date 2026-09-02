@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2230,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f9fa0aa317f9e0422038695a9a5e22ad085c8f39",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_dockerfile_apt_packages` skips only Dockerfile whole-line comments, while `_apt_packages_in_line` tokenizes the remainder without shell-comment semantics. A Dockerfile line such as `RUN true # apt-get install -y jq python3-yaml` installs neither package because `#` begins a comment for the RUN shell, but the new extractor emits both names and `_assert_container_selftest_deps` returns success. Thus the check can report that the authoring image satisfies every declared dependency when it does not. The existing comment fixture does not catch this because it tests only a whole-line Dockerfile comment, not the RUN/shell comment seam.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Make the assertion reject or correctly parse shell-commented install text (and other non-RUN Dockerfile instructions), then add a negative self-test using `RUN true # apt-get install -y jq python3-yaml` and a positive control showing a real RUN install still passes. The negative row must exercise `_assert_container_selftest_deps`, not only the tokenizer.",
+    "severity": "major",
+    "title": "Dependency check accepts packages hidden after a shell comment"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe Dockerfile dependency addition itself is reasonable, but the new fail-closed gate can accept package names that occur in shell-commented text and therefore does not prove that the image installs them. This is a major, non-vacuity defect in the marquee control, so the change is not ready to approve.",
+  "verdict": "request_changes"
+ }
+}
