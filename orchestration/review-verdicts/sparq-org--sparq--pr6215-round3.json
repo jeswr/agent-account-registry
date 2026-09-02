@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6215,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f4fcd650e3e8daaba8048193cf798942431b7d3d",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The source-install exemption is now keyed by workflow and job, its exact cardinality is enforced, and mutation coverage demonstrates that both a second release.yml job and a duplicate install inside gui-bundle are rejected. The repo-wide posture test passes, the converted workflow sites use the same SHA-pinned action and exact wasm-pack version, and the sole remaining source install is the documented multi-platform release job exemption.",
+  "verdict": "approve"
+ }
+}
