@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6252,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4a63d0f5c478342c7c67cf0149d399d124328e4a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains sound on the supplied diff. The cache uses the complete normalized visibility decision as the exact map key, with hashing only for shard selection; masked replicas are bounded and feature-gated. Store-owned mutation seams advance the write generation before graph mutation, including the load-bearing data-update path, and Rust's shared/exclusive borrowing prevents a write from interleaving replica construction. Cache misses may duplicate construction under contention but converge on one stored Arc without changing answers. Tests non-vacuously cover reuse, distinct decisions, insert/delete invalidation, authorization revocation, bounded eviction, normalization, and concurrent same-/different-key readers. The public docs accurately describe held handles as snapshots and direct graph mutation as requiring explicit invalidation. No reviewer-directed instruction was detected in the diff. With no prior findings and no new defects, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
