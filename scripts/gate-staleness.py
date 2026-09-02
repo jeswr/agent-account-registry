@@ -434,6 +434,21 @@ def _refused(assertion, job):
     return ""
 
 
+def _refused_cleanly(assertion, job):
+    """`_refused`, except that an escape which is NOT an AssertionError reads as its own string.
+
+    For the rows measuring a guard whose whole job is to CONVERT a raw exception into a refusal
+    (issue #1430). Delete that guard and the raw exception escapes: under plain `_refused` it
+    aborts the harness with every row below it unrun and no roll-up printed, which records as a
+    kill while measuring nothing (AGENTS.md pre-flight item 4, "crash-after-partial-run"). Here it
+    reds exactly one row — and a checker that crashed is not a checker that refused, so the row
+    must red."""
+    try:
+        return _refused(assertion, job)
+    except Exception as exc:  # noqa: BLE001 — the escape IS the observation
+        return f"escaped as {type(exc).__name__}: {exc}"
+
+
 def _self_test():
     import tempfile
     ok = True
@@ -757,6 +772,47 @@ def _self_test():
     for name, fragment, mutation in inert_mutants():
         chk(f"the seam check REFUSES when {name}, naming the {fragment!r} requirement",
             fragment in _refused(assert_report_seam, mutate(mutation)), True)
+
+    # ---- THE BODY'S REMAINING TWO REFUSALS (issue #1430). Every row above resolves at the line
+    # COUNT or at the token COMPARISON, so the guard on the FIRST line and the arm that turns an
+    # untokenisable invocation line into a refusal were both never-executed refusal branches —
+    # and a refusal branch that has never executed has never been shown to refuse (AGENTS.md
+    # pre-flight item 1). Each row pins the fragment unique to ITS raise, so a refusal produced by
+    # one of the other branches cannot be banked as the kill (item 4, "false kill").
+    FIRST_LINE = "opens with"          # said ONLY by the `set -euo pipefail` raise
+    TOKENISE = "does not tokenise"     # said ONLY by the shlex `except ValueError` arm
+
+    # The tokenise row below is only worth its kill if `_refused_cleanly` really does report a
+    # non-AssertionError escape instead of propagating it, so both of its directions are their own
+    # rows — otherwise this harness would answer #1430 by adding a never-executed branch of its
+    # own.
+    def _raises_value_error(_job):
+        raise ValueError("not an AssertionError")
+
+    chk("a non-AssertionError escape is REPORTED, so the mutant below reds one row instead of "
+        "aborting the suite", _refused_cleanly(_raises_value_error, good),
+        "escaped as ValueError: not an AssertionError")
+    chk("...while an ordinary refusal still reads as its own message, and an accept as ''",
+        (_refused_cleanly(assert_report_seam, mutate(lambda j: j["steps"].pop(1))),
+         _refused_cleanly(assert_report_seam, good)),
+        (f"expected exactly one `{GATE_JOB}` step invoking {INVOCATION}, found 0", ""))
+
+    def body_mutants():
+        # Distinct from "`set -euo pipefail` is dropped" above, which lands on the line count: the
+        # options line is still PRESENT, just weaker. Without `pipefail` a later edit that pipes
+        # the invocation would exit 0 on the reporter's failure, which is this report's silent-
+        # absence shape all over again.
+        yield ("the body's first line weakens the shell options", FIRST_LINE,
+               lambda j: _sub(j, "set -euo pipefail\n", "set -eu\n"))
+        # A dropped closing quote. bash would red the step, but `shlex.split` RAISES instead of
+        # returning tokens, so the seam check reaches this line with no verdict to give: without
+        # the `except ValueError` arm it dies with a ValueError rather than refusing.
+        yield ("the invocation line carries an unbalanced quote", TOKENISE,
+               lambda j: _sub(j, f'--base-ref "${BASE_REF_ENV}"', f'--base-ref "${BASE_REF_ENV}'))
+
+    for name, fragment, mutation in body_mutants():
+        chk(f"the seam check REFUSES when {name}, naming the {fragment!r} requirement",
+            fragment in _refused_cleanly(assert_report_seam, mutate(mutation)), True)
 
     def checkout_mutants():
         yield "the checkout step is dropped", lambda j: j["steps"].pop(0)
