@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6225,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5955b5f9ff4df8715bf1a3197a922bfdb4f635b1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`find_unread_set_plus_e` operates on logical lines rather than shell statements. After finding an opener, it puts the complete remainder of that line into one region element; `_statement_kind` then returns `status` whenever `$?` occurs anywhere in that element. Consequently `set +e; ./gate; echo diagnostic; rc=$?; set -e` has no element classified as `command` and yields no offence, even though `rc` captures `echo`'s success and the gate failure is swallowed. The same structural problem can misclassify other semicolon/`&&`/`||` combinations. This defeats W2's stated immediate-capture guarantee using ordinary shell syntax.",
+    "file": "scripts/check-workflow-run-swallow.py",
+    "fix_hint": "Tokenize each run body into shell statements while respecting quotes, substitutions, escaped `find -exec` semicolons, and control operators; then apply the opener/command/immediate-status/restore state machine to those statements, not whole source lines. Add negative self-tests for `set +e; ./gate; echo note; rc=$?; set -e` and a positive same-line `set +e; ./gate; rc=$?; set -e; exit $rc` case.",
+    "severity": "major",
+    "title": "W2 is bypassed when commands share a shell line"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The two round-2 findings are substantively addressed: W1 no longer exempts commands by name, and the added W2 tests reject an intervening command, a bare status print, and an unused capture. However, W2 still fails open for the natural one-line spelling of the exact same shell sequence. Because the scanner classifies each logical line as a single statement and gives any line containing `$?` the `status` kind, `set +e; ./gate; echo diagnostic; rc=$?; set -e` produces no offence: the entire tail after `set +e` is treated as a status statement, so the swallowed gate is never identified. This is a new major finding relative to round 2, hence progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
