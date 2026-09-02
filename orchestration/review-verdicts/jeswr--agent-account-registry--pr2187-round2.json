@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2187,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "63d9553537e6ba20713474ffdf0f161a55459266",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 diff remains correct and complete within scope. `PREMIUM_MODELS` now binds each premium alias to its own probe-success flag and quota-window prefix, and `usage_eligible` passes that exact pair into a fail-closed helper only after preserving the existing whole-account admission checks. Missing, failed, malformed, or exhausted alias-specific observations remain ineligible; non-premium aliases retain their prior behavior. The new self-tests are non-vacuous: opposing Fable and synthetic-alias fixtures make hard-coded helper arguments, incorrect tuple wiring, loss of whole-account precedence, registry drift, and failed global restoration produce explicit failures. The account-usage edits accurately update documentation references. No trust check, audit binding, workflow permission, routing label, or security control is weakened, and no reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
