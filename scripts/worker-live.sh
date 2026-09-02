@@ -1808,43 +1808,88 @@ SELFTEST_ENV_CONTAINER_PACKAGES='command|jq|jq
 pymodule|yaml|python3-yaml'
 
 # PURE (self-tested): print, one per line, every package name the `apt-get install` commands in ONE
-# logical shell line provision. Flag tokens (`-y`, `--no-install-recommends`) are dropped,
-# collection stops at a shell operator so `&& rm -rf /var/lib/apt/lists/*` cannot be read as a
-# package, and a `pkg=<version>` pin is reported under its bare name. `install` counts only after
-# `apt-get`/`apt`, so a `cargo install` elsewhere in the file contributes nothing.
+# logical shell line (a RUN's ARGUMENTS, instruction keyword already stripped) provision. Flag
+# tokens (`-y`, `--no-install-recommends`) are dropped, collection stops at a shell operator so
+# `&& rm -rf /var/lib/apt/lists/*` cannot be read as a package, and a `pkg=<version>` pin is
+# reported under its bare name. `install` counts only after `apt-get`/`apt`, so a `cargo install`
+# elsewhere in the file contributes nothing.
 #
-# [review r1 #2230] A word beginning `#` opens a SHELL comment, so the rest of the logical line is
-# text the RUN never executes: `RUN true # apt-get install -y jq` installs nothing and must yield
-# nothing. Reading it as an install was a soundness hole in the fail-OPEN direction — the check
-# would report the image satisfies a dependency it does not ship. Truncating here can only ever
-# report FEWER packages, which is the direction `_assert_container_selftest_deps` refuses in.
+# EVERY rule below exists to keep the one direction that matters closed. Over-reporting is
+# fail-OPEN — `_assert_container_selftest_deps` would declare a dependency satisfied that the image
+# does not ship — while under-reporting merely refuses, so where this cannot decide, it declines:
+#
+#   * [review r1 #2230] a word beginning `#` opens a SHELL comment, so `true # apt-get install -y
+#     jq` is text the RUN never executes: truncate there.
+#   * [review r2 #2230] `apt-get` opens an install list only in COMMAND POSITION — first word of the
+#     line, or first word after `&&`/`||`/`|`/`;`/`&` (optionally behind `VAR=value` assignment
+#     prefixes, which are part of the command per the shell grammar). `echo apt-get install -y jq`
+#     runs `echo`; the bare token sequence is ARGUMENT DATA and must yield nothing.
+#   * [review r2 #2230] words inside a quoted string are likewise data, not shell: `echo "a &&
+#     apt-get install -y jq"` executes no install, so its `&&` must not re-open command position.
+#     Quote state is tracked by parity of quote characters per word, and any word this cannot
+#     classify leaves the tracker INSIDE quotes, i.e. suppressing output rather than adding it.
 _apt_packages_in_line() {
   local -a toks=()
   read -r -a toks <<< "$1"
-  local i=0 saw_apt=0 collecting=0 tok bare
+  local i=0 saw_apt=0 collecting=0 cmd_pos=1 quoted=0 tok bare quotes
   while [[ $i -lt ${#toks[@]} ]]; do
     tok=${toks[$i]}
     i=$((i + 1))
+    # Quote state, before any word is read as syntax. A word carrying an ODD number of quote
+    # characters opens (or closes) a quoted string; a fully quoted word (`"pkg"`, even count) is
+    # left to the arms below, where it simply fails to match `apt-get`/an exact package name.
+    quotes=${tok//[^\"\']/}
+    if (( ${#quotes} % 2 )); then
+      [[ $quoted -eq 1 ]] && quoted=0 || { quoted=1; cmd_pos=0; }
+      continue
+    fi
+    [[ $quoted -eq 1 ]] && continue
     case "$tok" in
       '&&' | '||' | '|' | ';' | '&')
         saw_apt=0
         collecting=0
-        ;;
-      apt-get | apt)
-        saw_apt=1
-        collecting=0
+        cmd_pos=1
         ;;
       '#'*)
         # Unquoted word starting `#`: comment to end of the logical line. `"#"` / `'#'` keep their
         # quote as the first character, so a quoted hash is not mistaken for one.
         break
         ;;
+      apt-get | apt)
+        # Only an `apt-get` the shell would EXECUTE opens a list; one sitting in another command's
+        # argument list is data.
+        saw_apt=$cmd_pos
+        collecting=0
+        cmd_pos=0
+        ;;
       install)
         [[ $saw_apt -eq 1 ]] && collecting=1
+        cmd_pos=0
         ;;
-      -*) ;;
+      -*)
+        # A flag is never a command NAME, so it neither opens nor CLOSES command position. Both
+        # halves of that are load-bearing against FALSE REFUSALS of Dockerfiles that build fine:
+        # RUN's own BuildKit flags (`RUN --mount=type=cache,target=/var/cache/apt apt-get install
+        # ...`) sit in command position with the command AFTER them, and a terminator glued to a
+        # flag (`set -eux; apt-get install ...`, the commonest idiom of all) still ends the command.
+        # Leaving command position alone is safe in the fail-OPEN direction too: reaching a flag
+        # with `cmd_pos` still 1 means no command word has been read yet, and `echo -n apt-get
+        # install ...` cleared `cmd_pos` at `echo`, before the flag is ever seen.
+        case "$tok" in
+          *';'* | *'&'*)
+            saw_apt=0
+            collecting=0
+            cmd_pos=1
+            ;;
+        esac
+        ;;
       *)
+        # `VAR=value cmd ...`: an assignment prefix is part of the command, so the NEXT word is
+        # still in command position. Only reachable with `collecting` off (an `install` clears
+        # `cmd_pos`), so a `pkg=<version>` operand can never be swallowed here.
+        [[ $cmd_pos -eq 1 && "$tok" == ?*=* ]] && continue
         bare=${tok%%=*}
+        cmd_pos=0
         case "$tok" in
           # A `;` or `&&` glued to the last package still ends the list.
           *';'* | *'&'*)
@@ -1852,6 +1897,7 @@ _apt_packages_in_line() {
             [[ $collecting -eq 1 && -n "$bare" ]] && printf '%s\n' "$bare"
             saw_apt=0
             collecting=0
+            cmd_pos=1
             ;;
           *)
             [[ $collecting -eq 1 ]] && printf '%s\n' "$bare"
@@ -1871,6 +1917,16 @@ _dockerfile_instruction() {
   printf '%s\n' "${rest%%[[:space:]]*}"
 }
 
+# PURE (self-tested): print one logical line's instruction ARGUMENTS — everything after the
+# instruction keyword — or nothing when the line carries none. Companion to
+# `_dockerfile_instruction`: only these words are the shell a RUN executes, and command-position
+# analysis needs them WITHOUT the keyword in front (`RUN` is not the command `apt-get` follows).
+_dockerfile_instruction_args() {
+  local rest=${1#"${1%%[![:space:]]*}"}
+  [[ "$rest" == *[[:space:]]* ]] || return 0
+  printf '%s\n' "${rest#*[[:space:]]}"
+}
+
 # PURE (self-tested): print, one per line, every package name an `apt-get install` in <dockerfile>
 # provisions. Line continuations are joined first so a multi-line install list is read whole.
 # Emitting the package SET lets the caller assert EXACT membership rather than a substring —
@@ -1882,6 +1938,10 @@ _dockerfile_instruction() {
 # the same fail-OPEN hole as the shell comment handled in `_apt_packages_in_line`. Skipping an
 # instruction this does not recognise (`ONBUILD RUN`, JSON exec form) under-reports, which the
 # caller refuses on; the whole-line comment skip below stays for the same reason.
+#
+# The RUN filter is necessary but NOT sufficient on its own — `RUN echo apt-get install -y jq` is a
+# RUN whose apt tokens are argument data (review r2 #2230). Deciding that is `_apt_packages_in_line`'s
+# job, via command position and quote state; this function only decides WHICH lines are shell.
 _dockerfile_apt_packages() {
   local file=$1 line acc="" logical instr
   [[ -f "$file" ]] || {
@@ -1901,11 +1961,11 @@ _dockerfile_apt_packages() {
     acc=""
     instr=$(_dockerfile_instruction "$logical")
     if [[ "$instr" == [Rr][Uu][Nn] ]]; then
-      _apt_packages_in_line "$logical"
+      _apt_packages_in_line "$(_dockerfile_instruction_args "$logical")"
     fi
   done < "$file"
   if [[ -n "$acc" && "$(_dockerfile_instruction "$acc")" == [Rr][Uu][Nn] ]]; then
-    _apt_packages_in_line "$acc"
+    _apt_packages_in_line "$(_dockerfile_instruction_args "$acc")"
   fi
   return 0
 }
@@ -1924,11 +1984,15 @@ _dockerfile_apt_packages() {
 #
 # SCOPE, stated because it was measured rather than assumed: reading the definition catches
 # omission, a typo, and drift between the suite's declared dependencies and the image — the ways
-# this actually regresses. It does NOT evaluate shell control flow, so an install rendered inert by
-# a preceding always-false guard (`RUN false || true && apt-get install ... jq`) still reads as
-# provisioning the package, and that mutant survives this check. Deciding that statically means
-# executing the RUN, i.e. building the image; containers/ is a trust-surface path under the human
-# arm gate, which is where an obfuscated install is caught.
+# this actually regresses. It is a LEXICAL reader, not a shell interpreter. Words that are plainly
+# not an executed command (a comment, a non-RUN instruction, another command's arguments, quoted
+# data) yield nothing, and anything the tokeniser cannot classify yields FEWER packages, which lands
+# on the refusal side. What it does NOT do is evaluate shell CONTROL FLOW, so an install rendered
+# inert by a preceding always-false guard (`RUN false || true && apt-get install ... jq`) still
+# reads as provisioning the package, and that mutant survives this check — the residue is a command
+# in real command position that the shell would not reach. Deciding that statically means executing
+# the RUN, i.e. building the image; containers/ is a trust-surface path under the human arm gate,
+# which is where an obfuscated install is caught.
 _assert_container_selftest_deps() {
   local file=$1 table=${2-$SELFTEST_ENV_REQUIREMENTS} map=${3-$SELFTEST_ENV_CONTAINER_PACKAGES}
   local provisioned
@@ -5449,6 +5513,59 @@ tail is not read as one)" \
     > "$tmp/apt-contcomment.Dockerfile"
   chk "a comment line INSIDE a continuation is stripped before joining, not treated as line end" \
     "$(_dockerfile_apt_packages "$tmp/apt-contcomment.Dockerfile" | sort | paste -sd' ' -)" \
+    "jq python3-yaml"
+  # [review r2 #2230] The third fail-OPEN seam, and the one the RUN filter above does NOT close:
+  # inside a genuine RUN, the bare token sequence `apt-get install -y ...` can be another command's
+  # ARGUMENTS. `echo` executes and installs nothing, so this must be refused; pre-fix the tokeniser
+  # emitted both packages and this fixture read "satisfied". Asserted through the checker, because
+  # that verdict is what the gate consumes.
+  printf 'FROM x@sha256:%s\nRUN echo apt-get install -y jq python3-yaml\n' \
+    "$(printf 'a%.0s' {1..64})" > "$tmp/dep-argv.Dockerfile"
+  chk "an apt-get install that is another command's ARGUMENTS does not satisfy the dependency" \
+    "$(_assert_container_selftest_deps "$tmp/dep-argv.Dockerfile" >/dev/null 2>&1 \
+      && echo satisfied || echo missing)" "missing"
+  # ...and the same words QUOTED are data too, so the `&&` inside them must not re-open command
+  # position. Both package names sit INSIDE the quotes with a further word after them, so each is a
+  # clean bare token: drop quote tracking and this fixture reads "satisfied" on an image that
+  # installs nothing. (Closing on the package itself would leave `python3-yaml"` and pass on the
+  # exact-match rule instead — a vacuous fixture that survives the mutant.)
+  printf 'FROM x@sha256:%s\nRUN echo "note: run && apt-get install -y jq python3-yaml manually"\n' \
+    "$(printf 'a%.0s' {1..64})" > "$tmp/dep-quoted.Dockerfile"
+  chk "an apt-get install inside a QUOTED string does not satisfy the dependency" \
+    "$(_assert_container_selftest_deps "$tmp/dep-quoted.Dockerfile" >/dev/null 2>&1 \
+      && echo satisfied || echo missing)" "missing"
+  # ...and quote tracking CLOSES again, so a real install after a quoted argument still counts.
+  # Without this the safe direction could be reached by suppressing everything after any quote.
+  printf 'RUN echo "installing deps" && apt-get install -y jq python3-yaml\n' \
+    > "$tmp/apt-afterquote.Dockerfile"
+  chk "a real install AFTER a closed quoted argument still yields its packages" \
+    "$(_dockerfile_apt_packages "$tmp/apt-afterquote.Dockerfile" | sort | paste -sd' ' -)" \
+    "jq python3-yaml"
+  # The command-position rule must not over-fire: an apt-get REACHED as a command still counts. The
+  # `;` here is GLUED to the preceding word (the arm that ends a package list must also re-open
+  # command position, or the install after it is lost), and the install is written behind a
+  # `VAR=value` assignment prefix, which is how a real Dockerfile writes a non-interactive install.
+  # Drop either arm and this reads EMPTY instead of both. The `&&` operator's own re-open is
+  # anchored by the continued-install row above.
+  printf 'RUN echo setting up; DEBIAN_FRONTEND=noninteractive apt-get install -y jq python3-yaml\n' \
+    > "$tmp/apt-envprefix.Dockerfile"
+  chk "an apt-get in real command position (after a glued \`;\`, behind an env assignment) still counts" \
+    "$(_dockerfile_apt_packages "$tmp/apt-envprefix.Dockerfile" | sort | paste -sd' ' -)" \
+    "jq python3-yaml"
+  # ...and the terminator can be glued to a FLAG, which is the commonest real form of all. A
+  # command-position rule that lets the `-*` arm swallow this `;` reads EMPTY here and would refuse
+  # a Dockerfile that builds perfectly well — fail-closed, but a FALSE refusal.
+  printf 'RUN set -eux; apt-get install -y jq python3-yaml\n' > "$tmp/apt-setux.Dockerfile"
+  chk "the \`set -eux; apt-get install ...\` idiom (terminator glued to a FLAG) still yields its packages" \
+    "$(_dockerfile_apt_packages "$tmp/apt-setux.Dockerfile" | sort | paste -sd' ' -)" \
+    "jq python3-yaml"
+  # ...and the other direction of the same arm: RUN's own BuildKit flags precede the command, so a
+  # flag must not CLOSE command position either. Reading `--mount=...` as the command reads EMPTY
+  # here — again a false refusal of a Dockerfile that builds.
+  printf 'RUN --mount=type=cache,target=/var/cache/apt apt-get install -y jq python3-yaml\n' \
+    > "$tmp/apt-mount.Dockerfile"
+  chk "a BuildKit \`RUN --mount=...\` flag does not hide the apt-get that FOLLOWS it" \
+    "$(_dockerfile_apt_packages "$tmp/apt-mount.Dockerfile" | sort | paste -sd' ' -)" \
     "jq python3-yaml"
   # [review r1 #2230] Same fail-OPEN shape one instruction over: only RUN arguments are shell the
   # build executes, so an install command merely QUOTED in a LABEL (or ENV, or any other
