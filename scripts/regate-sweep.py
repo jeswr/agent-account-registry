@@ -197,11 +197,15 @@ REVIEW_PASS_LABEL = "review:pass"
 SELF_ID = "> \N{ROBOT FACE} **SPARQ agent** \N{EM DASH} regate-sweep"
 
 # The ONE definition of "which minute is taken by which registry cron" (#1046). It is DERIVED
-# from the tree by ci-latency-alert.py's `schedule_minute_map`, which is why this script has to
-# read that script and the whole workflows directory: the collision assertion below reads every
-# other lane's own schedule instead of a list somebody wrote down here and stopped updating.
+# from the tree by `schedule_minute_map`, which is why this script has to read that module and
+# the whole workflows directory: the collision assertion below reads every other lane's own
+# schedule instead of a list somebody wrote down here and stopped updating.
+#
+# The owner is a SMALL SHARED MODULE (#1280), not the CI-latency watchdog it was first hosted in:
+# this self-test used to import a 3000-line watchdog to ask one question, and the sweep job had to
+# check that watchdog out to do it.
 WORKFLOWS_DIR = ".github/workflows"
-CRON_MAP_SCRIPT = "scripts/ci-latency-alert.py"
+CRON_MAP_SCRIPT = "scripts/cron_map.py"
 
 # Every file the self-test asserts against. The sweep job sparse-checks-out exactly this set plus
 # REQUIRED_DIRS, and _test_workflow_seam asserts that it does: a trimmed checkout would make the

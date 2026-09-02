@@ -326,7 +326,10 @@ FLOOR_STEP_ID = "floor"
 # cron) expanded to :00/:15/:30/:45 instead of :07/:22/:37/:52. It was latent only because the one
 # workflow it is applied to writes explicit minutes, which is exactly how a second definition
 # survives: it is never asked the question that separates it from the first (#958).
-CRON_MINUTES_SCRIPT = "scripts/ci-latency-alert.py"
+#
+# The owner moved out of the CI-latency watchdog into a small shared module (#1280), so the floor
+# job now checks out one file instead of a 3000-line watchdog to ask its one question.
+CRON_MINUTES_SCRIPT = "scripts/cron_map.py"
 
 # Every file the self-test asserts against. The floor job sparse-checks-out exactly this set and
 # _test_selftest_inputs_are_checked_out asserts that it does — a trimmed checkout would make the
@@ -821,7 +824,7 @@ def _cron_minutes_module(root=None):
 def _cron_minutes(workflow, expand=None):
     """The set of minutes-past-the-hour this workflow's single cron fires at.
 
-    THE EXPANSION IS NOT DEFINED HERE (#1279) — `ci-latency-alert.cron_minutes` owns it, handles
+    THE EXPANSION IS NOT DEFINED HERE (#1279) — `cron_map.cron_minutes` owns it (#1280), handles
     `a-b/step` and is self-tested there in both directions. What IS defined here is the
     one-cron-per-workflow contract the caller depends on: the consumer counts minutes PER HOUR, so
     reading only the first of several schedules would under-count and make the budget invariant
@@ -966,8 +969,8 @@ def _test_cron_minute_expansion(chk):
         (sorted(healthy or ()), healthy_error), ([7, 22, 37, 52], None))
     # THE OWNERSHIP ITSELF. A checkout without the owner must RAISE: a fallback to a private copy
     # is how the second definition comes back, and it comes back green.
-    chk("cron: the expansion is OWNED by ci-latency-alert.py, and a checkout without it RAISES "
-        "instead of falling back to a private copy",
+    chk(f"cron: the expansion is OWNED by {CRON_MINUTES_SCRIPT}, and a checkout without it "
+        "RAISES instead of falling back to a private copy",
         (callable(getattr(_cron_minutes_module(), "cron_minutes", None)),
          _raised(lambda: _cron_minutes_module(os.path.join(_repo_root(), "no-such-tree")))),
         (True, True))
