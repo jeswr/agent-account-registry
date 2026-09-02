@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6223,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e1f526e4fc7f38fe32afa675c2f9f5bbac3d0913",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The public contract says `drained` reports whether the cursor was exhausted. When `maxRows` equals `rowCount` (or reaches the final partial batch), the loop breaks immediately after delivering the last batch and leaves `meta.drained` false, although every result row has been consumed and a subsequent `next()` would return `undefined`. This makes `drained: false` ambiguously mean either that rows remain or merely that exhaustion was not probed. The new test explicitly expects false for `maxRows === 2500`, so it validates implementation mechanics rather than the documented semantic. A caller using this flag for continuation/pagination would incorrectly believe more rows remain.",
+    "file": "packages/sparq-client/src/index.ts",
+    "fix_hint": "When stopping at the bound, set `drained` from the exact cursor metadata, e.g. mark it true when `cumulative >= meta.rowCount`; keep it false only when the bound stopped before all rows were delivered. Update the exact-bound test to expect true, and include final-partial-batch coverage. Alternatively rename/document the field as `exhaustionObserved` if that is the intended contract, but that is less useful to callers.",
+    "severity": "major",
+    "title": "`drained` is false even when the cursor has delivered the complete result"
+   }
+  ],
+  "progress": null,
+  "summary": "The bounded pull is otherwise a coherent prefix-preserving change, but the new public `drained` result contradicts its documented meaning when the bound exactly equals the result size. The tests currently encode that contradiction rather than catching it, so consumers cannot reliably use `drained` to decide whether more rows remain.",
+  "verdict": "request_changes"
+ }
+}
