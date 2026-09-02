@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6263,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "52bfea68cc225bf3fd4816cbf10f25162932a235",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "TestLabelReadsAreMonotone.test_every_label_read_is_a_positive_opt_in scans only LABEL_TRIGGERED, which excludes .github/workflows/ci-select.yml. Yet ci-select.yml consumes github.event.pull_request.labels.*.name and determines selection mode for four of those workflows. test_ci_select_still_reads_the_ci_full_label merely checks that one exact positive expression exists; it would continue passing if ci-select gained an additional `!contains(..., 'skip-ci')` or another label-dependent path where removal enables work. That is precisely the under-testing regression T3 claims to prevent, so the test is not a complete guard for the soundness argument.",
+    "file": "scripts/tests/test_label_trigger_economy.py",
+    "fix_hint": "Include ci-select.yml in the files passed through label_reference_violations (separately from LABEL_TRIGGERED, since it is reusable and need not have a pull_request trigger), and add a synthetic or file-level assertion demonstrating that an additional negative label read in ci-select is rejected. Keep the existing exact ci-full non-vacuity assertion if desired.",
+    "severity": "major",
+    "title": "Monotonicity audit omits the shared ci-select workflow"
+   }
+  ],
+  "progress": null,
+  "summary": "The current trigger removals appear sound for the label expressions presently in the workflows, and the new test passes. However, the regression test does not fully pin the stated monotonicity invariant: ci-select.yml is the shared component that turns label state into selection breadth, but it is excluded from the general label-reference audit. The lone exact-string assertion only proves one positive ci-full read remains and would still pass if a second negative or undeclared label read were added. Because such a change could make label removal enable work while `unlabeled` remains absent, the advertised fail-closed protection is incomplete.",
+  "verdict": "request_changes"
+ }
+}
