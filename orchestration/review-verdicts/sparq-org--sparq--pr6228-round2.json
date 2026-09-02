@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6228,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e7d89918ebcfca9bb17847596b19648d06df97ab",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`workflow_running_package_tests` applies `_NPM_TEST_RE` and `_selects_workspace` independently to the whole step chunk. This can combine separate commands: for example, a step containing `npm test` at the repository root followed by `npm ci -w @sparq/newpkg` is accepted for `newpkg`, although its `test` script never runs. `_NPM_TEST_RE` is also broad enough to cross command/newline boundaries (for example `npm ci` followed by `echo test`) because its repeated `\\S+\\s+` tokens are not confined to one shell command. This violates the gate's central claim that a CI leg actually invokes the new package's test script.",
+    "file": "scripts/gate-new-crate.py",
+    "fix_hint": "Parse individual `run:` command lines (including continuations as needed) and require the test command and package selector to belong to the same npm invocation; alternatively accept only a narrowly matched invocation with target working-directory. Add negative tests with multiple commands in one step, including root `npm test` plus a separate workspace-selected npm command, and `npm ci` followed by `echo test`.",
+    "severity": "major",
+    "title": "Unrelated commands in one workflow step can satisfy the package-test gate"
+   }
+  ],
+  "progress": null,
+  "summary": "The new gate has a fail-open command-matching flaw: it searches an entire workflow step for an npm-test-shaped token sequence and independently searches that same step for a workspace selector. Consequently, unrelated commands in one step can be combined into a fictitious package test invocation, allowing a newly added package's tests to remain unexecuted. The tests cover selectors for the intended invocation but not separation between multiple commands, so they do not protect the load-bearing invariant.",
+  "verdict": "request_changes"
+ }
+}
