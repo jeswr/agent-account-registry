@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2211,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9781f6ceccfc0d7215cabe58009a62f1b67498e6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow now fails closed when the target repository payload omits default_branch or supplies a non-string value, while preserving the existing safe-ref syntax check for genuine string branch names. The executable seam tests exercise the workflow's own embedded Python for absent, null, and numeric values and verify the exact refusal output; the paired string \"None\" control prevents an over-broad textual workaround and confirms the admitted ref is bound downstream. The sentinel correctly distinguishes an omitted JSON key from an explicit null. No trust check is weakened, no permissive fallback is introduced, and no hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
