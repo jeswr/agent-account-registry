@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2241,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ab4453d779f55309dfbafdc7fc7a1ec566b4b8b0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow-comment updates accurately document the existing fail-closed alert-routing behavior at each call site. The account-enumerating usage and worker alerts require a distinct destination positively confirmed private under ALERT_TOKEN before using the private route; plan/groom alerts likewise reject unverified destinations; and model-health intentionally treats a configured repo/token pair as the primary destination while independently requiring positive private verification before rendering detailed fleet data. The changes affect comments only, introduce no executable workflow expansion or permission change, and do not weaken any trust check or test.",
+  "verdict": "approve"
+ }
+}
