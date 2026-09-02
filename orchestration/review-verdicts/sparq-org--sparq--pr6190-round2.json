@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6190,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8fe4df412adaf15bd3cf246088174867e8b58c20",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3 models Wdel as PostgreSQL USING and states that a row failing USING is silently filtered. But section 5.1 builds F from the R-scoped replica, not an R-and-Wdel-scoped replica. A DELETE of a quad visible under R but outside Wdel therefore creates a captured delete effect, and step 6 returns DENY. This is observably different from silent filtering and makes the claimed USING analogy and fail-closed laws internally inconsistent. The L2 acceptance battery also does not pin this visible-but-outside-Wdel case.",
+    "file": "research/pattern-scoped-update-enforcement-2026-09.md",
+    "fix_hint": "Choose one semantic and make L2, L7, the algorithm, and tests agree. If Wdel is truly USING, ensure unauthorized deletions are omitted before delta authorization (without suppressing authorized effects from the same operation), and add a test showing a visible-but-outside-Wdel target is a successful no-op. If denial is intended instead, remove the USING/silent-filter claim, document its observable scope-boundary consequence, and add uniform-denial tests for Wdel failures.",
+    "severity": "major",
+    "title": "Proposed algorithm denies deletes that L2 says must be silently filtered"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes the prior L7 contradiction: DELETE of an absent or masked quad is now explicitly a successful no-op, while byte-identical denial checks compare only INSERT cases that both deny. However, the proposed mechanism still contradicts its stated Wdel/USING semantics. The fork is masked only by R, so a visible quad outside Wdel can be captured as a delete and step 6 denies the whole update, whereas section 3 says rows failing Wdel/USING are silently filtered. The record must choose and consistently specify one behavior before it is a usable implementation contract.",
+  "verdict": "request_changes"
+ }
+}
