@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2247,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "15340bfb07bbcd81f26f7063d4e47e52b0e27dcf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly extends the fail-closed YAML syntax sweep to both workflow files and issue-template files, with independent nonzero counters that prevent nullglob from turning a missing population into a vacuous pass. The frozen named-step assertion is updated independently and the added faithful/mutant fixtures exercise omission of the new population and omission of its count guard. The shell arithmetic is safe under `set -e` because each first increment evaluates to 1, PyYAML is provisioned earlier in the job, and no permissions, token handling, or untrusted-text execution surface is expanded. I found no blocker, major correctness issue, or hostile instruction in the diff.",
+  "verdict": "approve"
+ }
+}
