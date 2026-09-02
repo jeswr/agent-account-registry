@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6205,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d571bf3dae0331d92d754886570009511c9333e7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "This diff publicly exposes `store::object_store` and re-exports `ObjectStoreBlobStore`, including its constructors and prefix semantics. AGENTS.md's maintenance rule requires every new or changed public API to update the matching `skills/<surface>/SKILL.md` (and crate README) in the same change. No such file appears in this diff, so users of the Solid/LWS surface have no maintained instructions for constructing the real object-store backend, and the PR is incomplete by the repository's explicit public-API contract.",
+    "file": "crates/sparq-lws-core/src/store/mod.rs",
+    "fix_hint": "Update the Solid/LWS usage skill (`skills/solid-lws-server/SKILL.md`, moving longer material to its references if needed) and the crate README, if present/applicable, with a concise native-only `ObjectStoreBlobStore` construction example, prefix behavior, and the versionless reconciliation/CAS limitation. Include those documentation files in this PR.",
+    "severity": "major",
+    "title": "New public BlobStore adapter is missing the required surface documentation update"
+   }
+  ],
+  "progress": null,
+  "summary": "The adapter implementation and its end-to-end reconciliation test are internally coherent, but the PR adds and re-exports a new public native API without updating the required usage skill. Under this repository's maintenance rule, that makes the public-surface change incomplete and blocks approval until its consumer documentation is updated in the same PR.",
+  "verdict": "request_changes"
+ }
+}
