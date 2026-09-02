@@ -10,6 +10,12 @@ umask 077
 unset CDPATH
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 
+# The ONE model-sandbox image definition, repo-relative. `run_model` builds it and the
+# registry-selftest gate validates it (base-image pinning since #145, self-test dependencies since
+# #1507); spelling the path at each of those sites independently is the #958 shape, so it is
+# spelled once here.
+MODEL_SANDBOX_DOCKERFILE='containers/worker-model.Dockerfile'
+
 die() {
   printf 'worker-live: %s\n' "$*" >&2
   exit 1
@@ -376,7 +382,7 @@ _run_headless_harness() {
   mkdir -p "$image_context" "$worker_root/home/.cargo"
   chmod 700 "$image_context" "$worker_root/home/.cargo"
   docker build --quiet \
-    --file "$SCRIPT_DIR/../containers/worker-model.Dockerfile" \
+    --file "$SCRIPT_DIR/../$MODEL_SANDBOX_DOCKERFILE" \
     --tag "$image" \
     "$image_context" > "$worker_root/model-image.id"
   # shellcheck disable=SC2054  # comma-separated Docker mount/tmpfs options are single elements
@@ -1793,6 +1799,143 @@ _assert_dockerfile_pinned() {
   return 0
 }
 
+# [issue #1507] Which Debian package provides each SELFTEST_ENV_REQUIREMENTS dependency inside the
+# model sandbox. Row format: <probe-kind>|<probe-arg>|<package>. Keyed by the requirement's PROBE,
+# not by a label, so this table cannot silently answer for a dependency it was not written for: a
+# requirement row with no entry here is a REFUSAL below, which is precisely the #1507 hole (a
+# dependency the suite executes that the authoring container does not ship) re-opening.
+SELFTEST_ENV_CONTAINER_PACKAGES='command|jq|jq
+pymodule|yaml|python3-yaml'
+
+# PURE (self-tested): print, one per line, every package name the `apt-get install` commands in ONE
+# logical shell line provision. Flag tokens (`-y`, `--no-install-recommends`) are dropped,
+# collection stops at a shell operator so `&& rm -rf /var/lib/apt/lists/*` cannot be read as a
+# package, and a `pkg=<version>` pin is reported under its bare name. `install` counts only after
+# `apt-get`/`apt`, so a `cargo install` elsewhere in the file contributes nothing.
+_apt_packages_in_line() {
+  local -a toks=()
+  read -r -a toks <<< "$1"
+  local i=0 saw_apt=0 collecting=0 tok bare
+  while [[ $i -lt ${#toks[@]} ]]; do
+    tok=${toks[$i]}
+    i=$((i + 1))
+    case "$tok" in
+      '&&' | '||' | '|' | ';' | '&')
+        saw_apt=0
+        collecting=0
+        ;;
+      apt-get | apt)
+        saw_apt=1
+        collecting=0
+        ;;
+      install)
+        [[ $saw_apt -eq 1 ]] && collecting=1
+        ;;
+      -*) ;;
+      *)
+        bare=${tok%%=*}
+        case "$tok" in
+          # A `;` or `&&` glued to the last package still ends the list.
+          *';'* | *'&'*)
+            bare=${bare%%[;&]*}
+            [[ $collecting -eq 1 && -n "$bare" ]] && printf '%s\n' "$bare"
+            saw_apt=0
+            collecting=0
+            ;;
+          *)
+            [[ $collecting -eq 1 ]] && printf '%s\n' "$bare"
+            ;;
+        esac
+        ;;
+    esac
+  done
+  return 0
+}
+
+# PURE (self-tested): print, one per line, every package name an `apt-get install` in <dockerfile>
+# provisions. Line continuations are joined first so a multi-line install list is read whole.
+# Emitting the package SET lets the caller assert EXACT membership rather than a substring —
+# AGENTS.md pre-flight item 6: a containment check passes for `jq-DROPPED`.
+_dockerfile_apt_packages() {
+  local file=$1 line acc="" logical
+  [[ -f "$file" ]] || {
+    printf 'worker-live: container definition missing: %s\n' "$file" >&2
+    return 1
+  }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Dockerfile strips whole-line comments before joining continuations, and so must this: prose
+    # that merely NAMES a package must never be mistaken for an instruction that installs one.
+    [[ "${line#"${line%%[![:space:]]*}"}" == '#'* ]] && continue
+    if [[ "$line" == *'\' ]]; then
+      acc+="${line%\\} "
+      continue
+    fi
+    acc+="$line"
+    logical=$acc
+    acc=""
+    _apt_packages_in_line "$logical"
+  done < "$file"
+  [[ -z "$acc" ]] || _apt_packages_in_line "$acc"
+  return 0
+}
+
+# PURE (self-tested): [issue #1507] every dependency the enrolled suite EXECUTES must be installed
+# in the container an author authors in, so the pre-flight AGENTS.md requires ("run the touched
+# script's own --self-test before returning") is actually runnable there. Before this, the sandbox
+# shipped neither jq nor PyYAML while `ubuntu-latest` — where the gate runs — ships both, so the
+# gap was invisible to CI and paid for entirely by the author: `dashboard-gen.py --self-test`
+# reddened 19 rows for environmental reasons and `metrics.py --self-test` aborted outright.
+#
+# Fail-closed in BOTH of its directions: a requirement with no declared package refuses (a new
+# dependency cannot be added to the suite while the sandbox silently lacks it), and a declared
+# package the Dockerfile does not install refuses. It never installs or probes anything — it reads
+# the definition, so it runs offline in the gate.
+#
+# SCOPE, stated because it was measured rather than assumed: reading the definition catches
+# omission, a typo, and drift between the suite's declared dependencies and the image — the ways
+# this actually regresses. It does NOT evaluate shell control flow, so an install rendered inert by
+# a preceding always-false guard (`RUN false || true && apt-get install ... jq`) still reads as
+# provisioning the package, and that mutant survives this check. Deciding that statically means
+# executing the RUN, i.e. building the image; containers/ is a trust-surface path under the human
+# arm gate, which is where an obfuscated install is caught.
+_assert_container_selftest_deps() {
+  local file=$1 table=${2-$SELFTEST_ENV_REQUIREMENTS} map=${3-$SELFTEST_ENV_CONTAINER_PACKAGES}
+  local provisioned
+  provisioned=$(_dockerfile_apt_packages "$file") || return 1
+  # `pattern` only absorbs the requirement row's trailing ERE (which itself contains `|`, so it has
+  # to be the last field); the consumer-report pattern is not this check's business.
+  local label kind probe pattern pkg mkind mprobe mpkg have found rc=0
+  while IFS='|' read -r label kind probe pattern; do
+    [[ -n "$label" ]] || continue
+    pkg=""
+    while IFS='|' read -r mkind mprobe mpkg; do
+      [[ -n "$mkind" ]] || continue
+      if [[ "$mkind" == "$kind" && "$mprobe" == "$probe" ]]; then
+        pkg=$mpkg
+        break
+      fi
+    done <<< "$map"
+    if [[ -z "$pkg" ]]; then
+      printf 'worker-live: no container package is declared for self-test dependency %s (%s: %s) -- add a SELFTEST_ENV_CONTAINER_PACKAGES row and install it in %s\n' \
+        "$label" "$kind" "$probe" "$file" >&2
+      rc=1
+      continue
+    fi
+    found=0
+    while IFS= read -r have; do
+      [[ "$have" == "$pkg" ]] || continue
+      found=1
+      break
+    done <<< "$provisioned"
+    if [[ $found -eq 0 ]]; then
+      printf 'worker-live: %s does not install %s, so self-test dependency %s (%s: %s) is unavailable to an author running the pre-flight inside the model sandbox (issue #1507)\n' \
+        "$file" "$pkg" "$label" "$kind" "$probe" >&2
+      rc=1
+    fi
+  done <<< "$table"
+  return "$rc"
+}
+
 # PURE (self-tested): [issue #524] every non-local `uses:` in a workflow must pin a FULL 40-hex
 # commit sha (docker refs: a 64-hex sha256 digest). This MIRRORS the assertion pr-gate.yml enforces
 # on the whole workflow tree (sol audit #221) — actionlint does not check pinning, so before this
@@ -2366,6 +2509,15 @@ registry_selftest_gate() {
     if [[ "$kind" == dockerfile ]]; then
       printf 'worker-live: base-image pin check %s\n' "$name"
       _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
+      # [issue #1507] ...and the MODEL sandbox must additionally still ship every dependency the
+      # enrolled suite EXECUTES, so an author can run AGENTS.md's pre-flight where it authors.
+      # Scoped to the one image this script builds: another container definition under containers/
+      # (e.g. a future network-denied gate image) has its own toolchain and is not this invariant.
+      if [[ "$name" == "$MODEL_SANDBOX_DOCKERFILE" ]]; then
+        printf 'worker-live: self-test dependency check %s\n' "$name"
+        _assert_container_selftest_deps "$name" \
+          || die "model sandbox lacks a dependency the enrolled suite executes: $name (fail closed — issue #1507)"
+      fi
       direct=$((direct + 1))
     fi
   done
@@ -5147,7 +5299,7 @@ PY
   # the real worker sandbox is digest-pinned, that an unpinned base is rejected, and that a
   # multi-stage FROM referencing a prior build stage is allowed unpinned. ---
   chk "the live worker-model sandbox is digest-pinned" \
-    "$( _assert_dockerfile_pinned "$SCRIPT_DIR/../containers/worker-model.Dockerfile" >/dev/null 2>&1 \
+    "$( _assert_dockerfile_pinned "$SCRIPT_DIR/../$MODEL_SANDBOX_DOCKERFILE" >/dev/null 2>&1 \
         && echo pinned || echo unpinned)" "pinned"
   printf 'FROM node:20-slim@sha256:%s AS node\nFROM rust:1.88@sha256:%s\nCOPY --from=node /x /x\n' \
     "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" > "$tmp/ok.Dockerfile"
@@ -5182,6 +5334,88 @@ PY
   chk "empty digest is REJECTED" \
     "$( _assert_dockerfile_pinned "$tmp/empty.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
     "unpinned"
+
+  # --- [issue #1507] the model sandbox must ship every dependency the enrolled suite EXECUTES, or
+  # the AGENTS.md pre-flight ("run the touched script's own --self-test") is unrunnable exactly
+  # where authoring happens. Measured on the pre-#1507 image: dashboard-gen's #922 hermetic
+  # keepalive harness reddened 19 rows for want of `jq`, and metrics.py's workflow-seam block could
+  # abort outright for want of PyYAML — while `ubuntu-latest`, where the gate runs, ships both, so
+  # CI never saw it. ---
+  local apt_fix
+  chk "MODEL_SANDBOX_DOCKERFILE names a file that exists" \
+    "$([[ -f "$SCRIPT_DIR/../$MODEL_SANDBOX_DOCKERFILE" ]] && printf present || printf missing)" \
+    "present"
+  # The tokeniser, before anything that depends on it. EXACT set, not containment: the reject rows
+  # below are only meaningful if this reads real package names out of a real install list.
+  printf 'RUN apt-get update \\\n  && apt-get install -y --no-install-recommends jq python3-yaml \\\n  && rm -rf /var/lib/apt/lists/*\n' \
+    > "$tmp/apt-multi.Dockerfile"
+  chk "a continued apt-get install list yields exactly its packages (flags dropped, and the \`&&\` \
+tail is not read as one)" \
+    "$(_dockerfile_apt_packages "$tmp/apt-multi.Dockerfile" | sort | paste -sd' ' -)" \
+    "jq python3-yaml"
+  printf 'RUN cargo install ripgrep\nRUN apt install -y jq\n' > "$tmp/apt-cargo.Dockerfile"
+  chk "a non-apt \`install\` subcommand contributes no package (only apt-get/apt opens the list)" \
+    "$(_dockerfile_apt_packages "$tmp/apt-cargo.Dockerfile" | sort | paste -sd' ' -)" "jq"
+  # The `;` is glued to the SECOND package, and the version pin to the first, so neither masks the
+  # other: without the glued-terminator arm the list runs on and swallows `/x`.
+  printf 'RUN apt-get install -y jq=1.6-2.1 python3-yaml; rm -rf /x\n' > "$tmp/apt-pin.Dockerfile"
+  chk "a version-pinned package is reported under its bare name and a glued \`;\` ends the list" \
+    "$(_dockerfile_apt_packages "$tmp/apt-pin.Dockerfile" | sort | paste -sd' ' -)" "jq python3-yaml"
+  chk "a container definition that does not exist REFUSES (fail closed, not an empty package set)" \
+    "$(_dockerfile_apt_packages "$tmp/no-such.Dockerfile" >/dev/null 2>&1 && echo read || echo refused)" \
+    "refused"
+  # THE FIX ITSELF, asserted against the REAL table, the REAL map and the REAL Dockerfile.
+  chk "the live model sandbox satisfies every declared self-test dependency" \
+    "$(_assert_container_selftest_deps "$SCRIPT_DIR/../$MODEL_SANDBOX_DOCKERFILE" >/dev/null 2>&1 \
+      && echo satisfied || echo missing)" "satisfied"
+  # ...and the accept path is not "accepts anything": a fixture installing ONLY jq is refused, by
+  # the REAL requirement table, and the refusal NAMES the dependency and its package.
+  printf 'FROM x@sha256:%s\nRUN apt-get install -y --no-install-recommends jq\n' \
+    "$(printf 'a%.0s' {1..64})" > "$tmp/dep-partial.Dockerfile"
+  apt_fix=$(_assert_container_selftest_deps "$tmp/dep-partial.Dockerfile" 2>&1 >/dev/null || true)
+  chk "a sandbox missing ONE declared dependency is REFUSED (non-vacuous)" \
+    "$(_assert_container_selftest_deps "$tmp/dep-partial.Dockerfile" >/dev/null 2>&1 \
+      && echo satisfied || echo missing)" "missing"
+  chk "...and the refusal names the dependency and the package to add, not just a status" \
+    "$(grep -c 'python3-yaml' <<< "$apt_fix" || true):$(grep -c 'PyYAML' <<< "$apt_fix" || true)" \
+    "1:1"
+  # AGENTS.md pre-flight item 6 — EXACT membership, never containment. `jq-DROPPED` /
+  # `python3-yaml-DROPPED` contain every declared package as a substring, so a containment
+  # regression passes this fixture while the sandbox installs neither real package.
+  printf 'FROM x@sha256:%s\nRUN apt-get install -y jq-DROPPED python3-yaml-DROPPED\n' \
+    "$(printf 'a%.0s' {1..64})" > "$tmp/dep-suffix.Dockerfile"
+  chk "a package name that merely CONTAINS the declared one is REFUSED (exact match, not substring)" \
+    "$(_assert_container_selftest_deps "$tmp/dep-suffix.Dockerfile" >/dev/null 2>&1 \
+      && echo satisfied || echo missing)" "missing"
+  # Prose that NAMES a package is not an instruction that installs one — this is the row that goes
+  # red if the whole-line comment skip is dropped.
+  { printf 'FROM x@sha256:%s\n' "$(printf 'a%.0s' {1..64})"
+    printf '# TODO: apt-get install -y python3-yaml\n'
+    printf 'RUN apt-get install -y --no-install-recommends jq\n'
+  } > "$tmp/dep-comment.Dockerfile"
+  chk "a COMMENT naming the package does not satisfy the dependency" \
+    "$(_assert_container_selftest_deps "$tmp/dep-comment.Dockerfile" >/dev/null 2>&1 \
+      && echo satisfied || echo missing)" "missing"
+  # The positive control for all four rejects: the SAME checker accepts a fixture that really does
+  # install both, so "missing" above is a verdict rather than a checker that never accepts.
+  printf 'FROM x@sha256:%s\nRUN apt-get install -y --no-install-recommends jq python3-yaml\n' \
+    "$(printf 'a%.0s' {1..64})" > "$tmp/dep-ok.Dockerfile"
+  chk "a fixture that installs both declared packages is ACCEPTED (the rejects are not vacuous)" \
+    "$(_assert_container_selftest_deps "$tmp/dep-ok.Dockerfile" >/dev/null 2>&1 \
+      && echo satisfied || echo missing)" "satisfied"
+  # A dependency the suite EXECUTES with no declared container package must REFUSE, not pass
+  # silently — that is #1507 itself re-opening one requirement row later. Driven with a fixture
+  # TABLE (not the real one) so the input does not derive from the constant the code reads.
+  chk "a requirement row with NO declared container package is REFUSED" \
+    "$(_assert_container_selftest_deps "$tmp/dep-ok.Dockerfile" \
+      'ripgrep|command|rg|(^|[^[:alnum:]_./-])rg([^[:alnum:]_-]|$)' \
+      "$SELFTEST_ENV_CONTAINER_PACKAGES" >/dev/null 2>&1 && echo satisfied || echo missing)" \
+    "missing"
+  chk "...and the map is keyed by the PROBE, so a package declared for a DIFFERENT probe cannot \
+answer for it" \
+    "$(_assert_container_selftest_deps "$tmp/dep-ok.Dockerfile" \
+      'jq-as-a-module|pymodule|jq|x' "$SELFTEST_ENV_CONTAINER_PACKAGES" >/dev/null 2>&1 \
+      && echo satisfied || echo missing)" "missing"
 
   # --- [issue #524] the 40-hex `uses:` pin assertion, mirrored from pr-gate.yml (#221) into the
   # host-side touched-workflow lint. NON-VACUOUS in BOTH directions, and both directions matter for
@@ -8590,6 +8824,10 @@ PY
   # so pin both lanes: registry_selftest_gate structurally (it needs a git tree, actionlint and a
   # dependency preflight, so driving it hermetically is not worth the fixture), and the
   # `run-selftest` CLI arm pr-gate.yml calls by EXECUTING it. ----
+  #
+  # [issue #1507] The extractor keeps every gate loop whose text names a self-test, so the container
+  # dependency call site is in here too. It is pinned rather than reworded around the filter: the
+  # block below IS the gate's whole self-test-related dispatch, and the pin stays an exact match.
   local expected_dispatch
   expected_dispatch=$(cat <<'DISPATCH'
 for t in "${targets[@]}"; do
@@ -8605,6 +8843,19 @@ for script in $FULL_SELFTEST_SUITE; do
 printf 'worker-live: suite self-test %s\n' "$script"
 run_enrolled_selftest "$script" || die "suite self-test failed: $script"
 ran=$((ran + 1))
+done
+for t in "${targets[@]}"; do
+kind=${t%%:*}; name=${t#*:}
+if [[ "$kind" == dockerfile ]]; then
+printf 'worker-live: base-image pin check %s\n' "$name"
+_assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
+if [[ "$name" == "$MODEL_SANDBOX_DOCKERFILE" ]]; then
+printf 'worker-live: self-test dependency check %s\n' "$name"
+_assert_container_selftest_deps "$name" \
+|| die "model sandbox lacks a dependency the enrolled suite executes: $name (fail closed — issue #1507)"
+fi
+direct=$((direct + 1))
+fi
 done
 DISPATCH
 )
