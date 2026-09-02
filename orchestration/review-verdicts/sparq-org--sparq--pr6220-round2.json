@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6220,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "263c9efee6495f7d7210e90e1e070e665c9fc475",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. The workflow now uses `shared-key` (not `key`) for the coverage-engine run/merge pair, so both jobs address the same partition-1 cache entry without retaining different job-ID components. The focused test models `shared-key` and `key` separately, rejects every missing/shared-key-only violation across all rust-cache steps, and pins the run/merge relationship plus the exact conformance-suite membership and shared scoreboard-build premise. All five focused cache-key hygiene tests pass. No correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
