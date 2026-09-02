@@ -450,6 +450,35 @@ def valid_timestamp(value):
     return True
 
 
+def _via_app_proof(event, kind, label):
+    """Is this timeline event PROVABLY App-driven? True only for a `performed_via_github_app`
+    that carries an ATTRIBUTABLE GitHub App identity — an integer `id` or a non-blank `slug`, the
+    two fields the REST timeline always ships on a real App object.
+
+    Absent/`null` is the ordinary "not an App" answer and returns False. ANY OTHER value —
+    `false`, a bare scalar, a list, `{}`, an object with neither an id nor a slug — RAISES
+    MalformedTimelineError (registry #2220). It cannot be read as False either: this bit is a
+    POSITIVE machine proof (`_is_proven_machine` returns MACHINE on it alone, with no actor at
+    all, and MACHINE is permission to DELETE a hold), so an unvalidated `is not None` let a
+    payload with no App identity whatsoever authorise the deletion — absence of attributable
+    automation evidence becoming permission, the exact direction #1849 closed on the actor side.
+    Raising instead of returning False keeps BOTH consumers conservative: the ownership walk
+    absorbs it to UNKNOWN (never clearable) and the veto walk suppresses the park."""
+    raw = event.get("performed_via_github_app")
+    if raw is None:
+        return False
+    if not isinstance(raw, dict):
+        raise MalformedTimelineError(
+            f"{kind} event for {label} has a non-object performed_via_github_app")
+    app_id = raw.get("id")
+    slug = raw.get("slug")
+    if not ((isinstance(app_id, int) and not isinstance(app_id, bool))
+            or (isinstance(slug, str) and slug.strip())):
+        raise MalformedTimelineError(
+            f"{kind} event for {label} has a performed_via_github_app naming no App id or slug")
+    return True
+
+
 def _event_rows(events, label):
     """Normalize a GitHub issue-timeline payload to (created_at, kind, actor_login, via_app)
     rows for `label`. RAISES MalformedTimelineError on any malformed RELEVANT shape — a
@@ -458,8 +487,8 @@ def _event_rows(events, label):
     newest human unlabel (the exact event the veto and the readmission window hinge on).
     Irrelevant event kinds and readable other-label events are skipped as before. A
     missing/unreadable actor is preserved as login "" (an UNVERIFIABLE actor — not human on
-    either side), and a non-null performed_via_github_app marks the event as App-driven (never
-    human).
+    either side), and a performed_via_github_app naming a real App identity marks the event as
+    App-driven (never human); a malformed one raises via `_via_app_proof`.
 
     Round-3 finding 3/4 (timestamp direction, deliberately RAISE not skip): a relevant event
     whose created_at fails the strict ISO parse can never prove a gesture — and raising is
@@ -487,8 +516,7 @@ def _event_rows(events, label):
                 f"{kind} event for {label} has an unreadable/non-ISO-8601 created_at")
         actor = event.get("actor")
         login = str(actor.get("login", "")) if isinstance(actor, dict) else ""
-        via_app = event.get("performed_via_github_app") is not None
-        rows.append((created, kind, login, via_app))
+        rows.append((created, kind, login, _via_app_proof(event, kind, label)))
     return rows
 
 
@@ -512,16 +540,17 @@ def _human_probe(is_human):
 def _is_proven_human(login, via_app, probe):
     """The ONE human test both the veto and the readmission window share (the strict
     worker-issue._is_human_maintainer pattern): a present, non-`[bot]` login, NOT App-driven
-    (performed_via_github_app is null), whose collaborator permission the probe confirms in
+    (performed_via_github_app absent or null), whose collaborator permission the probe confirms in
     HUMAN_MAINTAINER_PERMISSIONS. Anything unverifiable is NOT human."""
     return bool(login) and not login.endswith("[bot]") and not via_app and probe(login)
 
 
 def _is_proven_machine(login, via_app, machine_logins):
     """POSITIVE proof that an event was performed by AUTOMATION: an App-driven event
-    (`performed_via_github_app` non-null), a `[bot]`-suffixed login, or a login the caller named
-    as its own automation in `machine_logins` (case-insensitive, the `bot_login` convention every
-    other reader in this module already uses).
+    (`performed_via_github_app` naming a real App — see `_via_app_proof`, which REFUSES a
+    malformed one rather than counting it as proof), a `[bot]`-suffixed login, or a login the
+    caller named as its own automation in `machine_logins` (case-insensitive, the `bot_login`
+    convention every other reader in this module already uses).
 
     Deliberately NOT the negation of `_is_proven_human`, in EITHER direction. An unverifiable
     actor is neither human nor machine: both proofs are positive, and an actor that satisfies
@@ -3349,8 +3378,13 @@ def _self_test():
           human_unpark_veto([bot_park, outsider_unpark], "needs:user", trusted)[0], False)
     app_unpark = event("unlabeled", "needs:user", "2026-07-18T11:00:00Z", "jeswr",
                        via_app={"id": 7, "slug": "registry-app"})
+    # Through `attempt`, not bare: a WELL-FORMED App object must be READ, not raised on, and the
+    # #2220 validation put a raise on this path. Bare, a body that rejects every App aborts the
+    # suite here and records as a kill while the ~490 checks below never run (AGENTS.md
+    # pre-flight 4, crash-after-partial-run) — measured: 11 of 507 checks reached.
     check("App-driven removal under a maintainer login => NO veto",
-          human_unpark_veto([bot_park, app_unpark], "needs:user", trusted)[0], False)
+          attempt(lambda: human_unpark_veto([bot_park, app_unpark], "needs:user", trusted))[0],
+          False)
 
     def raising_probe(_login):
         raise RuntimeError("permission probe unavailable")
@@ -3372,6 +3406,21 @@ def _self_test():
           human_unpark_veto(
               [{"event": "unlabeled", "label": {"name": "status:parked"}, "created_at": None},
                bot_park, human_unpark], "needs:user", trusted)[0], True)
+    # [registry #2220] a `performed_via_github_app` that names NO App is a malformed relevant
+    # shape too. Pre-#2220 the bit was a bare `is not None`, so a plain `false` on the
+    # MAINTAINER's own removal read as App-driven, the removal stopped being human, and the park
+    # went ahead over a live human veto. The well-formed App object above (row 8) still denies the
+    # veto without raising, so this loop cannot be satisfied by ignoring the field.
+    for bad_app in (False, 0, "registry-app", [], {}, {"id": None, "slug": None},
+                    {"id": True, "slug": "  "}):
+        try:
+            human_unpark_veto(
+                [bot_park, event("unlabeled", "needs:user", "2026-07-18T11:00:00Z", "jeswr",
+                                 via_app=bad_app)], "needs:user", trusted)
+            check(f"malformed performed_via_github_app raises ({bad_app!r})",
+                  "no error", "MalformedTimelineError")
+        except MalformedTimelineError:
+            check(f"malformed performed_via_github_app raises ({bad_app!r})", "raised", "raised")
 
     # (10) park_vetoed: a timeline read failure suppresses the park AND logs it (fail open ONLY
     # toward NOT parking).
@@ -3395,6 +3444,15 @@ def _self_test():
     check("malformed timeline is logged loudly",
           any("park suppressed" in line and "timeline read failed" in line for line in logs),
           True)
+    # ...and so does a malformed App marker, END TO END: pre-#2220 this call returned False and
+    # the park was applied straight over jeswr's removal.
+    logs.clear()
+    check("a malformed performed_via_github_app on a maintainer's removal => park suppressed",
+          park_vetoed("o/r", 5, "needs:user",
+                      lambda _r, _n: [bot_park,
+                                      event("unlabeled", "needs:user", "2026-07-18T11:00:00Z",
+                                            "jeswr", via_app=False)],
+                      is_human=trusted, log=logs.append), True)
     # (11) the veto path logs the exact human-unpark line; the clean path stays quiet.
     logs.clear()
     check("veto => park suppressed",
@@ -3615,6 +3673,40 @@ def _self_test():
     # still read MACHINE, through performed_via_github_app.
     check("an App-driven application with no actor login is still PROVEN automation => MACHINE",
           (owner_of(5), clearable(5)), (LABEL_OWNER_MACHINE, True))
+    # ...and EITHER identity field alone is a real App: the live payloads carry `slug` (see
+    # dispatch-claim's readmission fixtures) or `id`, so requiring both would silently stop the
+    # drain. This row is the accept direction that a blanket "reject every App object" would red.
+    for identity in ({"id": 7}, {"slug": "registry-app"}):
+        own_timelines[12] = [{"event": "labeled", "label": {"name": audit},
+                              "created_at": "2026-07-28T10:00:00Z", "actor": None,
+                              "performed_via_github_app": identity}]
+        check(f"an App named by {sorted(identity)[0]} alone is still PROVEN automation",
+              (owner_of(12), clearable(12)), (LABEL_OWNER_MACHINE, True))
+    # [registry #2220] THE OTHER HALF OF THAT SEAM. `performed_via_github_app` is a POSITIVE
+    # machine proof that needs NO actor at all, so before it was validated a bare `is not None`
+    # let every value below — a plain `false` included — answer MACHINE for an application no one
+    # can attribute, i.e. permission to delete the hold. Each must be absorbed to UNKNOWN by the
+    # I/O wrapper (never clearable) and RAISE out of the pure walk, like any malformed shape.
+    bad_app_rows = []
+    for bad_app in (False, 0, 1, "registry-app", [], {}, {"id": None, "slug": None},
+                    {"id": True, "slug": "  "}):
+        own_timelines[13] = [{"event": "labeled", "label": {"name": audit},
+                              "created_at": "2026-07-28T10:00:00Z", "actor": None,
+                              "performed_via_github_app": bad_app}]
+        bad_app_rows.append(
+            (owner_of(13), clearable(13),
+             attempt(lambda: label_owner_from_events(own_timelines[13], audit,
+                                                     is_human=trusted))[1]))
+    check("an App marker naming NO App id or slug is never machine proof and never clearable — "
+          "it is a malformed read, in every non-null shape",
+          bad_app_rows,
+          [(LABEL_OWNER_UNKNOWN, False, "MalformedTimelineError")] * 8)
+    # The same refusal must not be reachable by simply losing the field: a bot login still owns
+    # its own application when performed_via_github_app is absent entirely.
+    own_timelines[14] = [{"event": "labeled", "label": {"name": audit},
+                          "created_at": "2026-07-28T10:00:00Z", "actor": {"login": own_bot}}]
+    check("an absent performed_via_github_app is the ordinary 'not an App' answer, not malformed",
+          (owner_of(14), clearable(14)), (LABEL_OWNER_MACHINE, True))
     check("a label with only an `unlabeled` event has no application to own => UNKNOWN",
           (owner_of(6), clearable(6)), (LABEL_OWNER_UNKNOWN, False))
     check("an unreadable timeline proves nothing => UNKNOWN",     # 7 has no fixture: own_fetch
