@@ -102,6 +102,9 @@ OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{16}")
 OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
 OBS_QUEUE_CLASS_RE = re.compile(r"[1-4][a-z]?")   # the #243 queue classes (1, 2, 2a..2d, 3, 4)
 OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#%-]{1,220}")
+# [#2039] The `flow.target_ci_queue` row key, hoisted beside its sibling shapes so the seam that
+# drops a row can name WHICH guard refused it rather than testing three things in one condition.
+OBS_TARGET_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
                       "queue_age_clamp_minutes", "merge_stall_minutes"}
 # [#1557] THE CACHE GROUP HAS NO PRODUCER, and the file the docs named as its source never had one
@@ -1814,8 +1817,76 @@ def _obs_mean(value):
 
 
 def _obs_text(value, cap):
+    """The published form ONLY — the sanitized, capped string, with nothing said about the cut.
+
+    [#2161] This is the spelling the three BUILD-LOG diagnostics use (`flow.queue`'s `class` at 16,
+    the target-CI `repository` and the trigger-fire `rule` at 64), and the question that issue asked
+    of them is answered here rather than left unnoticed: no truncation affordance, deliberately.
+    That cap is a HOSTILE-INPUT BOUND, not a display contract — it exists so a 4000-character rule
+    cannot write itself into the log that is diagnosing it (#1867) — and the row it quotes has
+    already been DROPPED, so there is no rendered surface a reader could mistake for the whole
+    value: the loss is announced in full by the drop line itself, which names the field and the
+    reason. An "…and 3936 more characters" tail there would restate what the `!r` quoting and the
+    drop already say, on a line whose entire purpose is to stay short and unforgeable. A cut over
+    text that IS published is the opposite case, and takes `_obs_text_capped`.
+
+    Delegated rather than reimplemented: one definition of the sanitize-then-cut rule, because two
+    copies of one guard make each copy individually unkillable (AGENTS.md pre-flight item 4)."""
+    return _obs_text_capped(value, cap)[0]
+
+
+def _obs_text_capped(value, cap):
+    """[#2161] A DISPLAY cap over a collector STRING, with what it hid: `(text[:cap], the PRE-cap
+    CHARACTER count)` — `_obs_capped` one type down.
+
+    #1868 published a pre-cap total beside every capped row ARRAY and #2009 did the same for the
+    `evidence` slice nested inside one fire. The trigger-fire `summary` was the last silent cut on
+    the panel and the one neither could reach, because it is not an array: a 900-character alarm
+    summary rendered as a 240-character one with NOTHING saying it had been cut — not on the page,
+    not in the build log — so the operator read a truncated sentence as the whole alarm. The count
+    is what travels; `dashboard/app.js` turns it into an ellipsis marker and a hover title, which is
+    the affordance a truncated STRING needs (`showing 240 of 900` is not a sentence a reader wants
+    where the sentence itself was cut).
+
+    The BUILD LOG stays silent, and that is the answer to the issue's other half rather than an
+    omission: a truncation of text this seam successfully READ is a display contract, not the
+    producer/consumer mismatch the `_ObsDropLog` warnings exist to announce, and a line per fire with
+    a long summary would fire on every healthy fleet — the decision #982/#1570/#1571 took for the row
+    arrays and #1868 kept. The operator-facing half is the one that was missing, and it is on the
+    page now.
+
+    It is a COUNT rather than a `summary_truncated` flag for the reason #1868 published totals: the
+    page can then say HOW MUCH was withheld, and a count is checkable against the slice beside it,
+    where a producer-supplied boolean is an assertion nothing on the page can contradict.
+
+    The UNIT is a Unicode CODE POINT, on both sides of the wire: `text[:cap]` cuts code points and
+    `len()` counts them, so the consumer has to measure the string it DREW the same way. It is named
+    here because the runtimes disagree by default — JavaScript's `String.prototype.length` counts
+    UTF-16 code units, which weighs an astral character (an emoji) twice — and a count compared
+    against a length in the other unit is worse than no count: a 241-emoji summary cut to 240 weighs
+    480 there against 241 here, `length > shown` reads false, and the page draws NOTHING on exactly
+    the alarm that was cut. `dashboard/app.js` uses `Array.from(...).length`; the astral rows in the
+    self-test are what hold the two units together — an ASCII suite cannot tell them apart.
+
+    Two decisions the self-tests pin, both in the direction that keeps this honest:
+
+    - It is the length of the SANITIZED text — after `str()`/`strip()`, over exactly the string that
+      was cut. A length taken off the raw input would count leading whitespace this seam removed and
+      report a cut that never happened on a summary that fits.
+    - A REFUSED value reports **0**, not its length. A non-printable summary is dropped WHOLE by the
+      guard below (it is a control-character injection risk, not a long sentence), and publishing its
+      length beside the empty string would draw a cut marker on a value that was not truncated at
+      all — a second, wrong reading of a loss the page cannot repair. Truncation and refusal are
+      different facts, exactly as #1868 keeps a malformed row out of a capped array's total.
+
+    Published UNCONDITIONALLY beside the string, cut or not, like every `_obs_capped` total: a count
+    emitted only when it has something to say is one a mutant can silence on the quiet fire, and the
+    page could no longer tell `240 of 240` from a producer that stopped sending it (AGENTS.md
+    pre-flight item 8). The page owns the `length > shown` decision."""
     text = str(value or "").strip()
-    return text[:cap] if text and text.isprintable() else ""
+    if not text or not text.isprintable():
+        return "", 0
+    return text[:cap], len(text)
 
 
 def _obs_capped(rows, cap):
@@ -2111,6 +2182,20 @@ def _obs_flow(flow):
     # published a load-balance figure derived from the other half, and a wrong number reads as a
     # measurement where an empty panel at least reads as nothing.
     #
+    # [#2040] ...and the CONTAINER is announced too, for the reason `_obs_drop_queue` makes the same
+    # check on `flow.queue`: a collector sending `flow.leases` as a mapping (account -> utilization,
+    # the natural shape for the value being aggregated) is a dict, which loses every row before the
+    # loop even starts. #1869 scoped itself to the non-object ROW — the case that SKEWS the published
+    # number — and this is the case that hides it entirely: `"leases" in flow` is still true, so
+    # precedence stays rows-first, the collector's `lease_utilization_1h` is not consulted, and the
+    # panel stat publishes None with the loss visible nowhere.
+    #
+    # Keyed on the KEY's presence, exactly as `flow.queue`/`flow.target_ci_queue` are: an ABSENT
+    # `leases` key is the row-free #841 contract, not a mismatch, and keying this on the VALUE
+    # instead would write one warning per build against every collector that already satisfies it.
+    # Decision 22 again bounds the message to a type name this build computed: the container's KEYS
+    # can themselves be account identities, so nothing out of the value is named.
+    #
     # A row is subtracted from that sample TWO ways, and both are announced: the row is not an
     # object at all, or it is a well-formed row whose `utilization_1h` this build cannot read. The
     # second is the likelier producer/consumer mismatch — a collector reporting a percentage, a
@@ -2128,7 +2213,11 @@ def _obs_flow(flow):
     # named by TYPE for the same reason, since a collector controls that value too.
     lease_drops = _ObsDropLog("observability lease rows")
     lease_utilizations = []
-    for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
+    raw_leases = flow.get("leases")
+    if "leases" in flow and not isinstance(raw_leases, list):
+        lease_drops.drop("observability lease input (`flow.leases` "
+                         f"(type {type(raw_leases).__name__}) is not a list of rows)")
+    for item in raw_leases if isinstance(raw_leases, list) else []:
         if not isinstance(item, dict):
             lease_drops.drop("observability lease input "
                              f"(the row (type {type(item).__name__}) is not an object)")
@@ -2183,17 +2272,61 @@ def _obs_flow(flow):
     # stays because a fourth stat, or an unbounded one, would make it load-bearing again.
     stat_drops.close()
 
+    # [#2039] Drop-the-row tolerance is unchanged — a malformed target-CI row never fails the build
+    # — but every drop is now ANNOUNCED, in the shape #982/#1867/#1869 set on the queue, trigger-fire
+    # and lease seams. This is the `flow.queue` failure one seam over: a collector handing over the
+    # natural congestion mapping (keyed BY repository, or carrying the integer depths `queue_stats()`
+    # produces) loses every row, and the target-CI panel then renders identically to a fleet with no
+    # congested targets at all. Unlike #1869 this seam EMPTIES rather than skews, so the harm is
+    # #982's rather than #1869's — but it is exactly as invisible, and the non-object `continue` it
+    # replaces had never executed anywhere in this suite (AGENTS.md pre-flight item 1).
+    #
+    # ONE LINE PER DROP REASON, as `flow.queue` and the trigger-fire seam already do. The pre-#2039
+    # guard tested `repository`'s type, its SHAPE and `depth` in a single condition, so a collector
+    # reporting a depth this build cannot read was told the same thing as one whose repository name
+    # is not owner/name — a diagnostic that names the wrong end is barely better than silence.
+    #
+    # The container check is part of it, for the reason `_obs_drop_queue` makes it on `flow.queue`:
+    # a `{repository: depth}` mapping is a dict, which loses every row before the loop starts. Keyed
+    # on the KEY's presence, so a collector that has not shipped the field yet stays silent.
+    #
+    # Only the SHAPE reaches the build log — a type name, a field name, and for the repository the
+    # `_obs_text` sanitized and BOUNDED form, since `repository` is collector-controlled text just
+    # like `flow.queue`'s class — so a malformed snapshot cannot inject lines into the log that is
+    # diagnosing it.
+    #
+    # [#1570] Counted SEPARATELY from the queue/lease/stat/evidence seams (a flood on one must not
+    # silence another's warning on the same document), and its `close()` is load-bearing:
+    # `target_ci_queue` is UNBOUNDED on the way IN — `_obs_capped` truncates it at 12 on the way out,
+    # below — so nothing else limits how many rows can announce themselves.
     ci_queue = []
-    for item in (flow.get("target_ci_queue")
-                 if isinstance(flow.get("target_ci_queue"), list) else []):
+    ci_drops = _ObsDropLog("observability target CI queue rows")
+    raw_ci_queue = flow.get("target_ci_queue")
+    if "target_ci_queue" in flow and not isinstance(raw_ci_queue, list):
+        ci_drops.drop("observability target CI queue input (`flow.target_ci_queue` "
+                      f"(type {type(raw_ci_queue).__name__}) is not a list of rows)")
+    for item in raw_ci_queue if isinstance(raw_ci_queue, list) else []:
         if not isinstance(item, dict):
+            ci_drops.drop("observability target CI queue input "
+                          f"(the row (type {type(item).__name__}) is not an object)")
             continue
         repository = item.get("repository")
+        if not isinstance(repository, str):
+            ci_drops.drop("observability target CI queue input (row `repository` "
+                          f"(type {type(repository).__name__}) is not an owner/name STRING)")
+            continue
+        if OBS_TARGET_REPO_RE.fullmatch(repository) is None:
+            ci_drops.drop("observability target CI queue input (row `repository` "
+                          f"{_obs_text(repository, 64)!r} is not an owner/name repository)")
+            continue
         depth = _obs_count(item.get("depth"))
-        if (not isinstance(repository, str) or depth is None or not re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repository)):
+        if depth is None:
+            ci_drops.drop("observability target CI queue input (row `depth` "
+                          f"(type {type(item.get('depth')).__name__}) is not a non-negative "
+                          "integer)")
             continue
         ci_queue.append({"repository": repository, "depth": depth})
+    ci_drops.close()
 
     # [#1868] Both row arrays publish the pre-cap total of well-formed rows beside themselves, so a
     # 26-class backlog and a 12-class one stop rendering identically. See `_obs_capped`.
@@ -2274,11 +2407,17 @@ def _obs_trigger_rows(items):
         # `+7 more`, and a count emitted only when it has something to say is one a mutant can
         # silence on the quiet fire (AGENTS.md pre-flight item 8).
         evidence, evidence_total = _obs_capped(evidence, 5)
+        # [#2161] ...and the summary's 240-character cut states itself the same way, in the form a
+        # truncated STRING needs: `summary_length` is the pre-cap character count of the sanitized
+        # text, published on every fire, and `dashboard/app.js` turns `summary_length > shown` into
+        # an ellipsis marker carrying the count in its title. See `_obs_text_capped`.
+        summary, summary_length = _obs_text_capped(item.get("summary"), 240)
         task = item.get("enqueued_task")
         rows.append({
             "rule": rule,
             "fired_at": _utc_iso(item.get("fired_at")),
-            "summary": _obs_text(item.get("summary"), 240),
+            "summary": summary,
+            "summary_length": summary_length,
             "evidence": evidence,
             "evidence_total": evidence_total,
             "enqueued_task": task if isinstance(task, str)
@@ -6400,6 +6539,10 @@ esac
         "trigger_fires": [
             {"rule": "worker-failure-rate", "fired_at": "2025-06-15T15:01:40Z",
              "summary": "worker failure rate 67% over 3 consecutive runs",
+             # [#2161] The pre-cap character count of the summary above, published on the quiet
+             # fire too: this one is nowhere near the 240-character cut, and the page draws no
+             # marker for it — the count is what lets it tell that from a cut it must announce.
+             "summary_length": 47,
              "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/1"],
              # [#2009] TWO links in, one pinned: `evidence_total` counts the links that SURVIVED
              # the github.com pin, so a total taken over the raw input reads 2 here. Nothing is
@@ -7251,8 +7394,10 @@ esac
         # keys, which makes it announce itself — a line about a different seam entirely. This capture
         # is unfiltered on purpose, so it is the FIXTURE that is quietened here rather than the
         # capture: a silent, publishing cache group, so any line these rows do see belongs to the
-        # queue or evidence seam under test.
+        # queue or evidence seam under test. [#2039] The golden `target_ci_queue` carries a
+        # malformed row too, and since that seam is loud it is emptied here for the same reason.
         fixture["cache"] = {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7}
+        fixture["flow"]["target_ci_queue"] = []
         stream = io.StringIO()
         try:                       # same crash-after-partial-run guard as ObsRefusal above
             with contextlib.redirect_stdout(stream):
@@ -7322,6 +7467,7 @@ esac
                                    "actions/runs/7"]}]),
           ([{"class": "2a", "depth": 1, "oldest_age_minutes": None}],
            [{"rule": "quiet-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+             "summary_length": 1,
              "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/7"],
              "evidence_total": 1, "enqueued_task": None}], []))
     # ---- [#1867] A DROPPED FIRE ROW MUST NAME ITSELF. The evidence-LINK drops above are loud while
@@ -7336,7 +7482,8 @@ esac
     _FIRE_ROWS = "observability trigger fire rows"
     _KEPT_FIRE = {"rule": "kept-rule", "fired_at": now - 300, "summary": "s", "evidence": []}
     _KEPT_PUBLISHED = {"rule": "kept-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
-                       "evidence": [], "evidence_total": 0, "enqueued_task": None}
+                       "summary_length": 1, "evidence": [], "evidence_total": 0,
+                       "enqueued_task": None}
     # THE REGRESSION, in the shape the issue names. Both directions in one row: the unreadable rule
     # is announced, AND the row beside it still publishes — this is a drop diagnostic, not a new
     # fatality and not a reason to fail the panel.
@@ -7619,6 +7766,235 @@ esac
           obs_evidence_page("unreachable"),
           ([[["evidence 1"], [evidence_note(2)]],
             [["evidence 1"], [evidence_note(1, " is")]]], [], None))
+    # ---- [#2161] THE FIRE `summary` IS A DISPLAY CUT TOO — THE LAST SILENT ONE ON THIS PANEL, AND
+    # THE ONE NEITHER #1868 NOR #2009 COULD REACH, because it is not an array. A 900-character alarm
+    # summary published as 240 characters with NO affordance at all: no marker, no title, and
+    # nothing in the build log either, so the operator read a sentence that stops mid-word as the
+    # whole alarm. Every input SIZE and every expected string below is a literal written HERE —
+    # sizing an input from the 240 the code reads is pre-flight 2(c)'s tautology and reading the
+    # published string back as the expectation is 2(b)'s — and the 900-character input is built
+    # around a `CUT` marker at the boundary so WHICH characters survive is pinned to the character:
+    # a cap moved by one reds the slice rather than passing on a length that still reads 900.
+    _LONG_SUMMARY = "x" * 239 + "CUT" + "y" * 658          # 900 characters
+    _CUT_SUMMARY = "x" * 239 + "C"                         # ...of which 240 are published
+    # The unit this whole affordance is denominated in, made testable: an ASTRAL character (one
+    # code point, TWO UTF-16 code units). `len()` and `text[:240]` count code points, so the count
+    # on the wire is code points and the page has to measure the string it drew in the same unit —
+    # an ASCII-only suite cannot tell the two units apart and so cannot see a page that does not.
+    _ASTRAL = "\U0001F600"
+
+    def obs_summary(value):
+        """(published `summary`, its `summary_length`) for one fire carrying `value`."""
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["trigger_fires"] = [{"rule": "summary-rule", "fired_at": now - 300,
+                                     "summary": value, "evidence": []}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            document = obs_normalized(fixture)
+        fires = document["trigger_fires"]
+        row = fires[0] if isinstance(fires, list) and fires else document
+        # `.get`, not a subscript, for the reason `obs_evidence` gives: a mutant that stops
+        # publishing the key must red THESE rows, not abort the suite under a KeyError with every
+        # check below it unrun (AGENTS.md pre-flight item 4, crash-after-partial-run).
+        return row.get("summary"), row.get("summary_length")
+
+    check("[#2161] a 900-character summary publishes 240 characters and STATES that it read 900. "
+          "A length derived from the published slice reds at 240, a moved cap reds the slice, and "
+          "dropping the key reds both halves",
+          obs_summary(_LONG_SUMMARY), (_CUT_SUMMARY, 900))
+    # The accept path and the zero row, which are what keep the row above and the refusal row below
+    # non-vacuous: a length emitted only when the cut BIT is the census that never zero-seals
+    # (pre-flight item 8), and the page could then no longer tell `240 of 240` from a producer that
+    # stopped sending the count at all.
+    check("[#2161] a summary UNDER the cut publishes whole and states its length ANYWAY — a cut "
+          "that hid nothing is still a reading, and the page owns the `length > shown` decision",
+          obs_summary("twelve chars"), ("twelve chars", 12))
+    check("[#2161] ...and a fire with NO summary publishes its ZERO rather than omitting the count",
+          obs_summary(""), ("", 0))
+    check("[#2161] ...an ABSENT summary key reads the same way — 0 characters, not a missing count",
+          obs_summary(None), ("", 0))
+    # THE DIRECTION THAT KEEPS THIS HONEST. A non-printable summary is REFUSED WHOLE by the existing
+    # guard (a control-character injection risk, not a long sentence), so its length is 0 and not
+    # 900: publishing 900 beside the empty string would draw `…` and `900 further characters` on a
+    # value that was never truncated — a second, WRONG reading of a loss the page cannot repair.
+    # Truncation and refusal are different facts, exactly as #1868 keeps a malformed row out of a
+    # capped array's total.
+    check("[#2161] a non-printable 900-character summary is REFUSED WHOLE and reports length 0 — a "
+          "refusal is not a truncation, and a length published beside an empty string would draw a "
+          "cut marker on a value that was never cut",
+          obs_summary("a" * 300 + "\n" + "b" * 599), ("", 0))
+    # ...and the count is taken over the SANITIZED text, the same string that was cut. Read off the
+    # raw input it would count the six spaces this seam strips and report 306 for a summary of 300.
+    check("[#2161] the length counts the STRIPPED text the cut is applied to, never the raw input — "
+          "a length read before `strip()` says 306 where 300 characters were published",
+          obs_summary("   " + "w" * 300 + "   "), ("w" * 240, 300))
+    # ...and both the cut and the count are in CODE POINTS. Pinned here because it is the unit the
+    # page is held to below: a count in UTF-16 code units reads 482 for this input, and a cut in
+    # them would publish 120 emoji.
+    check("[#2161] an astral summary is cut and counted in CODE POINTS — 241 emoji publish 240 "
+          "emoji beside a length of 241, never the 482 a UTF-16 code-unit count reports",
+          obs_summary(_ASTRAL * 241), (_ASTRAL * 240, 241))
+    # ...and THE PAGE IS WHAT THIS HAS TO DELIVER INTO (pre-flight item 11): a count published into
+    # site/data.json that no panel renders leaves the operator exactly where the issue found them.
+    # The affordance is deliberately NOT #1868's `showing 240 of 900` — a statistic under a sentence
+    # that stops mid-word is not what a reader of that sentence needs — so the fire draws an ELLIPSIS
+    # carrying the count in its title, INSIDE the summary span so it sits against the text it
+    # belongs to. EXECUTED against dashboard/app.js under the shared DOM shim (a lexical assertion
+    # is satisfiable by a comment — the #612 round-4 lesson), collected by EXACT className and only
+    # from the summary span's own children, so a marker appended to the ROW instead cannot pass. The
+    # card-level `obs-truncated` note is collected beside it, so an affordance delivered by
+    # re-labelling or by consuming the #1868 one reds too.
+    _OBS_SUMMARY_PAGE_BODY = r"""
+  const summaries = (root) => {
+    const found = [];
+    const walk = (el) => {
+      if (!el) return;
+      if (el.className === "obs-trigger-summary") {
+        found.push([el.textContent || "",
+          (el.children || []).filter((kid) => kid.className === "obs-summary-cut")
+            .map((kid) => [kid.textContent || "", (kid.attributes || {}).title || null])]);
+      }
+      for (const kid of el.children || []) walk(kid);
+    };
+    walk(root);
+    return found;
+  };
+  const panel = (root) => {
+    const found = [];
+    const walk = (el) => {
+      if (!el) return;
+      if (el.className === "obs-truncated") found.push(flat(el).join(" ").trim());
+      for (const kid of el.children || []) walk(kid);
+    };
+    walk(root);
+    return found;
+  };
+  const out = {};
+  for (const [name, document] of Object.entries(input.documents)) {
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      scope.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    out[name] = { error, fires: summaries(ids["obs-triggers"]), panel: panel(ids["obs-triggers"]) };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+
+    def summary_cut(hidden, plural="s are"):
+        """The `…` marker and its hover title, as test-side literals (pre-flight 2(b)).
+
+        The title is asserted because it carries the ONLY reading of the count — the visible marker
+        is one character and has no branch in it — and because the singular is otherwise an
+        unkillable region (pre-flight item 4's equivalent survivor)."""
+        return [["…", f"{hidden} further character{plural} in this fire's summary in the "
+                      "collector snapshot than this row displays"]]
+    # Real `_normalize_observability` output, so the page is handed the document this build actually
+    # publishes rather than one hand-shaped to suit the assertion. Three fires, newest first.
+    summary_page_input = copy.deepcopy(obs_fixture)
+    summary_page_input["trigger_fires"] = [
+        {"rule": "long-summary-rule", "fired_at": now - 300, "summary": _LONG_SUMMARY,
+         "evidence": []},
+        {"rule": "short-summary-rule", "fired_at": now - 400, "summary": "twelve chars",
+         "evidence": []},
+        {"rule": "no-summary-rule", "fired_at": now - 500, "summary": "", "evidence": []}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        summary_page_doc = obs_normalized(summary_page_input)
+    # Every unusable `summary_length` a future, tampered or pre-#2161 producer can put beside a
+    # five-character summary — a string, a boolean, a negative, a null, one EQUAL to the text, one
+    # SMALLER than it, a fractional one, and the LEGACY row that carries no length at all. None may
+    # draw a marker: an unknown length is not a truncation, and a `…` promising `undefined` more
+    # characters is a worse lie than the silence it replaces.
+    hostile_summary_doc = copy.deepcopy(summary_page_doc)
+    hostile_summary_doc["trigger_fires"] = [
+        {"rule": f"hostile-rule-{index}", "fired_at": "2025-06-15T15:01:40Z", "summary": "abcde",
+         "summary_length": length, "evidence": [], "evidence_total": 0, "enqueued_task": None}
+        for index, length in enumerate(("900", True, -1, None, 5, 3, 7.5))]
+    hostile_summary_doc["trigger_fires"].append(
+        {"rule": "legacy-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "abcde",
+         "evidence": [], "evidence_total": 0, "enqueued_task": None})
+    # The document that separates "characters this row DREW" from "the generator's 240-character
+    # cap". This generator cannot produce it — every summary it cuts is exactly 240 long — so a
+    # `shown` hard-coded to the cap is an EQUIVALENT survivor against any document it can (pre-flight
+    # item 4), and the decision is only assertable against a hand-edited page. TWO rows: the first
+    # pins the ARITHMETIC (3 characters drawn out of 10 collected is `7 further`, never the `660` a
+    # cap-derived `shown` would compute, and a cap-derived PREDICATE would draw nothing at all); the
+    # second pins the SINGULAR branch of the title, which nothing else on this page reaches.
+    unreachable_summary_doc = copy.deepcopy(summary_page_doc)
+    unreachable_summary_doc["trigger_fires"] = [
+        {"rule": "unreachable-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "abc",
+         "summary_length": 10, "evidence": [], "evidence_total": 0, "enqueued_task": None},
+        {"rule": "unreachable-rule-2", "fired_at": "2025-06-15T15:01:40Z", "summary": "abc",
+         "summary_length": 4, "evidence": [], "evidence_total": 0, "enqueued_task": None}]
+    # ...beside a card-level total that matches the fires, so the empty `panel` control below is
+    # asserting the per-row affordance and not merely inheriting the three-fire total copied above.
+    unreachable_summary_doc["trigger_fires_total"] = 2
+    # THE CROSS-RUNTIME SEAM, END TO END THROUGH THE REAL PRODUCER. Every document above is ASCII,
+    # where a code point and a UTF-16 code unit are the same number, so none of them can see a page
+    # that measures the drawn string in `String.prototype.length` while the count on the wire is
+    # Python `len()`. An astral character (one code point, two code units) separates them, and the
+    # separation is not cosmetic — it is a SILENT MISS on the alarm that was actually cut. Three
+    # fires, each a different failure of the unit mismatch, and all three are real
+    # `_normalize_observability` output rather than hand-shaped rows, so the slice, the count and
+    # the marker are asserted across the same seam an operator reads:
+    #   241 emoji  -> 240 published, 1 withheld;  a code-unit page compares 480 against 241 and
+    #                 draws NOTHING on a genuinely capped alarm — the finding's own example.
+    #   120 emoji + 200 'z' -> 240 published, 80 withheld;  a code-unit page compares 360 against
+    #                 320 and again draws nothing, so mixed text hides its cut too.
+    #   10 emoji + 1000 'z' -> 240 published, 770 withheld;  here a code-unit page DOES draw a
+    #                 marker, and it names 760 — the direction that kills a fix applied to the
+    #                 predicate but not to the subtraction (pre-flight item 3: the same guard,
+    #                 deleted and made conditionally inert, are different experiments).
+    astral_page_input = copy.deepcopy(obs_fixture)
+    astral_page_input["trigger_fires"] = [
+        {"rule": "astral-cap-rule", "fired_at": now - 300, "summary": _ASTRAL * 241,
+         "evidence": []},
+        {"rule": "astral-mixed-rule", "fired_at": now - 400,
+         "summary": _ASTRAL * 120 + "z" * 200, "evidence": []},
+        {"rule": "astral-tail-rule", "fired_at": now - 500,
+         "summary": _ASTRAL * 10 + "z" * 1000, "evidence": []}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        astral_page_doc = obs_normalized(astral_page_input)
+    summary_page = _executed_page(
+        _page_harness("renderObservability", _OBS_SUMMARY_PAGE_BODY),
+        {"documents": {"capped": copy.deepcopy(summary_page_doc),
+                       "hostile": hostile_summary_doc,
+                       "unreachable": unreachable_summary_doc,
+                       "astral": astral_page_doc}})
+
+    def obs_summary_page(name):
+        rendered = summary_page.get(name)
+        return ((rendered.get("fires"), rendered.get("panel"), rendered.get("error"))
+                if isinstance(rendered, dict) else summary_page)
+
+    check("[#2161] EXECUTED page script: the 900-character fire draws its 240 characters AND a `…` "
+          "whose title names the 660 it withheld; the twelve-character fire and the empty one draw "
+          "no marker at all. The card-level `obs-truncated` note is empty on the same stack, so the "
+          "per-row affordance is its own and did not arrive by relabelling the #1868 one",
+          obs_summary_page("capped"),
+          ([[_CUT_SUMMARY, summary_cut(660)], ["twelve chars", []], ["", []]], [], None))
+    check("[#2161] EXECUTED page script: an unusable `summary_length` draws NOTHING — a string, a "
+          "boolean, a negative, a null, one equal to the text beside it, one smaller, a FRACTIONAL "
+          "one, and a legacy row carrying no length at all are each 'no truncation known', never a "
+          "fabricated `…`. The summary text itself still renders on every row",
+          obs_summary_page("hostile"), ([["abcde", []]] * 8, [], None))
+    check("[#2161] EXECUTED page script: the title counts the characters the READER can see, not "
+          "the generator's cap — 3 drawn out of 10 collected is `7 further characters`, and a "
+          "`shown` pinned to 240 would draw no marker here at all. The second row takes the "
+          "SINGULAR branch of the title",
+          obs_summary_page("unreachable"),
+          ([["abc", summary_cut(7)], ["abc", summary_cut(1, " is")]], [], None))
+    check("[#2161] EXECUTED page script: the page counts the drawn summary in the producer's UNIT, "
+          "CODE POINTS. 241 emoji cut to 240 draw the marker a UTF-16 `String.length` (480 vs 241) "
+          "silently withholds, 120 emoji before 200 'z' likewise, and the mixed row a code-unit "
+          "page DOES mark names 770 rather than 760",
+          obs_summary_page("astral"),
+          ([[_ASTRAL * 240, summary_cut(1, " is")],
+            [_ASTRAL * 120 + "z" * 120, summary_cut(80)],
+            [_ASTRAL * 10 + "z" * 230, summary_cut(770)]], [], None))
     # ---- [#1880] A FLOW STAT THE COLLECTOR SENT AND THIS BUILD CANNOT READ MUST NOT PUBLISH AS A
     # HEALTHY NUMBER. `_obs_count(...) or 0` mapped every unreadable park/sample count to 0, so
     # `parks_1h: {"needs_user": "lots", "needs_orchestrator": -3}` published `0 user · 0 orch` on
@@ -8031,18 +8407,28 @@ esac
     _LEASE_ROWS = "observability lease rows"
     _KEPT_LEASE = {"label": "ab12cd340a5f9e71", "provider": "anthropic", "utilization_1h": 0.8}
 
-    def obs_lease_drops(rows, queue_rows=None):
+    def obs_lease_drops(rows, queue_rows=None, present=True, aggregate=None):
         """(published `flow.lease_utilization_1h`, EVERY `dashboard-gen:` line printed).
 
         The FIXTURE is quietened rather than the capture (as `obs_drops` does above): the golden
-        snapshot's unknown queue class, retired cache keys and unsafe trigger rule each announce
-        themselves from a different seam, and filtering them out of the capture would also hide a
-        lease line mislabelled as one of them.
+        snapshot's unknown queue class, retired cache keys, malformed target-CI row (#2039) and
+        unsafe trigger rule each announce themselves from a different seam, and filtering them out
+        of the capture would also hide a lease line mislabelled as one of them.
+
+        [#2040] `present=False` deletes the `leases` key outright (the row-free #841 contract, which
+        is the silent direction of the container check) and `aggregate` supplies the collector's
+        `flow.lease_utilization_1h`, which the fixture does not carry.
         """
         fixture = copy.deepcopy(obs_fixture)
-        fixture["flow"]["leases"] = rows
+        if present:
+            fixture["flow"]["leases"] = rows
+        else:
+            del fixture["flow"]["leases"]
+        if aggregate is not None:
+            fixture["flow"]["lease_utilization_1h"] = aggregate
         fixture["flow"]["queue"] = ([{"class": "2a", "depth": 1}]
                                     if queue_rows is None else queue_rows)
+        fixture["flow"]["target_ci_queue"] = []
         fixture["cache"] = {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7}
         fixture["trigger_fires"] = []
         stream = io.StringIO()
@@ -8184,6 +8570,234 @@ esac
           [_INT_CLASS]
           + [_LEASE_DROP.format("the row (type NoneType) is not an object")] * 12
           + [_SUPPRESSED.format(8, _LEASE_ROWS, 20)])
+    # ---- [#2040] ...AND SO MUST THE CONTAINER HOLDING THEM. #1869 above scoped itself to the
+    # non-object ROW — the case that SKEWS the published mean — and left the container it arrives in
+    # checked inline and silently. That is the `flow.queue` failure #982 announced, arriving one
+    # seam over and reading WORSE than #1869's: a collector sending `flow.leases` as a mapping
+    # (account -> utilization, the natural shape for the value being aggregated) loses every row
+    # before the loop starts, `"leases" in flow` is still true so precedence stays rows-first and
+    # the collector's own aggregate is never consulted, and the panel stat simply HIDES on a green
+    # build with the loss visible nowhere. Every expected string below is a test-side literal
+    # (pre-flight 2(b)) and every input is a literal (2(c)); the capture is the same ordered,
+    # unfiltered one the rows above use, so a line printed to the wrong seam, or once per KEY
+    # instead of once per container, reds.
+    _LEASE_CONTAINER = "`flow.leases` (type {}) is not a list of rows"
+    # THE REGRESSION, in the shape the issue names. The mapping carries TWO keys on purpose: a guard
+    # that announced per key (or that fell through into a loop over the keys) prints two lines here.
+    check("[#2040] a lease mapping keyed BY account loses EVERY row before the loop starts — the "
+          "container announces itself ONCE and the stat still hides, instead of a green build "
+          "publishing nothing where a load-balance figure belongs",
+          obs_lease_drops({"ab12cd340a5f9e71": 0.8, "ef56ab78b3c2d104": 0.4}),
+          (None, [_LEASE_DROP.format(_LEASE_CONTAINER.format("dict"))]))
+    # ONE LINE PER CONTAINER TYPE, walked by TYPE because a guard narrowed to one of them
+    # (`isinstance(raw, dict)`) survives a suite that only ever sends a mapping, and because null is
+    # the likeliest thing a JSON producer emits for a field it has stopped filling (pre-flight item
+    # 3's #938 shape: a guard made inert for exactly the null input).
+    for case, container, type_name in (
+        ("an explicitly null container", None, "NoneType"),
+        ("a string container", "ab12cd340a5f9e71=0.8", "str"),
+        ("a bare-scalar container", 0.8, "float"),
+    ):
+        check(f"[#2040] {case} names its type and nothing else, and the stat hides",
+              obs_lease_drops(container),
+              (None, [_LEASE_DROP.format(_LEASE_CONTAINER.format(type_name))]))
+    # THE SILENT DIRECTION, and the row that makes the guard's key the KEY's presence rather than
+    # the value's shape: an absent `leases` key is the row-free #841 contract every collector on the
+    # new contract satisfies. Rewrite the guard as `not isinstance(flow.get("leases"), list)` — the
+    # tempting one-line form — and this row reds with one warning per build, on every healthy fleet.
+    check("[#2040] an ABSENT `leases` key announces NOTHING and still consults the collector's "
+          "aggregate: a field the row-free contract deliberately omits is not a shape mismatch",
+          obs_lease_drops(None, present=False, aggregate={"mean": 0.31, "max": 0.77}),
+          ({"mean": 0.31, "max": 0.77}, []))
+    # ...and an EMPTY list is a well-formed container that measured nothing, not a mismatch either:
+    # a container check rewritten on truthiness (`not raw_leases`) announces this one and reds here.
+    check("[#2040] an EMPTY lease list is a well-formed container — it publishes null for want of a "
+          "sample, and announces nothing",
+          obs_lease_drops([]), (None, []))
+    # PRECEDENCE IS UNTOUCHED by the announcement: #841's rows-first rule keys on the legacy KEY, so
+    # a container this build cannot read must still refuse to fall back to the aggregate. Announcing
+    # the container and then consulting `lease_utilization_1h` would publish {0.99, 0.99} here — the
+    # silent override #841 forbids, dressed up as a fix.
+    check("[#2040] a non-list container does not hand the panel over to the collector's aggregate: "
+          "the stat hides and SAYS WHY, rather than silently publishing a figure the legacy key it "
+          "was sent alongside is supposed to outrank",
+          obs_lease_drops({"ab12cd340a5f9e71": 0.8}, aggregate={"mean": 0.99, "max": 0.99}),
+          (None, [_LEASE_DROP.format(_LEASE_CONTAINER.format("dict"))]))
+    # DECISION 22 bounds the container line exactly as it bounds #1869's row line, and it binds
+    # HARDER here: a mapping's KEYS are the account identities #374/#841 removed from the published
+    # page, so an `_obs_text` form of the container would republish a whole fleet's fingerprints —
+    # or a raw handle — into the build log diagnosing it. The type name is all that may be said.
+    _leaky_container = obs_lease_drops({handle: 0.5, "ab12cd340a5f9e71": 0.8})
+    check("[#2040] decision 22: a dropped lease container names its TYPE and nothing out of the "
+          "value — neither a raw handle nor a salted fingerprint keyed inside it reaches the log",
+          (_leaky_container[0], _leaky_container[1],
+           [text for text in (handle, "ab12cd340a5f9e71")
+            if text in "\n".join(_leaky_container[1])]),
+          (None, [_LEASE_DROP.format(_LEASE_CONTAINER.format("dict"))], []))
+    # ...and the container drop is counted into the LEASE seam, not a neighbour's: the queue seam's
+    # own bad row still names itself and the ordering is fixed (the queue loop closes first), so a
+    # container line emitted from the wrong `_ObsDropLog` reds on both text and position.
+    check("[#2040] the container drop belongs to the lease seam and leaves the queue seam's budget "
+          "and diagnostics untouched",
+          obs_lease_drops({"ab12cd340a5f9e71": 0.8}, queue_rows=[{"class": 1, "depth": 4}])[1],
+          [_INT_CLASS, _LEASE_DROP.format(_LEASE_CONTAINER.format("dict"))])
+    # ---- [#2039] A DROPPED TARGET-CI ROW MUST NAME ITSELF. This is #982's `flow.queue` failure one
+    # seam over, and it EMPTIES rather than skews: an empty target-CI panel is exactly what a fleet
+    # with NO congested targets renders as, so a collector handing over the natural congestion
+    # mapping published a green build, a green self-test and a panel reading as healthy, with the
+    # loss visible nowhere. The non-object `continue` this replaces had never executed anywhere in
+    # this suite on a `python3 -m trace --count --missing` run (pre-flight item 1), which is why it
+    # is walked explicitly below. Every expected string is a test-side literal (reading the message
+    # back off the module under test is pre-flight 2(b)'s tautology) and every input is a literal
+    # (2(c)); the capture keeps EVERY `dashboard-gen:` line, in order and unfiltered, so a line
+    # printed to the wrong seam, or with the wrong text, reds.
+    _CI_DROP = "dashboard-gen: dropped observability target CI queue input ({})"
+    _CI_ROWS = "observability target CI queue rows"
+    _KEPT_CI = {"repository": "sparq-org/sparq", "depth": 5}
+
+    def obs_ci_drops(rows, present=True, queue_rows=None):
+        """(published `flow.target_ci_queue`, EVERY `dashboard-gen:` line printed).
+
+        The FIXTURE is quietened rather than the capture, for the reason `obs_drops` and
+        `obs_lease_drops` above quieten theirs: the golden snapshot's unknown queue class, retired
+        cache keys and unsafe trigger rule each announce themselves from a DIFFERENT seam, and
+        filtering them out of the capture would also hide a target-CI line mislabelled as one.
+        """
+        fixture = copy.deepcopy(obs_fixture)
+        if present:
+            fixture["flow"]["target_ci_queue"] = rows
+        else:
+            del fixture["flow"]["target_ci_queue"]
+        fixture["flow"]["queue"] = ([{"class": "2a", "depth": 1}]
+                                    if queue_rows is None else queue_rows)
+        fixture["cache"] = {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7}
+        fixture["trigger_fires"] = []
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        except Exception as error:  # noqa: BLE001 — #1880's arm, for #1880's reason: this seam
+            # walks rows it has just declared unreadable, so a guard that ANNOUNCES a row without
+            # skipping it raises out of `item.get(...)` and would abort every check below rather
+            # than red the row that provoked it. Rendered, not swallowed: nothing here equals it.
+            document = ObsRefusal(raised=f"{type(error).__name__}: {error}"[:200])
+        return (document["flow"]["target_ci_queue"],
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen:")])
+
+    # THE REGRESSION, in the two shapes the issue names, and both directions in one row each: the
+    # panel EMPTIES, and the rows that emptied it now name themselves. A congestion mapping keyed BY
+    # repository never reaches the loop at all, so the container check is what catches it; handed
+    # over as (repository, depth) PAIRS it reaches the loop and dies on the never-executed line.
+    check("[#2039] a congestion mapping keyed BY repository loses EVERY row before the loop starts "
+          "— an empty target-CI panel is what a fleet with no congested targets renders as, so the "
+          "container names itself instead of publishing a healthy-looking panel on a green build",
+          obs_ci_drops({"sparq-org/sparq": 5, "jeswr/agent-account-registry": 2}),
+          ([], [_CI_DROP.format(
+              "`flow.target_ci_queue` (type dict) is not a list of rows")]))
+    check("[#2039] a target-CI list handed over as (repository, depth) PAIRS drops every row "
+          "LOUDLY — this is the line a coverage run showed had never executed anywhere",
+          obs_ci_drops([["sparq-org/sparq", 5], ["jeswr/agent-account-registry", 2]]),
+          ([], [_CI_DROP.format("the row (type list) is not an object")] * 2))
+    # ...and the survivors beside a dropped row still publish: this is a drop diagnostic, NOT a new
+    # fatality. Turning the drop into a raise (or into a `flow: None`) reds this row.
+    check("[#2039] an unreadable row does not cost the rows beside it — the readable target still "
+          "publishes its depth and the build stays green",
+          obs_ci_drops([None, copy.deepcopy(_KEPT_CI), {"repository": "not-a-repo", "depth": 2}]),
+          ([{"repository": "sparq-org/sparq", "depth": 5}],
+           [_CI_DROP.format("the row (type NoneType) is not an object"),
+            _CI_DROP.format("row `repository` 'not-a-repo' is not an owner/name repository")]))
+    # The accept path must stay SILENT, or the warning marks nothing: an unconditional drop, or one
+    # hoisted above the guards, publishes these same rows and turns this row red. The zero depth is
+    # deliberate — a guard rewritten on truthiness drops an idle-but-reported target loudly.
+    check("[#2039] a target-CI list whose rows all parse prints NOTHING (the warning marks a real "
+          "drop, so it can never fire on the accept path), including a reported depth of ZERO",
+          obs_ci_drops([copy.deepcopy(_KEPT_CI),
+                        {"repository": "jeswr.agent-account_registry/x.y-z", "depth": 0}]),
+          ([{"repository": "sparq-org/sparq", "depth": 5},
+            {"repository": "jeswr.agent-account_registry/x.y-z", "depth": 0}], []))
+    # ...and the container check is keyed on the KEY's PRESENCE, exactly as `flow.queue`'s is: a
+    # collector that has not shipped the field yet is not a producer/consumer mismatch. Keying it on
+    # the VALUE instead writes one warning per build against every collector alive today.
+    check("[#2039] an ABSENT target-CI key announces nothing — a field a collector has not shipped "
+          "is not a shape mismatch",
+          obs_ci_drops(None, present=False), ([], []))
+    # ONE WARNING PER DROP REASON, each naming the field AND the guard that refused it. The issue's
+    # own point: pre-#2039 a `depth` mismatch, a `repository` that is not a string and a `repository`
+    # that is not owner/name shaped shared ONE silent `continue`, so a single shared message would
+    # still leave a depth mismatch reading as a repository mismatch — every row below reds for it.
+    # The null/missing cases are here because their wrongly-typed siblings do not cover them: a
+    # guard made inert for exactly the null input survives a suite that only ever sends the wrong
+    # TYPE (pre-flight item 3's #938 shape), and null is the likeliest thing a JSON producer emits.
+    for case, rows, detail in (
+        ("a whole non-list container", None,
+         "`flow.target_ci_queue` (type NoneType) is not a list of rows"),
+        ("a string container", "sparq-org/sparq=5",
+         "`flow.target_ci_queue` (type str) is not a list of rows"),
+        ("a null row", [None], "the row (type NoneType) is not an object"),
+        ("a bare-scalar row", [5], "the row (type int) is not an object"),
+        ("a missing repository", [{"depth": 4}],
+         "row `repository` (type NoneType) is not an owner/name STRING"),
+        ("an explicitly null repository", [{"repository": None, "depth": 4}],
+         "row `repository` (type NoneType) is not an owner/name STRING"),
+        ("a non-string repository", [{"repository": 7, "depth": 4}],
+         "row `repository` (type int) is not an owner/name STRING"),
+        ("a bare repository name", [{"repository": "sparq", "depth": 4}],
+         "row `repository` 'sparq' is not an owner/name repository"),
+        ("an owner/name carrying a path segment", [{"repository": "sparq-org/sparq/ci", "depth": 4}],
+         "row `repository` 'sparq-org/sparq/ci' is not an owner/name repository"),
+        ("a missing depth", [{"repository": "sparq-org/sparq"}],
+         "row `depth` (type NoneType) is not a non-negative integer"),
+        ("an explicitly null depth", [{"repository": "sparq-org/sparq", "depth": None}],
+         "row `depth` (type NoneType) is not a non-negative integer"),
+        ("a non-integer depth", [{"repository": "sparq-org/sparq", "depth": "5"}],
+         "row `depth` (type str) is not a non-negative integer"),
+        ("a fractional depth", [{"repository": "sparq-org/sparq", "depth": 2.5}],
+         "row `depth` (type float) is not a non-negative integer"),
+        ("a boolean depth", [{"repository": "sparq-org/sparq", "depth": True}],
+         "row `depth` (type bool) is not a non-negative integer"),
+        ("a negative depth", [{"repository": "sparq-org/sparq", "depth": -1}],
+         "row `depth` (type int) is not a non-negative integer"),
+    ):
+        check(f"[#2039] {case} is dropped LOUDLY, by the REASON that failed — a shared message "
+              "leaves a depth mismatch reading as a repository mismatch",
+              obs_ci_drops(rows), ([], [_CI_DROP.format(detail)]))
+    # ...and the ONE collector value any of these messages quotes is sanitized and BOUNDED on the way
+    # out, as `flow.queue`'s class is. `repository` is collector-controlled text living on a PUBLIC
+    # branch this build does not own (pre-flight item 5): echo it raw instead of through
+    # `_obs_text(repository, 64)` and a hostile — or merely enormous — name writes itself into the
+    # build log that is diagnosing it.
+    for case, repository, quoted in (
+        ("non-printable", "ok\ndashboard-gen: dropped observability target CI queue input (forged)",
+         "''"),
+        ("4000 characters long", "9" * 4000, f"'{'9' * 64}'"),
+    ):
+        check(f"[#2039] a {case} repository is not echoed into the build log that diagnoses it",
+              obs_ci_drops([{"repository": repository, "depth": 1}]),
+              ([], [_CI_DROP.format(f"row `repository` {quoted} is not an owner/name repository")]))
+    # `flow.target_ci_queue` is UNBOUNDED on the way IN — `_obs_capped` truncates it at 12 on the way
+    # OUT, after every row has been walked — so nothing but this seam's own `_ObsDropLog` limits the
+    # emission: the #1570 flood, exactly. The 21st row still publishes, because capping a WARNING
+    # must never cap the DATA. Every size and expected string here is a literal; deriving either
+    # from OBS_DROP_WARN_MAX is the #941 tautology that left 76/76 green.
+    check("[#2039] 20 unreadable target-CI rows print 12 warnings and ONE tail naming the real "
+          "total, and the readable row beside them still publishes its depth",
+          obs_ci_drops([None] * 20 + [copy.deepcopy(_KEPT_CI)]),
+          ([{"repository": "sparq-org/sparq", "depth": 5}],
+           [_CI_DROP.format("the row (type NoneType) is not an object")] * 12
+           + [_SUPPRESSED.format(8, _CI_ROWS, 20)]))
+    # The target-CI seam counts SEPARATELY from the queue seam (#1570's reason for keeping the queue
+    # and evidence seams apart): one shared budget would let a flood of unreadable target rows
+    # silence the queue warning on the same document — trading one invisible loss for another — and
+    # would print a single tail naming the wrong seam. Ordering is fixed: the queue loop closes first.
+    check("[#2039] a flooded target-CI seam does not consume the queue seam's budget: the lone bad "
+          "queue row still names itself, and the tail names the TARGET-CI seam",
+          obs_ci_drops([None] * 20, queue_rows=[{"class": 1, "depth": 4}])[1],
+          [_INT_CLASS]
+          + [_CI_DROP.format("the row (type NoneType) is not an object")] * 12
+          + [_SUPPRESSED.format(8, _CI_ROWS, 20)])
     try:
         with_observability = build_dashboard(
             issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)

@@ -84,7 +84,6 @@ def self_test():
 
 
 if __name__ == "__main__":
-    import sys
-    if sys.argv[1:] == ["--self-test"]:
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
         raise SystemExit(self_test())
     raise SystemExit("usage: yaml_dependency.py --self-test")

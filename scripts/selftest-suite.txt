@@ -18,6 +18,7 @@ gate-base-lead.py
 gate-staleness.py
 gh_403.py
 gh_retry.py
+graded_base.py
 grant-account.py
 grant-scope-audit.py
 groom-alert.py
@@ -60,4 +61,5 @@ usage-alert.py
 worker-issue.py
 worker-live.sh
 worker-pr.py
+workflow_if.py
 yaml_dependency.py

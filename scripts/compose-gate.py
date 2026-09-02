@@ -108,6 +108,18 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# THE graded-base derivation — "the commit this run graded is the FIRST PARENT of the checked-out
+# refs/pull/N/merge" — IMPORTED, never re-declared (registry #1429). This module and
+# gate-staleness.py each carried a private copy: the same git argv, the same `parents[1]`, the same
+# parent-count refusal in different words, with nothing comparing them, so a repoint had to land in
+# both at once. Bound as a MODULE so the self-test can probe the delegation by swapping the
+# attribute; a `from ... import` would capture the function and make a re-inlined copy invisible.
+# The two consumers' FAIL DIRECTIONS still differ on purpose — `unprovable` BLOCKS here and does not
+# there — and that policy stays in this file.
+import graded_base as _graded_base  # noqa: E402 — the sys.path arm above has to run first
+
 FRESH = "fresh"              # the graded base IS the live tip — nothing to compose
 CLEAN = "composes-clean"     # stale, merges cleanly, the overlap suite passes
 CONFLICT = "conflict"        # stale, TEXTUAL conflict — the author's routine problem, not a red
@@ -193,6 +205,24 @@ RUNNER_ARM = "run-selftest)"
 #   structurally complete fix is INVERSE POLARITY (require a recognised positive verdict line), which
 #   needs 7 of 56 entries normalised onto a `PASSED/FAILED`-shaped terminal line first; a follow-up,
 #   not a one-token addition here.
+#   ⚠️ AND THAT NORMALISATION HAS THREE TERMINAL SHAPES TO COVER, NOT TWO — enumerate them, do not
+#   infer them from `PASSED`'s absence. Since #1740 `retriage.py --self-test` prints a third terminal
+#   line, `retriage self-test ENV-BLOCKED`, beside `PASSED`/`FAILED` (a dependency its EXECUTED rows
+#   shell out to is missing), and the sibling follow-up would give the other dependency-bearing
+#   entries the same class, so expect the shape to spread. It is emphatically NOT a positive verdict:
+#   it exits non-zero, and a genuine row failure OUTRANKS it and still prints `FAILED`. So the
+#   inverse-polarity check must list it as a RECOGNISED NON-POSITIVE verdict — a refusal, graded as a
+#   failure, exactly as today — and never let it fall through the unrecognised-shape branch into NOT
+#   GRADEABLE. Neither reading is fail-open (both block), but ungradeable loses the attribution: it
+#   asserts the HARNESS faulted when the harness worked and the entry returned a considered refusal,
+#   and its receipt tells the operator re-running clears it, which a missing dependency does not.
+#   ⚠️ An entry's own ENV-BLOCKED is a DIFFERENT OBJECT from the harness's (`worker-live:
+#   registry-selftest gate: ENV-BLOCKED`, a fault by the marker below, because there the SANDBOX
+#   could not run the entry at all). The two are told apart ONLY by the `worker-live: ` prefix, so a
+#   bare `"ENV-BLOCKED"` added to the markers would swallow the entry's verdict line with it; both
+#   directions are pinned by self-test rows. Nothing to change on the composed side today —
+#   compose-gate runs on ubuntu-latest, where jq and PyYAML are present, so the entry-level class is
+#   not reachable there.
 #   The broad `"worker-live: "` substring is a latent FAIL-CLOSED trip: a future self-test that echoes
 #   such a line ON SUCCESS would be read as ungradeable. Measured zero false positives across all 56
 #   known-PASS logs today, and the failure direction is a visible red, never a silent green.
@@ -428,15 +458,14 @@ def compose(base_ref, cwd, full=False, manifest=SUITE_MANIFEST, git=_git, run_su
     if not valid_base_ref(base_ref):
         return classify("", "", None)
     try:
-        parents = git(["rev-list", "--parents", "-n", "1", "HEAD"], cwd)[1].split()
+        parents = git(list(_graded_base.GRADED_BASE_ARGV), cwd)[1]
     except GitError as exc:
         return dict(classify("", "", None), reason=f"the checked-out commit is unreadable ({exc})")
-    if len(parents) != 3:
-        return dict(classify("", "", None),
-                    reason=(f"the checked-out commit has {max(len(parents) - 1, 0)} parent(s), so "
-                            "it is not the two-parent refs/pull/N/merge commit this gate grades — "
-                            "no base tip can be attributed to it"))
-    graded_base, pr_head = parents[1], parents[2]
+    # The ONE owner of "which parent is the graded base", argv included (#1429). It hands back no
+    # shas when it refuses, so an unattributable checkout cannot reach `classify` as a tip.
+    graded_base, pr_head, refusal = _graded_base.graded_base(parents)
+    if refusal:
+        return dict(classify("", "", None), reason=refusal)
     try:
         live_tip = git(["rev-parse", "--verify", "--end-of-options",
                         f"refs/remotes/origin/{base_ref}^{{commit}}"], cwd)[1]
@@ -890,6 +919,35 @@ def _self_test():
     chk("a graded base equal to the live tip short-circuits to FRESH", fresh["state"], FRESH)
     chk("...having run NO self-tests at all (the zero-cost path)", fresh["entries"], [])
 
+    # ---- [#1429] THE SHARED-CODE LEG. The parent-count row above is satisfied just as well by the
+    # PRIVATE copy of the derivation this module used to carry, so long as the copy agrees today —
+    # the #958 shape #1429 removed, and #945 measured why it survives (two copies of one rule make
+    # each copy INDIVIDUALLY unkillable). So probe the delegation: swap the shared owner's members
+    # for sentinels and require this module's verdict to follow them. Restored in a `finally`, and
+    # the restoration is its own row — a leaked sentinel would poison every row below it.
+    _real_reader, _real_argv = _graded_base.graded_base, _graded_base.GRADED_BASE_ARGV
+    # A stale pair whose composition CONFLICTS: a terminal state the fake git reaches without
+    # touching a real tree, so the restoration row below has something unambiguous to assert.
+    _wired = [("rev-list", 0, f"{'c' * 40} {A} {B}"), ("rev-parse", 0, B), ("merge", 1, "")]
+    try:
+        _graded_base.graded_base = lambda _line: ("", "", "SENTINEL-REFUSAL")
+        _sentinel = compose("master", ".", git=fake_git(_wired))
+        chk("the graded-base reading DELEGATES to graded_base.graded_base (a re-inlined private "
+            "copy would not follow this sentinel)",
+            (_sentinel["state"], _sentinel["reason"]), (UNPROVABLE, "SENTINEL-REFUSAL"))
+    finally:
+        _graded_base.graded_base = _real_reader
+    try:
+        # ...and so does the git ARGV: sharing the parser while keeping a private invocation leaves
+        # the repoint half-done. `rev-parse HEAD` prints ONE token, so the shared parser refuses.
+        _graded_base.GRADED_BASE_ARGV = ("rev-parse", "HEAD")
+        chk("...and so does the git ARGV (a private invocation would still read three tokens)",
+            "0 parent(s)" in compose("master", ".", git=fake_git(_wired))["reason"], True)
+    finally:
+        _graded_base.GRADED_BASE_ARGV = _real_argv
+    chk("...and BOTH sentinels are UNDONE, so every row below reads the real shared owner",
+        compose("master", ".", git=fake_git(_wired))["state"], CONFLICT)
+
     # ---- _baseline_failures FAILS CLOSED. An entry master ADDED has no baseline in the graded
     # tree, and excusing it as pre-existing would mask exactly the break this check exists for.
     with tempfile.TemporaryDirectory() as _bt:
@@ -915,6 +973,15 @@ def _self_test():
             chk(f"{why} is a HARNESS FAULT, never a verdict", harness_fault(marker), True)
         chk("a plain failing self-test is NOT a harness fault",
             harness_fault("  FAIL something: 1 (want 2)\ndispatch-claim self-test FAILED"), False)
+        # ⚠️ THE OTHER ENV-BLOCKED, and the pair is the point. The loop above pins the HARNESS's
+        # ENV-BLOCKED (the sandbox could not run the entry) as a fault; an ENTRY's own #1740 terminal
+        # line is a considered REFUSAL the harness delivered intact, so it stays a verdict — graded a
+        # failure, which is the fail-closed direction. The two differ ONLY by the `worker-live: `
+        # prefix, so a bare `"ENV-BLOCKED"` marker would swallow this one; that mutant reds here and
+        # nowhere else. See the INVERSE POLARITY note by HARNESS_FAULT_MARKERS.
+        chk("an ENTRY's own ENV-BLOCKED verdict line is NOT a harness fault",
+            harness_fault("ENV-BLOCKED jq is unavailable — the EXECUTED sweep-paging rows run the "
+                          "workflow's own step body\nretriage self-test ENV-BLOCKED"), False)
         chk("a gh-escape is NOT a harness fault — the sandbox WORKED and caught a real escape",
             harness_fault("::error::gh-escape dispatch-claim.py reached the real gh"), False)
         chk("clean output is not a fault", harness_fault(""), False)

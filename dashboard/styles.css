@@ -210,6 +210,11 @@ td.degraded { color: var(--warn); }   /* [#1106] an unreadable dispatch history,
 }
 .obs-trigger-rule { font-weight: 750; letter-spacing: .04em; text-transform: uppercase; font-size: .68rem; color: var(--bad); }
 .obs-trigger-summary { line-height: 1.4; }
+/* Issue #2161: the third shape of the #1868 display-cap affordance — a summary cut at 240
+   characters says so with an ellipsis carrying the hidden count in its title, because a count IS
+   the affordance for a capped array and is the wrong one for a sentence that stops mid-word.
+   `cursor: help` is what tells a reader the marker has a title worth hovering. */
+.obs-summary-cut { color: var(--muted); cursor: help; padding-left: 1px; }
 .obs-trigger-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: .74rem; }
 .obs-evidence { color: var(--accent-2); text-decoration: none; border-bottom: 1px dotted var(--accent-2); }
 /* Issue #2009: the per-FIRE half of the #1868 display-cap affordance — `+7 more` beside the five

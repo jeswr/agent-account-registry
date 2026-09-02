@@ -177,6 +177,15 @@ def _load_policy_resolve():
     return _load_script_module("policy-resolve.py", "registry_policy_resolve")
 
 
+def _load_workflow_if():
+    """[#2184] THE shared workflow-`if:` reader and the canonical default-branch guard text —
+    IMPORTED, never re-declared. The `(declared, condition)` derivation and the guard's spelling
+    used to be a private four lines plus a private constant in EACH of this reader,
+    backfill-provenance and auto-mint-provenance; #945 measured what that costs (two copies of one
+    guard make each copy individually unkillable)."""
+    return _load_script_module("workflow_if.py", "registry_workflow_if")
+
+
 def _load_lease_schema():
     """THE canonical `area:*` -> package reduction (lease_schema.plan_package). Imported for the
     same reason review-fix.yml's resolve step imports it: a second derivation is how a claim the
@@ -1015,6 +1024,21 @@ def _workflow(name):
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+# [#223 — sol-audit arbitrary-ref] The mint job's guard, transcribed from the WORKFLOW by hand and
+# never derived from the reader under test (AGENTS.md pre-flight 2b): an expected value read back
+# out of the code that produces it is a tautology that cannot fail. Whitespace-normalised, which is
+# what `job_if` reports, so the `${{ }}` may be re-wrapped or folded without a spurious red.
+#
+# [#2184] That transcription now lives ONCE, in `workflow_if`, for the three provenance readers
+# that each carried their own copy of it — but it is still this file that declares WHICH guard
+# THIS workflow's job must carry, because the expectation is workflow-specific: the sweep's is the
+# same expression with a `schedule` carve-out disjoined in front, and collapsing the two would
+# silently accept either guard on either job. `workflow_if` reads no workflow and produces no
+# `if:`, so pre-flight 2b still holds — the comparison is still between two independent
+# derivations.
+MINT_REF_GUARD = _load_workflow_if().DEFAULT_BRANCH_REF_GUARD
+
+
 def mint_workflow_seam_report(workflow=None):
     """Structural findings about the LIVE mint-provenance.yml, each asserted by --self-test.
 
@@ -1038,7 +1062,12 @@ def mint_workflow_seam_report(workflow=None):
     step = next((s for s in steps
                  if "mint-provenance.py" in strip(str(s.get("run") or ""))), None)
     run = strip(str((step or {}).get("run") or ""))
-    guard = str(job.get("if") or "")
+    # [#223 — sol-audit arbitrary-ref] PRESENCE and VALUE are separate facts, and `str(job["if"])`
+    # rather than `str(job.get("if") or "")`: PyYAML parses `if: false` to the boolean False, so
+    # the `or ""` form reported a NEUTERED job identically to one carrying no guard at all.
+    # [#2184] Both facts come from the SHARED reader now (`workflow_if.if_condition`), which also
+    # owns the whitespace normalisation `job_if` used to apply on its own line below.
+    guard_declared, guard = _load_workflow_if().if_condition(job)
     self_at = run.find("mint-provenance.py --self-test")
     invoke_at = run.find('mint-provenance.py "${args[@]}"')
     census_at = run.find("mint-provenance.py --census")
@@ -1051,8 +1080,27 @@ def mint_workflow_seam_report(workflow=None):
                  re.finditer(r'\[\[\s*"\$(?:PR|ISSUE)_NUMBER"\s*=~', run)]
     step_env = {key: str(value) for key, value in ((step or {}).get("env") or {}).items()}
     return {
-        # The salt is a secret: a modified branch copy of this workflow must never see it.
-        "job_ref_guarded": "github.ref ==" in guard and "default_branch" in guard,
+        # The salt is a secret: a modified branch copy of this workflow must never see it, and the
+        # same guard is what stops a branch that adds ITSELF to policy/repos.toml from being read
+        # as the enrolment allowlist (the `dispatch-secrets` deployment-branch policy covers the
+        # first of those, not the second — so this guard is load-bearing on its own).
+        #
+        # [#223 — sol-audit arbitrary-ref] TWO findings, the #1619 shape backfill-provenance
+        # already carried, applied to the last containment probes of this class — and, since
+        # #2184, read through the ONE owner of that shape (`workflow_if.if_condition`).
+        # The form this replaces — `"github.ref ==" in guard and "default_branch" in guard` — is
+        # blind in BOTH directions that matter: `<the shipped guard> && false` keeps every
+        # substring it looks for while disabling the lane forever (fail-closed-and-silent), and
+        # `always() || <the shipped guard>` keeps them while admitting EVERY ref, which is the
+        # arbitrary-ref hole the guard exists to close. A missing `if:` is the third, separate
+        # failure and is why presence is its own finding.
+        #
+        # Whitespace is normalised, and only whitespace (in `workflow_if.if_condition`): GitHub's
+        # expression evaluation does not depend on it, so a YAML reflow (a `>-` fold, a re-wrap) is
+        # not a security event and must not red — while every TOKEN and its ORDER stay pinned
+        # exactly.
+        "job_if_declared": guard_declared,
+        "job_if": guard,
         "job_environment": job.get("environment"),
         "contents_write": (job.get("permissions") or {}).get("contents"),
         # The identity source is the live API. This job must NOT be able to read run logs — that
@@ -1933,7 +1981,31 @@ def _self_test():                                                       # noqa: 
 
     # ---- the workflow seam --------------------------------------------------------------------
     seam = mint_workflow_seam_report()
-    check("the mint job refuses to run off the default ref", seam["job_ref_guarded"], True)
+    # [#223] The guard is pinned EXACTLY, never by containment (AGENTS.md pre-flight 6): both
+    # `<the guard> && false` and `always() || <the guard>` satisfy every substring the probe this
+    # replaced looked for, and the second one re-opens the arbitrary-ref class outright.
+    check("the mint job DECLARES a job-level `if:` (none at all => it runs from any ref)",
+          seam["job_if_declared"], True)
+    check("the mint job's guard is EXACTLY the default-branch check (no `&& false`, no widening)",
+          seam["job_if"], MINT_REF_GUARD)
+    # [#2184] THE SHARED-CODE LEG. The two rows above are satisfied just as well by a PRIVATE copy
+    # of the four lines this reader used to carry, so long as the copy agrees today — which is the
+    # #958 shape this issue removed, and #945 measured why it survives (two copies of one rule make
+    # each copy individually unkillable). So the delegation itself is probed: swap the shared
+    # reader for a sentinel and require this file's finding to follow it. Only shared code can.
+    # Restored in a `finally`, and the restoration is its own row — a leaked sentinel would
+    # otherwise silently poison every seam row after this one.
+    _wif = _load_workflow_if()
+    _real_if_condition = _wif.if_condition
+    try:
+        _wif.if_condition = lambda node: (True, "SENTINEL")
+        check("the guard finding DELEGATES to workflow_if.if_condition (a re-inlined private copy "
+              "would not follow this sentinel)",
+              mint_workflow_seam_report()["job_if"], "SENTINEL")
+    finally:
+        _wif.if_condition = _real_if_condition
+    check("...and the sentinel is UNDONE, so every row below reads the real shared reader",
+          mint_workflow_seam_report()["job_if"], MINT_REF_GUARD)
     check("the mint job takes the secret-scoped environment", seam["job_environment"],
           "dispatch-secrets")
     check("the mint job may write ledger contents", seam["contents_write"], "write")
@@ -2044,11 +2116,29 @@ def _self_test():                                                       # noqa: 
         anchor = rest.index("args=(--target-repo")
         step["run"] = rest[:anchor] + branch + rest[anchor:]
 
+    # [#223] POSITIVE CONTROL for the guard rows, and it is not optional: each of them asserts a
+    # finding is NOT its expected value, which ANY broken reader satisfies for free — an empty
+    # parse, a moved file, a renamed key would pass all four while measuring nothing. This row
+    # runs the SAME harness with a no-op edit and requires the SHIPPED guard back out.
+    check("YAML-seam mutant harness reads the SHIPPED tree (a no-op edit returns the live guard)",
+          mutated(lambda d: None)["job_if"], MINT_REF_GUARD)
+
+    def widen_guard(doc, tail):
+        """The mutants the containment probe was blind to: the shipped guard is left spelled out in
+        full — every substring `"github.ref ==" in guard and "default_branch" in guard` looked for
+        is still there — and only its BOOLEAN STRUCTURE is changed."""
+        job = doc["jobs"]["mint"]
+        inner = str(job["if"]).strip()
+        assert inner.startswith("${{") and inner.endswith("}}"), inner
+        job["if"] = inner[:-2].rstrip() + " " + tail + " }}"
+
     for name, edit, key, want in (
             ("the job is neutered with if: false",
-             lambda d: d["jobs"]["mint"].update(**{"if": "false"}), "job_ref_guarded", False),
+             lambda d: d["jobs"]["mint"].update(**{"if": "false"}), "job_if", "false"),
+            ("...including the BOOLEAN false PyYAML parses `if: false` into",
+             lambda d: d["jobs"]["mint"].update(**{"if": False}), "job_if", "False"),
             ("the default-ref guard is deleted",
-             lambda d: d["jobs"]["mint"].pop("if"), "job_ref_guarded", False),
+             lambda d: d["jobs"]["mint"].pop("if"), "job_if_declared", False),
             ("the secret-scoped environment is dropped",
              lambda d: d["jobs"]["mint"].pop("environment"), "job_environment", None),
             ("actions: read is granted (backfill's identity source)",
@@ -2109,6 +2199,18 @@ def _self_test():                                                       # noqa: 
              lambda d: prepend_to_run(d, "python3 scripts/mint-provenance.py --census\n"),
              "self_test_before_every_invocation", False)):
         check(f"YAML-seam mutant reds: {name}", mutated(edit)[key], want)
+    # [#223] THE TWO MUTANTS THE CONTAINMENT PROBE PASSED, measured through the PRODUCTION
+    # assertion rather than through a hand-copied expected string: each leaves the shipped guard
+    # spelled out in full — so `"github.ref ==" in guard and "default_branch" in guard` is still
+    # True on both — and only changes its boolean structure. `&& false` skips the lane forever
+    # while reading as hardened; `|| always()` runs the salt-reading job from EVERY ref, which is
+    # the sol-audit arbitrary-ref finding itself. Both must now make `job_if != MINT_REF_GUARD`.
+    for _tail, _effect in (("&& false", "hardened-looking, but permanently skipped"),
+                           ("|| always()", "runs from ANY ref, salt in reach")):
+        check(f"YAML-seam mutant reds: the guard keeps every substring but gains `{_tail}` "
+              f"({_effect})",
+              mutated(lambda d, tail=_tail: widen_guard(d, tail))["job_if"] == MINT_REF_GUARD,
+              False)
     # The wrong-input seam needs a value comparison rather than a boolean.
     check("YAML-seam mutant reds: APPLY is bound to the WRONG input",
           mutated(lambda d: mint_step(d)["env"].update(
