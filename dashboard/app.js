@@ -1227,6 +1227,16 @@ function obsFlowCard(flow, thresholds) {
   // must still be stated when the grid carries nothing else.
   const targetNote = obsTruncationNote(targets, flow.target_ci_queue_total, "target repositories");
   if (targetNote) card.append(targetNote);
+  // Issue #2173: the same unreadable-row note the queue list above already draws, one seam over.
+  // A target-CI input the generator refused whole leaves NO metric cells, which is exactly what a
+  // fleet with no congested targets renders as — so the refusals are stated rather than left to
+  // the build log no operator reads. On the CARD like the truncation note above, since the cells
+  // it accounts for share the grid with the review/park/latency stats and the grid can be empty.
+  const targetDropped = obsNum(flow.target_ci_queue_dropped);
+  if (targetDropped !== null && targetDropped > 0) {
+    card.append(node("p", "obs-truncation-note bad",
+      `${targetDropped} target CI ${targetDropped === 1 ? "row was" : "rows were"} unreadable`));
+  }
   // Issue #374: this used to be one bar PER SALTED ACCOUNT — a per-account row array by another
   // name, whose length was the fleet size and whose labels were stable across builds. The
   // generator now sends only the mean and max of the reported utilizations, which is what the

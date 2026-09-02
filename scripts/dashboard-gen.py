@@ -2335,11 +2335,23 @@ def _obs_flow(flow):
     # [#1896] The build log is not the layer an operator reads. Publish the refused-row count so
     # the page can distinguish a genuinely empty queue from one whose entire input was unreadable,
     # and so its depth trend can refuse an incomplete sample instead of fabricating a zero.
+    #
+    # [#2173] ...and the SAME count one seam over, for the reason #2039 announced the drops at all:
+    # an empty target-CI panel is exactly what a fleet with no congested targets renders as, so
+    # #2039 fixed the #982 ambiguity for the collector author reading the build log and left it
+    # standing for the operator reading the page. Both counts are the REFUSALS, not the warnings
+    # that fit in the #1570 budget: a flood publishes 20 beside the 12 lines it printed.
+    #
+    # Published UNCONDITIONALLY, including the zero row — a census that emits only when it has
+    # something to say is one a mutant can silence on exactly the quiet tick an operator
+    # interrogates (AGENTS.md pre-flight item 8), and the page could then no longer tell "nothing
+    # was refused" from a producer that stopped sending the count.
     return {"queue": queue, "queue_total": queue_total, "queue_dropped": drops.dropped,
             "lease_utilization_1h": lease_utilization,
             "review_rounds": review_rounds,
             "parks_1h": parks_1h, "arm_to_merge_minutes_24h": arm_to_merge,
-            "target_ci_queue": ci_queue, "target_ci_queue_total": ci_queue_total}
+            "target_ci_queue": ci_queue, "target_ci_queue_total": ci_queue_total,
+            "target_ci_queue_dropped": ci_drops.dropped}
 
 
 def _obs_trigger_rows(items):
@@ -6595,7 +6607,11 @@ esac
                  "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
                  "arm_to_merge_minutes_24h": {"p50": 18.0, "p90": 55.5, "samples": 9},
                  "target_ci_queue": [{"repository": "sparq-org/sparq", "depth": 5}],
-                 "target_ci_queue_total": 1},
+                 "target_ci_queue_total": 1,
+                 # [#2173] The golden input's one malformed target-CI row is published as loss
+                 # evidence beside the survivor, exactly as `queue_dropped` is above; the
+                 # surviving-row total beside it deliberately remains 1.
+                 "target_ci_queue_dropped": 1},
         "trigger_fires": [
             {"rule": "worker-failure-rate", "fired_at": "2025-06-15T15:01:40Z",
              "summary": "worker failure rate 67% over 3 consecutive runs",
@@ -8753,8 +8769,8 @@ esac
     _CI_ROWS = "observability target CI queue rows"
     _KEPT_CI = {"repository": "sparq-org/sparq", "depth": 5}
 
-    def obs_ci_drops(rows, present=True, queue_rows=None):
-        """(published `flow.target_ci_queue`, EVERY `dashboard-gen:` line printed).
+    def obs_ci_document(rows, present=True, queue_rows=None):
+        """(the normalized document, EVERY `dashboard-gen:` line printed).
 
         The FIXTURE is quietened rather than the capture, for the reason `obs_drops` and
         `obs_lease_drops` above quieten theirs: the golden snapshot's unknown queue class, retired
@@ -8781,9 +8797,14 @@ esac
             # skipping it raises out of `item.get(...)` and would abort every check below rather
             # than red the row that provoked it. Rendered, not swallowed: nothing here equals it.
             document = ObsRefusal(raised=f"{type(error).__name__}: {error}"[:200])
-        return (document["flow"]["target_ci_queue"],
+        return (document,
                 [line for line in stream.getvalue().splitlines()
                  if line.startswith("dashboard-gen:")])
+
+    def obs_ci_drops(rows, present=True, queue_rows=None):
+        """(published `flow.target_ci_queue`, EVERY `dashboard-gen:` line printed)."""
+        document, lines = obs_ci_document(rows, present=present, queue_rows=queue_rows)
+        return (document["flow"]["target_ci_queue"], lines)
 
     # THE REGRESSION, in the two shapes the issue names, and both directions in one row each: the
     # panel EMPTIES, and the rows that emptied it now name themselves. A congestion mapping keyed BY
@@ -8896,6 +8917,158 @@ esac
           [_INT_CLASS]
           + [_CI_DROP.format("the row (type NoneType) is not an object")] * 12
           + [_SUPPRESSED.format(8, _CI_ROWS, 20)])
+    # ---- [#2173] ...AND THE COUNT MUST REACH THE PAGE. #2039 announced every refusal in the BUILD
+    # LOG, which is not the layer an operator reads — the same thing #1896 said when it published
+    # `flow.queue_dropped` beside `flow.queue`. So the target-CI refusals are published too, and the
+    # rows below pin BOTH halves: the count here, the note on the executed page below.
+    #
+    # The count is read with a MISSING sentinel rather than through a defaulting `.get`: a census
+    # that emits only when it has something to say is one a mutant can silence on exactly the quiet
+    # tick an operator interrogates (pre-flight item 8), and a default would score that mutant as a
+    # pass. `queue_dropped` rides along in every row so a count wired to the QUEUE seam's log — the
+    # one plausible mix-up, since both keys now sit in the same returned dict — reds rather than
+    # matching by coincidence. Every expected number is a literal written here (pre-flight 2(b)).
+    def obs_ci_dropped(rows, present=True, queue_rows=None):
+        """(published `flow.target_ci_queue`, published `target_ci_queue_dropped`, `queue_dropped`),
+        with a key the document does not carry rendered as the string ABSENT rather than a zero."""
+        flow = obs_ci_document(rows, present=present, queue_rows=queue_rows)[0]["flow"]
+        return (flow["target_ci_queue"],
+                flow["target_ci_queue_dropped"] if "target_ci_queue_dropped" in flow else "ABSENT",
+                flow["queue_dropped"] if "queue_dropped" in flow else "ABSENT")
+
+    check("[#2173] a target-CI input the seam refused WHOLE publishes the refusal count beside the "
+          "empty row array — the page can no longer read a fleet whose input was unreadable as one "
+          "with no congested targets",
+          obs_ci_dropped([["sparq-org/sparq", 5], ["jeswr/agent-account-registry", 2]]),
+          ([], 2, 0))
+    check("[#2173] ...and one refused row beside a readable one publishes 1 — the count is the "
+          "REFUSALS, never the rows that survived them",
+          obs_ci_dropped([copy.deepcopy(_KEPT_CI), {"repository": "not-a-repo", "depth": 2}]),
+          ([{"repository": "sparq-org/sparq", "depth": 5}], 1, 0))
+    # THE ZERO ROW, and the mutant it exists for: emitting the count only when it is non-zero (or
+    # only when the array emptied) leaves the page unable to tell "nothing was refused" from a
+    # producer that stopped sending the count — pre-flight item 8's census that never zero-seals.
+    check("[#2173] a fleet whose target-CI rows ALL parse publishes the ZERO count anyway — a "
+          "census that emits only when it has something to say is one a mutant can silence",
+          obs_ci_dropped([copy.deepcopy(_KEPT_CI)]),
+          ([{"repository": "sparq-org/sparq", "depth": 5}], 0, 0))
+    check("[#2173] ...and so does a collector that has not shipped the field at all: an absent key "
+          "refused nothing, which is a fact worth stating rather than a reason to omit the count",
+          obs_ci_dropped(None, present=False), ([], 0, 0))
+    # The count is the seam's OWN, in both directions: a document that drops one QUEUE row and no
+    # target-CI row publishes 0 here beside that 1, and the flood row below publishes 20 where the
+    # #1570 budget printed only 12 lines — a count wired to `printed` reads 12.
+    check("[#2173] the published count belongs to the target-CI seam: a lone bad QUEUE row moves "
+          "`queue_dropped` and leaves the target-CI count at zero",
+          obs_ci_dropped([copy.deepcopy(_KEPT_CI)], queue_rows=[{"class": 1, "depth": 4}]),
+          ([{"repository": "sparq-org/sparq", "depth": 5}], 0, 1))
+    check("[#2173] 20 unreadable target-CI rows publish 20, not the 12 warnings the #1570 budget "
+          "let through — the operator is told how many rows were lost, not how many lines fit",
+          obs_ci_dropped([None] * 20 + [copy.deepcopy(_KEPT_CI)]),
+          ([{"repository": "sparq-org/sparq", "depth": 5}], 20, 0))
+    # ...and THE PAGE IS WHAT THIS HAS TO DELIVER INTO (pre-flight item 11): a count published into
+    # site/data.json that no panel renders leaves the operator exactly where #2039 left them. So the
+    # note is EXECUTED against dashboard/app.js under the shared DOM shim — a lexical assertion here
+    # is satisfiable by a comment (the #612 round-4 lesson) — and the notes are collected by EXACT
+    # className, never by searching the card's text for "unreadable".
+    _OBS_CI_LOSS_PAGE_BODY = r"""
+  const byClass = (root, wanted) => {
+    const found = [];
+    const walk = (el) => {
+      if (!el) return;
+      if (el.className === wanted) found.push(flat(el).join(" ").trim());
+      for (const kid of el.children || []) walk(kid);
+    };
+    walk(root);
+    return found;
+  };
+  const out = {};
+  for (const [name, document] of Object.entries(input.documents)) {
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers", "warning"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      scope.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    const card = ids["obs-grid"].children.find((kid) => kid.tagName === "article"
+      && kid.children[0] && kid.children[0].textContent === "Queue & flow");
+    out[name] = {
+      error,
+      notes: card ? byClass(card, "obs-truncation-note bad") : null,
+      // The CI cells the note accounts for, so a page that draws the note while losing the
+      // congestion rows beside it cannot read as a pass.
+      targets: card ? byClass(card, "obs-metric-label").filter((label) =>
+        label.startsWith("CI queue")) : null,
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+    # `legacy` is a data.json published BEFORE this count existed — one a browser still holds, or one
+    # hand-edited — and the hostile rows are every unusable count a future or tampered producer can
+    # put in a JSON document. None of them may draw a note: `"2" > 0` is TRUE in JavaScript, so a
+    # note reached through anything looser than `obsNum` states a refusal count it never read.
+    ci_page_docs = {
+        "unreadable": obs_ci_document(
+            [["sparq-org/sparq", 5], ["jeswr/agent-account-registry", 2]])[0],
+        "empty": obs_ci_document([])[0],
+        # One refused row, one readable row, AND one refused queue row: the singular wording, the
+        # surviving congestion cell, and the queue card's own #1896 note all in one scenario, so a
+        # note that replaced its sibling rather than joining it reds.
+        "one-of-two": obs_ci_document(
+            [copy.deepcopy(_KEPT_CI), {"repository": "not-a-repo", "depth": 2}],
+            queue_rows=[{"class": 1, "depth": 4}])[0],
+    }
+    # The CI cells share the metric grid with the review/park/latency stats, and the page attaches
+    # that grid only `if (grid.childElementCount)` — so a note written INTO the grid vanishes on
+    # exactly the document that needs it most: every stat hidden, every target row refused. The
+    # #1868 truncation note sits on the CARD for this reason and so does this one.
+    ci_page_docs["grid-empty"] = copy.deepcopy(ci_page_docs["unreadable"])
+    for stat in ("review_rounds", "parks_1h", "arm_to_merge_minutes_24h"):
+        ci_page_docs["grid-empty"]["flow"][stat] = None
+    ci_page_docs["legacy"] = copy.deepcopy(ci_page_docs["unreadable"])
+    # `pop`, not `del`: a mutant that stops publishing the count at all would otherwise raise HERE,
+    # aborting every check below and recording as a kill while they never ran (pre-flight item 4's
+    # crash-after-partial-run). Measured: it took the run from 501 checks to 487.
+    ci_page_docs["legacy"]["flow"].pop("target_ci_queue_dropped", None)
+    for label, value in (("string", "2"), ("null", None), ("boolean", True)):
+        hostile_ci_doc = copy.deepcopy(ci_page_docs["unreadable"])
+        hostile_ci_doc["flow"]["target_ci_queue_dropped"] = value
+        ci_page_docs[f"hostile-{label}"] = hostile_ci_doc
+    ci_loss_page = _executed_page(
+        _page_harness("renderObservability", _OBS_CI_LOSS_PAGE_BODY), {"documents": ci_page_docs})
+
+    def ci_loss(name):
+        rendered = ci_loss_page.get(name)
+        return ((rendered.get("notes"), rendered.get("targets"), rendered.get("error"))
+                if isinstance(rendered, dict) else ci_loss_page)
+
+    check("[#2173] EXECUTED page script: a fleet whose entire target-CI input was unreadable states "
+          "the refusals, while a fleet with NO congested targets states nothing — the two rendered "
+          "identically before this row",
+          (ci_loss("unreadable"), ci_loss("empty")),
+          ((["2 target CI rows were unreadable"], [], None), ([], [], None)))
+    check("[#2173] EXECUTED page script: one refused row reads in the SINGULAR, the readable target "
+          "beside it still renders its congestion cell, and the queue card's own #1896 note is "
+          "still drawn — the new note joins its sibling rather than replacing it",
+          ci_loss("one-of-two"),
+          (["1 queue row was unreadable", "1 target CI row was unreadable"],
+           ["CI queue · sparq-org/sparq"], None))
+    check("[#2173] EXECUTED page script: ...and it is still stated when the metric grid carries "
+          "NOTHING — every stat hidden and every target row refused is the document an operator "
+          "most needs the note on, and it is the one a note written into the grid vanishes from",
+          ci_loss("grid-empty"), (["2 target CI rows were unreadable"], [], None))
+    check("[#2173] EXECUTED page script: a LEGACY data.json published before the count existed "
+          "draws no note rather than `undefined target CI rows were unreadable`, and the page does "
+          "not throw reaching for a key that is not there",
+          ci_loss("legacy"), ([], [], None))
+    for label in ("string", "null", "boolean"):
+        check(f"[#2173] EXECUTED page script: a {label} refusal count is 'nothing known', never a "
+              "fabricated note — a page reaching this through JavaScript's own `> 0` coercion "
+              "states a count it never read",
+              ci_loss(f"hostile-{label}"), ([], [], None))
     try:
         with_observability = build_dashboard(
             issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
