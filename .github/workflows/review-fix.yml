@@ -1354,7 +1354,16 @@ jobs:
           default_branch = repo.get("default_branch")
           login = user.get("login")
           user_id = str(user.get("id", ""))
-          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", str(default_branch)):
+          # [registry #985] THE TYPE CHECK IS PART OF THE GUARD. `repo.get(...)` is `None` when the
+          # payload carries no `default_branch` at all, and `str(None)` is the literal `"None"` —
+          # which MATCHES the safe-ref pattern. So an absent field used to ADMIT and bind
+          # `default_branch=None`, sending the next step's checkout after a branch literally named
+          # `None`: the run died at the checkout, attributed to the ref rather than to the missing
+          # field, and a target that DID carry such a branch would have been checked out silently.
+          # `isinstance` first, exactly as the sibling `user_id` line above refuses an absent id
+          # via its `""` default rather than stringifying `None` into something plausible.
+          if not isinstance(default_branch, str) or not re.fullmatch(
+                  r"[A-Za-z0-9][A-Za-z0-9_.-]*", default_branch):
               refuse("unsafe-default-branch")
           if self_attested:
               # [registry #1288] THE #657 SELF-ATTESTED PATH. The App-author check below does not
