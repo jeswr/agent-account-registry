@@ -108,6 +108,25 @@ with it: it truncated the list before the pin ran, so a 9th link that was not a 
 neither published nor counted by the drop diagnostic that exists to announce exactly that. `evidence`
 itself remains unbounded on the way in, like every other row array here.
 
+**Issue #2161 closed the last silent cut on the panel, and it is not an array**: a fire's `summary`
+is still sanitized and cut at 240 characters, but `trigger_fires[].summary_length` now carries the
+pre-cap character count of that sanitized text, published on every fire including the ones that fit,
+and the page draws an ELLIPSIS with the withheld count in its title rather than a `showing 240 of
+900` note — a statistic under a sentence that stops mid-word is not what the reader of that sentence
+needs. The UNIT is a Unicode CODE POINT on both sides of the wire — the cut is `text[:240]` and
+the count is `len()` — so a consumer must measure the string it drew the same way: JavaScript's
+`String.length` counts UTF-16 code units, which weighs an emoji twice and would leave a genuinely
+capped summary comparing 480 against 241 and drawing no marker at all. The length is counted after
+`strip()`, over exactly the string that was cut, and a summary
+REFUSED whole (a non-printable one — a control-character injection risk, not a long sentence)
+reports **0**, never its length: truncation and refusal are different facts, and a length beside an
+empty string would draw a cut marker on a value that was never cut. Like the totals above this is an
+OUTPUT-side key on the `total > shown` rule, so a pre-#2161 or hand-edited document degrades to the
+old silence. The much shorter cut on the three BUILD-LOG diagnostics (`class` at 16, `repository`
+and `rule` at 64) deliberately keeps no affordance: it is a hostile-input bound so a huge value cannot
+write itself into the log diagnosing it (#1867), and the row it quotes has already been dropped in
+full by a line that names the field and the reason.
+
 Validation is otherwise FAIL-CLOSED as before: an absent file hides the panel; a present document
 with the wrong `schema` fails the dashboard build LOUD; malformed rows inside a well-formed
 document are dropped (the model-health tolerance) — EXCEPT privacy violations, which are
