@@ -1003,7 +1003,33 @@ function obsRenderTriggers(fires, total) {
     const row = node("div", "obs-trigger-row");
     row.setAttribute("role", "alert");
     row.append(node("span", "obs-trigger-rule", String(fire.rule || "trigger")));
-    row.append(node("span", "obs-trigger-summary", String(fire.summary || "")));
+    // [#2161] The generator cuts a fire's summary at 240 characters, and until now it did so in
+    // total silence: a 900-character alarm rendered as a 240-character sentence with nothing — no
+    // marker, no title, no build-log line — saying it had been cut, so the operator read the
+    // fragment as the whole alarm. A truncated STRING needs a different affordance from the arrays
+    // #1868/#2009 closed: `showing 240 of 900 characters` under a sentence that was cut mid-word
+    // reads as a statistic, not as "there is more". So the marker is an ELLIPSIS with the count in
+    // its title, appended INSIDE the summary span so it sits against the text it belongs to.
+    //
+    // It reaches the SAME `obsTruncated` predicate as the two array affordances rather than
+    // re-deriving the comparison, so the `Number.isInteger` rule lives in one place and all three
+    // live or die with it (AGENTS.md pre-flight item 4): an absent, non-numeric, negative,
+    // fractional or already-satisfied `summary_length` is "no truncation known" and draws nothing,
+    // which is what a data.json published before #2161 degrades to.
+    //
+    // `shown` is the length of the string this row actually DREW, not the generator's cap: a
+    // hand-edited document can carry a summary shorter than the cap beside a larger length, and the
+    // marker has to be honest about the characters the READER can see (the #2009 lesson).
+    const summaryText = String(fire.summary || "");
+    const summary = node("span", "obs-trigger-summary", summaryText);
+    if (obsTruncated(summaryText.length, fire.summary_length)) {
+      const hidden = obsNum(fire.summary_length) - summaryText.length;
+      const cut = node("span", "obs-summary-cut", "…");
+      cut.setAttribute("title", `${hidden} further character${hidden === 1 ? " is" : "s are"}`
+        + " in this fire's summary in the collector snapshot than this row displays");
+      summary.append(cut);
+    }
+    row.append(summary);
     const meta = node("span", "obs-trigger-meta");
     meta.append(node("span", "", fire.fired_at ? `fired ${relative(fire.fired_at)}` : "fire time unknown"));
     if (typeof fire.enqueued_task === "string" && fire.enqueued_task) {

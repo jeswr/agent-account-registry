@@ -1817,8 +1817,67 @@ def _obs_mean(value):
 
 
 def _obs_text(value, cap):
+    """The published form ONLY — the sanitized, capped string, with nothing said about the cut.
+
+    [#2161] This is the spelling the three BUILD-LOG diagnostics use (`flow.queue`'s `class` at 16,
+    the target-CI `repository` and the trigger-fire `rule` at 64), and the question that issue asked
+    of them is answered here rather than left unnoticed: no truncation affordance, deliberately.
+    That cap is a HOSTILE-INPUT BOUND, not a display contract — it exists so a 4000-character rule
+    cannot write itself into the log that is diagnosing it (#1867) — and the row it quotes has
+    already been DROPPED, so there is no rendered surface a reader could mistake for the whole
+    value: the loss is announced in full by the drop line itself, which names the field and the
+    reason. An "…and 3936 more characters" tail there would restate what the `!r` quoting and the
+    drop already say, on a line whose entire purpose is to stay short and unforgeable. A cut over
+    text that IS published is the opposite case, and takes `_obs_text_capped`.
+
+    Delegated rather than reimplemented: one definition of the sanitize-then-cut rule, because two
+    copies of one guard make each copy individually unkillable (AGENTS.md pre-flight item 4)."""
+    return _obs_text_capped(value, cap)[0]
+
+
+def _obs_text_capped(value, cap):
+    """[#2161] A DISPLAY cap over a collector STRING, with what it hid: `(text[:cap], the PRE-cap
+    CHARACTER count)` — `_obs_capped` one type down.
+
+    #1868 published a pre-cap total beside every capped row ARRAY and #2009 did the same for the
+    `evidence` slice nested inside one fire. The trigger-fire `summary` was the last silent cut on
+    the panel and the one neither could reach, because it is not an array: a 900-character alarm
+    summary rendered as a 240-character one with NOTHING saying it had been cut — not on the page,
+    not in the build log — so the operator read a truncated sentence as the whole alarm. The count
+    is what travels; `dashboard/app.js` turns it into an ellipsis marker and a hover title, which is
+    the affordance a truncated STRING needs (`showing 240 of 900` is not a sentence a reader wants
+    where the sentence itself was cut).
+
+    The BUILD LOG stays silent, and that is the answer to the issue's other half rather than an
+    omission: a truncation of text this seam successfully READ is a display contract, not the
+    producer/consumer mismatch the `_ObsDropLog` warnings exist to announce, and a line per fire with
+    a long summary would fire on every healthy fleet — the decision #982/#1570/#1571 took for the row
+    arrays and #1868 kept. The operator-facing half is the one that was missing, and it is on the
+    page now.
+
+    It is a COUNT rather than a `summary_truncated` flag for the reason #1868 published totals: the
+    page can then say HOW MUCH was withheld, and a count is checkable against the slice beside it,
+    where a producer-supplied boolean is an assertion nothing on the page can contradict.
+
+    Two decisions the self-tests pin, both in the direction that keeps this honest:
+
+    - It is the length of the SANITIZED text — after `str()`/`strip()`, over exactly the string that
+      was cut. A length taken off the raw input would count leading whitespace this seam removed and
+      report a cut that never happened on a summary that fits.
+    - A REFUSED value reports **0**, not its length. A non-printable summary is dropped WHOLE by the
+      guard below (it is a control-character injection risk, not a long sentence), and publishing its
+      length beside the empty string would draw a cut marker on a value that was not truncated at
+      all — a second, wrong reading of a loss the page cannot repair. Truncation and refusal are
+      different facts, exactly as #1868 keeps a malformed row out of a capped array's total.
+
+    Published UNCONDITIONALLY beside the string, cut or not, like every `_obs_capped` total: a count
+    emitted only when it has something to say is one a mutant can silence on the quiet fire, and the
+    page could no longer tell `240 of 240` from a producer that stopped sending it (AGENTS.md
+    pre-flight item 8). The page owns the `length > shown` decision."""
     text = str(value or "").strip()
-    return text[:cap] if text and text.isprintable() else ""
+    if not text or not text.isprintable():
+        return "", 0
+    return text[:cap], len(text)
 
 
 def _obs_capped(rows, cap):
@@ -2339,11 +2398,17 @@ def _obs_trigger_rows(items):
         # `+7 more`, and a count emitted only when it has something to say is one a mutant can
         # silence on the quiet fire (AGENTS.md pre-flight item 8).
         evidence, evidence_total = _obs_capped(evidence, 5)
+        # [#2161] ...and the summary's 240-character cut states itself the same way, in the form a
+        # truncated STRING needs: `summary_length` is the pre-cap character count of the sanitized
+        # text, published on every fire, and `dashboard/app.js` turns `summary_length > shown` into
+        # an ellipsis marker carrying the count in its title. See `_obs_text_capped`.
+        summary, summary_length = _obs_text_capped(item.get("summary"), 240)
         task = item.get("enqueued_task")
         rows.append({
             "rule": rule,
             "fired_at": _utc_iso(item.get("fired_at")),
-            "summary": _obs_text(item.get("summary"), 240),
+            "summary": summary,
+            "summary_length": summary_length,
             "evidence": evidence,
             "evidence_total": evidence_total,
             "enqueued_task": task if isinstance(task, str)
@@ -6465,6 +6530,10 @@ esac
         "trigger_fires": [
             {"rule": "worker-failure-rate", "fired_at": "2025-06-15T15:01:40Z",
              "summary": "worker failure rate 67% over 3 consecutive runs",
+             # [#2161] The pre-cap character count of the summary above, published on the quiet
+             # fire too: this one is nowhere near the 240-character cut, and the page draws no
+             # marker for it — the count is what lets it tell that from a cut it must announce.
+             "summary_length": 47,
              "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/1"],
              # [#2009] TWO links in, one pinned: `evidence_total` counts the links that SURVIVED
              # the github.com pin, so a total taken over the raw input reads 2 here. Nothing is
@@ -7389,6 +7458,7 @@ esac
                                    "actions/runs/7"]}]),
           ([{"class": "2a", "depth": 1, "oldest_age_minutes": None}],
            [{"rule": "quiet-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+             "summary_length": 1,
              "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/7"],
              "evidence_total": 1, "enqueued_task": None}], []))
     # ---- [#1867] A DROPPED FIRE ROW MUST NAME ITSELF. The evidence-LINK drops above are loud while
@@ -7403,7 +7473,8 @@ esac
     _FIRE_ROWS = "observability trigger fire rows"
     _KEPT_FIRE = {"rule": "kept-rule", "fired_at": now - 300, "summary": "s", "evidence": []}
     _KEPT_PUBLISHED = {"rule": "kept-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
-                       "evidence": [], "evidence_total": 0, "enqueued_task": None}
+                       "summary_length": 1, "evidence": [], "evidence_total": 0,
+                       "enqueued_task": None}
     # THE REGRESSION, in the shape the issue names. Both directions in one row: the unreadable rule
     # is announced, AND the row beside it still publishes — this is a drop diagnostic, not a new
     # fatality and not a reason to fail the panel.
@@ -7686,6 +7757,189 @@ esac
           obs_evidence_page("unreachable"),
           ([[["evidence 1"], [evidence_note(2)]],
             [["evidence 1"], [evidence_note(1, " is")]]], [], None))
+    # ---- [#2161] THE FIRE `summary` IS A DISPLAY CUT TOO — THE LAST SILENT ONE ON THIS PANEL, AND
+    # THE ONE NEITHER #1868 NOR #2009 COULD REACH, because it is not an array. A 900-character alarm
+    # summary published as 240 characters with NO affordance at all: no marker, no title, and
+    # nothing in the build log either, so the operator read a sentence that stops mid-word as the
+    # whole alarm. Every input SIZE and every expected string below is a literal written HERE —
+    # sizing an input from the 240 the code reads is pre-flight 2(c)'s tautology and reading the
+    # published string back as the expectation is 2(b)'s — and the 900-character input is built
+    # around a `CUT` marker at the boundary so WHICH characters survive is pinned to the character:
+    # a cap moved by one reds the slice rather than passing on a length that still reads 900.
+    _LONG_SUMMARY = "x" * 239 + "CUT" + "y" * 658          # 900 characters
+    _CUT_SUMMARY = "x" * 239 + "C"                         # ...of which 240 are published
+
+    def obs_summary(value):
+        """(published `summary`, its `summary_length`) for one fire carrying `value`."""
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["trigger_fires"] = [{"rule": "summary-rule", "fired_at": now - 300,
+                                     "summary": value, "evidence": []}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            document = obs_normalized(fixture)
+        fires = document["trigger_fires"]
+        row = fires[0] if isinstance(fires, list) and fires else document
+        # `.get`, not a subscript, for the reason `obs_evidence` gives: a mutant that stops
+        # publishing the key must red THESE rows, not abort the suite under a KeyError with every
+        # check below it unrun (AGENTS.md pre-flight item 4, crash-after-partial-run).
+        return row.get("summary"), row.get("summary_length")
+
+    check("[#2161] a 900-character summary publishes 240 characters and STATES that it read 900. "
+          "A length derived from the published slice reds at 240, a moved cap reds the slice, and "
+          "dropping the key reds both halves",
+          obs_summary(_LONG_SUMMARY), (_CUT_SUMMARY, 900))
+    # The accept path and the zero row, which are what keep the row above and the refusal row below
+    # non-vacuous: a length emitted only when the cut BIT is the census that never zero-seals
+    # (pre-flight item 8), and the page could then no longer tell `240 of 240` from a producer that
+    # stopped sending the count at all.
+    check("[#2161] a summary UNDER the cut publishes whole and states its length ANYWAY — a cut "
+          "that hid nothing is still a reading, and the page owns the `length > shown` decision",
+          obs_summary("twelve chars"), ("twelve chars", 12))
+    check("[#2161] ...and a fire with NO summary publishes its ZERO rather than omitting the count",
+          obs_summary(""), ("", 0))
+    check("[#2161] ...an ABSENT summary key reads the same way — 0 characters, not a missing count",
+          obs_summary(None), ("", 0))
+    # THE DIRECTION THAT KEEPS THIS HONEST. A non-printable summary is REFUSED WHOLE by the existing
+    # guard (a control-character injection risk, not a long sentence), so its length is 0 and not
+    # 900: publishing 900 beside the empty string would draw `…` and `900 further characters` on a
+    # value that was never truncated — a second, WRONG reading of a loss the page cannot repair.
+    # Truncation and refusal are different facts, exactly as #1868 keeps a malformed row out of a
+    # capped array's total.
+    check("[#2161] a non-printable 900-character summary is REFUSED WHOLE and reports length 0 — a "
+          "refusal is not a truncation, and a length published beside an empty string would draw a "
+          "cut marker on a value that was never cut",
+          obs_summary("a" * 300 + "\n" + "b" * 599), ("", 0))
+    # ...and the count is taken over the SANITIZED text, the same string that was cut. Read off the
+    # raw input it would count the six spaces this seam strips and report 306 for a summary of 300.
+    check("[#2161] the length counts the STRIPPED text the cut is applied to, never the raw input — "
+          "a length read before `strip()` says 306 where 300 characters were published",
+          obs_summary("   " + "w" * 300 + "   "), ("w" * 240, 300))
+    # ...and THE PAGE IS WHAT THIS HAS TO DELIVER INTO (pre-flight item 11): a count published into
+    # site/data.json that no panel renders leaves the operator exactly where the issue found them.
+    # The affordance is deliberately NOT #1868's `showing 240 of 900` — a statistic under a sentence
+    # that stops mid-word is not what a reader of that sentence needs — so the fire draws an ELLIPSIS
+    # carrying the count in its title, INSIDE the summary span so it sits against the text it
+    # belongs to. EXECUTED against dashboard/app.js under the shared DOM shim (a lexical assertion
+    # is satisfiable by a comment — the #612 round-4 lesson), collected by EXACT className and only
+    # from the summary span's own children, so a marker appended to the ROW instead cannot pass. The
+    # card-level `obs-truncated` note is collected beside it, so an affordance delivered by
+    # re-labelling or by consuming the #1868 one reds too.
+    _OBS_SUMMARY_PAGE_BODY = r"""
+  const summaries = (root) => {
+    const found = [];
+    const walk = (el) => {
+      if (!el) return;
+      if (el.className === "obs-trigger-summary") {
+        found.push([el.textContent || "",
+          (el.children || []).filter((kid) => kid.className === "obs-summary-cut")
+            .map((kid) => [kid.textContent || "", (kid.attributes || {}).title || null])]);
+      }
+      for (const kid of el.children || []) walk(kid);
+    };
+    walk(root);
+    return found;
+  };
+  const panel = (root) => {
+    const found = [];
+    const walk = (el) => {
+      if (!el) return;
+      if (el.className === "obs-truncated") found.push(flat(el).join(" ").trim());
+      for (const kid of el.children || []) walk(kid);
+    };
+    walk(root);
+    return found;
+  };
+  const out = {};
+  for (const [name, document] of Object.entries(input.documents)) {
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      scope.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    out[name] = { error, fires: summaries(ids["obs-triggers"]), panel: panel(ids["obs-triggers"]) };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+
+    def summary_cut(hidden, plural="s are"):
+        """The `…` marker and its hover title, as test-side literals (pre-flight 2(b)).
+
+        The title is asserted because it carries the ONLY reading of the count — the visible marker
+        is one character and has no branch in it — and because the singular is otherwise an
+        unkillable region (pre-flight item 4's equivalent survivor)."""
+        return [["…", f"{hidden} further character{plural} in this fire's summary in the "
+                      "collector snapshot than this row displays"]]
+    # Real `_normalize_observability` output, so the page is handed the document this build actually
+    # publishes rather than one hand-shaped to suit the assertion. Three fires, newest first.
+    summary_page_input = copy.deepcopy(obs_fixture)
+    summary_page_input["trigger_fires"] = [
+        {"rule": "long-summary-rule", "fired_at": now - 300, "summary": _LONG_SUMMARY,
+         "evidence": []},
+        {"rule": "short-summary-rule", "fired_at": now - 400, "summary": "twelve chars",
+         "evidence": []},
+        {"rule": "no-summary-rule", "fired_at": now - 500, "summary": "", "evidence": []}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        summary_page_doc = obs_normalized(summary_page_input)
+    # Every unusable `summary_length` a future, tampered or pre-#2161 producer can put beside a
+    # five-character summary — a string, a boolean, a negative, a null, one EQUAL to the text, one
+    # SMALLER than it, a fractional one, and the LEGACY row that carries no length at all. None may
+    # draw a marker: an unknown length is not a truncation, and a `…` promising `undefined` more
+    # characters is a worse lie than the silence it replaces.
+    hostile_summary_doc = copy.deepcopy(summary_page_doc)
+    hostile_summary_doc["trigger_fires"] = [
+        {"rule": f"hostile-rule-{index}", "fired_at": "2025-06-15T15:01:40Z", "summary": "abcde",
+         "summary_length": length, "evidence": [], "evidence_total": 0, "enqueued_task": None}
+        for index, length in enumerate(("900", True, -1, None, 5, 3, 7.5))]
+    hostile_summary_doc["trigger_fires"].append(
+        {"rule": "legacy-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "abcde",
+         "evidence": [], "evidence_total": 0, "enqueued_task": None})
+    # The document that separates "characters this row DREW" from "the generator's 240-character
+    # cap". This generator cannot produce it — every summary it cuts is exactly 240 long — so a
+    # `shown` hard-coded to the cap is an EQUIVALENT survivor against any document it can (pre-flight
+    # item 4), and the decision is only assertable against a hand-edited page. TWO rows: the first
+    # pins the ARITHMETIC (3 characters drawn out of 10 collected is `7 further`, never the `660` a
+    # cap-derived `shown` would compute, and a cap-derived PREDICATE would draw nothing at all); the
+    # second pins the SINGULAR branch of the title, which nothing else on this page reaches.
+    unreachable_summary_doc = copy.deepcopy(summary_page_doc)
+    unreachable_summary_doc["trigger_fires"] = [
+        {"rule": "unreachable-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "abc",
+         "summary_length": 10, "evidence": [], "evidence_total": 0, "enqueued_task": None},
+        {"rule": "unreachable-rule-2", "fired_at": "2025-06-15T15:01:40Z", "summary": "abc",
+         "summary_length": 4, "evidence": [], "evidence_total": 0, "enqueued_task": None}]
+    # ...beside a card-level total that matches the fires, so the empty `panel` control below is
+    # asserting the per-row affordance and not merely inheriting the three-fire total copied above.
+    unreachable_summary_doc["trigger_fires_total"] = 2
+    summary_page = _executed_page(
+        _page_harness("renderObservability", _OBS_SUMMARY_PAGE_BODY),
+        {"documents": {"capped": copy.deepcopy(summary_page_doc),
+                       "hostile": hostile_summary_doc,
+                       "unreachable": unreachable_summary_doc}})
+
+    def obs_summary_page(name):
+        rendered = summary_page.get(name)
+        return ((rendered.get("fires"), rendered.get("panel"), rendered.get("error"))
+                if isinstance(rendered, dict) else summary_page)
+
+    check("[#2161] EXECUTED page script: the 900-character fire draws its 240 characters AND a `…` "
+          "whose title names the 660 it withheld; the twelve-character fire and the empty one draw "
+          "no marker at all. The card-level `obs-truncated` note is empty on the same stack, so the "
+          "per-row affordance is its own and did not arrive by relabelling the #1868 one",
+          obs_summary_page("capped"),
+          ([[_CUT_SUMMARY, summary_cut(660)], ["twelve chars", []], ["", []]], [], None))
+    check("[#2161] EXECUTED page script: an unusable `summary_length` draws NOTHING — a string, a "
+          "boolean, a negative, a null, one equal to the text beside it, one smaller, a FRACTIONAL "
+          "one, and a legacy row carrying no length at all are each 'no truncation known', never a "
+          "fabricated `…`. The summary text itself still renders on every row",
+          obs_summary_page("hostile"), ([["abcde", []]] * 8, [], None))
+    check("[#2161] EXECUTED page script: the title counts the characters the READER can see, not "
+          "the generator's cap — 3 drawn out of 10 collected is `7 further characters`, and a "
+          "`shown` pinned to 240 would draw no marker here at all. The one-character case takes the "
+          "SINGULAR branch, which no document this generator produces can reach",
+          obs_summary_page("unreachable"),
+          ([["abc", summary_cut(7)], ["abc", summary_cut(1, " is")]], [], None))
     # ---- [#1880] A FLOW STAT THE COLLECTOR SENT AND THIS BUILD CANNOT READ MUST NOT PUBLISH AS A
     # HEALTHY NUMBER. `_obs_count(...) or 0` mapped every unreadable park/sample count to 0, so
     # `parks_1h: {"needs_user": "lots", "needs_orchestrator": -3}` published `0 user · 0 orch` on
