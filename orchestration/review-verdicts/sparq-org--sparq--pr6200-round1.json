@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6200,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "724b65de1932c290a267336d8db9e557c218d8c3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 6\u20139 say phases 1\u20134 are unblocked today, yet the PR intentionally supplies none of the bead's requested wiring: no pinned fetch script, vector reader, encoder, stratified oracle test, or ratcheted floor. The central 19/19 result was obtained with an out-of-tree probe and borrowed JavaScript encoder, so neither that result nor the security-critical assertion that the four-stratum path avoids a fail-open decision is reproducible or gated by this repository. A design record alone is not a complete implementation of the stated conformance-vector task.",
+    "file": "research/lws-spec-conformance-vectors.md",
+    "fix_hint": "Implement at least the self-contained phases 1\u20134 in this change or retitle/rescope the PR and its bead explicitly as a design-only prerequisite. For implementation, add the pinned fetch path, strict manifest/encoder handling, a real `reason_n3_stratified` test over all 19 evaluate-access vectors, a regression/mutation witness proving the naive single-pass path fails on the two deny cases, and the monotone conformance floor described by the record.",
+    "severity": "major",
+    "title": "The PR documents but does not implement the unblocked conformance work"
+   }
+  ],
+  "progress": null,
+  "summary": "The research is careful and the lib.rs correction remains appropriately caveated, but the change is incomplete against its stated bead: it explicitly delivers no fetcher, manifest harness, encoder, oracle test, or conformance floor even though it concludes phases 1\u20134 are unblocked. The key 19/19 access-decision claim is supported only by an out-of-tree, uncommitted probe, so there is no reproducible in-repository test of the load-bearing fail-closed stratification invariant.",
+  "verdict": "request_changes"
+ }
+}
