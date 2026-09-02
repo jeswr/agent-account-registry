@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2203,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d40b494d8d3dd5c530d8f0e5594dc4289cde3ba3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change remains correct and complete. Evidence labels now derive from the count of accepted, rendered GitHub anchors, so refused entries cannot create numbering gaps, while the existing rendered-count logic for `+N more` stays aligned. The executed-page test is non-vacuous: its interior-refusal case distinguishes the prior array-index implementation, its leading-refusal case rejects partial gap-closing fixes, and its all-accepted control catches zero-based or collapsed numbering. Documentation matches the behavior. This display-only adjustment preserves the URL refusal and does not weaken trust-plane controls, permissions, token handling, or injection defenses. Round 2 has the same clean result as the approved prior round.",
+  "verdict": "approve"
+ }
+}
