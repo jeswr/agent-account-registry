@@ -1688,9 +1688,10 @@ _selftest_env_blocked() {
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
 # self-test feeds a fixture. Prints, one per line: "self:<script>" for a touched script that has a
 # --self-test, "py:<file>" for a touched *.py, "bash:<file>" for a touched *.sh, "wf:<file>" for a
-# touched workflow yml, "dockerfile:<file>" for a touched container definition, and "js:<file>" for
-# a touched dashboard renderer script. EVERY kind emitted here must have a validating loop in
-# registry_selftest_gate — its `direct == #targets` invariant fails the gate closed otherwise.
+# touched workflow yml, "form:<file>" for a touched issue form, "dockerfile:<file>" for a touched
+# container definition, and "js:<file>" for a touched dashboard renderer script. EVERY kind emitted
+# here must have a validating loop in registry_selftest_gate — its `direct == #targets` invariant
+# fails the gate closed otherwise.
 _registry_selftest_targets() {
   local suite="$1" path base
   while IFS= read -r path; do
@@ -1716,6 +1717,16 @@ _registry_selftest_targets() {
         ;;
       .github/workflows/*.yml|.github/workflows/*.yaml)
         printf 'wf:%s\n' "$path"
+        ;;
+      # [issue #1110] the issue FORMS are MINT PATHS, not decoration: account.yml's prefill is the
+      # text an operator submits VERBATIM as an account record, and set-up-account.yml states the
+      # label contract the broker enforces. A touched form was classified into NOTHING, so nothing
+      # ever checked that it parses — and a broken form does not fail a gate, it fails silently on
+      # github.com, where the form stops rendering and the operator falls back to a free-form body
+      # that no schema shaped. Emit a form: target so the gate parses it and holds it to the shape
+      # the renderer requires.
+      .github/ISSUE_TEMPLATE/*.yml|.github/ISSUE_TEMPLATE/*.yaml)
+        printf 'form:%s\n' "$path"
         ;;
       # [issue #145] the model-isolation sandbox. A touched container definition was previously
       # classified into NOTHING — the gate never looked at it — so a benign PR could swap the
@@ -1791,6 +1802,132 @@ _assert_dockerfile_pinned() {
     [[ -n "$as_seen" ]] && stage_alias[$as_seen]=1
   done < "$file"
   return 0
+}
+
+# PURE (self-tested): [issue #1110] an issue form under .github/ISSUE_TEMPLATE/ must PARSE and must
+# carry the shape GitHub's renderer requires. Parsing alone is not enough: a form whose `body` was
+# deleted, emptied, or given an element type the renderer does not know is perfectly valid YAML and
+# still does not render — and a form that does not render is not a loud failure, it is an operator
+# submitting a free-form body against a MINT path (an account record, a broker request) that no
+# schema shaped. The shape is checked by TYPE, not by truthiness: `label: [x]`, `options: text`, a
+# checkbox option with no `label`, and a duplicate element `id` are each truthy-and-present and each
+# render nothing. Returns non-zero and names every fault on stderr; an unreadable or unparseable file
+# is a refusal too, never "no faults found".
+#
+# `config.yml` is the issue CHOOSER config, a deliberately different schema
+# (blank_issues_enabled / contact_links) — it is still parsed, but the form-element rules below do
+# not apply to it. Without that exemption the gate would fail closed on a legitimate file.
+_assert_issue_form_valid() {
+  local file="$1"
+  [[ -f "$file" ]] || { printf 'worker-live: issue form missing: %s\n' "$file" >&2; return 1; }
+  python3 - "$file" <<'PY'
+import re, sys, yaml
+
+
+def _text(value):
+    """A renderer-required scalar: a non-empty string. `label: [x]` is TRUTHY and renders nothing."""
+    if not isinstance(value, str) or not value.strip():
+        return "must be a non-empty string"
+    return None
+
+
+def _dropdown_options(value):
+    """dropdown options are a non-empty list of choice STRINGS."""
+    if not isinstance(value, list) or not value:
+        return "must be a non-empty list of choice strings"
+    for index, option in enumerate(value):
+        if _text(option):
+            return f"[{index}] must be a non-empty string"
+    return None
+
+
+def _checkbox_options(value):
+    """checkbox options are a non-empty list of MAPPINGS, each carrying its own required `label`."""
+    if not isinstance(value, list) or not value:
+        return "must be a non-empty list of {label: ...} mappings"
+    for index, option in enumerate(value):
+        if not isinstance(option, dict):
+            return f"[{index}] must be a mapping carrying a label"
+        problem = _text(option.get("label"))
+        if problem:
+            return f"[{index}].label {problem}"
+    return None
+
+
+# The renderer's element types, each mapped to the `attributes` keys it REQUIRES *and the shape it
+# requires of them*. A truthiness check is not enough: `label: [x]`, `options: text`, and a checkbox
+# option with no `label` are all truthy and all render nothing.
+ELEMENT_SCHEMA = {
+    "markdown": {"value": _text},
+    "input": {"label": _text},
+    "textarea": {"label": _text},
+    "dropdown": {"label": _text, "options": _dropdown_options},
+    "checkboxes": {"label": _text, "options": _checkbox_options},
+}
+
+# `id` is OPTIONAL in GitHub's form schema — do not "fix" this to required, a form whose elements
+# carry no id renders fine and refusing one would fail the gate closed on a legitimate file. But
+# WHERE PRESENT it is constrained: alpha-numerics, `-` and `_` only, and unique within the form.
+ID_SYNTAX = re.compile(r"^[A-Za-z0-9_-]+$")
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+except Exception as exc:  # unparseable -> refuse, never "no faults found"
+    print(f"worker-live: issue form does not parse: {path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+faults = []
+if path.rsplit("/", 1)[-1] in ("config.yml", "config.yaml"):
+    pass  # the chooser config: parsed above, exempt from the form-element rules
+elif not isinstance(doc, dict):
+    faults.append("top level is not a mapping")
+else:
+    for key in ("name", "description"):
+        value = doc.get(key)
+        if not isinstance(value, str) or not value.strip():
+            faults.append(f"{key}: must be a non-empty string (the chooser will not render it)")
+    body = doc.get("body")
+    if not isinstance(body, list) or not body:
+        faults.append("body: must be a non-empty list of form elements")
+    else:
+        seen_ids = {}
+        for index, element in enumerate(body):
+            if not isinstance(element, dict):
+                faults.append(f"body[{index}]: is not a mapping")
+                continue
+            etype = element.get("type")
+            if etype not in ELEMENT_SCHEMA:
+                faults.append(f"body[{index}]: unknown element type {etype!r} "
+                              f"(known: {', '.join(sorted(ELEMENT_SCHEMA))})")
+                continue
+            if "id" in element:
+                eid = element["id"]
+                if not isinstance(eid, str) or not ID_SYNTAX.match(eid):
+                    faults.append(f"body[{index}] ({etype}): id {eid!r} may use only alpha-numerics, "
+                                  "'-' and '_'")
+                elif eid in seen_ids:
+                    faults.append(f"body[{index}] ({etype}): id {eid!r} duplicates body[{seen_ids[eid]}] "
+                                  "(ids must be unique within a form)")
+                else:
+                    seen_ids[eid] = index
+            attributes = element.get("attributes")
+            if not isinstance(attributes, dict):
+                faults.append(f"body[{index}] ({etype}): has no attributes mapping")
+                continue
+            for required, is_valid in ELEMENT_SCHEMA[etype].items():
+                if required not in attributes:
+                    faults.append(f"body[{index}] ({etype}): attributes.{required} is required")
+                    continue
+                problem = is_valid(attributes[required])
+                if problem:
+                    faults.append(f"body[{index}] ({etype}): attributes.{required} {problem}")
+
+for fault in faults:
+    print(f"worker-live: issue form {path}: {fault}", file=sys.stderr)
+sys.exit(1 if faults else 0)
+PY
 }
 
 # PURE (self-tested): [issue #524] every non-local `uses:` in a workflow must pin a FULL 40-hex
@@ -2355,6 +2492,22 @@ registry_selftest_gate() {
       [[ -n "$actionlint_bin" ]] || actionlint_bin=$(_ensure_actionlint) \
         || die "actionlint unavailable and pinned provisioning failed: $name (fail closed — a workflow change cannot be under-validated)"
       "$actionlint_bin" "$name" || die "actionlint failed: $name"
+      direct=$((direct + 1))
+    fi
+  done
+
+  # 4b) [issue #1110] every touched issue FORM is parsed and held to the renderer's required shape.
+  #    These are mint paths (an account record, a broker request), and a broken one is silent: the
+  #    form simply stops rendering on github.com. PyYAML is the dependency, and the answer here is
+  #    the one the workflow lint lane above already gives — FAIL CLOSED, never skip and never
+  #    provision: the #824 preflight at the top of this gate refuses under its own ENV-BLOCKED class
+  #    when PyYAML is absent, so this loop never runs unvalidated in a container that lacks it.
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == form ]]; then
+      printf 'worker-live: issue form check %s\n' "$name"
+      _assert_issue_form_valid "$name" \
+        || die "issue form is malformed or would not render: $name (fail closed — a broken form fails silently on github.com, not here)"
       direct=$((direct + 1))
     fi
   done
@@ -4911,6 +5064,9 @@ PY
     "dashboard/app.js" \
     "dashboard/render.mjs" \
     "dashboard/index.html" \
+    ".github/ISSUE_TEMPLATE/account.yml" \
+    ".github/ISSUE_TEMPLATE/legacy.yaml" \
+    ".github/ISSUE_TEMPLATE/README.md" \
     | _registry_selftest_targets "$FULL_SELFTEST_SUITE" | sort | paste -sd',' -)
   chk "registry gate selects touched suite py" \
     "$(grep -c 'self:worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
@@ -4954,6 +5110,22 @@ PY
     "$(grep -cE '^(self|py):.*app\.js' <<< "${sel//,/$'\n'}" || true)" "0"
   chk "registry gate ignores a non-js dashboard asset" \
     "$(grep -c 'index\.html' <<< "${sel//,/$'\n'}" || true)" "0"
+  # [issue #1110] a touched ISSUE FORM was classified into NOTHING — the gate never checked that the
+  # account-record / broker-request forms even parse. Both extensions are claimed (a `.yaml` form
+  # renders exactly like a `.yml` one, and an unmatched half of the pair is the #1035 silently-
+  # shrinking-set shape), a non-form asset in the same directory stays unclassified (a spurious
+  # form: on it would fail the gate closed for the wrong reason), and the form must not be misfiled
+  # as a workflow — the wf: loop actionlints it, which an issue form cannot survive.
+  chk "registry gate classifies a touched issue form" \
+    "$(grep -c '^form:\.github/ISSUE_TEMPLATE/account\.yml$' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate classifies a .yaml issue form too" \
+    "$(grep -c '^form:\.github/ISSUE_TEMPLATE/legacy\.yaml$' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate does NOT misfile an issue form as a workflow (it would be actionlinted)" \
+    "$(grep -c '^wf:\.github/ISSUE_TEMPLATE/' <<< "${sel//,/$'\n'}" || true)" "0"
+  chk "registry gate ignores a non-form asset under ISSUE_TEMPLATE/" \
+    "$(grep -c 'ISSUE_TEMPLATE/README\.md' <<< "${sel//,/$'\n'}" || true)" "0"
+  chk "registry gate does NOT classify a real workflow as an issue form" \
+    "$(grep -c '^form:\.github/workflows/' <<< "${sel//,/$'\n'}" || true)" "0"
 
   # --- [issue #141] porcelain parser feeding BOTH gate paths: `-z` + NUL-aware so a space/control
   # -char path or a rename's two paths cannot slip past classification. The old `cut -c4-` on the
@@ -5289,6 +5461,197 @@ PY
     "$(printf '%s\n' "$gate_body" | grep -c '_assert_workflow_actions_pinned')" "1"
   chk "#524 wiring: an unpinned action REFUSES the gate, it does not warn and continue" \
     "$(printf '%s\n' "$gate_body" | grep -c 'die "workflow action reference is not 40-hex commit-pinned')" "1"
+
+  # --- [issue #1110] the ISSUE FORM validator. The forms are mint paths — account.yml's prefill is
+  # submitted verbatim as an account record — and a broken one is SILENT: github.com just stops
+  # rendering it and the operator falls back to a free-form body no schema shaped. So both
+  # directions, and both KINDS of breakage: a form that does not parse, and a form that parses
+  # PERFECTLY and still renders nothing (no body, an empty body, an element type the renderer does
+  # not know, an element missing the attribute its type requires). Every fixture is composed from
+  # the SAME accepted base parts with exactly one mutation, so a refusal cannot be a false kill on
+  # an incidental YAML typo (pre-flight item 4) — the base itself is asserted to pass first. ---
+  local formfix="$tmp/issue-forms"
+  mkdir -p "$formfix" "$formfix/cfg-broken"
+  local ff_name='name: Model account'
+  local ff_desc='description: Register a model account for the worker fleet'
+  local ff_body='body:
+  - type: textarea
+    id: spec
+    attributes:
+      label: Account spec (YAML)'
+  printf '%s\n%s\n%s\n' "$ff_name" "$ff_desc" "$ff_body" > "$formfix/good.yml"
+  printf '%s\n%s\n%s\n' "$ff_name" "$ff_desc" 'body: [ - type: textarea' > "$formfix/unparseable.yml"
+  printf '%s\n%s\n' "$ff_name" "$ff_desc" > "$formfix/no-body.yml"
+  printf '%s\n%s\n%s\n' "$ff_name" "$ff_desc" 'body: []' > "$formfix/empty-body.yml"
+  printf '%s\n%s\n' "$ff_desc" "$ff_body" > "$formfix/no-name.yml"
+  printf '%s\n%s\n%s\n' "$ff_name" "$ff_desc" "${ff_body/type: textarea/type: freeform}" \
+    > "$formfix/unknown-type.yml"
+  printf '%s\n%s\n%s\n' "$ff_name" "$ff_desc" "${ff_body/      label: Account spec (YAML)/      placeholder: none}" \
+    > "$formfix/no-required-attribute.yml"
+  # the chooser config is a DIFFERENT schema and must stay accepted (a spurious refusal here fails
+  # the gate closed on a legitimate file) — but it is still PARSED, so a broken one is refused.
+  printf 'blank_issues_enabled: false\ncontact_links:\n  - name: Security\n    url: https://example.invalid\n    about: Report privately\n' \
+    > "$formfix/config.yml"
+  printf 'blank_issues_enabled: [\n' > "$formfix/cfg-broken/config.yml"
+  chk "a well-formed issue form passes (the base every mutant below is derived from)" \
+    "$(_assert_issue_form_valid "$formfix/good.yml" >/dev/null 2>&1 && echo valid || echo refused)" "valid"
+  chk "an UNPARSEABLE issue form is refused, not read as having no faults" \
+    "$(_assert_issue_form_valid "$formfix/unparseable.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a form with NO body is refused (parses fine, renders nothing)" \
+    "$(_assert_issue_form_valid "$formfix/no-body.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a form with an EMPTY body is refused (the quiet way a form loses its fields)" \
+    "$(_assert_issue_form_valid "$formfix/empty-body.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a form with no name is refused (the chooser cannot render it)" \
+    "$(_assert_issue_form_valid "$formfix/no-name.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "an element type the renderer does not know is refused" \
+    "$(_assert_issue_form_valid "$formfix/unknown-type.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "an element missing the attribute its type REQUIRES is refused" \
+    "$(_assert_issue_form_valid "$formfix/no-required-attribute.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "the chooser config.yml is exempt from the form-element rules, not refused" \
+    "$(_assert_issue_form_valid "$formfix/config.yml" >/dev/null 2>&1 && echo valid || echo refused)" "valid"
+  chk "but an UNPARSEABLE config.yml is still refused (the exemption is not a bypass)" \
+    "$(_assert_issue_form_valid "$formfix/cfg-broken/config.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a MISSING issue form is refused (fail closed)" \
+    "$(_assert_issue_form_valid "$formfix/no-such.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  # SHAPE, not presence. Every row above moves a key's PRESENCE — none of them can see an attribute
+  # that is present, truthy, and still unrenderable. These do: one accepted form carrying EVERY
+  # supported element type, then that same form with exactly one shape mutation. Each mutant is
+  # accepted by a truthiness-only `attributes.get(required)` check, so each row goes red the moment
+  # the type / nested-option / id rules are dropped.
+  _ff_compose() {  # $1 = destination, $2.. = body element blocks
+    local dest="$1"; shift
+    { printf '%s\n%s\nbody:\n' "$ff_name" "$ff_desc"; printf '%s\n' "$@"; } > "$dest"
+  }
+  local ff_md='  - type: markdown
+    attributes:
+      value: "Everything the broker reads is a LABEL."'
+  local ff_input='  - type: input
+    id: handle
+    attributes:
+      label: Account handle'
+  local ff_area='  - type: textarea
+    id: spec
+    attributes:
+      label: Account spec (YAML)'
+  local ff_drop='  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - anthropic
+        - openai'
+  local ff_check='  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirm the label contract
+      options:
+        - label: "One grant label per authorized repository is applied."
+          required: true'
+  _ff_compose "$formfix/all-types.yml" "$ff_md" "$ff_input" "$ff_area" "$ff_drop" "$ff_check"
+  # `id` is OPTIONAL in GitHub's schema, so the SAME form with every id stripped must stay accepted:
+  # an over-tight id rule would fail the gate closed on a legitimate form.
+  _ff_compose "$formfix/no-ids.yml" "$ff_md" "${ff_input/$'\n    id: handle'/}" \
+    "${ff_area/$'\n    id: spec'/}" "${ff_drop/$'\n    id: provider'/}" "${ff_check/$'\n    id: confirm'/}"
+  _ff_compose "$formfix/bad-id.yml" "$ff_md" "${ff_input/id: handle/id: account handle}" \
+    "$ff_area" "$ff_drop" "$ff_check"
+  _ff_compose "$formfix/dup-id.yml" "$ff_md" "$ff_input" "${ff_area/id: spec/id: handle}" \
+    "$ff_drop" "$ff_check"
+  _ff_compose "$formfix/label-not-string.yml" "$ff_md" \
+    "${ff_input/label: Account handle/label: [Account handle]}" "$ff_area" "$ff_drop" "$ff_check"
+  _ff_compose "$formfix/markdown-value-not-string.yml" \
+    "${ff_md/value: \"Everything the broker reads is a LABEL.\"/value: [broken]}" \
+    "$ff_input" "$ff_area" "$ff_drop" "$ff_check"
+  _ff_compose "$formfix/dropdown-options-scalar.yml" "$ff_md" "$ff_input" "$ff_area" \
+    "${ff_drop/$'options:\n        - anthropic\n        - openai'/options: anthropic}" "$ff_check"
+  _ff_compose "$formfix/dropdown-option-not-string.yml" "$ff_md" "$ff_input" "$ff_area" \
+    "${ff_drop/- anthropic/- anthropic: true}" "$ff_check"
+  _ff_compose "$formfix/checkbox-option-no-label.yml" "$ff_md" "$ff_input" "$ff_area" "$ff_drop" \
+    "${ff_check/- label: /- text: }"
+  _ff_compose "$formfix/checkbox-options-bare-strings.yml" "$ff_md" "$ff_input" "$ff_area" "$ff_drop" \
+    "${ff_check/$'- label: "One grant label per authorized repository is applied."\n          required: true'/- One grant label per authorized repository is applied.}"
+  chk "a form using EVERY supported element type passes (the base of every shape mutant below)" \
+    "$(_assert_issue_form_valid "$formfix/all-types.yml" >/dev/null 2>&1 && echo valid || echo refused)" "valid"
+  # the id-strip is the ONE mutation whose failure to apply would pass VACUOUSLY (the unmutated base
+  # is accepted too), so assert the fixture really carries no id before reading its verdict.
+  chk "the no-id fixture really has every id stripped (the mutation applied)" \
+    "$(grep -c '^    id:' "$formfix/no-ids.yml" || true)" "0"
+  chk "elements with NO id stay accepted (id is optional in GitHub's schema — not an over-tight rule)" \
+    "$(_assert_issue_form_valid "$formfix/no-ids.yml" >/dev/null 2>&1 && echo valid || echo refused)" "valid"
+  chk "an element id outside GitHub's id syntax is refused" \
+    "$(_assert_issue_form_valid "$formfix/bad-id.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a DUPLICATE element id is refused (ids must be unique within a form)" \
+    "$(_assert_issue_form_valid "$formfix/dup-id.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a truthy non-string label is refused (\`label: [x]\` renders nothing)" \
+    "$(_assert_issue_form_valid "$formfix/label-not-string.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a truthy non-string markdown value is refused" \
+    "$(_assert_issue_form_valid "$formfix/markdown-value-not-string.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "dropdown options given as a bare scalar are refused (truthy, unrenderable)" \
+    "$(_assert_issue_form_valid "$formfix/dropdown-options-scalar.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a dropdown option that is not a choice string is refused" \
+    "$(_assert_issue_form_valid "$formfix/dropdown-option-not-string.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "a checkbox option missing its own label is refused" \
+    "$(_assert_issue_form_valid "$formfix/checkbox-option-no-label.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  chk "checkbox options given as bare strings are refused (they must be {label: ...} mappings)" \
+    "$(_assert_issue_form_valid "$formfix/checkbox-options-bare-strings.yml" >/dev/null 2>&1 && echo valid || echo refused)" "refused"
+  # Parity on the REAL tree: every shipped form must pass today, or the gate this PR adds refuses
+  # the next unrelated touch of one. The scanned count is asserted too, so an empty glob cannot make
+  # the parity claim vacuous. Both extensions, matching the classifier's pair.
+  local form_real form_scanned=0 form_rejected=0
+  for form_real in "$SCRIPT_DIR"/../.github/ISSUE_TEMPLATE/*.yml "$SCRIPT_DIR"/../.github/ISSUE_TEMPLATE/*.yaml; do
+    [[ -f "$form_real" ]] || continue
+    form_scanned=$((form_scanned + 1))
+    _assert_issue_form_valid "$form_real" >/dev/null 2>&1 || form_rejected=$((form_rejected + 1))
+  done
+  chk "the form parity sweep actually scanned the real ISSUE_TEMPLATE tree (non-vacuous)" \
+    "$([[ "$form_scanned" -gt 0 ]] && echo scanned || echo none)" "scanned"
+  chk "every REAL issue form passes the validator" "$form_rejected" "0"
+  # WIRING, on the PARSED gate body: the validator above could be perfectly correct and never
+  # reached from the touched-form classification — and it must DIE, not warn.
+  chk "#1110 wiring: the touched-form loop calls the form validator" \
+    "$(printf '%s\n' "$gate_body" | grep -c '_assert_issue_form_valid')" "1"
+  chk "#1110 wiring: a malformed form REFUSES the gate, it does not warn and continue" \
+    "$(printf '%s\n' "$gate_body" | grep -c 'die "issue form is malformed or would not render')" "1"
+  # ...and the loop as an EXACT block, because the two containment rows above cannot see a call that
+  # is PRESENT and INERT (pre-flight item 3). The gate's `direct == #targets` invariant catches an
+  # inert loop that also stops counting — but NOT a wrapper that keeps the tally while skipping the
+  # validator, which passes every count. The occurrence count is asserted beside the block so a
+  # decoy `form` block cannot be pinned in place of a weakened real one (the #1680 name-spoof shape).
+  _form_loop_block() {
+    printf '%s\n' "$1" \
+      | awk '/^[[:space:]]*if \[\[ "\$kind" == form \]\]; then$/,/^[[:space:]]*fi;$/ { sub(/^[[:space:]]+/, ""); print }' \
+      | paste -sd'|' -
+  }
+  local expected_form_loop
+  expected_form_loop=$(cat <<'FORMLOOP' | paste -sd'|' -
+if [[ "$kind" == form ]]; then
+printf 'worker-live: issue form check %s\n' "$name";
+_assert_issue_form_valid "$name" || die "issue form is malformed or would not render: $name (fail closed — a broken form fails silently on github.com, not here)";
+direct=$((direct + 1));
+fi;
+FORMLOOP
+)
+  chk "#1110 wiring: the gate carries EXACTLY one touched-form block (no decoy to pin instead)" \
+    "$(printf '%s\n' "$gate_body" | grep -c '"\$kind" == form')" "1"
+  chk "#1110 wiring: the form loop is EXACTLY the expected block (a present-but-inert call is not a call)" \
+    "$(_form_loop_block "$gate_body")" "$expected_form_loop"
+  # NON-VACUITY of that block pin: each mutant is the real block with exactly one weakening, so a
+  # difference is the mutation and never an incidental typo.
+  local fl_inert fl_ortrue
+  fl_inert=$(printf '%s\n' 'if [[ "$kind" == form ]]; then' \
+    'printf '"'"'worker-live: issue form check %s\n'"'"' "$name";' \
+    'if false; then' \
+    '_assert_issue_form_valid "$name" || die "issue form is malformed or would not render: $name (fail closed — a broken form fails silently on github.com, not here)";' \
+    'fi;' 'direct=$((direct + 1));' 'fi;')
+  fl_ortrue=$(printf '%s\n' 'if [[ "$kind" == form ]]; then' \
+    'printf '"'"'worker-live: issue form check %s\n'"'"' "$name";' \
+    '_assert_issue_form_valid "$name" || true;' \
+    'direct=$((direct + 1));' 'fi;')
+  chk "block pin is NON-VACUOUS: a conditionally-inert validator call no longer matches" \
+    "$([[ "$(_form_loop_block "$fl_inert")" == "$expected_form_loop" ]] && printf missed || printf caught)" "caught"
+  chk "block pin is NON-VACUOUS: an '|| true'-suppressed refusal no longer matches" \
+    "$([[ "$(_form_loop_block "$fl_ortrue")" == "$expected_form_loop" ]] && printf missed || printf caught)" "caught"
+  chk "block pin fails CLOSED when the block is absent entirely" \
+    "$([[ "$(_form_loop_block 'f () { :; }')" == "$expected_form_loop" ]] && printf missed || printf caught)" "caught"
 
   # --- [issue #40 -> #575] The post-gate token-TTL problem app-token-post/app-token-publish existed
   # to solve is now solved STRUCTURALLY: the publisher is a separate job on a fresh runner, so it
