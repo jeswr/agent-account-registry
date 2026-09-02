@@ -62,10 +62,11 @@ on:
         type: string
       impl_alias:
         description: >-
-          Implementing model alias. Must resolve to provider `openai` in the target's routing
-          catalog — that pin is what keeps the review side constant (the lane inverts the provider).
-        required: false
-        default: sol
+          Explicit operator attestation of the model that implemented this PR. It must resolve in
+          the target's protected routing catalog to a provider with an opposite review chain;
+          Sol/OpenAI selects Opus review, while the permitted Opus/Anthropic fallback selects
+          OpenAI review. There is deliberately no default: route preference is not authorship.
+        required: true
         type: string
       apply:
         description: Write the record (false = dry run)

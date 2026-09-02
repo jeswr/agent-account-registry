@@ -2858,11 +2858,14 @@ def _self_test():                                                       # noqa: 
         check(f"...and a row whose `enabled` is {label} is NOT a target — enrolment is opt-IN",
               enrolled_targets({"repos": {"o/r": row}}, lambda name, doc: ["x"]), [])
 
-    check("the pinned implementing alias resolves to the pinned provider in the LIVE catalog",
-          mint_provenance.alias_mint_refusal(
-              AUTO_IMPL_ALIAS, _live_routing()), None)
-    check("...and the shared writer's provider pin is the one the lane inverts",
-          mint_provenance.ORCHESTRATOR_IMPL_PROVIDER, "openai")
+    live_routing = _live_routing()
+    check("the pinned automatic implementing alias resolves to a supported provider in the LIVE "
+          "catalog", mint_provenance.alias_mint_refusal(AUTO_IMPL_ALIAS, live_routing), None)
+    auto_provider = live_routing["models"][AUTO_IMPL_ALIAS]["provider"]
+    check("...and that alias still resolves to OpenAI, so this fail-closed automatic lane cannot "
+          "silently move to the fallback provider", auto_provider, "openai")
+    check("...which remains one of the providers the review lane can invert",
+          auto_provider in mint_provenance.ORCHESTRATOR_IMPL_PROVIDERS, True)
 
     check("an enrolled author's open PR is in the population",
           [row["number"] for row in enrolled_class_pulls([pull()], ("jeswr",))], [41])
@@ -4181,7 +4184,7 @@ def _self_test():                                                       # noqa: 
 
 def _live_routing():
     """This repository's OWN routing catalog, read from the checkout. Used only by --self-test, to
-    prove the pinned alias still resolves to the pinned provider."""
+    prove the pinned automatic alias still resolves to a supported provider."""
     import tomllib
 
     with open(SCRIPTS_DIR.parent / "orchestration" / "routing.toml", "rb") as handle:
