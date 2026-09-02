@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2216,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "dc9293834414d0c994e1d3fc52531a2a5ff2affa",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The routing changes explicitly retain `opus5` as a continuity fallback for implementation, and `auto-mint-provenance.py` now correctly refuses to guess whether Sol or Opus authored a PR. But this file simultaneously changes the manual writer's sole accepted provider to `openai`: `ORCHESTRATOR_IMPL_PROVIDER = \"openai\"`, so `alias_mint_refusal(\"opus5\", ...)` refuses. Therefore a PR genuinely implemented by the permitted Opus fallback cannot be auto-minted and cannot be manually attested truthfully either. It remains without a record and invisible to the provenance-derived cross-provider lane, contradicting the claimed continuity fallback and the comments that describe the manual workflow as the recovery path. The tests only prove that Anthropic aliases are rejected; they do not demonstrate any end-to-end admission path for the fallback the live route permits.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Provide a sound recovery path that accepts trustworthy per-PR implementation evidence and records either provider, then selects the opposite review provider, while retaining SHA binding and fail-closed validation. Add an end-to-end test for an Opus-fallback-authored PR proving that it can be truthfully recorded as Anthropic and routed to OpenAI review. If the provenance design intentionally supports only Sol-authored PRs, remove Opus from the implementation routes instead of advertising an unusable fallback.",
+    "severity": "major",
+    "title": "The permitted Opus fallback has no truthful provenance recovery path"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior round's false-attestation blocker is fixed: the unattended sweep now refuses rather than inventing Sol provenance. However, the change leaves the explicitly supported Opus implementation fallback with no provenance path at all. Auto-mint refuses it because evidence is absent, while the only advertised recovery writer now rejects the truthful Anthropic alias. Such PRs cannot enter the cross-provider review lane, so the new fallback policy is incomplete and does not deliver continuity. This is a new major finding, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
