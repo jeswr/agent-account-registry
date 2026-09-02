@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6212,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "becae577110b2e2ec2534e632becd38127a42f7f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change is internally consistent with the workflow and gating policy. The checkout confirms that determinism-gate and a11y-ratchet are separate unconditional jobs, neither is registered advisory, foundation-smoke is advisory, the workflow has pull_request and main-push triggers but no merge_group trigger, and the documented timeout/runtime distinction matches the workflow. The decline rationale is complete and does not alter CI behavior. Injection detection is true because the untrusted diff contains imperative prose (\"Do not re-file\"); it appears to be a maintainer-facing comment and did not influence this review.",
+  "verdict": "approve"
+ }
+}
