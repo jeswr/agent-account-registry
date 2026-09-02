@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6291,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0b1233e483b332623d35b6ad0efe13e04d1b404a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3 says a schedule run can never appear on a merge-authorizing pull_request SHA because a PR head cannot equal its base. That does not establish the claim: schedules run on the default branch head, but a pull request may target a different base branch. For example, a PR whose head is main and whose base is a release branch can have real changes to merge while its head SHA is exactly the SHA used by a scheduled run. The workflow's pull_request trigger shown in the repository is not branch-restricted, and section 6 applies the exclusion to every gate evaluation. Thus the claimed no-op property and the rationale for making the rule unconditional are incomplete.",
+    "file": "research/ci-gate-schedule-event-scoping.md",
+    "fix_hint": "Either scope the exclusion to gate events/target branches for which the PR or merge-group head is demonstrably distinct from the default-branch head, or revise the decision record to analyze and justify exclusion for non-default-base PRs explicitly. Add the corresponding implementation test to the required test list so the chosen behavior is pinned.",
+    "severity": "major",
+    "title": "Safety proof conflates the PR base with the default branch"
+   }
+  ],
+  "progress": null,
+  "summary": "The event-scoping proposal is careful about fail-closed handling and identifies the three relevant exclusion points, but its central safety proof is not valid for every pull_request evaluation as claimed. A scheduled run targets the default branch head, while a pull request's base need not be the default branch; a PR from the default branch into another branch can therefore have a head SHA equal to the scheduled run's SHA while still containing changes to merge. Because the proposed rule is unconditional across all triggers, this unaddressed case invalidates the stated proof that exclusion is vacuous on every merge-authorizing ref.",
+  "verdict": "request_changes"
+ }
+}
