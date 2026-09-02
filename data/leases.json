@@ -23,12 +23,12 @@
   {
    "account": "c0ac92ebee2c590e",
    "claim_id": "6e7c2cce2209401496abdc4e10ba7279",
-   "holder": "fix:sparq-org/sparq#6070@dispatch-33602765350.1",
+   "holder": "fix:sparq-org/sparq#6070@33603691365.1",
    "package": "sparq-lws-core",
    "role": "fix",
    "model": "opus5",
-   "issued_at": 1788334060,
-   "expires_at": 1788340360
+   "issued_at": 1788334091,
+   "expires_at": 1788340391
   }
  ]
 }
