@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6234,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "35a78200c53af535e8fe73ec374d59d48def22d1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new contract says all non-WHERE operations are bounded by operand size and that capping accepted update text bounds INSERT/DELETE DATA, CLEAR/DROP/CREATE/LOAD. That is not true for operations whose operand names existing or external data: a short CLEAR/DROP can act on a store-sized graph or dataset, and LOAD (when an allowlisted base is installed) reads and parses a file whose size is independent of the SPARQL text. The same misleading assurance is repeated in the MCP and skill documentation. This is security-relevant guidance because callers are told how to bound the gap left by QueryBudget, but the proposed mitigation does not cover that gap.",
+    "file": "crates/sparq-solid/src/lib.rs",
+    "fix_hint": "Narrow the documentation to say that QueryBudget does not cover these operations and describe their actual separate limits. At minimum, distinguish inline DATA operations (bounded by request size) from CLEAR/DROP (bounded by affected store size) and LOAD (bounded only if disabled or separately capped). If the API intends to promise a fully bounded update call, reject these operations on the MCP path or add explicit store/load-size cooperative limits, with a test for the chosen policy. Update the matching README and both skill files consistently.",
+    "severity": "major",
+    "title": "Request-text limits do not bound the documented bulk operations"
+   }
+  ],
+  "progress": null,
+  "summary": "The budget is correctly threaded through the variable-graph authorization SELECT and the DELETE/INSERT WHERE apply path, and the tests exercise both real sites with positive controls. However, the new public documentation makes a materially false resource-bound claim: limiting the update text does not bound all non-WHERE operations. A tiny CLEAR/DROP can process or release a store-sized graph/dataset, and an enabled LOAD can read and parse an allowlisted file whose size is unrelated to the request text. This must be corrected so embedders do not mistake the new API for a complete per-call resource bound.",
+  "verdict": "request_changes"
+ }
+}
