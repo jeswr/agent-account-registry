@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2220,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0c4192fae730f10170c9e3cc618c29f46826d24e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_event_rows` computes `via_app = event.get(\"performed_via_github_app\") is not None`, and `label_owner_from_events` then lets `_is_proven_machine(..., via_app, ...)` return MACHINE immediately. Consequently an event with no actor and `performed_via_github_app: false` (or any other non-null malformed scalar) is classified MACHINE and the boolean projection authorizes deletion. Even `{}` is accepted without an App id or slug. This contradicts the new wrapper contract that malformed relevant event shapes are absorbed to UNKNOWN and leaves exactly the trust direction this change is meant to close: absence of valid attributable automation evidence becomes permission. The added App test only exercises a well-formed object, so it does not catch the permissive type/presence check.",
+    "file": "scripts/park_policy.py",
+    "fix_hint": "Validate `performed_via_github_app` as the expected GitHub App object before setting the machine-proof bit; reject malformed non-null values with `MalformedTimelineError` so the I/O wrapper yields UNKNOWN and pure callers can census `read-failed`. Add red tests for at least `false`/scalar and structurally invalid object values, asserting they never produce MACHINE or clearability, while retaining the well-formed App case.",
+    "severity": "blocker",
+    "title": "Malformed App metadata is accepted as positive machine proof"
+   }
+  ],
+  "progress": null,
+  "summary": "The positive-machine split is directionally sound and the new tests cover unknown actors, failed human probes, newest-wins behavior, ties, and the principal consumer seams. However, the new shared authorization still treats any non-null `performed_via_github_app` value as positive App proof. That includes malformed values such as `false`, strings, numbers, and empty objects, despite the wrapper's contract that malformed relevant event shapes become UNKNOWN. Because MACHINE is permission to remove a hold, this remains a fail-open path and must be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
