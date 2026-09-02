@@ -103,7 +103,12 @@ published before #1868 or edited by hand degrades to the old silence instead of 
 5, but the cut is now counted first — `trigger_fires[].evidence_total` is the number of links that
 survived the `https://github.com/` pin, published on every fire including the ones that hid nothing,
 and the page draws a per-FIRE `+7 more` beside the links rather than a card-level note (a
-`showing 5 of 12` above a stack of alarms names none of them). The 8-link cap on the READ is gone
+`showing 5 of 12` above a stack of alarms names none of them). **Both halves of that row count the
+same thing — the links the reader can REACH (#2162).** The anchors are numbered by the order they
+were drawn, not by their position in `evidence`, so a link the page's own `https://github.com/` pin
+refuses (only possible on a hand-edited document — this generator publishes none) closes up instead
+of leaving `evidence 1  evidence 3`, and the last label plus the `+N` beside it is the total.
+The 8-link cap on the READ is gone
 with it: it truncated the list before the pin ran, so a 9th link that was not a github.com URL was
 neither published nor counted by the drop diagnostic that exists to announce exactly that. `evidence`
 itself remains unbounded on the way in, like every other row array here.
