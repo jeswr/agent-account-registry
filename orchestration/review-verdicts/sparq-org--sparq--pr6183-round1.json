@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6183,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "89e8b27e4b184de8f44c0b1947f92e3a0e93594b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `find_violations`, any non-empty inline value is accepted whenever the raw text contains the substring `workflows`. Thus `workflow_run: {workflows: []}` is treated as clean even though the filter is empty, and `workflow_run: {not_workflows: [CI]}` is treated as if it had the required key. Quoted strings/comments containing that word can similarly fool the check. This contradicts the script's stated guarantee of an explicit, non-empty `workflows:` filter and leaves exactly the silent configuration failure this gate is intended to prevent. None of the fixtures tests an inline mapping, so the defective branch is unverified.",
+    "file": "scripts/check-workflow-run-filters.py",
+    "fix_hint": "Parse the flow mapping structurally (including quoted values and comments) and apply the same populated-value validation used for block mappings. Add fixtures that reject `{workflows: []}` and a mapping with only a similarly named key, while accepting `{workflows: [CI], types: [completed]}`.",
+    "severity": "major",
+    "title": "Inline workflow_run mappings bypass the non-empty workflows requirement"
+   }
+  ],
+  "progress": null,
+  "summary": "The new lint does not enforce its stated invariant for flow-style YAML. Its inline `workflow_run` handling only searches for the substring `workflows`, so empty filters and unrelated key names can pass. The self-test table does not exercise this branch, despite the workflow comment claiming each violation branch is covered. This creates a silent false-negative in the gating check it introduces.",
+  "verdict": "request_changes"
+ }
+}
