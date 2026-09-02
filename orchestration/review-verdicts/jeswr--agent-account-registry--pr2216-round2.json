@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2216,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "20cee1359e250a74674ae8e571924858cc196d58",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`enrolled_class_pulls` classifies candidates only by PR author, and `_mint_caller` unconditionally passes `AUTO_IMPL_ALIAS = \"sol\"`. But this diff changes the live impl/site/ci/default routes to `[\"sol\", \"opus5\"]`, explicitly allowing Opus to author when Sol is unavailable. Such an Opus-authored PR is therefore minted as OpenAI/Sol; `REVIEW_CHAIN` then selects Opus as reviewer, so an Anthropic-authored change can receive an Anthropic review while the record falsely satisfies the cross-provider check. The same problem applies to historical Anthropic-authored PRs missing records: there is no creation-time or actual-dispatch evidence check before the constant is recorded. The new self-tests merely assert that the pinned alias resolves to OpenAI and cannot detect this false attestation.",
+    "file": "scripts/auto-mint-provenance.py",
+    "fix_hint": "Bind `impl_provider`/`impl_alias` to trustworthy per-PR dispatch or authorship evidence and refuse when it is absent or inconsistent. At minimum, do not auto-mint a Sol record for PRs that may have been produced by the Opus fallback or by the prior Anthropic-first protocol; add an end-to-end test where an Opus fallback authored the PR and prove the lane either records Anthropic and selects OpenAI review or fails closed.",
+    "severity": "blocker",
+    "title": "The sweep fabricates OpenAI provenance for permitted Anthropic fallback implementations"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe provider inversion is not sound for the implementation routes introduced here. The unattended writer now asserts that every enrolled-author PR was implemented by Sol/OpenAI, while the same diff explicitly permits Opus/Anthropic to implement when Sol is unavailable. That can turn same-provider Opus review into an apparently cross-provider approval. The tests pin the new literals but do not exercise the contradictory fallback-authorship case.",
+  "verdict": "request_changes"
+ }
+}
