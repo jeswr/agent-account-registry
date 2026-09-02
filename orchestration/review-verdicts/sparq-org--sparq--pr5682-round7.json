@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5682,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "198d1c04791776a6c2d46ceef380ad8ca49c28eb",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 7 remains correct and complete on the supplied diff. The five workflow trigger lists consistently retain `labeled`, remove `unlabeled`, and preserve the default pull-request events. The resulting asymmetry is fail-toward-more-work: applying a full-work label immediately re-evaluates scope, while removing it leaves the previously wider result standing only until another subscribed event re-reads the current labels. The workflow comments, ci-select predicate rationale, and branch-protection documentation are mutually consistent, including the distinction between the four guarded ci-select callers and the unguarded vectorized workflow. The focused test reads the real YAML for all five workflows and non-vacuously checks the required and forbidden trigger membership without overstating what static wiring proves. No correctness, soundness, test-validity, security defect, or embedded hostile instruction is evident.",
+  "verdict": "approve"
+ }
+}
