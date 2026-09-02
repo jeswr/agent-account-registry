@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2208,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e273fa9cb6c9cbce2a9e632734093d00ac52bbce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change implements the intended asymmetric concurrency policy without weakening the quarantine path: only `labeled` events share the repository-wide debounce group and preserve the active run, while `unlabeled` and every other declared trigger retain per-issue groups with cancellation. The self-test reads both expressions and the trigger set from the workflow, evaluates every declared event against independently stated expected results, exercises the pre-change and over-collapsed regression shapes, and fail-closes on unsupported syntax. The added evaluator covers the operators and `format()` form actually used by this seam, and its refusal tests include positive and negative controls. I found no correctness, security, or test-validity defect in the diff.",
+  "verdict": "approve"
+ }
+}
