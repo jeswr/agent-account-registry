@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 2138,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "eff3eb15fb381567cbbafb93a64ffdd1309ed981",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The anchor read still ends in `|| true`, so `last` is empty in three distinct situations: (1) all 30 newest runs concluded `action_required`, (2) the workflow has no runs at all (never fired, or its runs aged out of retention), and (3) the `gh api` call itself failed \u2014 5xx, rate limit, network blip \u2014 which `|| true` swallows. The annotation asserts case (1) unconditionally: \"has no accepted run among its newest 30; action_required runs are not liveness evidence\".\n\nControl flow is correct in all three (prev=0 -> stale -> kick, the intended fail-open), so this is a diagnostics defect, not a behaviour defect. But this repo has an explicit norm against exactly this conflation: ci-latency-alert.py's M4 census keeps `not-sampled` and `rejected-jobs-unreadable` as SEPARATE states because a workflow that is INSIDE the population and UNREAD is not the same as one observed rejected. The new comment names M4's alarm as the owner of human recovery, so an annotation that misattributes an API outage to ingestion rejection points the human at the wrong M4 finding. On the registry leg this can also fire up to 5 times per 15-minute tick during a transient API outage.\n\nSame text at dashboard.yml:520 and :580 and metrics.yml:305.",
+    "file": ".github/workflows/dashboard.yml",
+    "fix_hint": "Capture the read's success separately from its emptiness, e.g. replace `|| true` with `if ! last=$(gh api ...); then last=\"\"; read_ok=0; fi`, and emit three distinct messages: read failure, zero runs listed, and newest-30 all `action_required`. Only the third should claim rejection. If that is too much shell for this leg, soften the wording to the observation rather than the cause (\"no accepted run was READ for ${wf} \u2014 the listing was empty, unreadable, or entirely action_required\").",
+    "severity": "minor",
+    "title": "Empty `last` conflates an UNREAD run listing with an observed rejected stream, so the new ::error:: asserts a cause it never established"
+   },
+   {
+    "body": "The rewritten comment states the invariant as \"an accepted run IMPLIES the workflow did its work\". `action_required` is now excluded, but `startup_failure` \u2014 GitHub's conclusion for a run it created and could not start \u2014 is the same counterexample and is left in. A workflow stuck emitting `startup_failure` on every cron fire still reads as permanently live to all three legs: the #922/#1375 blindness one conclusion over.\n\nThe repo already codifies the concept at scripts/dispatch-claim.py:547, `BROKEN_CONCLUSIONS = {\"cancelled\", \"action_required\", \"startup_failure\", \"stale\", ...}` for exactly \"a run that produced nothing\". Minor rather than major because #1375's MEASURED fingerprint is `action_required` + jobs=0 (dashboard-gen.py:4968), so the diff does fix the defect it was scoped to \u2014 but the gap is one line wide and the same outage class.\n\n`cancelled` deserves separate thought before inclusion: singleton concurrency groups cancel superseded runs routinely, and there the surviving run DID work, so blanket-excluding it could over-kick.",
+    "file": ".github/workflows/dashboard.yml",
+    "fix_hint": "Widen to the conclusions meaning \"created but executed nothing\", e.g. `select((.conclusion // \"\") | IN(\"action_required\", \"startup_failure\") | not)`, and add one dashboard-gen.py row per added conclusion mirroring the `[#1375] a fresh action_required run cannot hide ...` pair so the widening is not vacuous. Update the `::error::` wording to name the set. If `startup_failure` is deliberately out of scope, say so beside the filter and reference the issue that carries it \u2014 an undocumented omission reads as an oversight at the next audit.",
+    "severity": "minor",
+    "title": "Only `action_required` is excluded; `startup_failure` (this repo's own BROKEN_CONCLUSIONS set) still counts as liveness"
+   },
+   {
+    "body": "ci-latency-alert.py:306-311 records the false positive this conclusion carries: \"a scheduled run held by an ENVIRONMENT protection rule can also conclude `action_required` \u2014 and this repo does gate privileged jobs on the `dispatch-secrets` environment. That run HAS jobs. Zero jobs is what separates 'GitHub refused to ingest the file' from 'a human has not approved a deployment'\", so M4 confirms `jobs.total_count == 0` before alarming.\n\nEvery workflow on both watch lists (metrics/conflict-resolver/curate/dispatch/groom-core/retriage and the cross-repo sweeper) runs under `environment: dispatch-secrets`. The live-run guard covers the `waiting`/`queued` window, so only SETTLED approval-gated runs reach this filter \u2014 but for those the leg both kicks (producing another run that would be held the same way, once per tick) and prints an annotation stating the cause as ingestion rejection, which is precisely the confirmation M4 refuses to skip. The new comment honestly flags the missing jobs query; the annotation text does not inherit that hedge.\n\nSame text on the two dashboard.yml legs.",
+    "file": ".github/workflows/metrics.yml",
+    "fix_hint": "Either confirm the fingerprint before asserting it (one `actions/runs/{id}/jobs?per_page=1` read on the newest run, only when the anchor came back empty \u2014 the same 'healthy repo pays nothing' shape M4 uses), or reword the annotation to the observable (\"no run concluded other than action_required\") and let M4 own the cause. Behaviour can stay as-is; it is the claim that outruns the evidence.",
+    "severity": "minor",
+    "title": "A settled environment-approval run is indistinguishable from an ingestion rejection here, and the annotation asserts the wrong one"
+   },
+   {
+    "body": "_PUBLISH_KICK_GH_STUB is rewritten to serve the two per_page=30 shapes, and its anchor branch hardcodes `\"conclusion\":\"success\"`. That keeps the three existing `_run_publish_kick` rows (scripts/metrics.py:2376-2388) green, but no row in this file ever supplies an `action_required` run, so metrics.yml's OWN suite never asserts the behaviour the PR exists to add \u2014 the coverage lives entirely in scripts/dashboard-gen.py, which drives metrics.yml's leg as the mesh's third source.\n\nNot vacuous \u2014 I traced the reversion path: deleting the `select(.conclusion != \"action_required\")` from metrics.yml makes the argv miss both stub patterns, hit `*) exit 64`, and (via `|| true`) empty the anchor, so the `last_run_age=60` row at :2381 sees an unexpected dispatch and reds. The mutation is killed, just indirectly and with a confusing message. The concern is locality: a reader of metrics.py sees a stub branch modelling `action_required` routing and no row exercising it.",
+    "file": "scripts/metrics.py",
+    "fix_hint": "Add a `rejected_run=True`-style parameter to `_run_publish_kick` (or a STUB_LAST_RUN_CONCLUSION env) plus two rows mirroring dashboard-gen.py's pair: a fresh `action_required` run ahead of a stale accepted one still kicks, and a pure rejected stream kicks AND emits the `::error::`. Alternatively add a one-line comment above _PUBLISH_KICK_GH_STUB pointing at the dashboard-gen.py rows that own this leg's #1375 coverage, so the branch is not orphaned.",
+    "severity": "minor",
+    "title": "The stub is reshaped to keep passing, but metrics.py's own suite gains no #1375 assertion"
+   },
+   {
+    "body": "The THE ANCHOR block was rewrapped to insert the #1375 paragraph, and the edit ends a line at \"since the\\n# #819 tick\" with roughly half the column budget unused, continuing \"# floor, a within-floor ring concludes ...\" on the next. It reads correctly but scans as a leftover from the hunk rather than deliberate wrapping, in a comment block whose density is otherwise carefully maintained.",
+    "file": ".github/workflows/dashboard.yml",
+    "fix_hint": "Re-flow the paragraph so \"#819 tick floor\" sits on one line, matching the surrounding wrap width.",
+    "severity": "nit",
+    "title": "Comment rewrap leaves `# #819 tick` / `# floor,` split mid-phrase with most of the line unused"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "#1375: the three run-anchored keepalive legs stop reading ingestion-rejected runs (`action_required`, jobs=0 \u2014 M4's fingerprint, ci-latency-alert.py:280-315) as liveness. All three readers change consistently \u2014 dashboard.yml's registry leg (:513), its cross-repo sparq leg (:576), metrics.yml's third mesh leg (:301) \u2014 swapping `.workflow_runs[0].created_at` over per_page=1 for `[... | select(.conclusion != \"action_required\") | .created_at] | max // empty` over per_page=30.\n\nSemantics re-verified: `_utc_iso` and GitHub both emit fixed-width `...Z` stamps, so lexicographic `max` is chronological; `[] | max` is null and `null // empty` yields the empty string, so a fully-rejected stream falls to prev=0 and kicks (documented fail-open preserved). In-progress runs carry `conclusion: null` and pass the filter, so #559's fail-open is unchanged, and `waiting`/`queued` approval holds are still caught by the live guard ahead of it. per_page=30 is no truncation risk at the watched cadences (900-3600s). dispatch.yml's marker anchor and ingestion-alarm.yml's detector read are correctly untouched. No permissions/token/pinning change; `${wf}` comes from the hardcoded spec list, so the annotation adds no injection surface.\n\nTest validity: not vacuous. Deleting the `select(...)` makes the argv miss both stub branches, hit the stub's `exit 64`, and the new `code = 64 if \"gh-stub: unexpected argv:\" in log` promotion turns production's `|| true` swallow into a red row; the fresh-rejected-ahead-of-stale-accepted rows also assert the outcome semantically, and the pure-rejected rows pin the literal `::error::` through all three real leg bodies. Fixture annotations stay contained: check() prints `{got!r}`, so no `::error::` reaches a line start.\n\nRemaining issues are the prior round's four plus one adjacent minor; none blocking. No commits since round 3, hence stagnant.",
+  "verdict": "approve"
+ }
+}
