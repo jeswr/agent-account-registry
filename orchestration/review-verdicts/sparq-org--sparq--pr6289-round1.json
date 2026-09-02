@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6289,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "669321c4a0f11865551782c3a39f482ed1c79460",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The merge-group override is correctly enforced in both the reusable workflow and the selector itself, takes precedence over shadow mode, and preserves the classify-only early-return behavior. The executable selector tests are non-vacuous: they demonstrate that the same changed-path input remains selected for pull_request but resolves to full/all-members for merge_group. Documentation accurately records the ordered transition and the still-live ALLGREEN setting. The three selector tests passed locally; the wiring test module could not run in this checkout because PyYAML is unavailable, which is an environment dependency rather than a defect in the change.",
+  "verdict": "approve"
+ }
+}
