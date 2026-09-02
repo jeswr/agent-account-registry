@@ -2578,9 +2578,18 @@ def _collect_defuse_prs(
     now: int,
     stale_seconds: int,
     bot_login: str,
-) -> dict[tuple[str, int], tuple[str, str]]:
-    """Collect live safe-class parked PRs; an unreadable latch skips only that PR."""
+) -> tuple[dict[tuple[str, int], tuple[str, str]], tuple[str, ...]]:
+    """Collect live safe-class parked PRs; an unreadable latch defers only that PR.
+
+    Returns the candidates AND that repo's per-PR deferrals, because the deferrals are an
+    EXIT-STATUS input, not just log text ([#1650] review round 1). This read is where the defuse
+    phase takes an object up, so a candidate lost here has to reach `phase_exit_failure` through
+    the same `deferred` tuple as one lost at the mutation boundary; dropped on the floor, "every
+    admissible parked PR failed its latch read" reported as an outcome of (0 changed, 0 attempted,
+    no deferrals) — byte-identical to "this tick had no parked PRs" — and exited green.
+    """
     candidates: dict[tuple[str, int], tuple[str, str]] = {}
+    deferrals: list[str] = []
     for number, listed in sorted(pulls.items()):
         try:
             if _parked_pr_snapshot(listed, now, stale_seconds, bot_login) is None:
@@ -2600,15 +2609,21 @@ def _collect_defuse_prs(
             # timestamp shapes straight off a listing payload, so a plain TypeError/KeyError on one
             # malformed row is the reachable case.
             #
-            # The loudness available HERE is the ALERT alone: collection has no PhaseOutcome, so
-            # there is no `deferred` tuple to append to and no exit precedence to feed. That is
-            # unchanged from the GroomError path this replaces — deliberately, because inventing a
-            # new exit-status input for this site is a different decision from fixing the boundary.
-            print(f"ALERT PR {repo}#{number}: {_deferral_detail(exc)} — defuse deferred")
+            # [#1650 review round 1] The ALERT is NOT the loudness this site gets to stop at.
+            # Broadening the catch is what made that a live exit-zero-swallows-failure hole: a
+            # repeating malformed listing row used to escape and red the run (before that, loudly;
+            # after the per-repo handler widened, as a recorded snapshot deferral), and a catch
+            # that records nowhere converted it into a green sweep. So the deferral is RETURNED,
+            # and run_sweep feeds it to this phase's `deferred` tuple — precedence rule 2's
+            # disjunction on `deferred` exists for exactly this shape, a per-object failure in a
+            # READ that happens before the object is counted as attempted.
+            detail = _deferral_detail(exc)
+            print(f"ALERT PR {repo}#{number}: {detail} — defuse deferred")
+            deferrals.append(f"{repo}#{number}: {detail}")
             continue
         if snapshot is not None:
             candidates[(repo, number)] = snapshot
-    return candidates
+    return candidates, tuple(deferrals)
 
 
 def _gh_failure_detail(result: Any, token: str) -> str:
@@ -2690,15 +2705,19 @@ def phase_exit_failure(outcome: PhaseOutcome) -> str | None:
     Rule 2 fires on `deferred` as well as on `attempted` (issue #647). A phase whose per-object
     failure happens in a READ — before it counts the object as attempted — must not be able to
     report nothing-completed-and-something-failed as green; the disjunction makes that swallow
-    unrepresentable rather than merely unlikely. It is a no-op for the defuse phase, which counts
-    the attempt before anything it records as a deferral.
+    unrepresentable rather than merely unlikely. It is LOAD-BEARING for the defuse phase as of
+    [#1650] review round 1, which is where the swallow was actually found: both of that phase's
+    READ boundaries — collection's live-latch read and the mutation boundary's re-read — record a
+    deferral without an attempt, so "every admissible parked PR failed its read" reaches rule 2
+    through `deferred` alone. Until then those two sites recorded nowhere, and an all-failed defuse
+    phase returned the same empty outcome as an idle one.
 
     A deliberate SKIP counts as a COMPLETED object, not a failure: a phase that correctly decided
     to do nothing to every object it saw is a working phase (this is what keeps rule 2 from
-    red-flagging, say, a hand-off loop whose every candidate was revalidated away). Defuse keeps
-    its own narrower counting — deferrals from its PRE-redraft revalidation are recorded nowhere,
-    since those reads already failed closed per PR before #644 and counting them would change an
-    unrelated path's status semantics.
+    red-flagging, say, a hand-off loop whose every candidate was revalidated away). The distinction
+    from the paragraph above is the whole point: defuse's revalidated-away SKIP still records
+    nothing, because the read SUCCEEDED and the phase decided; a read that REFUSED decided nothing
+    and is a deferral.
     """
     if outcome.unavailable:
         return (
@@ -3334,6 +3353,7 @@ def _execute_defuse_actions(
     now: int,
     stale_seconds: int,
     bot_login: str = "",
+    collection_deferrals: tuple[str, ...] = (),
 ) -> DefuseOutcome:
     """Revalidate and redraft bounded safe-class actions, then write one audit comment.
 
@@ -3344,10 +3364,15 @@ def _execute_defuse_actions(
     on every run for hours. A PR that cannot be converted to draft is not a reason to stop
     reclaiming dead leases. The failures are RECORDED, not swallowed: defuse_exit_failure decides
     the run's exit status from this outcome once the sweep has finished.
+
+    "RECORDED" is now literal for EVERY per-PR failure this phase can suffer ([#1650] review round
+    1). `collection_deferrals` carries in the PRs `_collect_defuse_prs` could not even take up, and
+    the mutation-boundary re-read below appends its own; both used to vanish, which let an
+    all-candidates-failed phase report the same (0, 0, ()) outcome as an idle one and exit green.
     """
     changed = 0
     attempted = 0
-    deferred: list[str] = []
+    deferred: list[str] = list(collection_deferrals)
     unavailable: list[str] = []
     for action in actions:
         if action.mode != "defuse":
@@ -3374,10 +3399,19 @@ def _execute_defuse_actions(
             # See _execute_age_unpark_actions' handler for the canonical rationale: a
             # non-GroomError escaping here aborts run_sweep before _release_claims — the #644
             # head-of-line abort in the very phase #644 was raised for, reached through a
-            # different exception class. Accounting is unchanged: this PR left the phase BEFORE
-            # `attempted` counted it, exactly as the revalidated-away SKIP below does.
+            # different exception class.
+            #
+            # [#1650 review round 1] The deferral IS recorded, and deliberately WITHOUT counting
+            # the PR as `attempted` — this read failed, so the phase never took the object up.
+            # That is the shape precedence rule 2's `attempted or deferred` disjunction was
+            # written for: a revalidation that refuses for EVERY candidate now reds the run
+            # (nothing completed, something failed) instead of reporting an empty phase, while one
+            # refusal alongside a completed redraft stays rule 3's green per-PR ALERT. The
+            # revalidated-away SKIP below is NOT this case — it is a completed decision, not a
+            # failure, and still records nothing.
             detail = _deferral_detail(exc)
             print(f"ALERT PR {action.repo}#{action.number}: {detail} — defuse deferred")
+            deferred.append(f"{action.repo}#{action.number}: {detail}")
             continue
         if snapshot != (action.head_sha, action.updated_at):
             print(
@@ -4030,6 +4064,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     issues: dict[str, dict[int, dict[str, Any]]] = {}
     pulls: dict[str, dict[int, dict[str, Any]]] = {}
     attempts: dict[tuple[str, int], int] = {}
+    # [#1650 review round 1] The defuse phase's READ-side deferrals, accumulated across repos and
+    # handed to `_execute_defuse_actions` so they land in the SAME `deferred` tuple as its
+    # mutation-side ones. Not a second PhaseOutcome: collection is the defuse phase taking an
+    # object up, and splitting it off would let one half report green while the other failed.
+    defuse_collection_deferrals: list[str] = []
     stale_prs: dict[tuple[str, int], str] = {}
     # [registry #1598] The aged worker orphans this sweep has NO disposition for — non-drafts with
     # no admissible provenance record whose merge state is not one BAD_MERGE_STATES names. Kept as
@@ -4089,7 +4128,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             repo_pulls = _consistent_snapshot(
                 lambda: _pulls(api, repo), repo, reread_budget
             )
-            repo_defuse = _collect_defuse_prs(
+            repo_defuse, repo_defuse_deferrals = _collect_defuse_prs(
                 api, repo, repo_pulls, now, defuse_stale_seconds, bot_login
             )
         except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #1650)
@@ -4112,6 +4151,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         issues[repo] = repo_issues
         pulls[repo] = repo_pulls
         defuse_prs.update(repo_defuse)
+        defuse_collection_deferrals.extend(repo_defuse_deferrals)
         for number, issue in issues[repo].items():
             # THE SWEEP'S DOMINANT COST (registry #1303). One request per commented issue, every
             # tick, against the partition every other lane's `issues`/`pulls` reads also draw on
@@ -4644,7 +4684,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     )
 
     defuse_outcome = _execute_defuse_actions(
-        pull_actions, groomable, target_tokens, now, defuse_stale_seconds, bot_login
+        pull_actions, groomable, target_tokens, now, defuse_stale_seconds, bot_login,
+        collection_deferrals=tuple(defuse_collection_deferrals),
     )
 
     (unpark_outcome, unpark_count, converge_count, stalled_count,
@@ -6079,13 +6120,25 @@ def _self_test() -> int:
             return {}
 
     defuse_api = _DefuseAPI()
-    defuse_candidates = _collect_defuse_prs(
+    defuse_candidates, defuse_collect_deferrals = _collect_defuse_prs(
         defuse_api,
         "owner/repo",
         defuse_details,
         defuse_now,
         defuse_stale_seconds,
         DEFUSE_BOT_LOGIN,
+    )
+    check(
+        "[#1650 rr1] the collection's returned deferrals are EXACTLY the PRs whose latch read "
+        "REFUSED (#8 auto_merge unknown, #9 merge-latch unknown) — every DECLINED PR in this "
+        "twenty-row fixture, #7's live auto-merge included, is a completed decision and appears "
+        "nowhere. Widen this to cover declines and rule 2 reds a sweep whose every candidate was "
+        "correctly left alone; drop it and an unreadable latch stops reaching the exit status",
+        defuse_collect_deferrals,
+        (
+            "owner/repo#8: parked pull request auto_merge state is unknown",
+            "owner/repo#9: parked pull request merge-latch state is unknown",
+        ),
     )
     check(
         "#548 tripwire (b): a recently-active parked PR is NOT defused",
@@ -6196,31 +6249,36 @@ def _self_test() -> int:
     collect_pulls = {30: _defuse_pull(30), 31: _defuse_pull(31)}
 
     class _CollectBoundaryAPI:
-        """Both PRs are admissible; #30's LIVE latch read raises whatever it was handed."""
+        """Both PRs are admissible; the named ones' LIVE latch read raises what it was handed."""
 
-        def __init__(self, failure: BaseException) -> None:
+        def __init__(self, failure: BaseException, failing: set[int]) -> None:
             self.failure = failure
+            self.failing = failing
 
         def request(self, method, path, body=None, allow_404=False, **_kwargs):
             if method == "GET":
                 return collect_pulls.get(int(path.rsplit("/", 1)[1]))
             if path == "/graphql":
-                if body["variables"]["number"] == 30:
+                if body["variables"]["number"] in self.failing:
                     raise self.failure
                 return {"data": {"repository": {"pullRequest": {
                     "mergeQueueEntry": None, "autoMergeRequest": None}}}}
             raise AssertionError("defuse collection must never write")
 
-    def _collect_with(failure: BaseException) -> tuple[set[tuple[str, int]], str, str]:
-        """(candidates, escaped exception name, operator log) for one collection over the pair."""
+    def _collect_with(
+        failure: BaseException, failing: set[int] | None = None
+    ) -> tuple[set[tuple[str, int]], tuple[str, ...], str, str]:
+        """(candidates, deferrals, escaped exception name, log) for one collection over the pair."""
         log = io.StringIO()
         saved = sys.stdout
         sys.stdout = log
         escaped = ""
         found: dict[tuple[str, int], tuple[str, str]] = {}
+        collected_deferrals: tuple[str, ...] = ()
         try:
-            found = _collect_defuse_prs(
-                _CollectBoundaryAPI(failure), "owner/repo", collect_pulls,
+            found, collected_deferrals = _collect_defuse_prs(
+                _CollectBoundaryAPI(failure, {30} if failing is None else failing),
+                "owner/repo", collect_pulls,
                 defuse_now, defuse_stale_seconds, DEFUSE_BOT_LOGIN,
             )
         except Exception as exc:  # noqa: BLE001 — the ESCAPE is the observation (issue #1650)
@@ -6232,9 +6290,9 @@ def _self_test() -> int:
             escaped = type(exc).__name__
         finally:
             sys.stdout = saved
-        return set(found), escaped, log.getvalue()
+        return set(found), collected_deferrals, escaped, log.getvalue()
 
-    collect_found, collect_escaped, collect_log = _collect_with(parse_ts_failure)
+    collect_found, collect_deferrals, collect_escaped, collect_log = _collect_with(parse_ts_failure)
     check(
         "MUTATION #1650 (defuse collection): a NON-GroomError out of the head-of-line candidate's "
         "LIVE latch read defers only THAT PR — #31 is still collected and the call RETURNS. "
@@ -6249,19 +6307,67 @@ def _self_test() -> int:
         ),
         ("", {("owner/repo", 31)}, True, True, True),
     )
-    _leaky_collected, _leaky_escaped, collect_leaky_log = _collect_with(_leaky_failure())
+    check(
+        "[#1650 rr1] the deferred PR is RETURNED as an exit-status input, not just ALERTed — "
+        "delete the `deferrals.append` and the log line still prints while the phase forgets #30",
+        collect_deferrals,
+        (f"owner/repo#30: {parse_ts_failure}",),
+    )
+    # THE ALL-FAILED COLLECTION, carried END TO END to the exit status ([#1650] review round 1).
+    # This is the swallow the round-1 review found, and it is invisible to the row above: with #31
+    # succeeding, rule 3 leaves the run green either way, so a collection that returned its
+    # deferrals and a run_sweep that dropped them on the floor read identically. When EVERY
+    # admissible PR fails its latch read, `_plan_actions` gets no candidates and the phase executes
+    # NOTHING — so the deferrals are the only surviving evidence, and rule 2 has to red on them
+    # alone. Driven through the REAL `_execute_defuse_actions` with the empty action list
+    # production hands it in exactly this situation.
+    all_collect_found, all_collect_deferrals, _all_collect_escaped, _all_collect_log = (
+        _collect_with(parse_ts_failure, failing={30, 31})
+    )
+    all_collect_outcome = _execute_defuse_actions(
+        [], {}, {}, defuse_now, defuse_stale_seconds, DEFUSE_BOT_LOGIN,
+        collection_deferrals=all_collect_deferrals,
+    )
+    all_collect_reason = defuse_exit_failure(all_collect_outcome)
+    check(
+        "MUTATION #1650 (review round 1): EVERY admissible parked PR failing COLLECTION is "
+        "systemic — no candidate survives, the phase attempts nothing, and rule 2 reds the run "
+        "off the deferrals ALONE, naming both PRs. Drop the collection deferrals anywhere on the "
+        "path (the `deferrals.append`, the return value, run_sweep's `extend`, or the "
+        "`collection_deferrals=` argument) and this all-failed sweep exits GREEN",
+        (
+            all_collect_found,
+            len(all_collect_deferrals),
+            (all_collect_outcome.changed, all_collect_outcome.attempted),
+            all_collect_outcome.unavailable,
+            all_collect_reason is not None,
+            "every parked PR defuse failed (0 attempted, 0 completed)" in (all_collect_reason or ""),
+            "owner/repo#30" in (all_collect_reason or "")
+            and "owner/repo#31" in (all_collect_reason or ""),
+        ),
+        (set(), 2, (0, 0), (), True, True, True),
+    )
+    _leaky_collected, _leaky_deferrals, _leaky_escaped, collect_leaky_log = _collect_with(
+        _leaky_failure()
+    )
     check(
         "#1650 (defuse collection): THIS handler's deferral goes through the masking contract — "
         "credential SHAPE masked, collapsed to ONE line, truncated at the bound (the raiser's "
         "message spans three lines and is over 5000 characters). Wire this one call site back to "
         "`str(exc)`, leaving the shared helper untouched, and the raw token, both newlines and all "
-        "5000 characters reach the operator log",
+        "5000 characters reach the operator log — and, since [#1650] review round 1, the "
+        "`deferred` entry the EXIT REPORT quotes as well",
         (
             "ghs_deferralleak87654321" in collect_leaky_log,
             [line for line in collect_leaky_log.splitlines()
              if line.startswith("ALERT PR owner/repo#30:")],
+            _leaky_deferrals,
         ),
-        (False, [f"ALERT PR owner/repo#30: {leaky_detail} — defuse deferred"]),
+        (
+            False,
+            [f"ALERT PR owner/repo#30: {leaky_detail} — defuse deferred"],
+            (f"owner/repo#30: {leaky_detail}",),
+        ),
     )
 
     empty_plan_args = (
@@ -6605,8 +6711,9 @@ def _self_test() -> int:
         (False, [21, 22], 0, 2, True),
     )
     check(
-        "#644: a phase with NO attempted candidate is green (an unreadable latch already defers "
-        "per PR by design; that unrelated path's status semantics are unchanged)",
+        "#644: a phase with NO candidate at all is green — nothing attempted, nothing deferred, "
+        "nothing to report (this is the row an all-failed phase must NOT be able to imitate; "
+        "[#1650] review round 1 pins the distinguishing direction immediately below)",
         defuse_exit_failure(DefuseOutcome()),
         None,
     )
@@ -6629,8 +6736,9 @@ def _self_test() -> int:
         "MUTATION #1650 (defuse revalidation): a NON-GroomError re-reading the head-of-line "
         "candidate defers only THAT PR — #22 is still redrafted and audited, and the phase RETURNS "
         "(narrow this handler back to `except GroomError` and the exception escapes run_sweep "
-        "before _release_claims). #21 left the phase before `attempted` counted it, exactly as the "
-        "revalidated-away SKIP does, so the phase reports 1 of 1 and stays green",
+        "before _release_claims). #21 failed a READ, so it is RECORDED as a deferral WITHOUT being "
+        "counted as attempted ([#1650] review round 1) — the phase reports 1 attempted, 1 "
+        "completed, 1 deferred, and rule 3 keeps it green because #22 completed",
         (
             reval_aborted,
             reval_drafted,
@@ -6639,7 +6747,74 @@ def _self_test() -> int:
             if reval_out else "aborted",
             defuse_exit_failure(reval_out) if reval_out else "aborted",
         ),
-        (False, [22], ["/repos/owner/repo/issues/22/comments"], (1, 1, (), ()), None),
+        (
+            False,
+            [22],
+            ["/repos/owner/repo/issues/22/comments"],
+            (1, 1, (f"owner/repo#21: {parse_ts_failure}",), ()),
+            None,
+        ),
+    )
+    # THE ALL-FAILED REVALIDATION, the second half of the round-1 swallow. Distinct from the
+    # collection case above and not implied by it: this boundary sits in a DIFFERENT function,
+    # after `_plan_actions` has already admitted the candidates, and its deferral is what makes
+    # rule 2's `attempted or deferred` disjunction fire when `attempted` is still 0. The row above
+    # cannot see it — #22 completes there, so rule 3 returns None whether or not #21 was recorded.
+    all_reval_api = _RedraftAPI()
+    all_reval_api.revalidate_failures = {21: parse_ts_failure, 22: parse_ts_failure}
+    all_reval_out, all_reval_aborted, all_reval_drafted = _run_defuse(
+        all_reval_api, failing=set()
+    )
+    all_reval_reason = defuse_exit_failure(all_reval_out) if all_reval_out else None
+    check(
+        "MUTATION #1650 (review round 1): EVERY candidate failing the mutation-boundary RE-READ is "
+        "systemic — nothing is redrafted, nothing is audited, `attempted` never leaves 0, and rule "
+        "2 reds the run off the deferrals ALONE, naming both PRs. Delete this handler's "
+        "`deferred.append` and a phase that defused nothing at all exits GREEN",
+        (
+            all_reval_aborted,
+            all_reval_drafted,
+            all_reval_api.comments,
+            (all_reval_out.changed, all_reval_out.attempted, all_reval_out.unavailable)
+            if all_reval_out else "aborted",
+            len(all_reval_out.deferred) if all_reval_out else -1,
+            all_reval_reason is not None,
+            "every parked PR defuse failed (0 attempted, 0 completed)" in (all_reval_reason or ""),
+            "owner/repo#21" in (all_reval_reason or "")
+            and "owner/repo#22" in (all_reval_reason or ""),
+        ),
+        (False, [], [], (0, 0, ()), 2, True, True, True),
+    )
+    # The SKIP is NOT a deferral, and that boundary is what keeps the two rows above honest. A
+    # candidate revalidated AWAY (head or activity moved under us) had its read SUCCEED and the
+    # phase DECIDE; recording it would red every tick on which a worker simply pushed a commit
+    # between planning and the mutation boundary. Only a REFUSED read defers.
+    skip_api = _RedraftAPI()
+    skip_api.pulls = {
+        number: {**_defuse_pull(number), "head": {"sha": "f" * 40}} for number in (21, 22)
+    }
+    skip_actions = [
+        PullAction(
+            repo="owner/repo", number=number, reason="terminally parked and quiet",
+            mode="defuse", head_sha="a" * 40,
+            updated_at=skip_api.pulls[number]["updated_at"],
+        )
+        for number in (21, 22)
+    ]
+    skip_out = _execute_defuse_actions(
+        skip_actions, {"owner/repo": skip_api}, {"owner": "owner-target-token"},
+        defuse_now, defuse_stale_seconds, DEFUSE_BOT_LOGIN,
+    )
+    check(
+        "[#1650 rr1] a revalidated-AWAY candidate is a completed DECISION, not a deferral — every "
+        "candidate skipping leaves the phase empty and GREEN (append to `deferred` on the SKIP "
+        "path too and an ordinary mid-tick push reds the sweep)",
+        (
+            skip_api.comments,
+            (skip_out.changed, skip_out.attempted, skip_out.deferred, skip_out.unavailable),
+            defuse_exit_failure(skip_out),
+        ),
+        ([], (0, 0, (), ()), None),
     )
     write_api = _RedraftAPI()
     write_api.comment_errors = {21: parse_ts_failure}
@@ -6713,20 +6888,26 @@ def _self_test() -> int:
         revalidate_failures={21: _leaky_failure()}
     )
     check(
-        "#1650 (defuse revalidation): THIS handler's deferral goes through the masking contract — "
+        "#1650 (defuse revalidation): THIS handler's deferral goes through the masking contract, "
+        "in BOTH the operator log and (since review round 1) the recorded `deferred` entry — "
         "credential SHAPE masked, collapsed to ONE line, truncated at the bound. Wire this one "
-        "call site back to `str(exc)`, leaving the shared helper AND the sibling handler five "
-        "lines below untouched, and the raw token, both newlines and all 5000 characters reach "
-        "the operator log",
+        "call site back to `str(exc)`, leaving the shared helper AND the sibling handler below "
+        "untouched, and the raw token, both newlines and all 5000 characters reach the operator "
+        "log AND the exit reason",
         (
             "ghs_deferralleak87654321" in leaky_reval_text,
             [line for line in leaky_reval_text.splitlines()
              if line.startswith("ALERT PR owner/repo#21:")],
             # The phase still COMPLETED #22, so this really is the revalidation site and not the
-            # mutation pair leaking through a mis-wired fixture.
-            (leaky_reval_out.changed, leaky_reval_out.deferred) if leaky_reval_out else "aborted",
+            # mutation pair leaking through a mis-wired fixture: #21 never reached `attempted`.
+            (leaky_reval_out.changed, leaky_reval_out.attempted, leaky_reval_out.deferred)
+            if leaky_reval_out else "aborted",
         ),
-        (False, [f"ALERT PR owner/repo#21: {leaky_detail} — defuse deferred"], (1, ())),
+        (
+            False,
+            [f"ALERT PR owner/repo#21: {leaky_detail} — defuse deferred"],
+            (1, 1, (f"owner/repo#21: {leaky_detail}",)),
+        ),
     )
     leaky_defuse_out, leaky_defuse_text = _leaky_defuse(comment_errors={21: _leaky_failure()})
     check(
@@ -8172,6 +8353,40 @@ def _self_test() -> int:
             "detect_outcome", "repair_outcome", "defuse_outcome", "stale_outcome",
             "unpark_outcome", "snapshot_outcome", "budget_outcome", "reap_outcome",
         ])))
+
+    # [#1650 review round 1] THE COLLECTION SEAM, on the same parsed module and for the same
+    # reason. `_collect_defuse_prs` now RETURNS its per-PR deferrals, and every behavioural row
+    # above drives that function (or `_execute_defuse_actions`) DIRECTLY — so run_sweep unpacking
+    # the deferrals and then never handing them on, or handing on a literal `()`, leaves the whole
+    # #1650 block green while production swallows exactly the failure it was written for. The three
+    # links of the chain are pinned as source, EXACTLY: the unpack binds a name, that name is
+    # extended from it, and the SAME accumulator reaches the phase's `collection_deferrals`.
+    _collect_unpack = sorted(
+        ast.unparse(node.targets[0])
+        for node in ast.walk(_sweep_fn) if isinstance(node, ast.Assign)
+        if isinstance(node.value, ast.Call)
+        and getattr(node.value.func, "id", "") == "_collect_defuse_prs")
+    _collect_extend = sorted(
+        f"{ast.unparse(node.value.func)}({', '.join(ast.unparse(a) for a in node.value.args)})"
+        for node in ast.walk(_sweep_fn) if isinstance(node, ast.Expr)
+        if isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func).startswith("defuse_collection_deferrals."))
+    _defuse_carried = sorted(
+        ast.unparse(keyword.value)
+        for node in ast.walk(_sweep_fn) if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "_execute_defuse_actions"
+        for keyword in node.keywords if keyword.arg == "collection_deferrals")
+    check(
+        "[#1650 rr1] run_sweep WIRES the collection deferrals through: it unpacks them, extends "
+        "the per-sweep accumulator with them, and hands that accumulator (never a literal) to the "
+        "defuse phase",
+        (_collect_unpack, _collect_extend, _defuse_carried),
+        (
+            ["(repo_defuse, repo_defuse_deferrals)"],
+            ["defuse_collection_deferrals.extend(repo_defuse_deferrals)"],
+            ["tuple(defuse_collection_deferrals)"],
+        ),
+    )
 
     # Orphan repair: closed-unmerged worker PRs strip every status label ('complete' adds nothing),
     # and a dead review loop leaves status:in-progress-review. Both are recoverable ONLY when the
@@ -9731,6 +9946,81 @@ def _self_test() -> int:
             (True, True, True),
         )
         terminal_sweep_env.update(pulls=[], gets={})
+
+        # ---- [#1650] review round 1: the same rule 2, reached through COLLECTION -----------------
+        # The scenario above proves rule 2 for a candidate that was PLANNED and then failed. The
+        # round-1 review found the hole one step earlier: when the collection read itself refuses,
+        # NO candidate is planned, `_execute_defuse_actions` runs over an empty action list, and
+        # the phase reported (0 changed, 0 attempted, no deferrals) — byte-identical to a tick with
+        # no parked PRs — so a repeating malformed payload or refused latch read exited GREEN while
+        # a real parked PR sat ready-for-review forever.
+        #
+        # It has to be driven through the REAL run_sweep, and this is the ONLY row that can be:
+        # every unit row above calls `_collect_defuse_prs` or `_execute_defuse_actions` directly,
+        # so run_sweep accumulating the returned deferrals under a condition (`if defuse_prs:` —
+        # exactly the shape that drops the all-failed case) leaves all of them green. MEASURED: as
+        # a conditionally-inert mutant it survived the whole 621-check suite until this row existed
+        # (AGENTS.md pre-flight item 3). The AST wiring pin cannot see it either — the call is
+        # still there, just guarded.
+        #
+        # Same lease, same PR, same reclaim requirement as #644's: the refusal must not cost the
+        # sweep its dead-lease release, and it must not cost the run its exit status.
+        #
+        # That the deferral really travels the COLLECTION path — and not the mutation boundary,
+        # which re-reads the same URL — is established by mutation rather than asserted: making
+        # `_execute_defuse_actions` ignore its `collection_deferrals` argument reds THIS row, and
+        # nothing but a deferral arriving through that argument can produce that. Structurally it
+        # cannot be the boundary either: collection gates on the same read, so a refusal there
+        # leaves `_plan_actions` with no candidate and the boundary with an empty action list.
+        terminal_sweep_leases[:] = [{
+            **base,
+            "claim_id": "f" * 32,
+            "holder": "owner/repo#7@777.1",
+            "issued_at": 1,
+            "expires_at": 2,
+        }]
+        terminal_sweep_env.update(
+            planned_issues=[],
+            fresh_issues={},
+            pulls=[stuck_pr],
+            gets={},
+            # The NON-GroomError of the #774/#1650 boundary instrument, at the collection read of
+            # the one admissible parked PR. `_parked_pr_snapshot` admits it off the LISTING, so the
+            # loop has genuinely taken the PR up before this refusal — a fixture that declined it
+            # earlier would assert nothing about the deferral path.
+            http_failures={("GET", "/repos/owner/repo/pulls/21"): parse_ts_failure},
+            writes=[],
+        )
+        terminal_sweep_releases.clear()
+        collect_sweep_log = io.StringIO()
+        saved_stdout = sys.stdout
+        sys.stdout = collect_sweep_log
+        collect_sweep_error = ""
+        try:
+            _collect_sweep_summary = _terminal_sweep()
+        except GroomError as exc:
+            collect_sweep_error = str(exc)
+        finally:
+            sys.stdout = saved_stdout
+        collect_sweep_output = collect_sweep_log.getvalue()
+        check(
+            "MUTATION [#1650 rr1] END-TO-END: a refused COLLECTION read for the only parked PR "
+            "still reclaims the dead lease, still reaches the SUMMARY, and still exits NON-zero "
+            "naming the phase and the PR — 0 attempted, 0 completed, ONE deferral. Guard "
+            "run_sweep's `extend` on anything (or drop the deferral at any link of the chain) and "
+            "this sweep exits GREEN with the parked PR left ready-for-review",
+            (
+                terminal_sweep_releases,
+                "ALERT PR owner/repo#21:" in collect_sweep_output,
+                "defuse deferred" in collect_sweep_output,
+                "SUMMARY reclaimed=1" in collect_sweep_output,
+                "defused_prs=0 defuse_deferred=1" in collect_sweep_output,
+                "every parked PR defuse failed (0 attempted, 0 completed)" in collect_sweep_error,
+                f"owner/repo#21: {parse_ts_failure}" in collect_sweep_error,
+            ),
+            ([{"f" * 32}], True, True, True, True, True, True),
+        )
+        terminal_sweep_env.update(pulls=[], gets={}, http_failures={})
 
         # ---- issue #647: the SAME head-of-line abort shape in the two OTHER per-object loops -----
         # #644 fixed the defuse phase. The stale-PR hand-off loop and the issue-repair loop kept the
