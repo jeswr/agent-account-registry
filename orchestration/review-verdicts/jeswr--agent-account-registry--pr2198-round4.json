@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2198,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "89dfef5658a45db13883785381ac2d49de5724d1",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 change remains correct and complete within the diff's scope. The newly broadened per-object boundaries preserve the existing fail-closed directions: unreadable snapshots exclude whole repositories, unreadable attempt budgets exclude only their issues from planning, terminal-reap read failures withdraw claims and retain leases, and defuse failures defer only the affected PR while downstream reclamation continues. Arbitrary exception text is consistently passed through the shared bounded, single-line credential-shape mask. Collection- and mutation-boundary defuse failures are now carried into one phase outcome, so an all-failed phase exits non-zero while a successful revalidation skip remains distinct from a refusal. RedraftUnavailable still precedes the broad handler and retains whole-run status. The added fixed-expectation tests independently exercise every production boundary, fail direction, masking call site, all-failed status path, collection wiring seam, and the end-to-end run_sweep path without relying on implementation constants. No reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
