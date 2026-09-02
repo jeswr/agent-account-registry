@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2225,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "81c24ca1d2776f51a8b81f6b0715a5bfeee94f78",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change cleanly adds the workflow event payload's base SHA as a validated, observation-only receipt field without feeding it into the freshness verdict. The workflow seam pins the exact env expression and argv wiring, the receipt parser preserves historical five-field receipts while strictly accepting only the complete appended tail, and gate-base-lead's expectations are updated for the extended producer grammar. The added tests cover renderer validation, old/new receipt parsing, CLI propagation and absence, exact YAML wiring, and the key non-vacuous case where the event base differs from the graded base. No trust check is weakened and no author-controlled text is introduced into shell interpolation.",
+  "verdict": "approve"
+ }
+}
