@@ -113,7 +113,11 @@ is still sanitized and cut at 240 characters, but `trigger_fires[].summary_lengt
 pre-cap character count of that sanitized text, published on every fire including the ones that fit,
 and the page draws an ELLIPSIS with the withheld count in its title rather than a `showing 240 of
 900` note — a statistic under a sentence that stops mid-word is not what the reader of that sentence
-needs. The length is counted after `strip()`, over exactly the string that was cut, and a summary
+needs. The UNIT is a Unicode CODE POINT on both sides of the wire — the cut is `text[:240]` and
+the count is `len()` — so a consumer must measure the string it drew the same way: JavaScript's
+`String.length` counts UTF-16 code units, which weighs an emoji twice and would leave a genuinely
+capped summary comparing 480 against 241 and drawing no marker at all. The length is counted after
+`strip()`, over exactly the string that was cut, and a summary
 REFUSED whole (a non-printable one — a control-character injection risk, not a long sentence)
 reports **0**, never its length: truncation and refusal are different facts, and a length beside an
 empty string would draw a cut marker on a value that was never cut. Like the totals above this is an

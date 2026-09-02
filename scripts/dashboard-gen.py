@@ -1859,6 +1859,15 @@ def _obs_text_capped(value, cap):
     page can then say HOW MUCH was withheld, and a count is checkable against the slice beside it,
     where a producer-supplied boolean is an assertion nothing on the page can contradict.
 
+    The UNIT is a Unicode CODE POINT, on both sides of the wire: `text[:cap]` cuts code points and
+    `len()` counts them, so the consumer has to measure the string it DREW the same way. It is named
+    here because the runtimes disagree by default — JavaScript's `String.prototype.length` counts
+    UTF-16 code units, which weighs an astral character (an emoji) twice — and a count compared
+    against a length in the other unit is worse than no count: a 241-emoji summary cut to 240 weighs
+    480 there against 241 here, `length > shown` reads false, and the page draws NOTHING on exactly
+    the alarm that was cut. `dashboard/app.js` uses `Array.from(...).length`; the astral rows in the
+    self-test are what hold the two units together — an ASCII suite cannot tell them apart.
+
     Two decisions the self-tests pin, both in the direction that keeps this honest:
 
     - It is the length of the SANITIZED text — after `str()`/`strip()`, over exactly the string that
@@ -7768,6 +7777,11 @@ esac
     # a cap moved by one reds the slice rather than passing on a length that still reads 900.
     _LONG_SUMMARY = "x" * 239 + "CUT" + "y" * 658          # 900 characters
     _CUT_SUMMARY = "x" * 239 + "C"                         # ...of which 240 are published
+    # The unit this whole affordance is denominated in, made testable: an ASTRAL character (one
+    # code point, TWO UTF-16 code units). `len()` and `text[:240]` count code points, so the count
+    # on the wire is code points and the page has to measure the string it drew in the same unit —
+    # an ASCII-only suite cannot tell the two units apart and so cannot see a page that does not.
+    _ASTRAL = "\U0001F600"
 
     def obs_summary(value):
         """(published `summary`, its `summary_length`) for one fire carrying `value`."""
@@ -7813,6 +7827,12 @@ esac
     check("[#2161] the length counts the STRIPPED text the cut is applied to, never the raw input — "
           "a length read before `strip()` says 306 where 300 characters were published",
           obs_summary("   " + "w" * 300 + "   "), ("w" * 240, 300))
+    # ...and both the cut and the count are in CODE POINTS. Pinned here because it is the unit the
+    # page is held to below: a count in UTF-16 code units reads 482 for this input, and a cut in
+    # them would publish 120 emoji.
+    check("[#2161] an astral summary is cut and counted in CODE POINTS — 241 emoji publish 240 "
+          "emoji beside a length of 241, never the 482 a UTF-16 code-unit count reports",
+          obs_summary(_ASTRAL * 241), (_ASTRAL * 240, 241))
     # ...and THE PAGE IS WHAT THIS HAS TO DELIVER INTO (pre-flight item 11): a count published into
     # site/data.json that no panel renders leaves the operator exactly where the issue found them.
     # The affordance is deliberately NOT #1868's `showing 240 of 900` — a statistic under a sentence
@@ -7912,11 +7932,38 @@ esac
     # ...beside a card-level total that matches the fires, so the empty `panel` control below is
     # asserting the per-row affordance and not merely inheriting the three-fire total copied above.
     unreachable_summary_doc["trigger_fires_total"] = 2
+    # THE CROSS-RUNTIME SEAM, END TO END THROUGH THE REAL PRODUCER. Every document above is ASCII,
+    # where a code point and a UTF-16 code unit are the same number, so none of them can see a page
+    # that measures the drawn string in `String.prototype.length` while the count on the wire is
+    # Python `len()`. An astral character (one code point, two code units) separates them, and the
+    # separation is not cosmetic — it is a SILENT MISS on the alarm that was actually cut. Three
+    # fires, each a different failure of the unit mismatch, and all three are real
+    # `_normalize_observability` output rather than hand-shaped rows, so the slice, the count and
+    # the marker are asserted across the same seam an operator reads:
+    #   241 emoji  -> 240 published, 1 withheld;  a code-unit page compares 480 against 241 and
+    #                 draws NOTHING on a genuinely capped alarm — the finding's own example.
+    #   120 emoji + 200 'z' -> 240 published, 80 withheld;  a code-unit page compares 360 against
+    #                 320 and again draws nothing, so mixed text hides its cut too.
+    #   10 emoji + 1000 'z' -> 240 published, 770 withheld;  here a code-unit page DOES draw a
+    #                 marker, and it names 760 — the direction that kills a fix applied to the
+    #                 predicate but not to the subtraction (pre-flight item 3: the same guard,
+    #                 deleted and made conditionally inert, are different experiments).
+    astral_page_input = copy.deepcopy(obs_fixture)
+    astral_page_input["trigger_fires"] = [
+        {"rule": "astral-cap-rule", "fired_at": now - 300, "summary": _ASTRAL * 241,
+         "evidence": []},
+        {"rule": "astral-mixed-rule", "fired_at": now - 400,
+         "summary": _ASTRAL * 120 + "z" * 200, "evidence": []},
+        {"rule": "astral-tail-rule", "fired_at": now - 500,
+         "summary": _ASTRAL * 10 + "z" * 1000, "evidence": []}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        astral_page_doc = obs_normalized(astral_page_input)
     summary_page = _executed_page(
         _page_harness("renderObservability", _OBS_SUMMARY_PAGE_BODY),
         {"documents": {"capped": copy.deepcopy(summary_page_doc),
                        "hostile": hostile_summary_doc,
-                       "unreachable": unreachable_summary_doc}})
+                       "unreachable": unreachable_summary_doc,
+                       "astral": astral_page_doc}})
 
     def obs_summary_page(name):
         rendered = summary_page.get(name)
@@ -7936,10 +7983,18 @@ esac
           obs_summary_page("hostile"), ([["abcde", []]] * 8, [], None))
     check("[#2161] EXECUTED page script: the title counts the characters the READER can see, not "
           "the generator's cap — 3 drawn out of 10 collected is `7 further characters`, and a "
-          "`shown` pinned to 240 would draw no marker here at all. The one-character case takes the "
-          "SINGULAR branch, which no document this generator produces can reach",
+          "`shown` pinned to 240 would draw no marker here at all. The second row takes the "
+          "SINGULAR branch of the title",
           obs_summary_page("unreachable"),
           ([["abc", summary_cut(7)], ["abc", summary_cut(1, " is")]], [], None))
+    check("[#2161] EXECUTED page script: the page counts the drawn summary in the producer's UNIT, "
+          "CODE POINTS. 241 emoji cut to 240 draw the marker a UTF-16 `String.length` (480 vs 241) "
+          "silently withholds, 120 emoji before 200 'z' likewise, and the mixed row a code-unit "
+          "page DOES mark names 770 rather than 760",
+          obs_summary_page("astral"),
+          ([[_ASTRAL * 240, summary_cut(1, " is")],
+            [_ASTRAL * 120 + "z" * 120, summary_cut(80)],
+            [_ASTRAL * 10 + "z" * 230, summary_cut(770)]], [], None))
     # ---- [#1880] A FLOW STAT THE COLLECTOR SENT AND THIS BUILD CANNOT READ MUST NOT PUBLISH AS A
     # HEALTHY NUMBER. `_obs_count(...) or 0` mapped every unreadable park/sample count to 0, so
     # `parks_1h: {"needs_user": "lots", "needs_orchestrator": -3}` published `0 user · 0 orch` on
