@@ -7732,11 +7732,38 @@ esac
     # ...beside a card-level total that matches the fires, so the empty `panel` control below is
     # asserting the per-row affordance and not merely inheriting the three-fire total copied above.
     unreachable_evidence_doc["trigger_fires_total"] = 2
+    # [#2162] ...and the ANCHOR LABELS are the other half of that same decision, left disagreeing
+    # with the note by #2009. Numbered by ARRAY index a refused link leaves a HOLE in the sequence —
+    # `evidence 1  evidence 3` numbers a link the reader cannot reach and does not say it was
+    # withheld, and beside a `+N more` that counts what rendered the row describes more links than
+    # its own total holds. Same document class as `unreachable` above and equally unproducible by
+    # this generator, but the refusal must sit in the MIDDLE and at the FRONT: a trailing refusal
+    # renumbers nothing, so a fixture with only that one is an equivalent-survivor harness
+    # (pre-flight item 4). The `evidence_total`s are chosen so labels and note read as ONE sequence:
+    # every row's last label plus its `+N` equals its total.
+    gap_evidence_doc = copy.deepcopy(evidence_page_doc)
+    gap_evidence_doc["trigger_fires"] = [
+        # A hole in the middle: array-index labels read `evidence 1  evidence 3` here.
+        {"rule": "interior-gap-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+         "evidence": [_RUN.format(1), "https://evil.example/exfil", _RUN.format(2)],
+         "evidence_total": 3, "enqueued_task": None},
+        # A hole at the FRONT: array-index labels start the sequence at `evidence 3`, so a fix that
+        # merely closes interior gaps (numbering from the first accepted entry) still reds here.
+        {"rule": "leading-gap-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+         "evidence": ["https://evil.example/exfil", "https://evil.example/two", _RUN.format(3)],
+         "evidence_total": 3, "enqueued_task": None},
+        # The ACCEPT direction on the same stack: with nothing refused the labels are unchanged, so
+        # a mutant that renumbers from zero or labels every anchor alike cannot hide here either.
+        {"rule": "no-gap-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+         "evidence": [_RUN.format(4), _RUN.format(5)], "evidence_total": 2,
+         "enqueued_task": None}]
+    gap_evidence_doc["trigger_fires_total"] = 3
     evidence_page = _executed_page(
         _page_harness("renderObservability", _OBS_EVIDENCE_PAGE_BODY),
         {"documents": {"capped": copy.deepcopy(evidence_page_doc),
                        "hostile": hostile_evidence_doc,
-                       "unreachable": unreachable_evidence_doc}})
+                       "unreachable": unreachable_evidence_doc,
+                       "gaps": gap_evidence_doc}})
 
     def obs_evidence_page(name):
         rendered = evidence_page.get(name)
@@ -7766,6 +7793,17 @@ esac
           obs_evidence_page("unreachable"),
           ([[["evidence 1"], [evidence_note(2)]],
             [["evidence 1"], [evidence_note(1, " is")]]], [], None))
+    check("[#2162] EXECUTED page script: the anchor LABELS count what rendered too, so a refused "
+          "link leaves no HOLE in the sequence — a github.com link, a refusal and a second "
+          "github.com link number `evidence 1  evidence 2`, never the `evidence 1  evidence 3` of "
+          "an array index; two leading refusals still number the one reachable link `evidence 1`, "
+          "never `evidence 3`; and a row with nothing refused is numbered exactly as before. Each "
+          "row's last label plus its `+N more` is its total, which is what the two affordances "
+          "disagreed about",
+          obs_evidence_page("gaps"),
+          ([[["evidence 1", "evidence 2"], [evidence_note(1, " is")]],
+            [["evidence 1"], [evidence_note(2)]],
+            [["evidence 1", "evidence 2"], []]], [], None))
     # ---- [#2161] THE FIRE `summary` IS A DISPLAY CUT TOO — THE LAST SILENT ONE ON THIS PANEL, AND
     # THE ONE NEITHER #1868 NOR #2009 COULD REACH, because it is not an array. A 900-character alarm
     # summary published as 240 characters with NO affordance at all: no marker, no title, and
