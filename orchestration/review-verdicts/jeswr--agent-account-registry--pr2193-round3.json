@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2193,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a17620c02da179493e17a1e05adb24b885cff3cd",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-3 diff remains correct and complete. The producer sanitizes once, publishes the capped summary with an unconditional pre-cap code-point count, reports zero for absent or wholly refused non-printable values, and leaves hostile-input-only log caps unchanged. The renderer measures the text actually drawn with Array.from(...).length, applies the existing fail-closed integer predicate, and computes the hidden count in the same unit. The executed-page evidence is non-vacuous: it uses real normalized producer output, pins capped, quiet, absent, refused, stripped, malformed/legacy, hand-edited, singular, all-astral, and mixed astral/BMP cases, including both a silently missed marker and a wrong subtraction. No embedded instruction directed at the reviewer was detected, and no correctness, security, or test-validity issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
