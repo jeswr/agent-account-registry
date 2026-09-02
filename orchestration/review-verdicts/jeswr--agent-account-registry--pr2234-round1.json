@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2234,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b6eda054d16d94508d471ccfe12e9a7477679077",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 4 and 6 require the audit marker to be posted before label writes, while refusal row 0 says that presence of that marker means the script already corrected the PR and must no-op. If the process dies after POSTing the marker but before deleting the human hold, applying `review:parked`, completing the source-issue transition, or retiring the PR, the public receipt exists but the promised transition is incomplete. On rerun, row 0 refuses before inspecting or completing that state. The document calls receipt-then-label recoverable and consume-exactly-once, but the specified state machine provides no convergence branch analogous to `auto-receipt`/`void-receipt`; it therefore strands an interrupted member permanently. Pointing to the existing `already_reconciled` shape reproduces the problem rather than resolving it.",
+    "file": "research/1997-human-terminal-park-drain.md",
+    "fix_hint": "Specify and test a crash-convergent protocol. For example, make the durable record encode the exact authorized transition/disposition and treat it as an idempotent intent receipt: on rerun, re-read and re-prove the live state, safely finish only the recorded transition, and emit/recognize a distinct completion state. Add interruption tests after each external write (comment, each label delete/add, and retirement steps) proving that reruns either converge to the intended final state or fail closed without falsely declaring the PR already corrected. Also define how a partial source-issue transition is recovered.",
+    "severity": "blocker",
+    "title": "Receipt-first marker makes an interrupted drain permanently non-convergent"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe record is careful about ownership, attestation binding, cap separation, and the over-cap disposition, but its proposed consume-once protocol is not crash-convergent. It prescribes posting the durable marker before label writes and then making that marker the first unconditional refusal. A crash after the comment but before any or all label mutations leaves an explained but still-undrained PR, and every later run refuses it as already reconciled. Because this is the design record's required implementation shape, it would authorize a permanent strand in the exact failure window receipt-first ordering is meant to make recoverable.",
+  "verdict": "request_changes"
+ }
+}
