@@ -2206,15 +2206,46 @@ def _issues(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
     return result
 
 
-def _pull_snapshot(api: GitHubAPI, repo: str, path: str) -> dict[int, dict[str, Any]]:
-    """{number: pull} for a pull listing, with every row validated the same way.
+# [#1745] The page size a KEYED reap read asks for — GitHubAPI.paginate's own, so both halves of
+# the reap boundary are bounded identically. What differs is what happens AT that boundary: the
+# walk pages past it, a keyed read refuses.
+KEYED_READ_PAGE = 100
+
+
+def _complete_page(api: GitHubAPI, path: str, where: str) -> list[Any]:
+    """[#1745] ONE request whose completeness is provable, or a refusal — never a cursor walk.
+
+    A page WALK cannot prove a row's ABSENCE: a row removed between two page reads pulls the rows
+    behind it forward across the cursor boundary, so a still-live row can be missing from the
+    assembled result (STABLE_LISTING_ORDER; #1121 closed the ISSUE half of exactly this, and the
+    same shift applies to any listing of a mutable set, refs included). The reap boundary's keyed
+    corroboration exists precisely to prove an absence, so it reads each listing as a SINGLE
+    request: one server-side answer, with no boundary for a row to shift across.
+
+    The price is that the answer must FIT. A full page is not provably the whole listing, and
+    fetching the next one would reintroduce the very boundary this avoids, so a full page RAISES
+    and the caller defers the reap. That is the fail-closed direction: a partial listing read as
+    complete is read as an ABSENCE, and an absence is what RELEASES a claim."""
+    separator = "&" if "?" in path else "?"
+    page = api.request("GET", f"{path}{separator}per_page={KEYED_READ_PAGE}&page=1")
+    if not isinstance(page, list):
+        raise GroomError(f"{where} is malformed")
+    if len(page) >= KEYED_READ_PAGE:
+        raise GroomError(f"{where} does not fit in one page and cannot be read completely")
+    return page
+
+
+def _pull_snapshot(repo: str, rows: list[Any]) -> dict[int, dict[str, Any]]:
+    """{number: pull} for a pull listing's rows, with every row validated the same way.
 
     Factored out for issue #1745 so the repo-wide open-pull walk and the per-issue keyed read
     below share ONE validator: two copies of a guard make each copy individually unkillable
     (AGENTS.md pre-flight item 4), and this one is what turns a malformed row into a refusal
-    the reap boundary defers on."""
+    the reap boundary defers on. It takes ROWS, not a path, because its two callers disagree
+    about how a listing may be READ — the walk pages, the keyed read takes one complete page —
+    and only the validation is shared."""
     result: dict[int, dict[str, Any]] = {}
-    for pull in api.paginate(path):
+    for pull in rows:
         if not isinstance(pull, dict):
             raise GroomError(f"target pull request snapshot is malformed for {repo}")
         number = pull.get("number")
@@ -2232,7 +2263,7 @@ def _pull_snapshot(api: GitHubAPI, repo: str, path: str) -> dict[int, dict[str, 
 
 def _pulls(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
     return _pull_snapshot(
-        api, repo, _stably_ordered(f"/repos/{repo}/pulls?state=open")
+        repo, api.paginate(_stably_ordered(f"/repos/{repo}/pulls?state=open"))
     )
 
 
@@ -2247,10 +2278,16 @@ def _worker_pulls_for_issue(
     `_pulls` listing whose residual skip (STABLE_LISTING_ORDER: a row removed mid-walk pulls
     later rows forward) can silently drop one still-open row at a page boundary.
 
-    Two KEYED reads, neither a walk over a population that can shift under the cursor:
+    Two KEYED reads, each taken as ONE `_complete_page` request — a listing of matching refs is
+    still a listing of a MUTABLE set, so reading it by cursor walk would import the very skip
+    this is here to corroborate away. Neither read pages, and neither answers at all unless its
+    whole answer fits in one page:
 
       * every ``sparq-agent/issue-<issue>-*`` head ref, via an exact-prefix `matching-refs` read.
         The trailing hyphen is load-bearing — it is what stops `issue-7-` matching `issue-70-`.
+        The prefix is per-ISSUE, so the set is the issue's re-dispatch attempts and their
+        leftovers; more than one page of those is a REFUSAL (and a deferred reap), never a
+        silently truncated set read as "no worker PR".
       * the open PRs from each of those heads (`?head=<owner>:<branch>`), which is at most one
         per base branch. The head value is fully percent-encoded: a ref name is not restricted
         to the worker's own `[A-Za-z0-9._-]` alphabet, and an unencoded `&` would smuggle a
@@ -2267,7 +2304,11 @@ def _worker_pulls_for_issue(
     repo can create a worker-SHAPED ref, and anyone can open a PR from one. Neither buys anything
     a release depends on — every row found here can only ADD linkage, whose effect is the reap
     stand-down, so the worst a forged ref achieves is DELAYING a reap by one tick, exactly as it
-    already could through the repo-wide listing. Nothing here can cause a release."""
+    already could through the repo-wide listing. Nothing here can cause a release. Enough forged
+    refs to FILL the ref page hold the reap off every tick rather than one — but that is not a new
+    capability: the same push access can simply keep one open worker-shaped PR, which stands the
+    reap down for as long as it stays open, and the claim's run-proven-dead reclaim path is
+    untouched either way."""
     prefix = f"sparq-agent/issue-{issue}-"
     encoded = WORKER_BRANCH.match(prefix)
     if encoded is None or int(encoded.group("issue")) != issue:
@@ -2279,7 +2320,11 @@ def _worker_pulls_for_issue(
         )
     owner = repo.split("/")[0]
     found: dict[int, dict[str, Any]] = {}
-    for ref in api.paginate(f"/repos/{repo}/git/matching-refs/heads/{prefix}"):
+    for ref in _complete_page(
+        api,
+        f"/repos/{repo}/git/matching-refs/heads/{prefix}",
+        f"worker head ref listing for {repo}#{issue}",
+    ):
         name = ref.get("ref") if isinstance(ref, dict) else None
         if not isinstance(name, str) or not name.startswith("refs/heads/"):
             raise GroomError(f"worker head ref listing is malformed for {repo}#{issue}")
@@ -2288,9 +2333,11 @@ def _worker_pulls_for_issue(
         if match is None or int(match.group("issue")) != issue:
             continue  # not a worker head for THIS issue: it cannot carry this issue's worker PR
         head = quote(f"{owner}:{branch}", safe="")
-        found.update(
-            _pull_snapshot(api, repo, f"/repos/{repo}/pulls?state=open&head={head}")
-        )
+        found.update(_pull_snapshot(repo, _complete_page(
+            api,
+            f"/repos/{repo}/pulls?state=open&head={head}",
+            f"open worker pull listing for {repo} head {branch}",
+        )))
     return found
 
 
@@ -4243,9 +4290,10 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         # requires both to be silent at once:
         #   * the walk can drop a row at a page boundary, but it sees a PR whose head branch was
         #     deleted while the PR stayed open (the PR record keeps `head.ref`);
-        #   * the keyed read cannot be page-skipped (an exact ref prefix, at most one open PR per
-        #     head+base), but it enumerates heads from `matching-refs`, so it cannot see a PR
-        #     whose head ref is gone.
+        #   * the keyed read has no cursor to be skipped across — every listing it reads is taken
+        #     as ONE `_complete_page` request, which REFUSES (and defers this reap) rather than
+        #     paging on if its answer does not fit — but it enumerates heads from `matching-refs`,
+        #     so it cannot see a PR whose head ref is gone.
         # The honest residual, stated rather than hidden: a PR that is BOTH dropped by the walk
         # and missing its head ref in the same tick is still invisible here, and its terminally
         # parked, run-proven-dead claim would still be reaped.
@@ -4294,7 +4342,9 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             # after the fresh issue read so a claim already disqualified by a refused issue read
             # never spends these requests, and merged into the repo's view so the confirmation
             # below still asks the ONE predicate. Bounded by MAX_TERMINAL_REAPS_PER_TICK
-            # candidates x (1 ref read + 1 read per matching head), and only on a reaping tick.
+            # candidates x (1 ref read + 1 read per matching head) — a real bound, because each
+            # of those is exactly ONE request that refuses rather than paging — and only on a
+            # reaping tick.
             try:
                 current_pulls[holder.repo].update(
                     _worker_pulls_for_issue(
@@ -6989,22 +7039,38 @@ def _self_test() -> int:
 
     # ---- #1745: _worker_pulls_for_issue, the KEYED PR-half read ------------------------------
     # The reap boundary's end-to-end legs live with the sweep fixtures below; these pin the
-    # reader's own three refusals and its one filter, none of which the sweep can reach.
+    # reader's own refusals and its one filter, none of which the sweep can reach.
     class _RefListingAPI:
-        """Paginated pages by path, recording every path it is asked for."""
+        """One-page GETs by path, recording every (method, path) it is asked for.
 
-        def __init__(self, pages: dict[str, list[Any]]) -> None:
+        `request`, not `paginate` (#1745 review round 1): a `matching-refs` listing enumerates a
+        MUTABLE set, so reading it by cursor walk would import the very page-boundary skip this
+        reader exists to corroborate away — the reader takes each listing as ONE bounded page.
+        A fixture that served whole page walks could express neither the exact request issued nor
+        the full page that must be REFUSED, which is precisely how the first round of this
+        reader shipped an unprovable completeness claim."""
+
+        def __init__(self, pages: dict[str, Any]) -> None:
             self.pages = pages
-            self.paths: list[str] = []
+            self.paths: list[tuple[str, str]] = []
 
-        def paginate(self, path: str) -> list[Any]:
-            self.paths.append(path)
-            return list(self.pages.get(path, []))
+        def request(self, method: str, path: str, *_args: Any, **_kwargs: Any) -> Any:
+            # The METHOD is recorded, not assumed: `/pulls?...` and `/git/matching-refs/...` are
+            # write paths under other verbs, and a read that is not a GET is not a read.
+            self.paths.append((method, path))
+            return self.pages.get(path, [])
 
-    keyed_refs = "/repos/owner/repo/git/matching-refs/heads/sparq-agent/issue-7-"
-    keyed_head = "/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-7-92-1"
-    retry_head = "/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-7-94-2"
-    other_head = "/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-70-93-1"
+    # Every path below carries the one-page query LITERALLY (AGENTS.md item 6): the `?`-vs-`&`
+    # separator, `per_page=100` (KEYED_READ_PAGE) and the absence of a second page are the whole
+    # completeness argument, so they are asserted, never rebuilt from the code under test.
+    keyed_refs = ("/repos/owner/repo/git/matching-refs/heads/sparq-agent/issue-7-"
+                  "?per_page=100&page=1")
+    keyed_head = ("/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-7-92-1"
+                  "&per_page=100&page=1")
+    retry_head = ("/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-7-94-2"
+                  "&per_page=100&page=1")
+    other_head = ("/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-70-93-1"
+                  "&per_page=100&page=1")
 
     def _keyed_pull(number: int, branch: str) -> dict[str, Any]:
         return {**backed_pull[92], "number": number,
@@ -7046,18 +7112,34 @@ def _self_test() -> int:
         "belonging to another issue",
         (_keyed_read(keyed_api), keyed_api.paths),
         ({92: backed_pull[92], 94: _keyed_pull(94, "sparq-agent/issue-7-94-2")},
-         [keyed_refs, keyed_head, retry_head]),
+         [("GET", keyed_refs), ("GET", keyed_head), ("GET", retry_head)]),
     )
 
-    def _keyed_refusal(pages: dict[str, list[Any]], issue: int = 7) -> Any:
+    def _keyed_refusal(pages: dict[str, Any], issue: int = 7) -> Any:
         return _keyed_read(_RefListingAPI(pages), issue)
 
     keyed_ref_row = {"ref": "refs/heads/sparq-agent/issue-7-92-1"}
+    # [review round 1] A page that comes back FULL is not provably the whole listing, and a second
+    # page read would reintroduce the mid-walk shift (a ref deleted between two reads pulls later
+    # refs forward across the cursor) that this reader exists to avoid — so a full page REFUSES.
+    # Both listings are full-page-able, and both legs are sharp: with the guard deleted, the ref
+    # leg reads 100 heads and answers `{}` ("no worker PR" — the release), and the head leg answers
+    # 100 PRs; neither equals the refusal below. The rows are DISTINCT and well-formed so that no
+    # other guard can claim the kill.
+    full_ref_page = [
+        {"ref": f"refs/heads/sparq-agent/issue-7-{n}-1", "object": {"sha": f"{n:040d}"}}
+        for n in range(1, KEYED_READ_PAGE + 1)
+    ]
+    full_pull_page = [
+        {**backed_pull[92], "number": 1000 + n} for n in range(KEYED_READ_PAGE)
+    ]
     check(
         "#1745: the keyed read FAILS CLOSED — a malformed ref row, a ref outside refs/heads/, "
         "and an issue number the worker-branch grammar cannot express all REFUSE, and so does a "
         "malformed PR row (the keyed head query goes through the SAME `_pull_snapshot` validator "
-        "as the repo-wide walk); a clean empty listing is the only way to answer 'no worker PR'",
+        "as the repo-wide walk), a listing that is not a list at all, and (review round 1) EITHER "
+        "listing coming back one page FULL, which is a set too large to prove complete rather "
+        "than a set to walk; a clean SHORT listing is the only way to answer 'no worker PR'",
         (
             _keyed_refusal({keyed_refs: ["refs/heads/sparq-agent/issue-7-92-1"]}),
             _keyed_refusal({keyed_refs: [{"object": {"sha": "d" * 40}}]}),
@@ -7065,6 +7147,9 @@ def _self_test() -> int:
             _keyed_refusal({}, issue=0),
             _keyed_refusal({keyed_refs: [keyed_ref_row], keyed_head: ["not-a-pull"]}),
             _keyed_refusal({keyed_refs: [keyed_ref_row], keyed_head: [{"number": 0}]}),
+            _keyed_refusal({keyed_refs: {"message": "Not Found"}}),
+            _keyed_refusal({keyed_refs: full_ref_page}),
+            _keyed_refusal({keyed_refs: [keyed_ref_row], keyed_head: full_pull_page}),
             _keyed_refusal({}),
         ),
         (
@@ -7074,6 +7159,11 @@ def _self_test() -> int:
             "worker head prefix for owner/repo#0 does not match the worker branch grammar",
             "target pull request snapshot is malformed for owner/repo",
             "target pull request number is malformed for owner/repo",
+            "worker head ref listing for owner/repo#7 is malformed",
+            "worker head ref listing for owner/repo#7 does not fit in one page and cannot be "
+            "read completely",
+            "open worker pull listing for owner/repo head sparq-agent/issue-7-92-1 does not fit "
+            "in one page and cannot be read completely",
             {},
         ),
     )
@@ -8641,7 +8731,20 @@ def _self_test() -> int:
                 number = int(path.rsplit("/", 1)[1])
                 return terminal_sweep_env["fresh_issues"].get(number)
             if method == "GET":
-                return terminal_sweep_env.get("gets", {}).get(path)
+                # [#1745, review round 1] Every UNPAGINATED read, recorded: the reap boundary's
+                # keyed corroboration is read one bounded page at a time through `request`, so
+                # `paginated` above cannot witness it and the "which requests are ISSUED"
+                # assertions need this list.
+                terminal_sweep_env.setdefault("reads", []).append(path)
+                if path in terminal_sweep_env.get("gets", {}):
+                    return terminal_sweep_env["gets"][path]
+                if "/git/matching-refs/" in path or "&head=" in path:
+                    # Default for the keyed reap reads: an EMPTY listing — no worker head, so no
+                    # worker PR. Every scenario reaching the reap boundary issues them, and this
+                    # is the answer the pre-review `pages` map gave; a scenario that cares about
+                    # them registers an explicit `gets` row (or an `http_failures` refusal).
+                    return []
+                return None
             if path == "/graphql":
                 # Both live merge latches absent, so a defuse candidate stays safe-class and the
                 # ONLY thing that can fail in the phase is the redraft itself (issue #644).
@@ -8872,11 +8975,23 @@ def _self_test() -> int:
         #   (e)/(f) either keyed read REFUSED             -> RETAIN, loudly, and counted as a
         #       deferral. An unread head cannot prove a PR's ABSENCE any more than an unread
         #       issue can, so the fail direction is the reap loop's, not record-and-continue.
+        #   (g) the ref listing comes back one page FULL  -> RETAIN, as a deferral, WITHOUT
+        #       reading a single head (review round 1). A `matching-refs` listing enumerates a
+        #       mutable set: paging it would let a ref deleted between two page reads pull the
+        #       live worker PR's ref across the cursor and out of the result, which — read as an
+        #       absence — RELEASES the claim the keyed read is here to save. A set too large to
+        #       read in one request is therefore unprovable, not walkable.
         # (a) also pins the two request paths EXACTLY (item 6): the trailing hyphen that stops
-        # `issue-7-` matching `issue-70-`, and the percent-encoded `head=` value.
-        worker_refs_path = "/repos/owner/repo/git/matching-refs/heads/sparq-agent/issue-7-"
+        # `issue-7-` matching `issue-70-`, the percent-encoded `head=` value, and the one-page
+        # query (`?`-vs-`&` separator, `per_page=100`, no second page) that IS the completeness
+        # argument — all spelled literally rather than rebuilt from the code under test.
+        worker_refs_path = (
+            "/repos/owner/repo/git/matching-refs/heads/sparq-agent/issue-7-"
+            "?per_page=100&page=1"
+        )
         worker_head_path = (
             "/repos/owner/repo/pulls?state=open&head=owner%3Asparq-agent%2Fissue-7-900-1"
+            "&per_page=100&page=1"
         )
         worker_ref_row = {
             "ref": "refs/heads/sparq-agent/issue-7-900-1",
@@ -8893,10 +9008,10 @@ def _self_test() -> int:
         }
 
         # The COMPANION candidate for the refusal legs: same repo, a different issue, and nothing
-        # in `pages` for its keyed reads, so it revalidates cleanly and reclaims. It is what keeps
-        # (e)/(f) about a SCOPED deferral — with the refused claim alone the whole batch fails,
-        # run_sweep's "every revalidation failed" precedence raises, and the assertion could no
-        # longer tell a scoped retention from a systemic abort.
+        # registered for its keyed reads, so it reads an empty ref listing, revalidates cleanly
+        # and reclaims. It is what keeps (e)/(f)/(g) about a SCOPED deferral — with the refused
+        # claim alone the whole batch fails, run_sweep's "every revalidation failed" precedence
+        # raises, and the assertion could no longer tell a scoped retention from a systemic abort.
         companion_claim = "9" * 32
         companion_lease = {
             **base, "claim_id": companion_claim, "holder": "owner/repo#8@778.1",
@@ -8908,12 +9023,13 @@ def _self_test() -> int:
             extra: tuple[dict[str, Any], ...] = (),
         ) -> tuple[Any, list[set[str]], list[str], str]:
             terminal_sweep_leases[:] = [dict(skipped_lease), *(dict(x) for x in extra)]
-            saved_pages = terminal_sweep_env.get("pages")
-            saved_failures = terminal_sweep_env.get("paginate_failures")
-            first_read = len(terminal_sweep_env.get("paginated", []))
+            saved_pages = terminal_sweep_env.get("gets")
+            saved_failures = terminal_sweep_env.get("http_failures")
+            first_read = len(terminal_sweep_env.get("reads", []))
             terminal_sweep_env.update(
                 planned_issues=[], fresh_issues={}, pulls=[], writes=[],
-                pages=dict(pages), paginate_failures=dict(refusals or {}),
+                gets=dict(pages),
+                http_failures={("GET", path): exc for path, exc in (refusals or {}).items()},
             )
             terminal_sweep_releases.clear()
             pr_half_log = io.StringIO()
@@ -8928,13 +9044,13 @@ def _self_test() -> int:
                     summary = f"raised {type(exc).__name__}"
             finally:
                 sys.stdout = saved_pr_half_stdout
-                terminal_sweep_env["pages"] = saved_pages if saved_pages else {}
-                terminal_sweep_env["paginate_failures"] = (
+                terminal_sweep_env["gets"] = saved_pages if saved_pages else {}
+                terminal_sweep_env["http_failures"] = (
                     saved_failures if saved_failures else {}
                 )
             keyed = [
-                path for path in terminal_sweep_env["paginated"][first_read:]
-                if "matching-refs" in path or "head=" in path
+                path for path in terminal_sweep_env.get("reads", [])[first_read:]
+                if "matching-refs" in path or "&head=" in path
             ]
             return (summary, list(terminal_sweep_releases), keyed,
                     pr_half_log.getvalue())
@@ -8991,6 +9107,45 @@ def _self_test() -> int:
                 (1, [{companion_claim}]), True, True, True, True,
                 (1, [{companion_claim}]), True, True,
             ),
+        )
+        # (g) The ref listing FILLS its page. The 100 refs are all well-formed worker heads for
+        # this issue and every one of their head queries is registered EMPTY, so a reader that
+        # paged on (or simply took the full page as the whole answer) would find no worker PR and
+        # RELEASE — the release this issue exists to prevent, arrived at through a set it could
+        # not prove complete. The claim is retained as a deferral instead, and NO head is read:
+        # an unprovable ref set is not a set to spend requests enumerating.
+        full_ref_listing = [
+            {"ref": f"refs/heads/sparq-agent/issue-7-{900 + n}-1",
+             "object": {"sha": f"{n:040d}", "type": "commit"}}
+            for n in range(KEYED_READ_PAGE)
+        ]
+        overfull = _pr_half(
+            {
+                worker_refs_path: full_ref_listing,
+                **{
+                    "/repos/owner/repo/pulls?state=open"
+                    f"&head=owner%3Asparq-agent%2Fissue-7-{900 + n}-1"
+                    "&per_page=100&page=1": []
+                    for n in range(KEYED_READ_PAGE)
+                },
+            },
+            extra=(companion_lease,),
+        )
+        check(
+            "#1745 (review round 1): a keyed ref listing too large to read in ONE request cannot "
+            "prove a worker PR's absence — a ref deleted between two page reads pulls the live "
+            "PR's ref across the cursor — so the claim is RETAINED as a deferral, no head query "
+            "is spent on the unprovable set, and the readable claim in the SAME batch still "
+            "reclaims",
+            (
+                (overfull[0], overfull[1]),
+                [path for path in overfull[2] if "&head=" in path],
+                overfull[2].count(worker_refs_path),
+                "does not fit in one page and cannot be read completely" in overfull[3],
+                "terminal reap revalidation deferred for owner/repo#7" in overfull[3],
+                "reap_deferred=1" in overfull[3],
+            ),
+            ((1, [{companion_claim}]), [], 1, True, True, True),
         )
 
         terminal_sweep_leases[:] = [
