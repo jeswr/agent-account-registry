@@ -1,33 +1,33 @@
 {
-  "generated_at": "2026-09-03T19:28:27Z",
+  "generated_at": "2026-09-03T19:58:50Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 2402,
+      "issues_open": 2404,
       "issues_ready": 284,
       "issues_closed_1h": 0,
       "issues_closed_24h": 8,
-      "prs_open": 163,
-      "prs_draft": 136,
-      "prs_opened_1h": 1,
+      "prs_open": 165,
+      "prs_draft": 138,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
       "prs_merged_24h": 5,
       "review_changes_backlog": 24,
       "needs_user_parked": 16,
-      "review_lane_health": "stalled",
-      "review_lane_runs_1h": 3,
-      "worker_attempts_1h": 3,
-      "worker_success_rate_1h": 0.3333,
-      "pr_open_rate": 1.0,
+      "review_lane_health": "ok",
+      "review_lane_runs_1h": 5,
+      "worker_attempts_1h": 2,
+      "worker_success_rate_1h": 0.5,
+      "pr_open_rate": 2.0,
       "pr_close_rate": 0.0,
-      "net_pr_flow": 1.0
+      "net_pr_flow": 2.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 1054,
+      "issues_open": 1053,
       "issues_ready": 705,
-      "issues_closed_1h": 1,
-      "issues_closed_24h": 13,
+      "issues_closed_1h": 2,
+      "issues_closed_24h": 15,
       "prs_open": 49,
       "prs_draft": 33,
       "prs_opened_1h": 0,
@@ -36,9 +36,9 @@
       "prs_merged_24h": 11,
       "review_changes_backlog": 6,
       "needs_user_parked": 17,
-      "review_lane_health": "stalled",
-      "review_lane_runs_1h": 1,
-      "worker_attempts_1h": 3,
+      "review_lane_health": "idle",
+      "review_lane_runs_1h": 0,
+      "worker_attempts_1h": 2,
       "worker_success_rate_1h": 0.0,
       "pr_open_rate": 0.0,
       "pr_close_rate": 0.0,
@@ -50,11 +50,11 @@
       "target": "sparq-org/sparq",
       "classification": "backlog-growing",
       "fire": true,
-      "summary": "open PRs 163 > 40 and net PR flow +1.0/hr (open 1.0 > close 0.0) sustained over 2 snapshots",
+      "summary": "open PRs 165 > 40 and net PR flow +2.0/hr (open 2.0 > close 0.0) sustained over 2 snapshots",
       "metrics": {
-        "prs_open": 163,
-        "net_pr_flow": 1.0,
-        "pr_open_rate": 1.0,
+        "prs_open": 165,
+        "net_pr_flow": 2.0,
+        "pr_open_rate": 2.0,
         "pr_close_rate": 0.0
       }
     },
@@ -66,27 +66,6 @@
       "metrics": {
         "issues_ready": 284,
         "issues_closed_1h": 0
-      }
-    },
-    {
-      "target": "sparq-org/sparq",
-      "classification": "worker-failing",
-      "fire": true,
-      "summary": "worker success rate 33% < 50% floor over 2 snapshots (3 attempts this hour)",
-      "metrics": {
-        "worker_success_rate_1h": 0.3333,
-        "worker_attempts_1h": 3
-      }
-    },
-    {
-      "target": "jeswr/agent-account-registry",
-      "classification": "review-lane-stalled",
-      "fire": true,
-      "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=6 waits",
-      "metrics": {
-        "review_changes_backlog": 6,
-        "review_lane_runs_1h": 1,
-        "prs_merged_1h": 0
       }
     }
   ]
