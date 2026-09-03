@@ -2514,7 +2514,11 @@ def _obs_trigger_rows(items):
     for another. The field seam is third rather than folded into the row seam because its rows are
     KEPT: counting a refused summary into `row_drops` would make the row seam's tail line report N
     dropped fire rows on a build that dropped none, and a flood of unprintable summaries would then
-    also consume the budget the genuinely-lost rows announce themselves out of."""
+    also consume the budget the genuinely-lost rows announce themselves out of.
+
+    The summary-refusal census covers EVERY well-formed fire before `_obs_capped` cuts the published
+    rows to 20, deliberately matching `flow.queue_dropped`, so it may exceed the slice beside it.
+    Deriving it from that slice would hide the broken-summary-formatter flood it exists to announce."""
     rows = []
     refused_summaries = 0
     row_drops = _ObsDropLog("observability trigger fire rows")
@@ -8339,7 +8343,7 @@ esac
     singular_refused_doc["trigger_summary_dropped"] = 1
     hostile_refusal_docs = {}
     for label, value in (("string", "2"), ("boolean", True), ("negative", -2),
-                         ("null", None)):
+                         ("fractional", 2.5), ("null", None)):
         hostile = copy.deepcopy(refused_summary_doc)
         hostile["trigger_summary_dropped"] = value
         hostile_refusal_docs[f"refusal-{label}"] = hostile
@@ -8394,7 +8398,7 @@ esac
            ([["", []], ["", []]], ["1 trigger summary was unreadable"], None)))
     check("[#2233] EXECUTED page script: a genuine ZERO refusal census draws no loss note",
           obs_summary_page("capped")[1], [])
-    for label in ("string", "boolean", "negative", "null", "legacy"):
+    for label in ("string", "boolean", "negative", "fractional", "null", "legacy"):
         check(f"[#2233] EXECUTED page script: a {label} summary-refusal count is nothing known and "
               "draws no fabricated loss note",
               obs_summary_page(f"refusal-{label}")[1], [])

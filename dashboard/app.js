@@ -1079,7 +1079,7 @@ function obsRenderTriggers(fires, total, summaryDropped) {
   // Issue #2233: a refused summary keeps its fire row with an empty summary and length zero, so it
   // is neither a missing row nor a truncation. State that distinct loss on the panel operators read.
   const dropped = obsNum(summaryDropped);
-  if (dropped !== null && dropped > 0) {
+  if (Number.isInteger(dropped) && dropped > 0) {
     host.append(node("p", "obs-truncation-note bad",
       `${dropped} trigger ${dropped === 1 ? "summary was" : "summaries were"} unreadable`));
   }
