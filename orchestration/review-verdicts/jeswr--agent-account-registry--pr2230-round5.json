@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2230,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4a48da75942642babbae6b36fa972f9acb87d668",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior finding remains unchanged at `_apt_packages_in_line`: `[[ $cmd_pos -eq 1 && \"$tok\" == ?*=* ]] && continue` tests the raw token without establishing that the assignment word is unquoted. For `RUN \"FOO=bar\" apt-get install -y jq python3-yaml`, the token has an even quote count, is accepted as an assignment prefix, and leaves `cmd_pos=1`; the parser then counts both packages. The shell instead treats the quoted first word as the command name `FOO=bar`, so apt-get is never reached. `_assert_container_selftest_deps` consequently returns success for an image that installs neither dependency. The newly added tests do not include this quoted assignment-shaped command-word case.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Recognize assignment prefixes according to shell quoting semantics, declining to count packages whenever that classification is uncertain. Add a regression fixture through `_assert_container_selftest_deps` using a quoted assignment-shaped command word and expect `missing`, plus retain an unquoted `FOO=bar apt-get ...` positive control expecting `satisfied`.",
+    "severity": "major",
+    "title": "Quoted assignment-shaped command words still fabricate installed packages"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 5 leaves the prior major fail-open finding unresolved. The assignment-prefix arm still classifies a raw, quoted assignment-shaped command word as a shell assignment, and there is still no regression fixture covering that case. The dependency gate can therefore report both required packages as provisioned even though the shell never executes apt-get. Progress is stagnant because the same major issue remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
