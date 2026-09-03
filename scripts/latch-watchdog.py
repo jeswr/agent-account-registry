@@ -53,6 +53,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -136,6 +137,50 @@ def _load_gh_retry():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+# #2256: a retry-aware read used to collapse every terminal failure to `(rc=1)` at this seam,
+# discarding the status, retry class and attempt count gh_retry had already recovered. Keep a
+# bounded, credential-scrubbed diagnostic for the operator-visible error while retaining the
+# historical `(code, stdout)` injection contract used by the hermetic tests.
+READ_DIAGNOSTIC_LIMIT = 240
+
+
+def _read_failure_class(status, reason):
+    if reason == "throttle-403" or str(status) == "429":
+        return "throttle"
+    if (reason or "").startswith("refused-http-"):
+        return "refusal"
+    if reason == "usage-error":
+        return "usage"
+    if reason and (reason.startswith("transient-") or reason.startswith("unparsed-http-")
+                   or reason in ("statusless", "caller-classifier")):
+        return "transient"
+    return "unknown"
+
+
+def _safe_read_detail(text, token):
+    """One-line, bounded gh diagnostic with common credential shapes removed.
+
+    gh_retry has already stripped its GH_DEBUG trace. This second boundary is deliberate: an
+    ordinary gh diagnostic is still external text, and the target token is in scope here, so an
+    echoed env/header value must not become part of a public workflow annotation.
+    """
+    detail = " ".join((text or "").split())
+    if token:
+        detail = detail.replace(token, "<redacted>")
+    detail = re.sub(
+        r"(?i)(\b(?:authorization|proxy-authorization)\s*:\s*)"
+        r"(?:(?:bearer|token)\s+)?[^\s,;]+",
+        r"\1<redacted>", detail)
+    detail = re.sub(
+        r"(?i)(\b(?:GH_TOKEN|GITHUB_TOKEN)\s*[=:]\s*)[^\s,;]+",
+        r"\1<redacted>", detail)
+    detail = re.sub(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+\b", "<redacted>", detail)
+    detail = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", detail)
+    if len(detail) > READ_DIAGNOSTIC_LIMIT:
+        detail = detail[:READ_DIAGNOSTIC_LIMIT - 3] + "..."
+    return detail
 
 
 # ---------------------------------------------------------------------------------------------
@@ -392,6 +437,7 @@ class Watchdog:
         self._clock = clock
         self._gh_read = gh_read
         self._gh_write = gh_write
+        self._last_read_diagnostic = None
         self.actions = 0
         self.errors = []
         self.census = []
@@ -400,6 +446,9 @@ class Watchdog:
         return (self._clock or time.time)()
 
     def gh_read(self, args, token):
+        # An injected two-tuple has no retry metadata. Clear the prior production result before
+        # every call so a later injected failure can never inherit an unrelated live diagnostic.
+        self._last_read_diagnostic = None
         return (self._gh_read or self._default_read)(args, token)
 
     def gh_write(self, args, token):
@@ -419,7 +468,28 @@ class Watchdog:
         # exactly how this tool failed 16/16 runs (#1137). The write seam is the opposite: it
         # execs the argv verbatim, so `_default_write` argvs DO carry "gh". Block (r) pins both.
         result = _load_gh_retry().run_gh(list(args), env=self._env(token))
+        if result.returncode != 0:
+            status = getattr(result, "gh_http_status", None)
+            reason = getattr(result, "gh_retry_reason", None)
+            self._last_read_diagnostic = {
+                "http": status or "unknown",
+                "class": _read_failure_class(status, reason),
+                "reason": reason or "unknown",
+                "attempts": getattr(result, "gh_attempts", 1),
+                "detail": _safe_read_detail(result.stderr, token),
+            }
         return result.returncode, result.stdout or ""
+
+    def _read_failure(self, subject, code):
+        diagnostic = self._last_read_diagnostic
+        if not diagnostic:
+            return "%s (rc=%d)" % (subject, code)
+        suffix = " http=%s class=%s reason=%s attempts=%s" % (
+            diagnostic["http"], diagnostic["class"], diagnostic["reason"],
+            diagnostic["attempts"])
+        if diagnostic["detail"]:
+            suffix += " detail=%s" % diagnostic["detail"]
+        return "%s (rc=%d%s)" % (subject, code, suffix)
 
     def _default_write(self, args, token):
         result = subprocess.run(list(args), capture_output=True, text=True, env=self._env(token))
@@ -436,7 +506,8 @@ class Watchdog:
                 args += ["-F", "cursor=" + cursor]
             code, out = self.gh_read(args, token)
             if code != 0:
-                raise RuntimeError("open-PR listing failed for %s (rc=%d)" % (repo, code))
+                raise RuntimeError(self._read_failure("open-PR listing failed for %s" % repo,
+                                                      code))
             page = json.loads(out)["data"]["repository"]["pullRequests"]
             for node in page["nodes"]:
                 auto = node.get("autoMergeRequest") or {}
@@ -471,8 +542,8 @@ class Watchdog:
                 % (pr["repo"], pr["head_sha"], self.required_check)]
         code, out = self.gh_read(args, token)
         if code != 0:
-            raise RuntimeError("check-run read failed for %s#%d (rc=%d)"
-                               % (pr["repo"], pr["number"], code))
+            raise RuntimeError(self._read_failure(
+                "check-run read failed for %s#%d" % (pr["repo"], pr["number"]), code))
         runs = json.loads(out).get("check_runs", [])
         # EQUALITY, applied here and not left to the server-side filter: `check_name=` is a query
         # parameter whose semantics we do not control, and a prefix match would let a check named
@@ -499,8 +570,8 @@ class Watchdog:
                 % (pr["repo"], pr["number"]), "--paginate"]
         code, out = self.gh_read(args, token)
         if code != 0:
-            raise RuntimeError("comment read failed for %s#%d (rc=%d)"
-                               % (pr["repo"], pr["number"], code))
+            raise RuntimeError(self._read_failure(
+                "comment read failed for %s#%d" % (pr["repo"], pr["number"]), code))
         needle = "%s head=%s" % (MARKER_PREFIX, pr["head_sha"])
         stamps = []
         for comment in json.loads(out):
@@ -1446,6 +1517,68 @@ def _self_test():
         ((live_prs[0] or {}).get("number"), (live_prs[0] or {}).get("head_sha"),
          (live_gate or {}).get("total"), live_markers),
         (999000617, "cd0ca3f", 1, (0, None)))
+
+    # #2256: drive the EXACT throttle shape observed in the explicit groom recovery through the
+    # production retry layer and this watchdog's production read seam. The patched `time.sleep`
+    # is bound when _load_gh_retry creates its module, so all five attempts execute without making
+    # the self-test wait through the real backoff schedule.
+    throttle_calls = []
+    throttle_secret = "ghp_must_not_reach_the_annotation"
+    throttle_stderr = (
+        "HTTP 403: API rate limit exceeded for installation; "
+        "GH_TOKEN=%s; Authorization: token %s; %s"
+        % (throttle_secret, throttle_secret, "x" * (READ_DIAGNOSTIC_LIMIT + 50)))
+
+    def _throttle_spawn(cmd, **kwargs):
+        throttle_calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=throttle_stderr)
+
+    throttle = Watchdog(apply_changes=False, grace_seconds=DEFAULT_GRACE_SECONDS,
+                        required_check="gate", deny_labels=DEFAULT_DENY_LABELS,
+                        require_label="review:pass", max_actions_per_head=2,
+                        max_actions_per_run=5, marker_actor="sparq-bot[bot]")
+    real_sleep, throttle_error = time.sleep, None
+    try:
+        subprocess.run = _throttle_spawn
+        time.sleep = lambda _seconds: None
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                throttle.list_open_prs("sparq-org/latch-watchdog-fixture-repo",
+                                       throttle_secret)
+            except RuntimeError as exc:
+                throttle_error = str(exc)
+    finally:
+        subprocess.run = real_run
+        time.sleep = real_sleep
+    chk("READ PATH [#2256]: an exhausted installation throttle retains structured status, class "
+        "and attempt count instead of collapsing to rc=1",
+        (len(throttle_calls),
+         all(field in (throttle_error or "") for field in
+             ("http=403", "class=throttle", "reason=throttle-403", "attempts=5"))),
+        (5, True))
+    chk("READ PATH [#2256]: the bounded detail names the useful throttle cause but exposes no "
+        "target token, Authorization value or unbounded remote text",
+        ("API rate limit exceeded for installation" in (throttle_error or ""),
+         throttle_secret in (throttle_error or ""),
+         len(throttle_error or "") < 512),
+        (True, False, True))
+    chk("READ PATH [#2256]: retry outcomes retain a small stable failure taxonomy",
+        tuple(_read_failure_class(status, reason) for status, reason in (
+            (429, None), (403, "refused-http-403"), (None, "usage-error"),
+            (502, "transient-502"), (None, "caller-classifier"), (418, "teapot"))),
+        ("throttle", "refusal", "usage", "transient", "transient", "unknown"))
+    independently_unsafe = _safe_read_detail(
+        "Authorization: Bearer ghp_not_the_target; "
+        "GITHUB_TOKEN=github_pat_also_not_the_target\r\nuseful-cause",
+        "a-different-target-token")
+    chk("READ PATH [#2256]: credential-shape and control-character scrubbing does not depend on "
+        "the caller supplying the exact leaked token",
+        ("ghp_not_the_target" in independently_unsafe,
+         "github_pat_also_not_the_target" in independently_unsafe,
+         "\r" in independently_unsafe or "\n" in independently_unsafe,
+         "useful-cause" in independently_unsafe),
+        (False, False, False, True))
+
     # ...AND WHAT THE FIX DELIVERS INTO. Correct argv is only worth anything because the census
     # depends on it: the shipped tool emitted `CENSUS-TOTAL {"considered":0,"errors":2}` on all 16
     # runs, i.e. it never reached `classify` at all. Same production seam, now driven through the

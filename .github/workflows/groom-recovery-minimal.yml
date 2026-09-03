@@ -3,12 +3,12 @@
 # groom-core.yml were rejected before job creation. It runs the real registry/ledger repair sweep
 # without target App credentials: registry-state recovery proceeds, while unavailable target
 # issue/PR repair is logged and skipped. Add credential-bearing target repair only after this
-# exact default-branch workflow has proved that GitHub creates and runs its job.
+# exact default-branch workflow has proved that GitHub creates and runs its job. #2256 keeps this
+# reduced-credential lane available by manual dispatch but removes its duplicate native schedule;
+# groom-sweep.yml is the single scheduled owner of the full repair.
 name: groom-recovery-minimal
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 permissions:

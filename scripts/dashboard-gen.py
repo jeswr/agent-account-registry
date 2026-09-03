@@ -239,10 +239,11 @@ FLEET_COMPOSITION_KEYS = frozenset({
 # [#1353 BLOCKED] Thresholds that CANNOT yet be re-sized to satisfy the #680 bound. The historical
 # groom keepalive leg at 1200 and retriage.yml at 2400 made dashboard.yml refuse ingestion
 # (action_required, jobs total_count=0 — measured on master 2026-07-31T03:04Z, PR #1363, reverted
-# by #1364). #2076 retargets that same conservative groom threshold to groom-core.yml; it does not
-# pretend the unexplained dashboard-ingestion failure has become safe. Remove this exemption once
-# #1353 is resolved and the tighter threshold is proved on default-branch runs.
-_THRESHOLD_BOUND_EXEMPT = frozenset({"groom-core.yml", "retriage.yml"})
+# by #1364). #2256 retargets that same conservative threshold to the one canonical scheduled full
+# sweep, groom-sweep.yml; it does not pretend the unexplained dashboard-ingestion failure has
+# become safe. Remove this exemption once #1353 is resolved and the tighter threshold is proved on
+# default-branch runs.
+_THRESHOLD_BOUND_EXEMPT = frozenset({"groom-sweep.yml", "retriage.yml"})
 
 
 # [#1084] The nominal cadence of every workflow the CROSS-REPO keepalive leg watches, keyed by
@@ -5452,20 +5453,20 @@ def _self_test():
           "quietly stops watching a workflow must go red here rather than silently narrow the "
           "bound below to whatever is left",
           sorted(keepalive_cadences),
-          ["conflict-resolver.yml", "curate.yml", "groom-core.yml", "metrics.yml", "retriage.yml"])
+          ["conflict-resolver.yml", "curate.yml", "groom-sweep.yml", "metrics.yml", "retriage.yml"])
     # [#1353 BLOCKED] The groom keepalive and retriage.yml SHOULD be re-sized to 1200 and 2400 to
     # satisfy the bound below. They are not, and this is a deliberate, documented exemption rather
     # than an oversight: setting those historical values in `.github/workflows/dashboard.yml` made
     # GitHub REFUSE TO INGEST THE WORKFLOW — every run concluded `action_required` with
     # `jobs total_count=0`, measured on master (2026-07-31T03:04Z, PR #1363, reverted by #1364).
-    # #2076 retargets the groom leg to groom-core.yml without claiming that unrelated
+    # #2256 retargets the groom leg to groom-sweep.yml without claiming that unrelated
     # dashboard-ingestion defect is fixed. Until it is, both sit at exactly 2x cadence.
     # ⚠️ REMOVE THIS EXEMPTION the moment #1353 is resolved — it is the weaker of the two states.
     check("[#680] every run-anchored threshold sits strictly between ONE and TWO nominal cadences "
           "of the workflow it watches (offenders listed as workflow -> (threshold, cadence)): at "
           "or under one cadence it kicks a punctual cron behind its own fire; at or over two, one "
           "dropped fire costs a whole extra cycle on a fleet losing ~40% of its fires "
-          "[groom-core.yml/retriage.yml exempt while #1353 blocks their re-sizing]",
+          "[groom-sweep.yml/retriage.yml exempt while #1353 blocks their re-sizing]",
           {name: (keepalive_specs[name][0], cadence)
            for name, cadence in keepalive_cadences.items()
            if name not in _THRESHOLD_BOUND_EXEMPT
@@ -5474,11 +5475,11 @@ def _self_test():
     check("[#1353] the exemption above is NOT silent — every exempt workflow is still watched, and "
           "the set is pinned so a future re-size that drops one cannot quietly widen it",
           sorted(_THRESHOLD_BOUND_EXEMPT & set(keepalive_cadences)),
-          ["groom-core.yml", "retriage.yml"])
+          ["groom-sweep.yml", "retriage.yml"])
 
     # --- #1084: the WIDENING direction, on the three thresholds the row above cannot see. The
     # strict bound covers three registry legs; the #1353 pair is excused from it ENTIRELY (so
-    # `groom-core.yml:1800` -> `:99999` is invisible), and the CROSS-REPO leg is not in that row's
+    # `groom-sweep.yml:1800` -> `:99999` is invisible), and the CROSS-REPO leg is not in that row's
     # population at all because sparq-org/sparq is not checked out here for
     # `_workflow_cadence_seconds` to read. With every fixture age below derived from the threshold
     # itself, `rearm-sweeper.yml:1200` -> `:99999` left the whole suite green (#1084 measured 187
@@ -5699,7 +5700,7 @@ def _self_test():
            "<self> curate.yml": ["dashboard.yml/registry-keepalive"],
            "<self> dashboard.yml": ["metrics.yml/dashboard-publish"],
            "<self> dispatch.yml": ["dashboard.yml/registry-keepalive"],
-           "<self> groom-core.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> groom-sweep.yml": ["dashboard.yml/registry-keepalive"],
            "<self> metrics.yml": ["dashboard.yml/registry-keepalive"],
            "<self> retriage.yml": ["dashboard.yml/registry-keepalive"],
            "sparq-org/sparq rearm-sweeper.yml": ["dashboard.yml/sparq-keepalive-dispatch"]})
@@ -5928,10 +5929,10 @@ esac
         (code, kicked), (0, ["dispatch.yml"]), log)
     # ...and the run-anchored legs are untouched by all of the above.
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)],
-                                           runs={"groom-core.yml": [_ka_run(99_999)]})
+                                           runs={"groom-sweep.yml": [_ka_run(99_999)]})
     keepalive_check(
         "[#922] the run-anchored legs still key on run age, and only the stale one is kicked",
-        (code, kicked), (0, ["groom-core.yml"]), log)
+        (code, kicked), (0, ["groom-sweep.yml"]), log)
     # #1375: GitHub creates one-second `action_required` runs when it refuses to ingest a
     # workflow. Their timestamps are evidence of rejection, not execution. Put a fresh rejected
     # run ahead of an old accepted run so selecting the newest row without filtering stays green
@@ -5993,7 +5994,7 @@ esac
     # #680: the bound above is arithmetic across two files; these two rows are the BEHAVIOUR it
     # buys, driven through the real leg. Every age is derived from the watched workflow's OWN
     # cadence and never from the spec list the leg reads, so moving a threshold to either side of
-    # the bound flips one of them: at 2x cadence (where groom-core.yml and retriage.yml sat) the
+    # the bound flips one of them: at 2x cadence (where groom-sweep.yml and retriage.yml sit) the
     # missed-a-fire row goes quiet for exactly those two, and at 1x cadence the punctual row starts
     # kicking. The pair is deliberately one row per direction — a single-direction row is satisfied
     # by a leg that kicks everything, or by one that kicks nothing.
@@ -6007,7 +6008,7 @@ esac
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)], runs=missed)
     keepalive_check(
         "[#680] ...and EVERY non-exempt run-anchored workflow that has missed exactly one fire is "
-        "kicked inside that same cycle. groom-core.yml/retriage.yml are EXEMPT while #1353 blocks their "
+        "kicked inside that same cycle. groom-sweep.yml/retriage.yml are EXEMPT while #1353 blocks their "
         "re-sizing: at exactly 2x cadence a single dropped fire still reads FRESH, so they are not "
         "kicked — that is the cost of the exemption, asserted here so it stays visible",
         (code, kicked),

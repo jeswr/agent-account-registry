@@ -484,7 +484,7 @@ jobs:
           # busiest workflow in the fleet into a manual recovery.
           # On a pure ingestion-rejected stream a kick is knowingly non-curative; the error
           # annotation is the payload, with ci-latency-alert.py's M4 alarm owning human recovery.
-          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200:dispatch-tick groom-core.yml:1800 retriage.yml:3600; do
+          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200:dispatch-tick groom-sweep.yml:1800 retriage.yml:3600; do
             wf="${spec%%:*}"; rest="${spec#*:}"; limit="${rest%%:*}"
             if [ "$rest" != "$limit" ]; then marker="${rest#*:}"; else marker=""; fi
             # LIVE-RUN GUARD (#559): a QUEUED or IN_PROGRESS run of the target counts as FRESH —
