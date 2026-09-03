@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6183,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b4aa7ecddd840e2e6d0d59d949442d0a4b6621c4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_flow_value_is_populated` treats every non-null value other than a same-line empty list as populated, while the block fallback accepts any descendant line beginning with `-`. Consequently filters with no workflow name, including `workflows: \"\"`, `workflows: {}`, `workflows: [` followed by `]`, and `workflows:` containing a nested mapping/list, produce no violation. The same parser also rejects a valid multiline flow mapping. These cases contradict the module's claim that the exact key must name at least one entry and leave the authoring-time gate bypassable.",
+    "file": "scripts/check-workflow-run-filters.py",
+    "fix_hint": "Validate the YAML subset structurally across continuation lines: require `workflows` to be a non-empty scalar name or a non-empty sequence of scalar names (according to the intended GitHub syntax), and require block-sequence items to be immediate children. Reject empty quoted scalars, mappings, block scalars, and multiline empty sequences. Add fixtures for each bypass plus a valid multiline flow mapping if that syntax is supported.",
+    "severity": "major",
+    "title": "Non-sequence and multiline-empty workflow filters bypass validation"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes the prior flow-mapping substring bug and adds meaningful regression fixtures, but the populated-value check still accepts several YAML representations that contain no workflow name. For example, `workflows: \"\"`, `workflows: {}`, a multiline empty flow sequence, and a nested mapping containing a sequence all pass. This violates the lint's stated exact, non-empty-filter invariant, so the gate remains bypassable. Because this is a new major finding relative to round 2's recorded issue, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
