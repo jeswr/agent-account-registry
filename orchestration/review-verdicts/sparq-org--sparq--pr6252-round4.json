@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6252,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "029714a7de6091e30f3c72ac572b147ea75fb3c5",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete on the supplied diff and checkout context. The cache key retains the complete canonicalized visibility decision and uses hashing only for shard selection; generation changes conservatively invalidate all cached replicas, while Rust's shared/exclusive borrowing prevents store writes from interleaving replica lookup or construction. The load-bearing data-update test observes both insertion and deletion through newly obtained replicas, the seam test pins generation advancement, and the concurrent test distinguishes masked from unmasked answers so it is non-vacuous. Documentation accurately distinguishes fresh store lookups from held snapshot handles, preserves the opt-in feature boundary, and labels work-box measurements non-canonical. No reviewer-directed instruction was detected. With no prior findings and no new defects, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
