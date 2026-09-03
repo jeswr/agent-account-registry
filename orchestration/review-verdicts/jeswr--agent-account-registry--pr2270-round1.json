@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2270,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "957818ccd14f3cbfe1f181967f84c4da56d075c1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change makes the header-based Retry-After parser conform to the existing bounded float-or-None contract, delegates plan-snapshot's job-specific cap at the parser call site, and preserves the fail-closed fallback for absent, malformed, non-positive, and HTTP-date values. The cross-module mirror checks compare independent constants and regex metadata, while literal-backed parser tests prevent agreement-by-common-degeneration. Call-site tests exercise fractional waits, malformed input, explicit cap delegation, removal of a duplicate post-parse cap, return type, sentinel behavior, and the secondary-before-budget classification order. I found no correctness, soundness, security, or test-vacuity defect in the diff.",
+  "verdict": "approve"
+ }
+}
