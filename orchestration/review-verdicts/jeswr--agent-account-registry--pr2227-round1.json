@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2227,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2ea7e49c2c51202f24319d86283386000565fa36",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly binds unredacted ops-alert bodies to the existing live private-repository probe: `_alert_route` is the sole positive producer, normalized destination membership carries that verdict to `_ops_alert`, and every unverified, refused, same-repository, half-configured, or direct-call path defaults to public-body redaction. Redaction occurs before the shared create/comment branch and remains inside the best-effort exception boundary. The added self-tests are non-vacuous and cover confirmed-private delivery, case normalization, refused-route fallback with preservation of the salted hash, direct unverified invocation, and redaction failure containment. The workflow commentary matches the implemented contract. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
