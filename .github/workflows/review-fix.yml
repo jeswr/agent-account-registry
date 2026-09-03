@@ -1763,6 +1763,10 @@ jobs:
           WORKER_FIX_ROUND: ${{ inputs.review_round }}
           WORKER_FIX_KIND: ${{ inputs.fix_kind }}
           WORKER_FIX_CONTEXT: ${{ inputs.fix_context }}
+          # [#1574] The SAME resolved profile the gate step below runs. The ci/rebase briefs state
+          # which local gate is in play; without this they asserted a hard-coded `crate-scoped`,
+          # which is false on every non-cargo target.
+          GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
           WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
           WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
