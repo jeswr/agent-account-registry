@@ -2231,6 +2231,43 @@ jobs:
           python3 registry/scripts/usage-alert.py --self-test
           python3 registry/scripts/usage-alert.py
 
+      # [issue #1142] THE UNDELIVERED-ALERT RECEIPT — DEFINED HERE ONCE for the whole estate; every
+      # other `continue-on-error` alert step carries the same step keyed to its own `id:` and points
+      # back at this block. `scripts/ci-latency-alert.py`'s `alert_delivery_receipts` derives the
+      # population from PARSED workflow structure (a step that runs a `*-alert.py` AND carries
+      # `continue-on-error: true`) and pins each receipt's `if:` by EXACT match, so a lane added
+      # without one, or a receipt neutralised to `&& false`, reds the watchdog's self-test.
+      #
+      # WHAT IS BROKEN. `continue-on-error: true` above is deliberate and stays — a watchdog fault
+      # must never red the sweep hosting it. But the jobs API reports a continue-on-error step that
+      # exited NONZERO as `conclusion: success`, so every alert script's fail-loud "the alert could
+      # NOT be delivered on any route — treat this run as FAILED" exit reached nothing queryable.
+      # Measured on run 30411293099 job 90448020180: the step exited 1 and `.steps[].conclusion`
+      # read `success`, with a check-run annotation as the only surviving witness. An alarm that
+      # FIRES BUT CANNOT DELIVER was, in every structured field a monitor reads, identical to an
+      # alarm that correctly found nothing wrong.
+      #
+      # WHY A RECEIPT STEP RATHER THAN DROPPING `continue-on-error`. `outcome` is the step's own
+      # result BEFORE continue-on-error rewrites `conclusion`, so this step RUNS (conclusion
+      # `success`) exactly when the alert above failed and is SKIPPED (conclusion `skipped`)
+      # otherwise — a step whose conclusion is NOT pinned, queryable by name, restoring
+      # `.steps[].conclusion` as an audit instrument on this lane. It deliberately exits 0 and reds
+      # NOTHING: this lane lives in dispatch.yml, whose RUN conclusion `dispatch-stall-alert.py`
+      # counts as a failure streak over executed ticks, so redding here would page a DISPATCHER
+      # STALL for an alert-route fault — a false alarm about the one component that was working.
+      # `always()` is load-bearing: the alert step runs under `if: always()`, so without it an
+      # earlier hard failure in this job would skip the receipt on exactly the tick it matters.
+      #
+      # ⚠️ POLARITY: this step RUNNING is the alarm. A healthy tick shows it `skipped`.
+      - name: RECEIPT — the worker-availability alert did NOT deliver
+        if: ${{ always() && steps.usage-alert.outcome == 'failure' }}
+        run: |
+          note="usage-alert exited nonzero: the worker-availability alert was NOT delivered on any route (issue #1142)"
+          printf '::error::%s\n' "$note"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### UNDELIVERED ALERT\n\n%s\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # FAIL-LOUD alert for a HARD PLAN failure (issue #38). Every always()/ops-alert step above lives
   # INSIDE the claim job, which is `needs: plan` — so when PLAN itself fails or is cancelled (e.g.
   # sustained snapshot 403s), claim is SKIPPED and none of them run: a persistent PLAN failure means
@@ -2292,6 +2329,10 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Alert maintainer that the dispatch PLAN job hard-failed
+        # `id:` so the undelivered-alert receipt below can gate on this step's own `outcome`
+        # (issue #1142). It is also this step's identity in ci-latency-alert.py's
+        # ALERT_ROUTE_CONSUMERS record, which is keyed `id` first and `name` second.
+        id: plan-alert
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2314,3 +2355,15 @@ jobs:
           set -uo pipefail
           python3 registry/scripts/plan-alert.py --self-test
           python3 registry/scripts/plan-alert.py
+
+      # [issue #1142] Undelivered-alert receipt — see the full rationale on the SAME step in the
+      # `claim` job above ("THE UNDELIVERED-ALERT RECEIPT"). Runs (conclusion `success`) exactly
+      # when the alert above exited nonzero; skipped otherwise. Exits 0 and reds nothing.
+      - name: RECEIPT — the hard-PLAN/CLAIM-termination alert did NOT deliver
+        if: ${{ always() && steps.plan-alert.outcome == 'failure' }}
+        run: |
+          note="plan-alert exited nonzero: the hard PLAN/CLAIM termination alert was NOT delivered on any route (issue #1142)"
+          printf '::error::%s\n' "$note"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### UNDELIVERED ALERT\n\n%s\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+          fi

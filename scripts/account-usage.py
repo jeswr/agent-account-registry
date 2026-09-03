@@ -734,8 +734,11 @@ def _persist_one(number, handle, line, registry_repo, run, schema_errors):
 def persist_limits(usage_path, run=None):
     """Write probed tier limits into the account issues' front-matter (title == handle) so the
     capacity model stops flying blind. Best-effort but HONEST (issue #198): every gh failure is
-    PROPAGATED as a non-zero return (the step is continue-on-error, so this surfaces the failure as a
-    red annotation instead of a false 'refreshed'), and each per-issue write goes through _persist_one
+    PROPAGATED as a non-zero return AND announced on the line before it as a `::warning::`
+    annotation, instead of a false 'refreshed'. ⚠️ The ANNOTATION is the observable, not the exit
+    code: the calling step is `continue-on-error`, and the jobs API reports a continue-on-error step
+    that exited non-zero as `conclusion: success` (issue #1142, measured on run 30411293099 job
+    90448020180 — this exact lane). Each per-issue write goes through _persist_one
     so a concurrent metadata edit is never silently overwritten (a clobber inside the write window is
     detected via the body-edit count and surfaced as failure, not confirmed as success). select-and-claim's _parse_account
     ignores unknown keys, so the extra line is inert for the allocator. Privacy: prints carry no
@@ -768,7 +771,10 @@ def persist_limits(usage_path, run=None):
                   capture_output=True, text=True, timeout=60, check=False)
     if listing.returncode != 0:
         # PROPAGATE (issue #198): the old code swallowed a failed catalog read and still printed
-        # 'refreshed'. A non-zero return makes the (continue-on-error) step surface the failure.
+        # 'refreshed'. ⚠️ [issue #1142] The `::warning::` below — not the non-zero return — is what
+        # a reader can actually find: this step is `continue-on-error`, so the jobs API reports its
+        # non-zero exit as `conclusion: success`. The annotation and the exit are emitted together
+        # on this path, which is what made this lane the measurement vehicle for #1142.
         print("::warning::account-usage: account catalog read failed; tier-limit persistence skipped")
         return 1
     try:

@@ -217,6 +217,21 @@ jobs:
           python3 registry/scripts/metrics-alert.py --self-test
           python3 registry/scripts/metrics-alert.py
 
+      # [issue #1142] Undelivered-alert receipt — full rationale on the SAME step in dispatch.yml's
+      # `claim` job ("THE UNDELIVERED-ALERT RECEIPT"). Runs (conclusion `success`) exactly when the
+      # alert above exited nonzero; skipped otherwise. Exits 0 and reds nothing — and here that is
+      # load-bearing for a second reason the publish-kick job below already states: a workflow_run
+      # conclusion aggregates EVERY job in this workflow, so redding this alert job would suppress
+      # the publish of a perfectly good snapshot.
+      - name: RECEIPT — the hard-METRICS-failure alert did NOT deliver
+        if: ${{ always() && steps.metrics-alert.outcome == 'failure' }}
+        run: |
+          note="metrics-alert exited nonzero: the hard METRICS-failure alert was NOT delivered on any route (issue #1142)"
+          printf '::error::%s\n' "$note"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### UNDELIVERED ALERT\n\n%s\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # [OPUS-5] PUBLISH KICK (#656 follow-up) + the pre-existing mutual keepalive, in that order.
   #
   # The snapshot the metrics job just CAS-published to ledger:data/metrics.json is NOT on the site

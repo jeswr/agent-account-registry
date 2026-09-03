@@ -924,8 +924,9 @@ ALERT_REPO_BINDING_RE = re.compile(r"^[ \t]*ALERT_REPO:[ \t]*(\S.*?)[ \t]*$", re
 ALERT_ROUTE_CONSUMERS = (
     f"{WORKFLOWS_DIR}/dispatch.yml::claim::claim",
     f"{WORKFLOWS_DIR}/dispatch.yml::claim::usage-alert",
-    f"{WORKFLOWS_DIR}/dispatch.yml::plan-alert::"
-    "Alert maintainer that the dispatch PLAN job hard-failed",
+    # [issue #1142] `plan-alert` and `groom-alert` below key by `id:`, not by `name:` — the two
+    # steps gained one so an undelivered-alert receipt could gate on their `outcome`.
+    f"{WORKFLOWS_DIR}/dispatch.yml::plan-alert::plan-alert",
     f"{WORKFLOWS_DIR}/groom-core.yml::groom::"
     "Decide + raise/close model-access health alerts",
     f"{GROOM_WORKFLOW}::groom::Decide + raise/close model-access health alerts",
@@ -934,8 +935,7 @@ ALERT_ROUTE_CONSUMERS = (
     f"{GROOM_WORKFLOW}::ci-latency::ci-latency",
     f"{GROOM_WORKFLOW}::ratelimit-budget::ratelimit-budget",
     f"{GROOM_WORKFLOW}::mint-gap::mint-gap",
-    f"{GROOM_WORKFLOW}::groom-alert::"
-    "Alert maintainer that the scheduled GROOM job hard-failed",
+    f"{GROOM_WORKFLOW}::groom-alert::groom-alert",
     f"{WORKFLOWS_DIR}/metrics.yml::metrics-alert::metrics-alert",
     f"{WORKFLOWS_DIR}/pat-validity.yml::probe::"
     "Probe PAT validity + upsert the rolling alert",
@@ -962,7 +962,9 @@ def alert_route_consumer_drift(consumers, enrolled=ALERT_ROUTE_CONSUMERS):
 
     Pure and total: it compares two identity sets and never inspects a binding, so it stays
     exactly as sound when every surviving binding is canonical — which is the state a
-    whole-block deletion leaves behind.
+    whole-block deletion leaves behind. Shared, for that reason, with the masked-alert seam
+    below (`enrolled=ALERT_DELIVERY_RECEIPTS`): both questions ARE this set comparison, and a
+    second copy of it would be two definitions of one rule, each individually unkillable.
     """
     live = set(consumers)
     return sorted(set(enrolled) - live), sorted(live - set(enrolled))
@@ -980,6 +982,37 @@ def _step_identity(step: dict, index: int) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return f"step[{index}]"
+
+
+def _parsed_workflows(root) -> list[tuple[str, dict]]:
+    """[(relative path, parsed document)] for EVERY workflow file under `root`, sorted.
+
+    ONE definition of "what this estate is", shared by every estate-wide scan below, so two
+    scans can never disagree about the population they judge (the #958 shape). EAGER — it
+    returns a list, not a generator — because the refusals here are the point: deferring them
+    to first iteration lets a caller that never iterates read a broken estate as an empty one.
+
+    FAIL CLOSED in every direction that would quietly shrink the estate: a missing workflows
+    directory raises, and so does an unparseable or non-mapping file. A file this loader skips
+    is a lane whose steps nobody read, which is indistinguishable from a lane that has none.
+    """
+    if yaml is None:  # pragma: no cover - fail loud rather than report an empty estate
+        raise AlarmError(f"PyYAML unavailable: {_YAML_IMPORT_ERROR}")
+    wf_dir = Path(root) / WORKFLOWS_DIR
+    if not wf_dir.is_dir():
+        raise AlarmError(f"no workflows directory at {wf_dir}")
+    docs: list[tuple[str, dict]] = []
+    for path in sorted(wf_dir.glob("*.yml")) + sorted(wf_dir.glob("*.yaml")):
+        rel = f"{WORKFLOWS_DIR}/{path.name}"
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            raise AlarmError(f"unparseable workflow YAML in {rel}: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise AlarmError(f"{rel} is not a YAML mapping: refusing to report it as binding "
+                             "nothing")
+        docs.append((rel, doc))
+    return docs
 
 
 def alert_route_consumers(root) -> dict[str, dict]:
@@ -1012,11 +1045,6 @@ def alert_route_consumers(root) -> dict[str, dict]:
     does not return is a binding the estate check does not watch, which is indistinguishable
     from a lane that never bound one.
     """
-    if yaml is None:  # pragma: no cover - fail loud rather than report an empty estate
-        raise AlarmError(f"PyYAML unavailable: {_YAML_IMPORT_ERROR}")
-    wf_dir = Path(root) / WORKFLOWS_DIR
-    if not wf_dir.is_dir():
-        raise AlarmError(f"no workflows directory at {wf_dir}")
     out: dict[str, dict] = {}
 
     def record(key: str, env) -> None:
@@ -1032,15 +1060,7 @@ def alert_route_consumers(root) -> dict[str, dict]:
         out[key] = {"ALERT_REPO": bound.get("ALERT_REPO"),
                     "ALERT_TOKEN": bound.get("ALERT_TOKEN")}
 
-    for path in sorted(wf_dir.glob("*.yml")) + sorted(wf_dir.glob("*.yaml")):
-        rel = f"{WORKFLOWS_DIR}/{path.name}"
-        try:
-            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except yaml.YAMLError as exc:
-            raise AlarmError(f"unparseable workflow YAML in {rel}: {exc}") from exc
-        if not isinstance(doc, dict):
-            raise AlarmError(f"{rel} is not a YAML mapping: refusing to report it as binding "
-                             "nothing")
+    for rel, doc in _parsed_workflows(root):
         record(f"{rel}::env", doc.get("env"))
         jobs = doc.get("jobs")
         if not isinstance(jobs, dict):
@@ -1056,6 +1076,140 @@ def alert_route_consumers(root) -> dict[str, dict]:
                 if isinstance(step, dict):
                     record(f"{rel}::{job_id}::{_step_identity(step, index)}", step.get("env"))
     return out
+
+
+# [issue #1142] THE MASKED-ALERT SEAM. A step with `continue-on-error: true` that exits NONZERO is
+# reported by the jobs API as `conclusion: success`, not `failure` — so every alert script's
+# deliberate "the alert could NOT be delivered on any route — treat this run as FAILED" exit
+# reached nothing a human or a machine reads. Measured on run 30411293099 job 90448020180: the
+# step exited 1, `.steps[].conclusion` read `success`, and a check-run annotation was the only
+# surviving witness. An alarm that FIRES BUT CANNOT DELIVER was, in every structured field a
+# monitor queries, identical to an alarm that correctly found nothing wrong.
+#
+# `continue-on-error` on those steps is deliberate and stays (a watchdog fault must never red the
+# sweep hosting it), so the fix is a RECEIPT step gated on the alert step's `outcome` — the step's
+# own result BEFORE continue-on-error rewrites `conclusion`. The receipt therefore RUNS
+# (conclusion `success`) exactly when the alert failed and is SKIPPED otherwise, which puts the
+# signal back into `.steps[].conclusion` without changing what can red.
+#
+# The bare-FILE name, not a path: the estate spells the same script both `scripts/x-alert.py` and
+# `registry/scripts/x-alert.py`, and a path-anchored pattern would silently drop a lane out of the
+# population this check watches — which reads exactly like a lane that has no alert step.
+ALERT_SCRIPT_RE = re.compile(r"\b([A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*-alert\.py)\b")
+
+
+def alert_receipt_condition(step_id: str) -> str:
+    """The EXACT `if:` an undelivered-alert receipt must carry for the alert step `step_id`.
+
+    `always()` is load-bearing, not decoration: the alert steps themselves run under
+    `if: always()`, so an earlier hard failure in the same job leaves the job in a failed state
+    and a receipt without it is SKIPPED on precisely the tick its signal is worth having.
+    """
+    return "${{ always() && steps." + step_id + ".outcome == 'failure' }}"
+
+
+def alert_delivery_receipts(root) -> dict[str, dict]:
+    """Every MASKED alert lane in this estate, with the step that observes its failure (#1142).
+
+    -> {"<path>::<job>::<step id>": {"scripts": [...], "receipt": <`if:` expr>|None,
+       "receipt_continue_on_error": <value>|None}} for every step that runs a `*-alert.py` AND
+    carries a truthy `continue-on-error`. `receipt` is the `if:` of the LATER step in the same
+    job that reads `steps.<id>.outcome`, taken VERBATIM off the workflow — never compared here.
+    The comparison against `alert_receipt_condition` belongs to the caller so that the expected
+    value and the observed one come from two different files; deciding equality in here would
+    reduce every row to "the constant equals itself".
+
+    WHY THE POPULATION IS DERIVED, NOT LISTED. An exemption list is a fail-open hole one PR
+    later: the next alert lane added with `continue-on-error` and no receipt would simply not be
+    in it. Structure decides membership, and ALERT_DELIVERY_RECEIPTS is the independent enrolled
+    record the derived set is compared against for EQUALITY in both directions.
+
+    ANY truthy `continue-on-error` masks — `true`, the string `'true'`, or a `${{ }}` expression
+    — so only an absent or explicitly-false one leaves a lane unwatched. Reading it as strictly
+    `is True` would let `continue-on-error: ${{ true }}` mask a lane out of this map entirely.
+
+    FAIL CLOSED. A masked lane with no `id:` RAISES: an `outcome` cannot be read off an anonymous
+    step, so no receipt could exist for it and recording `None` would make an unfixable lane look
+    like one that merely lost its receipt. Two later steps reading the same `outcome` raise
+    rather than one being picked — which one is the receipt is not a guess this makes.
+    """
+    out: dict[str, dict] = {}
+    for rel, doc in _parsed_workflows(root):
+        jobs = doc.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for job_id, job in sorted(jobs.items()):
+            if not isinstance(job, dict):
+                continue
+            steps = job.get("steps")
+            if not isinstance(steps, list):
+                continue
+            for index, step in enumerate(steps):
+                if not isinstance(step, dict):
+                    continue
+                scripts = sorted(set(ALERT_SCRIPT_RE.findall(str(step.get("run", "")))))
+                masked = step.get("continue-on-error")
+                if not scripts or masked is None or masked is False:
+                    continue
+                step_id = step.get("id")
+                if not isinstance(step_id, str) or not step_id.strip():
+                    raise AlarmError(
+                        f"{rel}::{job_id}::{_step_identity(step, index)} masks a nonzero "
+                        f"{scripts[0]} exit with `continue-on-error` and declares no `id:`, so "
+                        "nothing can read its `outcome`: the fail-loud path is unobservable and "
+                        "no receipt could exist to say so")
+                step_id = step_id.strip()
+                key = f"{rel}::{job_id}::{step_id}"
+                if key in out:
+                    raise AlarmError(
+                        f"two masked alert lanes share the identity {key!r}; which one the "
+                        "receipt check watches is not a question it gets to guess at")
+                marker = f"steps.{step_id}.outcome"
+                receipt = None
+                for later in steps[index + 1:]:
+                    if not isinstance(later, dict):
+                        continue
+                    if marker not in str(later.get("if", "")):
+                        continue
+                    if receipt is not None:
+                        raise AlarmError(
+                            f"{key} has more than one later step reading its `outcome`; which "
+                            "one is the delivery receipt is not a guess this makes")
+                    receipt = later
+                out[key] = {
+                    "scripts": scripts,
+                    "receipt": None if receipt is None else str(receipt.get("if", "")),
+                    "receipt_continue_on_error": (None if receipt is None
+                                                  else receipt.get("continue-on-error")),
+                }
+    return out
+
+
+# EVERY masked alert lane on master, by STRUCTURAL IDENTITY, compared for EQUALITY in BOTH
+# directions exactly as ALERT_ROUTE_CONSUMERS is — and for the same reason. `alert_delivery_
+# receipts` DISCOVERS its population from the workflows, so a lane that loses its
+# `continue-on-error` (fine) and a lane whose whole alert step was deleted (not fine) both leave
+# the map identically. This record is the independent oracle that tells them apart, and an
+# UNENROLLED lane is a new masked alert step whose receipt nobody has checked — a failure on the
+# PR that adds it, which is the only moment it is cheap.
+ALERT_DELIVERY_RECEIPTS = (
+    f"{WORKFLOWS_DIR}/dispatch.yml::claim::usage-alert",
+    f"{WORKFLOWS_DIR}/dispatch.yml::plan-alert::plan-alert",
+    f"{WORKFLOWS_DIR}/metrics.yml::metrics-alert::metrics-alert",
+    f"{GROOM_WORKFLOW}::ci-latency::ci-latency",
+    f"{GROOM_WORKFLOW}::dispatch-stall::dispatch-stall",
+    f"{GROOM_WORKFLOW}::groom-alert::groom-alert",
+    f"{GROOM_WORKFLOW}::metrics-stale::metrics-stale",
+    f"{GROOM_WORKFLOW}::mint-gap::mint-gap",
+    f"{GROOM_WORKFLOW}::ratelimit-budget::ratelimit-budget",
+)
+
+# The evidence floor for the derived scan, same shape and same reason as MIN_ALERT_REPO_BINDINGS:
+# a "every lane has a receipt" verdict over an EMPTY population is vacuously green, and a thin
+# checkout or a pattern that stopped matching is exactly how the population goes empty. Nine
+# masked lanes on master today. The floor cannot see a DELETION — that is the enrolled record's
+# job — and the enrolled record is held to this same floor so it cannot be thinned to a sample.
+MIN_ALERT_DELIVERY_RECEIPTS = 9
 
 
 def _alert_route(alert_repo, alert_token, registry_repo):
@@ -1845,6 +1999,208 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         pass
     except Exception:
         chk("alert route: a missing workflows directory raised the wrong error", False)
+
+    # --- [issue #1142] THE UNDELIVERED-ALERT RECEIPT, hermetic, both directions. Every fixture
+    # below RUNS an alert script; what varies is the one field that decides MEMBERSHIP
+    # (`continue-on-error`) and the one that decides the VERDICT (a later step's `if:`). The
+    # expected condition is composed here and the observed one is read out of the workflow, so
+    # no row compares the constant with itself. ---
+    chk("receipt: the canonical `if:` is EXACTLY the always()-guarded outcome test",
+        alert_receipt_condition("lane-x")
+        == "${{ always() && steps.lane-x.outcome == 'failure' }}")
+    chk("receipt: dropping `always()` is NOT the canonical condition — the alert steps run under "
+        "`if: always()`, so without it the receipt is SKIPPED on exactly the tick an earlier hard "
+        "failure in the job makes its signal worth having",
+        alert_receipt_condition("lane-x") != "${{ steps.lane-x.outcome == 'failure' }}")
+    chk("receipt: the condition names the STEP, so one lane's receipt cannot stand in for "
+        "another's (both would satisfy a check that only looked for `.outcome`)",
+        alert_receipt_condition("lane-x") != alert_receipt_condition("lane-y"))
+
+    def _lane_yaml(step_id, coe, receipt_if, script="usage-alert.py", with_id=True,
+                   receipt_first=False, receipt_coe=None):
+        alert = ["      - name: alert"]
+        if with_id:
+            alert.append(f"        id: {step_id}")
+        if coe is not None:
+            alert.append(f"        continue-on-error: {coe}")
+        alert.append(f"        run: python3 registry/scripts/{script}")
+        receipt = []
+        if receipt_if is not None:
+            receipt = ["      - name: receipt", f'        if: "{receipt_if}"']
+            if receipt_coe is not None:
+                receipt.append(f"        continue-on-error: {receipt_coe}")
+            receipt.append("        run: 'true'")
+        body = receipt + alert if receipt_first else alert + receipt
+        return "on:\n  push:\njobs:\n  watch:\n    steps:\n" + "\n".join(body) + "\n"
+
+    with tempfile.TemporaryDirectory() as _rtmp:
+        _rwf = Path(_rtmp) / WORKFLOWS_DIR
+        _rwf.mkdir(parents=True)
+        _inert_if = "${{ always() && steps.lane-inert.outcome == 'failure' && false }}"
+        for _name, _text in (
+                ("ok.yml", _lane_yaml("lane-ok", "true",
+                                      alert_receipt_condition("lane-ok"))),
+                ("inert.yml", _lane_yaml("lane-inert", "true", _inert_if)),
+                ("bare.yml", _lane_yaml("lane-bare", "true", None)),
+                ("before.yml", _lane_yaml("lane-before", "true",
+                                          alert_receipt_condition("lane-before"),
+                                          receipt_first=True)),
+                ("quoted.yml", _lane_yaml("lane-quoted", "'true'",
+                                          alert_receipt_condition("lane-quoted"))),
+                ("open.yml", _lane_yaml("lane-open", None, None)),
+                ("declared-false.yml", _lane_yaml("lane-false", "false", None)),
+                ("notanalert.yml", _lane_yaml("lane-groom", "true", None, script="groom.py")),
+                ("nojobs.yml", "on:\n  push:\n"),
+                # THE SHAPES THE WALK MUST STEP PAST WITHOUT STUMBLING, and — the direction that
+                # matters — without silently dropping the live lane sitting among them. Every
+                # `continue` in the descent is otherwise a line no fixture executes, so deleting
+                # one is free.
+                ("jobslist.yml", "on:\n  push:\njobs: []\n"),
+                ("odd-shapes.yml",
+                 "on:\n  push:\njobs:\n  notamap: []\n  nosteps:\n    steps: notalist\n"
+                 "  weird:\n    steps:\n      - 'a bare string step'\n"
+                 "      - name: alert\n        id: lane-odd\n        continue-on-error: true\n"
+                 "        run: python3 registry/scripts/usage-alert.py\n"
+                 "      - 'a bare string after it'\n"),
+                # A receipt is not required to be the very NEXT step: an unrelated conditional
+                # step between the two must not hide it. Pinning adjacency instead would red on
+                # every future insertion and invite the receipt to be deleted rather than moved.
+                ("interleaved.yml",
+                 "on:\n  push:\njobs:\n  watch:\n    steps:\n"
+                 "      - name: alert\n        id: lane-mid\n        continue-on-error: true\n"
+                 "        run: python3 registry/scripts/usage-alert.py\n"
+                 '      - name: unrelated\n        if: "${{ always() }}"\n        run: \'true\'\n'
+                 f'      - name: receipt\n        if: "{alert_receipt_condition("lane-mid")}"\n'
+                 "        run: 'true'\n")):
+            (_rwf / _name).write_text(_text)
+        # GUARDED, and every lookup below is `.get`-based. A mutant that makes this scan RAISE
+        # (or drop a lane) must red ONE row and let the rest of the block run: an exception
+        # escaping here records as a kill while every check under it never executes, which is
+        # AGENTS.md pre-flight item 4's crash-after-partial-run — the shape that hides a second
+        # defect behind the first. Measured on this very block: two mutants aborted it at 3 and
+        # 10 of 16 rows before this guard was added.
+        try:
+            _lanes = alert_delivery_receipts(_rtmp)
+        except AlarmError as _exc:
+            chk(f"receipt: the well-formed fixture estate scans without refusing ({_exc})", False)
+            _lanes = {}
+        _wf = WORKFLOWS_DIR
+
+        def _lane(name):
+            return _lanes.get(name) or {}
+
+        chk("receipt: MEMBERSHIP is exactly the MASKED alert steps — a step with no "
+            "`continue-on-error` (`lane-open`), one that declares it FALSE (`lane-false`) and a "
+            "masked step that runs no alert script (`lane-groom`) are all absent, while a live "
+            "lane surrounded by unwalkable shapes (`lane-odd`) is still THERE, so the population "
+            f"can be neither widened nor thinned into a vacuous pass (saw {sorted(_lanes)})",
+            sorted(_lanes) == [f"{_wf}/bare.yml::watch::lane-bare",
+                               f"{_wf}/before.yml::watch::lane-before",
+                               f"{_wf}/inert.yml::watch::lane-inert",
+                               f"{_wf}/interleaved.yml::watch::lane-mid",
+                               f"{_wf}/odd-shapes.yml::weird::lane-odd",
+                               f"{_wf}/ok.yml::watch::lane-ok",
+                               f"{_wf}/quoted.yml::watch::lane-quoted"])
+        chk("receipt: a receipt SEPARATED from its alert step by an unrelated conditional step is "
+            "still found — adjacency is not the invariant, observing the outcome is",
+            _lane(f"{_wf}/interleaved.yml::watch::lane-mid").get("receipt")
+            == alert_receipt_condition("lane-mid"))
+        chk("receipt: a canonical receipt is recorded VERBATIM off the workflow",
+            _lane(f"{_wf}/ok.yml::watch::lane-ok").get("receipt")
+            == alert_receipt_condition("lane-ok"))
+        chk("receipt: the invoking script is recorded, so a lane cannot be watched by name alone",
+            _lane(f"{_wf}/ok.yml::watch::lane-ok").get("scripts") == ["usage-alert.py"])
+        _inert = str(_lane(f"{_wf}/inert.yml::watch::lane-inert").get("receipt"))
+        chk("receipt: a receipt neutralised to `&& false` is recorded AS WRITTEN and is NOT the "
+            "canonical condition — and a containment test on `.outcome` would have accepted it, "
+            "which is why the seam pins EXACT equality",
+            _inert == _inert_if and _inert != alert_receipt_condition("lane-inert")
+            and "steps.lane-inert.outcome" in _inert)
+        chk("receipt: a masked lane with NO later step reading its `outcome` records None — the "
+            "whole-receipt deletion, which no check that reads a receipt's VALUE can see",
+            _lane(f"{_wf}/bare.yml::watch::lane-bare").get("receipt", "absent") is None)
+        chk("receipt: a receipt placed BEFORE the alert step records None — it runs before the "
+            "outcome it claims to report exists, so accepting it would pass on a dead signal",
+            _lane(f"{_wf}/before.yml::watch::lane-before").get("receipt", "absent") is None)
+        chk("receipt: `continue-on-error: 'true'` as a STRING still masks, so a lane cannot leave "
+            "this population by changing the spelling of the thing that hides it",
+            _lane(f"{_wf}/quoted.yml::watch::lane-quoted").get("receipt")
+            == alert_receipt_condition("lane-quoted"))
+        chk("receipt: a receipt's own `continue-on-error` is carried out for the seam to judge",
+            _lane(f"{_wf}/ok.yml::watch::lane-ok").get("receipt_continue_on_error", "absent") is None)
+        (_rwf / "coe-receipt.yml").write_text(
+            _lane_yaml("lane-coe", "true", alert_receipt_condition("lane-coe"),
+                       receipt_coe="true"))
+        try:
+            _coe = (alert_delivery_receipts(_rtmp).get(f"{_wf}/coe-receipt.yml::watch::lane-coe")
+                    or {}).get("receipt_continue_on_error")
+        except AlarmError as _exc:
+            _coe = f"refused: {_exc}"
+        chk("receipt: a receipt that is ITSELF continue-on-error is reported as such — the one "
+            f"step whose conclusion is the signal must not be maskable in turn (saw {_coe!r})",
+            _coe is True)
+        (_rwf / "coe-receipt.yml").unlink()
+        (_rwf / "anon.yml").write_text(
+            _lane_yaml("lane-anon", "true", None, with_id=False))
+        try:
+            alert_delivery_receipts(_rtmp)
+            chk("receipt: a masked alert step with NO `id:` RAISES — nothing can read the "
+                "`outcome` of an anonymous step, so recording it as 'no receipt' would make an "
+                "unfixable lane look like one that merely lost one", False)
+        except AlarmError:
+            pass
+        except Exception:
+            chk("receipt: an id-less masked alert step raised the wrong error", False)
+        (_rwf / "anon.yml").unlink()
+        (_rwf / "dupid.yml").write_text(
+            "on:\n  push:\njobs:\n  watch:\n    steps:\n"
+            "      - name: a\n        id: lane-dup\n        continue-on-error: true\n"
+            "        run: python3 registry/scripts/usage-alert.py\n"
+            "      - name: b\n        id: lane-dup\n        continue-on-error: true\n"
+            "        run: python3 registry/scripts/usage-alert.py\n")
+        try:
+            alert_delivery_receipts(_rtmp)
+            chk("receipt: two masked lanes with the SAME identity RAISE rather than one silently "
+                "overwriting the other — the overwritten lane is unwatched", False)
+        except AlarmError:
+            pass
+        except Exception:
+            chk("receipt: colliding masked-lane identities raised the wrong error", False)
+        (_rwf / "dupid.yml").unlink()
+        (_rwf / "twin.yml").write_text(
+            "on:\n  push:\njobs:\n  watch:\n    steps:\n"
+            "      - name: alert\n        id: lane-twin\n        continue-on-error: true\n"
+            "        run: python3 registry/scripts/usage-alert.py\n"
+            f'      - name: a\n        if: "{alert_receipt_condition("lane-twin")}"\n'
+            "        run: 'true'\n"
+            f'      - name: b\n        if: "{alert_receipt_condition("lane-twin")}"\n'
+            "        run: 'true'\n")
+        try:
+            alert_delivery_receipts(_rtmp)
+            chk("receipt: TWO later steps reading one `outcome` RAISE — which of them is the "
+                "delivery receipt is not a guess, and guessing wrong pins the wrong step", False)
+        except AlarmError:
+            pass
+        except Exception:
+            chk("receipt: colliding receipt candidates raised the wrong error", False)
+        (_rwf / "twin.yml").unlink()
+    try:
+        # The directory is gone with the context manager: a thin checkout must not read as
+        # "this estate masks no alert lane anywhere".
+        alert_delivery_receipts(_rtmp)
+        chk("receipt: a MISSING workflows directory raises rather than returning {}", False)
+    except AlarmError:
+        pass
+    except Exception:
+        chk("receipt: a missing workflows directory raised the wrong error", False)
+
+    chk("receipt: ALERT_DELIVERY_RECEIPTS lists each identity ONCE (a repeated entry shrinks the "
+        f"set the seam compares against) ({len(ALERT_DELIVERY_RECEIPTS)} entries)",
+        len(set(ALERT_DELIVERY_RECEIPTS)) == len(ALERT_DELIVERY_RECEIPTS))
+    chk(f"receipt: the enrolled record clears its own evidence floor "
+        f"({len(ALERT_DELIVERY_RECEIPTS)} enrolled, floor {MIN_ALERT_DELIVERY_RECEIPTS}) — "
+        "thinning it back toward a sample is what makes an equality check quietly narrow",
+        len(set(ALERT_DELIVERY_RECEIPTS)) >= MIN_ALERT_DELIVERY_RECEIPTS)
 
     # --- The enrolled record's own integrity. It is the ONE oracle here that is not derived from
     # the tree, so nothing else can notice it decaying. ---
@@ -2761,6 +3117,42 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             "here can see the deletion of. Enrol/retire it in ALERT_ROUTE_CONSUMERS in the same "
             "PR that adds/removes the step",
             _drift == ([], []))
+        # --- [issue #1142] THE UNDELIVERED-ALERT RECEIPT, on the LIVE tree ------------------
+        # Same three-part shape as the block above, for the same reasons: an evidence floor so a
+        # thin checkout cannot pass vacuously, an ENROLLED-SET equality so a deleted alert step
+        # is a missing key rather than a smaller green population, and an EXACT per-lane
+        # comparison so a receipt neutralised to `&& false` — which satisfies every containment
+        # test one could write — reds here.
+        _receipts = alert_delivery_receipts(root)
+        chk(f"seam: the masked-alert population clears its evidence floor "
+            f"(saw {len(_receipts)}, floor {MIN_ALERT_DELIVERY_RECEIPTS}) — a derivation that "
+            "stopped matching yields none, and 'every masked lane has a receipt' over an empty "
+            "population is vacuously green",
+            len(_receipts) >= MIN_ALERT_DELIVERY_RECEIPTS)
+        _receipt_drift = alert_route_consumer_drift(_receipts, ALERT_DELIVERY_RECEIPTS)
+        chk("seam: the live masked-alert lane set is EXACTLY the enrolled one (vanished: "
+            f"{_receipt_drift[0]}; unenrolled: {_receipt_drift[1]}) — a vanished lane is an "
+            "alert step deleted or renamed, and an unenrolled one is a new alert lane whose "
+            "fail-loud exit nobody has made observable. Enrol/retire it in "
+            "ALERT_DELIVERY_RECEIPTS in the same PR that adds/removes the step",
+            _receipt_drift == ([], []))
+        # `conclusion` is pinned to `success` on every one of these steps, so the ONLY structured
+        # field left that can say "this alarm fired and could not deliver" is the receipt's own
+        # conclusion — `success` when it ran, `skipped` when it did not. A lane whose receipt is
+        # missing or inert is back to an annotation nobody reads.
+        _unobservable = sorted(
+            (key, lane["receipt"]) for key, lane in _receipts.items()
+            if lane["receipt"] != alert_receipt_condition(key.rsplit("::", 1)[1]))
+        chk("seam: EVERY masked alert lane carries a receipt whose `if:` is the canonical "
+            "condition EXACTLY — a missing one leaves the fail-loud exit reported as "
+            f"`conclusion: success`, and an `&& false` one reads identically to a healthy tick "
+            f"({_unobservable})",
+            _unobservable == [])
+        _maskable = sorted(key for key, lane in _receipts.items()
+                           if lane["receipt_continue_on_error"] is not None)
+        chk("seam: no receipt is ITSELF `continue-on-error` — the one step whose conclusion "
+            f"carries the signal must not be maskable in turn ({_maskable})",
+            _maskable == [])
         wf = yaml.safe_load((root / GROOM_WORKFLOW).read_text())
         jobs = wf.get("jobs", {})
         chk("seam: groom-sweep.yml hosts a `ci-latency` job", "ci-latency" in jobs)

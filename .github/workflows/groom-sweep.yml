@@ -441,6 +441,20 @@ jobs:
           python3 registry/scripts/metrics-alert.py --self-test
           python3 registry/scripts/metrics-alert.py --stale-check
 
+      # [issue #1142] Undelivered-alert receipt — full rationale on the SAME step in dispatch.yml's
+      # `claim` job ("THE UNDELIVERED-ALERT RECEIPT"). `continue-on-error` above masks a nonzero
+      # exit as `conclusion: success`; `outcome` is the pre-mask result, so this step RUNS
+      # (conclusion `success`) exactly when the alert failed and is SKIPPED otherwise. Exits 0 and
+      # reds nothing — a watchdog fault must still never red the grooming sweep.
+      - name: RECEIPT — the metrics-snapshot staleness alert did NOT deliver
+        if: ${{ always() && steps.metrics-stale.outcome == 'failure' }}
+        run: |
+          note="metrics-alert --stale-check exited nonzero: the snapshot-staleness alert was NOT delivered on any route (issue #1142)"
+          printf '::error::%s\n' "$note"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### UNDELIVERED ALERT\n\n%s\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # WATCH THE DISPATCHER (issue #819). dispatch.yml already has a per-run failure alert — the
   # `plan-alert` job — and it fired ZERO times during the 2026-07-27 stall. Measured on run
   # 30295860510 and repeated on every failing tick from 18:26:17Z: PLAN `failure` (HTTP 403 on an
@@ -530,6 +544,18 @@ jobs:
           set -uo pipefail
           python3 registry/scripts/dispatch-stall-alert.py --self-test
           python3 registry/scripts/dispatch-stall-alert.py
+
+      # [issue #1142] Undelivered-alert receipt — full rationale on the SAME step in dispatch.yml's
+      # `claim` job ("THE UNDELIVERED-ALERT RECEIPT"). Runs (conclusion `success`) exactly when the
+      # alert above exited nonzero; skipped otherwise. Exits 0 and reds nothing.
+      - name: RECEIPT — the dispatch-stall alert did NOT deliver
+        if: ${{ always() && steps.dispatch-stall.outcome == 'failure' }}
+        run: |
+          note="dispatch-stall-alert exited nonzero: the dispatcher-stall alert was NOT delivered on any route (issue #1142)"
+          printf '::error::%s\n' "$note"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### UNDELIVERED ALERT\n\n%s\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # FAIL-LOUD alert for a HARD GROOM failure (issue #176). The model-access health decision is the
   # LAST step of the `groom` job under the default success() guard, and every other repair happens
@@ -629,6 +655,19 @@ jobs:
           MAINTAINER_HANDLE: jeswr
         run: python3 registry/scripts/ci-latency-alert.py
 
+      # [issue #1142] Undelivered-alert receipt — full rationale on the SAME step in dispatch.yml's
+      # `claim` job ("THE UNDELIVERED-ALERT RECEIPT"). The asymmetry this job already pins (the
+      # self-test step must be able to red the job; the ALERT step must not) is unchanged: this
+      # restores the alert step's MASKED exit as an observable without changing what can red.
+      - name: RECEIPT — the CI execution-latency alert did NOT deliver
+        if: ${{ always() && steps.ci-latency.outcome == 'failure' }}
+        run: |
+          note="ci-latency-alert exited nonzero: the CI execution-latency alert was NOT delivered on any route (issue #1142)"
+          printf '::error::%s\n' "$note"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### UNDELIVERED ALERT\n\n%s\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # [SPARQ agent] WATCH THE SHARED REQUEST BUDGET (issue #1123). Registry #1088 — groom losing
   # sweeps to a spent REST budget — was diagnosed only after ~9% of sweeps had already been lost,
   # by sampling failed runs by hand, because nothing watched the budget itself. That budget is
@@ -713,6 +752,18 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MAINTAINER_HANDLE: jeswr
         run: python3 registry/scripts/ratelimit-alert.py
+
+      # [issue #1142] Undelivered-alert receipt — full rationale on the SAME step in dispatch.yml's
+      # `claim` job ("THE UNDELIVERED-ALERT RECEIPT"). Runs (conclusion `success`) exactly when the
+      # alert above exited nonzero; skipped otherwise. Exits 0 and reds nothing.
+      - name: RECEIPT — the shared REST-budget alert did NOT deliver
+        if: ${{ always() && steps.ratelimit-budget.outcome == 'failure' }}
+        run: |
+          note="ratelimit-alert exited nonzero: the shared REST-budget alert was NOT delivered on any route (issue #1142)"
+          printf '::error::%s\n' "$note"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### UNDELIVERED ALERT\n\n%s\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # [OPUS-5] WATCH THE CREDENTIALS (issue #269). A DEFER THAT NEVER ENDS IS AN OUTAGE WEARING A
   # GREEN CHECK. The issue #168 fix made each per-owner target-token mint continue-on-error, so a
@@ -811,6 +862,18 @@ jobs:
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
         run: python3 registry/scripts/groom-mint-alert.py
 
+      # [issue #1142] Undelivered-alert receipt — full rationale on the SAME step in dispatch.yml's
+      # `claim` job ("THE UNDELIVERED-ALERT RECEIPT"). Runs (conclusion `success`) exactly when the
+      # alert above exited nonzero; skipped otherwise. Exits 0 and reds nothing.
+      - name: RECEIPT — the target-token mint-gap alert did NOT deliver
+        if: ${{ always() && steps.mint-gap.outcome == 'failure' }}
+        run: |
+          note="groom-mint-alert exited nonzero: the target-token mint-gap alert was NOT delivered on any route (issue #1142)"
+          printf '::error::%s\n' "$note"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### UNDELIVERED ALERT\n\n%s\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   groom-alert:
     name: ALERT (hard GROOM-job failure)
     needs: [groom]
@@ -842,6 +905,10 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Alert maintainer that the scheduled GROOM job hard-failed
+        # `id:` so the undelivered-alert receipt below can gate on this step's own `outcome`
+        # (issue #1142). It is also this step's identity in ci-latency-alert.py's
+        # ALERT_ROUTE_CONSUMERS record, which is keyed `id` first and `name` second.
+        id: groom-alert
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -861,4 +928,16 @@ jobs:
           set -uo pipefail
           python3 registry/scripts/groom-alert.py --self-test
           python3 registry/scripts/groom-alert.py
+
+      # [issue #1142] Undelivered-alert receipt — full rationale on the SAME step in dispatch.yml's
+      # `claim` job ("THE UNDELIVERED-ALERT RECEIPT"). Runs (conclusion `success`) exactly when the
+      # alert above exited nonzero; skipped otherwise. Exits 0 and reds nothing.
+      - name: RECEIPT — the hard-GROOM-failure alert did NOT deliver
+        if: ${{ always() && steps.groom-alert.outcome == 'failure' }}
+        run: |
+          note="groom-alert exited nonzero: the hard GROOM-failure alert was NOT delivered on any route (issue #1142)"
+          printf '::error::%s\n' "$note"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### UNDELIVERED ALERT\n\n%s\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
