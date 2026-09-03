@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6228,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e7d89918ebcfca9bb17847596b19648d06df97ab",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "workflow_running_package_tests() applies _NPM_TEST_RE to the complete step chunk, not specifically to the run scalar. A step such as `- name: npm test` with `working-directory: packages/newpkg` and `run: npm run build` therefore passes G1-pkg-ci even though tests never execute. The same false positive is possible through other scalar metadata such as env values. Stripping whole-line comments does not make the structural walk command-aware, so this violates the gate's load-bearing fail-closed invariant.",
+    "file": "scripts/gate-new-crate.py",
+    "fix_hint": "Extract only each step's `run:` scalar (including its block-scalar continuation at the correct indentation) and apply command detection solely to that value. Add a regression test where the step name or env mentions `npm test` while the run command only builds the target package, and assert a violation.",
+    "severity": "major",
+    "title": "Step metadata can be mistaken for an npm test invocation"
+   },
+   {
+    "body": "The code first finds any npm-test-looking text in a step chunk, then _selects_workspace() accepts any selector elsewhere in that chunk. A multiline run step containing `npm test -w @sparq/other` plus `npm run build -w @sparq/newpkg` is therefore credited as running newpkg's tests. Thus a newly added package can ship tests that remain dead while the hard gate passes.",
+    "file": "scripts/gate-new-crate.py",
+    "fix_hint": "Parse the run scalar into shell command units conservatively and require the target workspace selector to be part of the same npm invocation whose subcommand is `test`; alternatively only accept a directly visible, single npm test command line matching the target. Add the mixed-command counterexample as a regression test.",
+    "severity": "major",
+    "title": "Workspace selector need not belong to the detected test command"
+   }
+  ],
+  "progress": null,
+  "summary": "The new gate is fail-open because it searches an entire YAML step chunk for command-like text and independently searches that chunk for workspace selectors. Consequently, metadata or separate commands can satisfy the gate even though the package test script is never invoked. The tests cover comments and sibling script names, but not these real false-positive shapes.",
+  "verdict": "request_changes"
+ }
+}
