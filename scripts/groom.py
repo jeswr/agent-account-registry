@@ -1464,18 +1464,22 @@ def import_time_sibling_loads(source: str) -> tuple[str, ...]:
     `Path(__file__).resolve().with_name("<x>.py")` idiom both load forms in this module use — the
     `_load_module` calls and the bare `spec_from_file_location` pair at the top of the file.
 
-    Loads nested inside a `def`/`class`/`lambda` are deliberately EXCLUDED: those run on call, not
-    on import (policy-resolve.py, run_name_grammar.py, dispatch-secrets-guard.py), so they are not
-    a checkout dependency of every invocation and declaring them would over-constrain the sparse
-    lists this feeds. Raises SyntaxError on unparseable source — callers surface that as a refusal
-    rather than as an empty set, which would make every coverage check below vacuously true."""
+    Loads nested inside a `def`/`lambda` are deliberately EXCLUDED: those run on call, not on
+    import (policy-resolve.py, run_name_grammar.py, dispatch-secrets-guard.py), so they are not a
+    checkout dependency of every invocation and declaring them would over-constrain the sparse
+    lists this feeds. A `class` body is NOT deferred that way — it EXECUTES as the module executes,
+    so a load written directly in a class body is a dependency of every invocation exactly like a
+    module-level one, and this descends into it (round-1 review of #2033: skipping ClassDef let a
+    class-body load add a real dependency with the exactness assertion still green). Method bodies
+    inside that class are still excluded — the FunctionDef skip applies at every depth.
+
+    Raises SyntaxError on unparseable source — callers surface that as a refusal rather than as an
+    empty set, which would make every coverage check below vacuously true."""
     found: set[str] = set()
 
     def scan(node: Any) -> None:
         for child in ast.iter_child_nodes(node):
-            if isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
-            ):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                 continue
             if (
                 isinstance(child, ast.Call)
@@ -1570,17 +1574,69 @@ def _sparse_entry_covers(entry: str, path: str) -> bool:
     return path == normalized or path.startswith(normalized.rstrip("/") + "/")
 
 
+# A step-level `if:` this parser is prepared to call STATICALLY TRUE. Anything else — `false`, a
+# `steps.*`/`needs.*` expression, a trailing comment, a form not listed here — disqualifies the
+# step from PROVING a checkout, because a checkout that may not run cannot be evidence that the
+# siblings exist. Unrecognised is therefore always the strict direction, never the permissive one.
+_ALWAYS_RUN_STEP_CONDITIONS = frozenset(
+    {"true", "always()", "${{ true }}", "${{ always() }}"}
+)
+
+
+def _step_condition(step_lines: list[str]) -> str | None:
+    """Pure: one step's `if:` value verbatim, or None when the step declares none (= unconditional).
+    Comment lines cannot match: `#` follows the indent, so `if:` is never at the key position.
+    Indent-tolerant, like the `ref:` match, because over-matching here can only DISQUALIFY a
+    checkout — the strict direction (#621)."""
+    for line in step_lines:
+        match = re.match(r"^\s+if:\s*(.*?)\s*$", line)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _step_is_checkout(step_lines: list[str]) -> bool:
+    """Pure: does this step actually RUN actions/checkout? Matched at the step's OWN key indent, so
+    a commented-out `# uses: actions/checkout@…` and a `uses:` line living inside a `run:` block
+    scalar are both excluded.
+
+    This is the one place where over-matching is the DANGEROUS direction — every other pattern here
+    is deliberately indent-tolerant because over-matching them only excludes a step and tightens the
+    verdict, whereas a falsely-detected checkout would ADMIT one and prove coverage that no step
+    ever performs."""
+    if not step_lines:
+        return False
+    bullet = re.match(r"^(\s*)-\s+(.*)$", step_lines[0])
+    if bullet is None:
+        return False
+    indent = len(bullet.group(1)) + 2
+    keys = [bullet.group(2)] + [line[indent:] for line in step_lines[1:]
+                                if len(line) - len(line.lstrip(" ")) == indent]
+    return any(re.match(r"^uses:\s*actions/checkout@", key) for key in keys)
+
+
 def groom_checkout_coverage_verdict(
     workflow_text: str, workflow_name: str, siblings: tuple[str, ...]
 ) -> tuple[bool, str]:
-    """Pure: (ok, reason). Every job in `workflow_text` that invokes this script must check out
-    every path in `siblings` — via a full checkout, or via a sparse-checkout list covering all of
-    them. A workflow that never invokes this script is trivially ok.
+    """Pure: (ok, reason). Every step in `workflow_text` that invokes this script must be PRECEDED,
+    in its own job, by a checkout that materialises every path in `siblings` — via a full checkout,
+    or via a sparse-checkout list covering all of them. A workflow that never invokes this script
+    is trivially ok.
 
-    Comments are NOT stripped, deliberately, and that is the fail-closed direction here: this
-    detects the PRESENCE of a dependency, so over-detection (treating a commented-out invocation as
-    real) only over-constrains a checkout, while under-detection would let a live invocation run in
-    a job whose checkout was never proven.
+    ORDER and EXECUTABILITY are both load-bearing, and both were holes in round 1 of #2033. A
+    checkout BELOW the invocation materialises nothing for it: groom.py execs its siblings at
+    import, so the step is already dead by the time that checkout runs — a job-wide "any checkout
+    covers" test stays green while the producer sits after its consumer. Likewise a covering
+    checkout carrying `if: false` (or any condition this parser cannot prove true) may never run at
+    all. So a qualifying checkout must be at a LOWER step index than the invocation and must be
+    unconditional or carry one of `_ALWAYS_RUN_STEP_CONDITIONS`.
+
+    Comments are NOT stripped when detecting the INVOCATION, deliberately, and that is the
+    fail-closed direction there: it detects the PRESENCE of a dependency, so over-detection
+    (treating a commented-out invocation as real) only over-constrains a checkout, while
+    under-detection would let a live invocation run in a job whose checkout was never proven. The
+    CHECKOUT side is the mirror image — a falsely-detected checkout would PROVE coverage nothing
+    performs — so `_step_is_checkout` matches only at the step's own key indent.
 
     Checkout steps that pin an explicit `ref:` are EXCLUDED from the coverage decision. Every job
     below also checks out the `ledger` data-plane branch, which is data-only: counting that
@@ -1611,33 +1667,50 @@ def groom_checkout_coverage_verdict(
             "steps, so the checkout of an invoking job cannot be proven (fail closed)")
     problems = []
     for job_name, steps in invoking:
-        checkouts = [step for step in steps
-                     if any("uses: actions/checkout@" in line for line in step)
-                     and not any(re.match(r"^\s+ref:", line) for line in step)]
-        if not checkouts:
-            problems.append(f"{job_name} invokes groom.py with no ref-less actions/checkout step")
-            continue
-        shortfalls = []
-        for step in checkouts:
-            entries = sparse_checkout_entries(step)
-            if entries is None:
-                shortfalls = []
-                break
-            absent = [path for path in siblings
-                      if not any(_sparse_entry_covers(entry, path) for entry in entries)]
-            if not absent:
-                shortfalls = []
-                break
-            if not shortfalls or len(absent) < len(shortfalls):
-                shortfalls = absent
-        if shortfalls:
-            problems.append(f"{job_name} is sparse and omits " + ", ".join(sorted(shortfalls)))
+        # (step index, entries) for every checkout that could PROVE coverage: ref-less, and either
+        # unconditional or statically always-run. Position is kept so the ordering test below can
+        # ask "before THIS invocation", not merely "somewhere in this job".
+        checkouts: list[tuple[int, tuple[str, ...] | None]] = []
+        for index, step in enumerate(steps):
+            if not _step_is_checkout(step):
+                continue
+            if any(re.match(r"^\s+ref:", line) for line in step):
+                continue
+            condition = _step_condition(step)
+            if condition is not None and condition not in _ALWAYS_RUN_STEP_CONDITIONS:
+                continue
+            checkouts.append((index, sparse_checkout_entries(step)))
+        for index, step in enumerate(steps):
+            if not any(GROOM_INVOCATION.search(line) for line in step):
+                continue
+            earlier = [entries for at, entries in checkouts if at < index]
+            if not earlier:
+                problems.append(
+                    f"{job_name} step #{index + 1} invokes groom.py with no executable, ref-less "
+                    "actions/checkout step BEFORE it")
+                continue
+            shortfalls: list[str] = []
+            covered = False
+            for entries in earlier:
+                if entries is None:
+                    covered = True
+                    break
+                absent = [path for path in siblings
+                          if not any(_sparse_entry_covers(entry, path) for entry in entries)]
+                if not absent:
+                    covered = True
+                    break
+                if not shortfalls or len(absent) < len(shortfalls):
+                    shortfalls = absent
+            if not covered:
+                problems.append(f"{job_name} step #{index + 1} is sparse and omits "
+                                + ", ".join(sorted(shortfalls)))
     if problems:
         return False, (
             workflow_name + ": " + "; ".join(problems) + " — groom.py execs these siblings by path "
             "at MODULE IMPORT, so the step dies with `groom: cannot load <x>.py` before it can do "
             "anything. Add every path in PATH_LOADED_SIBLINGS to that job's sparse-checkout list, "
-            "or give the job a full checkout")
+            "or give the job a full checkout — in an unconditional step ABOVE the invocation")
     return True, "ok"
 
 
@@ -14128,17 +14201,21 @@ def _self_test() -> int:
     _pin_alpha, _pin_beta = "scripts/alpha.py", "scripts/beta.py"
     _pin_siblings = (_pin_alpha, _pin_beta)
 
-    def _pin_workflow(checkout: str, *, job: str = "groom", invoke: bool = True) -> str:
+    _pin_invoke_step = ("      - name: Sweep\n        run: |\n"
+                        "          python3 scripts/groom.py --registry-repo o/r\n")
+
+    def _pin_workflow(checkout: str, *, job: str = "groom", invoke: bool = True,
+                      condition: str = "") -> str:
         return (
             "name: fixture\non:\n  schedule:\n    - cron: '0 * * * *'\n"
             "permissions:\n  contents: read\n"
             f"jobs:\n  {job}:\n    runs-on: ubuntu-latest\n    steps:\n"
             "      - name: Checkout registry\n"
-            "        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n"
+            + (f"        if: {condition}\n" if condition else "")
+            + "        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n"
             "        with:\n          persist-credentials: false\n"
             + checkout
-            + ("      - name: Sweep\n        run: |\n"
-               "          python3 scripts/groom.py --registry-repo o/r\n" if invoke else "")
+            + (_pin_invoke_step if invoke else "")
         )
 
     _pin_full = ""
@@ -14160,7 +14237,7 @@ def _self_test() -> int:
     check("#2033 checkout pin: a DROPPED sibling reds, and the refusal NAMES the omitted path and "
           "ONLY it (the acceptance direction — this is the mutant that used to pass)",
           (_pin_dropped[0], _pin_beta in _pin_dropped[1], _pin_alpha in _pin_dropped[1],
-           "groom is sparse" in _pin_dropped[1]),
+           "groom step #2 is sparse and omits" in _pin_dropped[1]),
           (False, True, False, True))
     check("#2033 checkout pin: a bare directory entry DOES materialise the siblings (non-cone "
           "mode is gitignore-style) — this pin must not force a spurious rewrite",
@@ -14181,6 +14258,82 @@ def _self_test() -> int:
               "          python3 scripts/groom.py --registry-repo o/r\n",
               "fx.yml", _pin_siblings)[0],
           False)
+    # PRODUCER-BEFORE-CONSUMER at the step seam. groom.py execs its siblings at IMPORT, so a
+    # checkout below the invocation materialises nothing for it — the step is already dead. A
+    # job-wide "some checkout covers" test reads green on exactly this reordering, which is the
+    # move a least-exposure edit makes (round-1 review of #2033).
+    _pin_after = (
+        "name: fixture\non:\n  schedule:\n    - cron: '0 * * * *'\n"
+        "permissions:\n  contents: read\n"
+        "jobs:\n  groom:\n    runs-on: ubuntu-latest\n    steps:\n"
+        + _pin_invoke_step
+        + "      - name: Checkout registry\n"
+          "        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n"
+          "        with:\n          persist-credentials: false\n"
+    )
+    _pin_moved = groom_checkout_coverage_verdict(_pin_after, "fx.yml", _pin_siblings)
+    check("#2033 checkout pin: a FULL checkout placed AFTER the invocation does NOT satisfy the "
+          "pin — the import already died (order is load-bearing, not just presence)",
+          (_pin_moved[0], "no executable, ref-less actions/checkout step BEFORE it"
+           in _pin_moved[1]),
+          (False, True))
+    _pin_disabled = groom_checkout_coverage_verdict(
+        _pin_workflow(_pin_full, condition="false"), "fx.yml", _pin_siblings)
+    check("#2033 checkout pin: the covering checkout disabled with `if: false` fails CLOSED — a "
+          "step that never runs cannot prove the siblings exist",
+          (_pin_disabled[0], "no executable, ref-less actions/checkout step BEFORE it"
+           in _pin_disabled[1]),
+          (False, True))
+    check("#2033 checkout pin: _step_is_checkout reads the step's own key indent — the inline "
+          "bullet spelling counts, a block that is not a step at all does not, and a "
+          "deeper-indented `uses:` (block-scalar content) does not",
+          (_step_is_checkout([]),
+           _step_is_checkout(["        uses: actions/checkout@abc"]),
+           _step_is_checkout(["      - uses: actions/checkout@abc"]),
+           _step_is_checkout(["      - name: x", "          uses: actions/checkout@abc"])),
+          (False, False, True, False))
+
+    # The boundary of the ordering rule: a step is never its OWN producer. The invocation side
+    # over-detects comments on purpose (over-constraining is safe there), so an `at <= index`
+    # spelling would let a checkout step that merely MENTIONS the invocation satisfy it.
+    _pin_selfsat = groom_checkout_coverage_verdict(
+        "name: fixture\npermissions:\n  contents: read\n"
+        "jobs:\n  groom:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - name: Checkout registry\n"
+        "        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n"
+        "        with:\n          persist-credentials: false\n"
+        "        # the sweep below runs python3 scripts/groom.py --registry-repo o/r\n",
+        "fx.yml", _pin_siblings)
+    check("#2033 checkout pin: a checkout step does NOT satisfy an invocation located in that SAME "
+          "step — a step cannot be its own producer (`<` and not `<=`)",
+          (_pin_selfsat[0], "no executable, ref-less actions/checkout step BEFORE it"
+           in _pin_selfsat[1]),
+          (False, True))
+    _pin_commented = groom_checkout_coverage_verdict(
+        "name: fixture\npermissions:\n  contents: read\n"
+        "jobs:\n  groom:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - name: Checkout registry\n"
+        "        # uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 (disabled)\n"
+        "        with:\n          persist-credentials: false\n"
+        + _pin_invoke_step, "fx.yml", _pin_siblings)
+    check("#2033 checkout pin: a COMMENTED-OUT checkout proves nothing — the checkout side matches "
+          "at the step's own key indent, unlike the invocation side where over-matching is safe",
+          (_pin_commented[0], "no executable, ref-less actions/checkout step BEFORE it"
+           in _pin_commented[1]),
+          (False, True))
+    check("#2033 checkout pin: the CONDITION POLICY in both directions — a statically always-run "
+          "`if:` still qualifies, while a condition this parser cannot prove true does not",
+          (groom_checkout_coverage_verdict(
+              _pin_workflow(_pin_full, condition="${{ always() }}"), "fx.yml", _pin_siblings)[0],
+           groom_checkout_coverage_verdict(
+               _pin_workflow(_pin_full, condition="true"), "fx.yml", _pin_siblings)[0],
+           groom_checkout_coverage_verdict(
+               _pin_workflow(_pin_full, condition="${{ steps.gate.outputs.go == 'true' }}"),
+               "fx.yml", _pin_siblings)[0],
+           groom_checkout_coverage_verdict(
+               _pin_workflow(_pin_full, condition="false  # temporarily disabled"),
+               "fx.yml", _pin_siblings)[0]),
+          (True, True, False, False))
     check("#2033 checkout pin: a full checkout of the ledger DATA branch beside a deficient "
           "registry checkout does NOT satisfy the pin (a ref-pinned checkout is excluded)",
           groom_checkout_coverage_verdict(
@@ -14231,25 +14384,32 @@ def _self_test() -> int:
           False)
 
     # DERIVED-vs-DECLARED. The fixture source uses the two real load idioms with invented names.
+    # A CLASS BODY executes as the module executes; a `def` body does not. The fixture carries all
+    # three positions at once so the boundary is asserted, not assumed (round-1 review of #2033:
+    # skipping ClassDef wholesale let a class-body load become a real dependency of every
+    # invocation with the LIVE exactness row still green).
+    _pin_gamma = "scripts/gamma.py"
     _pin_source = (
         'import importlib.util\nfrom pathlib import Path\n'
         '_a = _load_module(Path(__file__).resolve().with_name("alpha.py"), "a")\n'
         '_spec = importlib.util.spec_from_file_location(\n'
         '    "b", Path(__file__).resolve().with_name("beta.py"))\n'
         'def later():\n'
-        '    return _load_module(Path(__file__).resolve().with_name("gamma.py"), "g")\n'
+        '    return _load_module(Path(__file__).resolve().with_name("epsilon.py"), "e")\n'
         'class Holder:\n'
+        '    LOADED = _load_module(Path(__file__).resolve().with_name("gamma.py"), "g")\n'
         '    def load(self):\n'
         '        return Path(__file__).resolve().with_name("delta.py")\n'
     )
-    check("#2033 load derivation: BOTH import-time load idioms are seen, and a load nested in a "
-          "def/class (lazy — not a dependency of every invocation) is NOT",
-          import_time_sibling_loads(_pin_source), (_pin_alpha, _pin_beta))
+    check("#2033 load derivation: BOTH import-time load idioms are seen, a MODULE-LEVEL CLASS BODY "
+          "load is seen too (a class body runs on import), and the def-local and method-local "
+          "loads (lazy — not a dependency of every invocation) are NOT",
+          import_time_sibling_loads(_pin_source), (_pin_alpha, _pin_beta, _pin_gamma))
     check("#2033 load derivation: an UNDECLARED import-time load reds against a declared set that "
           "omits it (the second acceptance direction)",
           (import_time_sibling_loads(_pin_source) == (_pin_alpha,),
            set(import_time_sibling_loads(_pin_source)) - {_pin_alpha}),
-          (False, {_pin_beta}))
+          (False, {_pin_beta, _pin_gamma}))
 
     # ---- the LIVE rows: this checkout, these workflows -------------------------------------------
     try:
