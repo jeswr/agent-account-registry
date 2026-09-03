@@ -99,6 +99,34 @@ total is a whole NUMBER OF ROWS greater than the slice beside it — a missing, 
 fractional or already-satisfied total is "no truncation known" and draws nothing, so a document
 published before #1868 or edited by hand degrades to the old silence instead of a fabricated count.
 
+**The three REFUSAL counts ride beside those totals: `flow.queue_dropped` (#1896),
+`flow.target_ci_queue_dropped` (#2173), and the top-level `trigger_summary_dropped` (#2233).** The
+first two count how many rows this build REFUSED at their seam — every drop, not the subset that fit
+the per-seam warning budget, so a flood publishes `20` beside the 12 lines it printed — and an array
+supplied as something other than a list is the ONE drop it is, since no row of it was ever read.
+They are OUTPUT-side keys on the same terms as the totals: a collector neither sends them nor is
+read for them, and all three publish on EVERY build, including the ones that refused nothing. That
+zero row is the point (#2039 left this ambiguity standing on the
+page): an empty `flow.queue` is what an idle queue renders as and an empty `flow.target_ci_queue`
+is what a fleet with no congested targets renders as, so without a count the operator reading the
+page cannot tell either from an input the generator threw away — a loss the build log names and
+nobody reads. `trigger_summary_dropped` counts summaries refused by `_obs_text_capped`; those fire
+rows still publish with an empty `summary` and `summary_length: 0`, so the count describes neither
+a dropped row nor truncation. It covers every well-formed fire before the 20-row display cap and
+may therefore exceed the slice beside it. The row-count PAGE rule is `> 0`, while the trigger
+summary count additionally has to be a whole number; neither uses the totals' `total > shown` rule.
+`dashboard/app.js` draws
+`N queue rows were unreadable` under the queue list and `N target CI rows were unreadable` on the
+flow card for a positive number, or `N trigger summaries were unreadable` under the trigger list for
+a positive integer. Thus a missing, non-numeric or zero count draws nothing; a fractional trigger
+count does too. A document published before #1896/#2173/#2233 or edited by hand degrades to silence
+rather than a fabricated refusal.
+`queue_dropped` has one further consumer, and it reads the key the other way
+round: the queue-depth sparkline plots a point only when the count is EXACTLY `0`, so a build that
+refused rows — or a document with no count at all — contributes `null` and breaks the trend line
+instead of plotting a depth that is quietly missing its refused rows. `target_ci_queue_dropped`
+has no trend to protect and is display-only.
+
 **Issue #2009 closed the one slice nested INSIDE a row**: a fire's `evidence` links are still cut at
 5, but the cut is now counted first — `trigger_fires[].evidence_total` is the number of links that
 survived the `https://github.com/` pin, published on every fire including the ones that hid nothing,
@@ -138,6 +166,15 @@ document are dropped (the model-health tolerance) — EXCEPT privacy violations,
 always fatal (decision 22): a `flow.leases[].label` that is not the salted account fingerprint
 raises, trigger `evidence` links are pinned to `https://github.com/`, and the existing
 `_assert_private` raw-handle sweep runs over the finished document.
+
+**Issue #2174: every collector-controlled string that reaches `site/data.json` is LENGTH-bounded,
+not just charset-pinned.** `flow.target_ci_queue[].repository` was the last one that was not: its
+`owner/name` pattern pinned the character set — so nothing injectable ever survived — but both
+halves were unbounded, and a repository that PARSES is published verbatim into the page and the
+`CI queue · <repo>` metric label that renders it. The bound is GitHub's own — **39** characters for
+the owner, **100** for the name — so nothing nameable on GitHub is refused, and anything longer is
+dropped LOUDLY by the same named `repository` diagnostic as any other malformed row. This is an
+INPUT-side pin, unlike the display caps above: the row is refused, never silently shortened.
 
 **The label is the CANONICAL account fingerprint — `sha256(handle + ":" + salt)[:16]`, 16 lowercase
 hex (locked decision 22a; issue #375).** It is the same value `model-health.account_hash` /

@@ -9,18 +9,21 @@
 # one dispatch per PR, and (measured on 2026-07-28) nobody ever had: zero orchestrator-attested
 # records on `ledger` while the ledger was otherwise busy with worker verdicts every few seconds.
 #
-# WHAT THIS IS. The periodic sweep that fires the SAME minting decision, per enrolled-class PR,
-# with no operator input at all. It is the TRIGGER, never the SCOPE:
+# WHAT THIS IS. The periodic sweep that derives and inventories the enrolled-class PRs which lack
+# provenance. It was originally also an unattended writer, but the Sol-first route retains an Opus
+# fallback: author enrolment and a routing order cannot prove which provider implemented one PR.
+# The sweep therefore now FAILS CLOSED at that boundary and leaves the explicit manual workflow as
+# the only writer until an immutable per-PR dispatch attestation exists. It remains narrower than
+# the shared minting policy:
 #
-#   * it imports mint-provenance.mint() rather than re-deriving any of its predicates, so every
-#     trust gate (fork head, worker namespace, draft, allowlist, alias->provider catalog lookup,
-#     attestation class, create-only idempotency, last-mile lane admissibility) is the SAME code
-#     the manual path runs — this file can only ever REFUSE more, never admit more;
+#   * it imports mint-provenance's decision types and readers rather than inventing another record
+#     shape, but its unattended caller refuses before the writer because no trustworthy input binds
+#     a model alias to the current PR and head SHA;
 #   * `review_enrolment_authors` (master-protected) stays the sole authority on the population.
 #     This file reads it; it can neither widen nor bypass it;
-#   * `impl_alias` is a PINNED CONSTANT here with no input, argument or env binding that can reach
-#     it. The lane picks the reviewer by INVERTING `impl_provider`, so an alias input would be a
-#     way for the class to choose its own reviewer's side. There is deliberately none;
+#   * there is no `impl_alias` input, argument or env binding. The lane picks the reviewer by
+#     INVERTING `impl_provider`, so guessing an alias from the preferred route would let an Opus
+#     fallback implementation receive a same-provider Opus review under a false Sol record;
 #   * `--allow-global-partition` is NEVER passed. A source issue that reduces to the serializing
 #     `__global__` partition is a per-mint human acceptance of a fleet-wide cost, and an unattended
 #     sweep must not be able to accept it.
@@ -31,7 +34,12 @@
 # cross-provider guarantee vacuous rather than merely weaker. They need a separate disposition
 # (sparq #4677), not a wider allowlist. Nothing here reaches them: they are not in
 # `review_enrolment_authors`, and `pr_mint_refusal` refuses a `[bot]` login outright.
-"""auto-mint-provenance — sweep every enrolled-class PR and mint the records that are missing.
+"""auto-mint-provenance — census every enrolled-class PR missing a provenance record.
+
+UNATTENDED WRITES CURRENTLY FAIL CLOSED. The live implementation route permits both Sol and an
+Opus continuity fallback, while this sweep has no immutable dispatch evidence bound to a PR and
+head SHA. It must not infer actual authorship from the preferred route or from the human account
+that opened the PR. The manual mint workflow remains the explicit operator-attested recovery path.
 
 THE ONE HARD INPUT IS `issue_number`, and it is DERIVED, never defaulted. mint-provenance's own
 input description says the source issue "decides the lease partition the review reserves and the
@@ -133,13 +141,11 @@ class UnknownRenderedElement(RuntimeError):
 
 
 # ---- WHAT THE SWEEP MAY ASSERT ----------------------------------------------------------------
-# The implementing alias this unattended path will ever record. A PIN, not a default, and there is
-# no CLI argument, workflow input or env binding on this path that can influence it — the seam
-# report below asserts that of the LIVE workflow, not just of this constant. mint-provenance's
-# `alias_mint_refusal` then resolves it through the TARGET's protected routing catalog and refuses
-# anything that is not `ORCHESTRATOR_IMPL_PROVIDER`, so the recorded provider is a catalog lookup
-# and the reviewer side (its inverse) is constant. The class cannot choose its own reviewer.
-AUTO_IMPL_ALIAS = "opus5"
+# [SPARQ agent] The preferred ordinary implementation alias. This constant is retained for live
+# protocol/seam checks only; it is NOT per-PR authorship evidence and the unattended caller below
+# never records it. There is no CLI argument, workflow input or env binding that can choose an
+# alias. The manual workflow receives an explicit operator attestation instead.
+AUTO_IMPL_ALIAS = "sol"
 
 # How many records ONE tick may write. The trust plane drains slowly on purpose: a bounded sweep
 # turns a bad change into a handful of records a human can read, not a ledger-wide rewrite. Stated
@@ -1239,12 +1245,11 @@ def new_counters(*, mint_cap, comment_cap, apply_changes):
         # a single scalar cannot say which disposition is failing to drain.
         "standing_refusals": {},
         # WHY each reason fired, bounded. `refusals` counts reason CODES, and one code —
-        # `mint-refused` — carries two operationally opposite situations: the shared gate
-        # declining one pull request (the lane is working) and the lane unable to run at all (an
-        # unreadable source issue, an alias missing from the routing catalog). Only the passthrough
-        # TEXT separates them, and that text reached the log line and the PR comment but never the
-        # machine-readable row — so the row could not tell an operator whether the lane was healthy
-        # or dead. This carries a capped, deduplicated, truncated summary of it.
+        # `mint-refused` carries several operationally different situations: the unattended
+        # implementation-evidence boundary, a shared gate declining one pull request, and the lane
+        # being unable to run at all. Only the decision TEXT separates them, and that text reaches
+        # the log line and PR comment but not the reason-code counter. This carries a capped,
+        # deduplicated, truncated summary of it.
         "refusal_causes": {},
         "skipped_targets": {},
         "mint_cap": mint_cap,
@@ -1454,20 +1459,26 @@ def _read_policy():
 
 
 def _mint_caller(mint_provenance, registry_repo, apply_changes, log, write_record=None):
-    """The bound call into the SHARED minting path. `write_record` is injectable for the same
-    reason every reader in mint() is: --self-test drives this exact call site, so a dropped or
-    rebound argument here reds a check instead of surviving as an untested seam.
+    """The unattended minting boundary, retaining the existing injectable call shape for tests.
 
-    Note what is NOT a parameter: `impl_alias` is the pinned AUTO_IMPL_ALIAS, and
-    `allow_global_partition` is never passed — an unattended sweep must not be able to accept the
-    serializing partition on the fleet's behalf, and must not be able to name the implementing
-    side the reviewer is chosen by inverting."""
+    This path deliberately refuses until it has immutable, per-PR implementation evidence.
+    Enrolment proves who opened the PR, not which model produced its commits; the routing catalog
+    is only the set of models that MAY implement and is not evidence of which one DID. In
+    particular, pinning `AUTO_IMPL_ALIAS` here would fabricate Sol/OpenAI provenance for an
+    Opus/Anthropic fallback implementation (and for historical Anthropic-first PRs), allowing a
+    same-provider Opus review to masquerade as cross-provider review.
+
+    The manual mint workflow remains the explicit operator-attested path. A future unattended
+    writer may replace this refusal only after it reads a machine-attested dispatch record bound
+    to this PR and head SHA; neither PR authorship, branch naming, commit prose nor the current
+    routing order is sufficient evidence."""
     def call(target_repo, pr_number, issue_number, routing, authors, pull, issue):
-        return mint_provenance.mint(
-            target_repo, pr_number, issue_number, AUTO_IMPL_ALIAS, registry_repo, routing, authors,
-            apply_changes=apply_changes,
-            read_pull=lambda: pull, read_issue=lambda: issue, read_record=lambda: None,
-            write_record=write_record, log=log)
+        return mint_provenance.MintDecision(
+            mint_provenance.ACTION_REFUSE,
+            "unattended minting has no immutable per-PR implementation evidence bound to this "
+            "head; author enrolment and the current routing order cannot attest whether Sol or "
+            "the permitted Opus fallback implemented it, so no provider is recorded",
+            None)
 
     return call
 
@@ -1582,7 +1593,7 @@ def sweep_workflow_seam_report(workflow=None):
         # quietly widened to another event either: the finding is the exact event name.
         "job_schedule_carveout": "github.event_name == 'schedule'" in guard,
         "job_environment": job.get("environment"),
-        "contents_write": permissions.get("contents"),
+        "contents_permission": permissions.get("contents"),
         # Requirement 4: a refusal has to be visible ON THE PR. Without this the sweep degrades to
         # a silent minter, which is the failure mode #929 says is worse than the manual one.
         "pull_requests_write": permissions.get("pull-requests"),
@@ -2848,11 +2859,14 @@ def _self_test():                                                       # noqa: 
         check(f"...and a row whose `enabled` is {label} is NOT a target — enrolment is opt-IN",
               enrolled_targets({"repos": {"o/r": row}}, lambda name, doc: ["x"]), [])
 
-    check("the pinned implementing alias resolves to the pinned provider in the LIVE catalog",
-          mint_provenance.alias_mint_refusal(
-              AUTO_IMPL_ALIAS, _live_routing()), None)
-    check("...and the shared writer's provider pin is the one the lane inverts",
-          mint_provenance.ORCHESTRATOR_IMPL_PROVIDER, "anthropic")
+    live_routing = _live_routing()
+    check("the pinned automatic implementing alias resolves to a supported provider in the LIVE "
+          "catalog", mint_provenance.alias_mint_refusal(AUTO_IMPL_ALIAS, live_routing), None)
+    auto_provider = live_routing["models"][AUTO_IMPL_ALIAS]["provider"]
+    check("...and that alias still resolves to OpenAI, so this fail-closed automatic lane cannot "
+          "silently move to the fallback provider", auto_provider, "openai")
+    check("...which remains one of the providers the review lane can invert",
+          auto_provider in mint_provenance.ORCHESTRATOR_IMPL_PROVIDERS, True)
 
     check("an enrolled author's open PR is in the population",
           [row["number"] for row in enrolled_class_pulls([pull()], ("jeswr",))], [41])
@@ -3003,7 +3017,7 @@ def _self_test():                                                       # noqa: 
             def read_routing(repo):
                 if routing_boom:
                     raise SweepError("the routing pointer is not a relative repository path")
-                return {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"}}}
+                return {"models": {AUTO_IMPL_ALIAS: {"provider": "openai"}}}
 
             def read_comments(repo, number):
                 self.comment_reads.append(number)
@@ -3069,7 +3083,7 @@ def _self_test():                                                       # noqa: 
           total(lambda: (rec.handed[0]["issue"] or {}).get("number")), 7)
     check("...and the TARGET's own routing catalog, which the pinned alias resolves against",
           total(lambda: rec.handed[0]["routing"]),
-          {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"}}})
+          {"models": {AUTO_IMPL_ALIAS: {"provider": "openai"}}})
     check("...and the derived issue number, not the PR's own",
           total(lambda: (rec.handed[0]["number"], rec.handed[0]["issue_number"])), (41, 7))
     # WHAT THE RENDERER WAS HANDED. `POST /markdown`'s `context` is what makes GitHub mark a
@@ -3363,9 +3377,9 @@ def _self_test():                                                       # noqa: 
     check("...and does not put a registry-side write failure on someone else's PR",
           failed_write.posted, [])
 
-    # THE SHARED WRITER IS REALLY THE ONE THAT DECIDES: drive `_mint_caller` into the real
-    # mint-provenance.mint over an issue that reduces to the serializing __global__ partition. The
-    # sweep never passes --allow-global-partition, so this must refuse.
+    # The unattended caller has no trustworthy implementation identity. It must refuse before the
+    # shared writer for BOTH a multi-provider fallback route and an apparently single-provider
+    # route: the latter still cannot establish how a historical PR was authored.
     written = []
     caller = _mint_caller(mint_provenance, "reg/istry", True, lambda *_a, **_k: None,
                           write_record=lambda: written.append("put"))
@@ -3373,44 +3387,38 @@ def _self_test():                                                       # noqa: 
     saved = {key: os.environ.get(key) for key in env}
     os.environ.update(env)
     try:
-        routing = {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"},
-                              "sol": {"provider": "openai"}}}
+        routing = {"models": {AUTO_IMPL_ALIAS: {"provider": "openai"},
+                              "opus5": {"provider": "anthropic"}},
+                   "routes": {"impl": {"models": [AUTO_IMPL_ALIAS, "opus5"]}}}
         decision = caller("o/r", 41, 7, routing, ("jeswr",), pull(body="Closes #7"),
                           issue(labels=[]))
-        check("the sweep can NEVER accept the serializing __global__ partition",
-              (decision.action, "__global__" in decision.reason),
+        check("the unattended sweep refuses a Sol/Opus fallback route without per-PR evidence",
+              (decision.action, "Sol or the permitted Opus fallback" in decision.reason),
               (mint_provenance.ACTION_REFUSE, True))
         check("...and that refusal writes nothing", written, [])
-        good = caller("o/r", 41, 7, routing, ("jeswr",), pull(body="Closes #7"), issue())
-        check("...while the ordinary single-area case reaches a real mint decision",
-              good.action, mint_provenance.ACTION_MINT)
-        check("...and writes exactly one record through the SHARED writer", written, ["put"])
-        check("...and the record it writes pins the constant provider and the pinned alias",
-              (good.document["impl_provider"], good.document["impl_alias"]),
-              (mint_provenance.ORCHESTRATOR_IMPL_PROVIDER, AUTO_IMPL_ALIAS))
-        # THE CALLER'S SHAPE, not just its output. `AUTO_IMPL_ALIAS` being a pinned constant is the
-        # reason this class cannot choose the provider that reviews it — but the pin lives inside a
-        # closure, and nothing observed that the closure takes no alias parameter. Adding one
-        # survived every check: the pin still held, and the SHAPE that guarantees it went
-        # unasserted. The signature is the guarantee, so the signature is asserted.
+        single = {"models": {AUTO_IMPL_ALIAS: {"provider": "openai"}},
+                  "routes": {"impl": {"models": [AUTO_IMPL_ALIAS]}}}
+        historical = caller("o/r", 41, 7, single, ("jeswr",), pull(body="Closes #7"), issue())
+        check("a current Sol-only route still cannot rewrite historical authorship as Sol",
+              (historical.action, historical.document),
+              (mint_provenance.ACTION_REFUSE, None))
+        check("...and the historical refusal also writes nothing", written, [])
+        # THE CALLER'S SHAPE, not just its output. It has no alias/global override and it cannot
+        # reach the shared writer while implementation evidence is absent.
         check("...and the bound caller exposes NO lever for the alias or the global partition",
               (sorted(inspect.signature(caller).parameters),
                sorted(inspect.signature(_mint_caller).parameters)),
               (["authors", "issue", "issue_number", "pr_number", "pull", "routing", "target_repo"],
                ["apply_changes", "log", "mint_provenance", "registry_repo", "write_record"]))
-        # ...and `read_record` is pinned to None on purpose: the sweep has ALREADY probed for an
-        # existing record, and letting the shared writer re-read it would be a second, unsynced
-        # opinion on the one question idempotence turns on.
-        check("...and the shared writer is told the record probe was already done",
-              total(lambda: mint_provenance.mint.__doc__ is not None
-                    and "read_record" in inspect.signature(mint_provenance.mint).parameters), True)
+        check("...and the unattended boundary never calls the shared writer without evidence",
+              "mint_provenance.mint(" in inspect.getsource(_mint_caller), False)
         dry = []
         dry_caller = _mint_caller(mint_provenance, "reg/istry", False, lambda *_a, **_k: None,
                                   write_record=lambda: dry.append("put"))
         dry_decision = dry_caller("o/r", 41, 7, routing, ("jeswr",), pull(body="Closes #7"),
                                   issue())
-        check("...and `--apply` really reaches the writer: without it, nothing is written",
-              (dry_decision.action, dry), (mint_provenance.ACTION_MINT, []))
+        check("...and dry-run mode cannot turn missing implementation evidence into a mint",
+              (dry_decision.action, dry), (mint_provenance.ACTION_REFUSE, []))
     finally:
         for key, value in saved.items():
             if value is None:
@@ -3418,20 +3426,20 @@ def _self_test():                                                       # noqa: 
             else:
                 os.environ[key] = value
 
-    # ---- END TO END: the production `sweep()` into the REAL `mint_provenance.mint()` -------------
-    # THE PATH AN INDEPENDENT REVIEW USED TO PROVE THE PREVIOUS HEAD MINTED. At `ba1a6030d`, each of
-    # the seven shapes below produced `minted=1 ledger_writes=['LEDGER-PUT'] refused=0` through this
-    # exact composition: production `sweep()`, `_mint_caller` bound to the real shared writer, only
-    # the ledger PUT stubbed, `apply_changes=True`. The unit rows above assert the derivation; these
-    # assert that nothing between the derivation and the ledger can undo it.
+    # ---- END TO END: production `sweep()` through the unattended evidence boundary --------------
+    # The oracle's rendered rows make this more than a unit test of our own parser. It drives the
+    # exact production composition with only the external PUT and comment POST replaced. Rows
+    # rejected by the parser must write nothing for their original reasons; rows which derive a
+    # source issue must reach the independent implementation-evidence refusal and also write
+    # nothing.
     e2e_rows = {label: (title, body) for label, title, body, _e in RENDERED_ORACLE_CORPUS}
 
     def e2e(label, render=None, pull_over=None):
         """One corpus row, all the way to the (stubbed) ledger PUT. Returns (census, writes, posts)."""
         title, body = e2e_rows.get(label, ("t", "no reference"))
         writes, posts = [], []
-        routing = {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"},
-                              "sol": {"provider": "openai"}}}
+        routing = {"models": {AUTO_IMPL_ALIAS: {"provider": "openai"},
+                              "opus5": {"provider": "anthropic"}}}
         # The TARGET is the oracle's own repository, because these rows are real GitHub renderings
         # captured in its numbering — the `issue-link` hrefs the third conjunct reads point there.
         row = total(lambda: sweep(
@@ -3456,15 +3464,16 @@ def _self_test():                                                       # noqa: 
     e2e_saved = {key: os.environ.get(key) for key in e2e_env}
     os.environ.update(e2e_env)
     try:
-        # POSITIVE CONTROL FIRST, and it has to be a REAL WRITE. Without it "the seven refuse" is
-        # satisfied by a sweep that refuses everything, which is the failure mode a fail-closed
-        # redesign is most likely to have.
+        # The derivation's positive controls above prove that this body binds the source issue.
+        # End to end it must nevertheless stop at the new, independent implementation-evidence
+        # boundary: issue identity is not implementer identity.
         row, writes, posts = e2e("plain closes line")
-        check("E2E CONTROL — a genuine `Closes #929` mints ONE record through the real shared "
-              "writer, and the ledger PUT really happens",
+        check("E2E IMPLEMENTER-EVIDENCE BOUNDARY — a genuine `Closes #929` still cannot fabricate "
+              "a provider record",
               (row["minted"], row["refused"], writes, posts),
-              (1, 0, ["LEDGER-PUT"], []))
-        check("...and the census says nothing was refused", row["refusals"], {})
+              (0, 1, [], [41]))
+        check("...and the census names the shared mint refusal",
+              row["refusals"], {REASON_MINT_REFUSED: 1})
         for label in ("R1 <pre> block", "R2 <pre> then indented",
                       "R3 quoted <pre> then indented", "R4 pipe-less GFM table then indented",
                       "R5 inline HTML <code>", "R6 <details> wrapping <pre>",
@@ -3503,12 +3512,14 @@ def _self_test():                                                       # noqa: 
                   (row["minted"], row["refusals"], writes),
                   (0, {REASON_REFERENCE_NOT_RESOLVED: 1}, []))
             check(f"...and the refusal for {label} is VISIBLE on the PR", posts, [41])
-        # ...and the CONTROLS, because a conjunct that refuses everything would satisfy all four.
+        # The grammar controls still reach the implementation-evidence boundary, but cannot pass
+        # it without a trustworthy dispatch attestation.
         for label in ("right boundary: hyphen", "right boundary: full stop",
                       "an unresolved run-on beside a real declaration still binds the real one"):
             row, writes, _posts = e2e(label)
-            check(f"E2E ROUND-7 CONTROL — {label}: still mints, and still writes",
-                  (row["minted"], row["refused"], writes), (1, 0, ["LEDGER-PUT"]))
+            check(f"E2E ROUND-7 CONTROL — {label}: binds the issue but stops before provenance",
+                  (row["minted"], row["refusals"], writes),
+                  (0, {REASON_MINT_REFUSED: 1}, []))
 
         # THE ROUND-8 CLASS, END TO END, AND THE ONE-CHARACTER PAIR. These two rows differ by a
         # single `> ` and differed in OUTCOME at the previous head: the quoted one refused, the
@@ -3527,16 +3538,17 @@ def _self_test():                                                       # noqa: 
         for label in ("a real declaration beside a run-on still binds",
                       "...and a real declaration in the TITLE beside a run-on in the body"):
             row, writes, _posts = e2e(label)
-            check(f"E2E ROUND-8 CONTROL — {label}: still mints, and still writes",
-                  (row["minted"], row["refused"], writes), (1, 0, ["LEDGER-PUT"]))
+            check(f"E2E ROUND-8 CONTROL — {label}: binds the issue but stops before provenance",
+                  (row["minted"], row["refusals"], writes),
+                  (0, {REASON_MINT_REFUSED: 1}, []))
 
         # THE RENDERER OUTAGE, end to end. Fail closed, censused, NOT commented.
         def _down(_repo, _text):
             raise RenderUnavailable("GitHub's markdown renderer returned 22")
 
         row, writes, posts = e2e("plain closes line", render=_down)
-        check("E2E RENDERER OUTAGE — the SAME body that mints when the renderer answers writes "
-              "NOTHING when it does not; there is no raw-markdown fallback",
+        check("E2E RENDERER OUTAGE — the SAME body that reaches the evidence boundary when the "
+              "renderer answers writes NOTHING when it does not; there is no raw-markdown fallback",
               (row["minted"], row["refusals"], writes),
               (0, {REASON_RENDER_UNAVAILABLE: 1}, []))
         check("...and a platform outage is not posted onto someone else's PR forever", posts, [])
@@ -3920,10 +3932,9 @@ def _self_test():                                                       # noqa: 
     # ---- THE CAPS: the VALUES, not only the mechanism -------------------------------------------
     # `M13`/`M26` taught this the hard way twice over: deleting each cap CHECK reds by name, but
     # raising DEFAULT_MAX_MINTS from 3 to 50 left the suite green with 0 FAILs. The workflow passes
-    # no override, so that constant IS the live bound on how many records one unattended tick may
-    # write to the ledger — an unpinned number deciding a write budget is worth a red test on its
-    # own terms, independently of whether any adversary can reach it.
-    check("the per-tick MINT cap is 3 — the live bound on ledger writes per tick, not a default",
+    # no override, so that constant remains the compatibility bound if a future evidence-backed
+    # unattended writer is introduced. Such a change must not silently expand the write budget.
+    check("the per-tick MINT cap remains 3 for any future evidence-backed writer",
           DEFAULT_MAX_MINTS, 3)
     check("...and the per-tick COMMENT cap is 5", DEFAULT_MAX_COMMENTS, 5)
     check("...and both are small enough that one bad tick is a handful of records a human can read",
@@ -3941,7 +3952,8 @@ def _self_test():                                                       # noqa: 
 
     # ---- the workflow seam ----------------------------------------------------------------------
     seam = sweep_workflow_seam_report()
-    check("the workflow passes NO cap override, so DEFAULT_MAX_MINTS is the live write budget",
+    check("the workflow passes NO cap override, preserving DEFAULT_MAX_MINTS for any future "
+          "evidence-backed writer",
           (seam["no_cap_argument"], seam["no_cap_input"]), (True, True))
     check("THE #929 FIX: the sweep is SELF-STARTING (mint-provenance.yml is dispatch-only)",
           bool(seam["schedule_crons"]), True)
@@ -3976,7 +3988,8 @@ def _self_test():                                                       # noqa: 
           seam["job_schedule_carveout"], True)
     check("the sweep job takes the secret-scoped environment", seam["job_environment"],
           "dispatch-secrets")
-    check("the sweep job may write ledger contents", seam["contents_write"], "write")
+    check("the sweep job cannot write ledger contents without implementation evidence",
+          seam["contents_permission"], "read")
     check("the sweep job may comment the refusal ON the PR", seam["pull_requests_write"], "write")
     check("the sweep job may NOT read run logs (that is backfill's identity source)",
           seam["no_actions_permission"], True)
@@ -4172,7 +4185,7 @@ def _self_test():                                                       # noqa: 
 
 def _live_routing():
     """This repository's OWN routing catalog, read from the checkout. Used only by --self-test, to
-    prove the pinned alias still resolves to the pinned provider."""
+    prove the pinned automatic alias still resolves to a supported provider."""
     import tomllib
 
     with open(SCRIPTS_DIR.parent / "orchestration" / "routing.toml", "rb") as handle:

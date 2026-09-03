@@ -104,7 +104,17 @@ OBS_QUEUE_CLASS_RE = re.compile(r"[1-4][a-z]?")   # the #243 queue classes (1, 2
 OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#%-]{1,220}")
 # [#2039] The `flow.target_ci_queue` row key, hoisted beside its sibling shapes so the seam that
 # drops a row can name WHICH guard refused it rather than testing three things in one condition.
-OBS_TARGET_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
+# [#2174] ...and BOUNDED, which it was not: every other collector-controlled string this panel
+# publishes is length-capped before it reaches `site/data.json` (a trigger `summary` at 240 via
+# `_obs_text_capped`, a `rule`/defer `reason` at 64 via OBS_TOKEN_RE, a queue `class` at 2 via
+# OBS_QUEUE_CLASS_RE, a lease `label` at 16 via OBS_SALTED_LABEL_RE), but this pattern's two `*`
+# quantifiers were unbounded. The character set already made it non-injectable; it did not make it
+# legible, and the snapshot is written on the PUBLIC `ledger` branch by a collector this build does
+# not own (AGENTS.md pre-flight item 5), so a megabyte-long "repository" would have published
+# straight into data.json and the `CI queue · <repo>` metric label that renders it. The bounds are
+# GitHub's own — 39 characters for an owner, 100 for a repository name — so nothing nameable on
+# GitHub is refused, and the `{0,N}` form keeps the FIRST character's own charset guard intact.
+OBS_TARGET_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
                       "queue_age_clamp_minutes", "merge_stall_minutes"}
 # [#1557] THE CACHE GROUP HAS NO PRODUCER, and the file the docs named as its source never had one
@@ -1186,6 +1196,88 @@ def _js_code_count(text, needle):
     return hits
 
 
+def _css_rules(text):
+    """`(prelude, body)` for every TOP-LEVEL block of a stylesheet, comments removed.
+
+    Issue #2218. `dashboard/app.js` is asserted by EXECUTION, but the stylesheet it renders into was
+    asserted by nothing at all — which is how two `.obs-truncation-note` paragraphs shipped with no
+    rule to match them. A substring search for the selector would be satisfiable by a comment, so
+    the sheet is PARSED instead. Anything it cannot account for — an unbalanced block, trailing
+    junk outside every rule — raises rather than being dropped silently."""
+    stripped = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    rules, index = [], 0
+    while True:
+        brace = stripped.find("{", index)
+        if brace < 0:
+            break
+        depth, cursor = 0, brace
+        while cursor < len(stripped):
+            if stripped[cursor] == "{":
+                depth += 1
+            elif stripped[cursor] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            cursor += 1
+        if depth != 0:
+            raise DashboardError("stylesheet has an unbalanced rule block — refusing to resolve it")
+        rules.append((" ".join(stripped[index:brace].split()), stripped[brace + 1:cursor]))
+        index = cursor + 1
+    if stripped[index:].strip():
+        raise DashboardError(
+            f"stylesheet has content outside every rule ({stripped[index:].strip()[:40]!r}) — "
+            "refusing to resolve it")
+    return rules
+
+
+_CSS_SIMPLE_SELECTOR = re.compile(r"^(?P<tag>[a-z][a-z0-9-]*)?(?P<classes>(?:\.[A-Za-z0-9_-]+)+)$")
+
+
+def _css_applied(text, tag, classes):
+    """The declarations a stylesheet applies to a `<tag class="...">` element, by real cascade order.
+
+    Issue #2218. Only tag/class simple selectors are modelled, which is the whole of the region
+    under test — but a selector or an at-rule this reader cannot resolve that MENTIONS one of the
+    classes asked about is a REFUSAL, never a skip: reporting "no colour applies" because the rule
+    that supplies it was silently unparseable is the same false pass the missing rule was. Later
+    rules win only at equal specificity, so a `td.bad` cannot be reported as beating a `.a.b`."""
+    wanted, applied = set(classes), {}
+    for order, (prelude, body) in enumerate(_css_rules(text)):
+        if prelude.startswith("@"):
+            mentions = sorted(name for name in wanted
+                              if re.search(rf"\.{re.escape(name)}\b", prelude + body))
+            if mentions:
+                raise DashboardError(
+                    f"at-rule `{prelude}` reaches {mentions} — this reader models only "
+                    "top-level rules, so it refuses rather than report a cascade it did not resolve")
+            continue
+        for selector in prelude.split(","):
+            selector = selector.strip()
+            match = _CSS_SIMPLE_SELECTOR.match(selector)
+            if match is None:
+                if any(re.search(rf"\.{re.escape(name)}\b", selector) for name in wanted):
+                    raise DashboardError(
+                        f"selector `{selector}` reaches {sorted(wanted)} through a form this "
+                        "reader cannot resolve — refusing")
+                continue
+            names = set(match.group("classes").lstrip(".").split("."))
+            if not names <= wanted or (match.group("tag") or tag) != tag:
+                continue
+            weight = (len(names), 1 if match.group("tag") else 0, order)
+            for declaration in body.split(";"):
+                prop, separator, value = declaration.partition(":")
+                if not separator:
+                    if declaration.strip():
+                        raise DashboardError(
+                            f"unreadable declaration {declaration.strip()!r} in `{prelude}` — "
+                            "refusing")
+                    continue
+                prop = prop.strip()
+                if prop not in applied or applied[prop][0] < weight:
+                    applied[prop] = (weight, " ".join(value.split()))
+    return {prop: value for prop, (_, value) in applied.items()}
+
+
 def _node_json(script, payload):
     """Run `script` under `node` with `payload` on stdin and parse its stdout as JSON, or raise.
 
@@ -1830,6 +1922,10 @@ def _obs_text(value, cap):
     drop already say, on a line whose entire purpose is to stay short and unforgeable. A cut over
     text that IS published is the opposite case, and takes `_obs_text_capped`.
 
+    [#2194] The refusal count the third element carries is dropped here for the same reason: the row
+    this quotes has ALREADY been announced by the guard that dropped it, so a second line saying its
+    `rule` was also unprintable names a loss the first line already named in full.
+
     Delegated rather than reimplemented: one definition of the sanitize-then-cut rule, because two
     copies of one guard make each copy individually unkillable (AGENTS.md pre-flight item 4)."""
     return _obs_text_capped(value, cap)[0]
@@ -1837,7 +1933,7 @@ def _obs_text(value, cap):
 
 def _obs_text_capped(value, cap):
     """[#2161] A DISPLAY cap over a collector STRING, with what it hid: `(text[:cap], the PRE-cap
-    CHARACTER count)` — `_obs_capped` one type down.
+    CHARACTER count, [#2194] the REFUSED character count or None)` — `_obs_capped` one type down.
 
     #1868 published a pre-cap total beside every capped row ARRAY and #2009 did the same for the
     `evidence` slice nested inside one fire. The trigger-fire `summary` was the last silent cut on
@@ -1882,11 +1978,30 @@ def _obs_text_capped(value, cap):
     Published UNCONDITIONALLY beside the string, cut or not, like every `_obs_capped` total: a count
     emitted only when it has something to say is one a mutant can silence on the quiet fire, and the
     page could no longer tell `240 of 240` from a producer that stopped sending it (AGENTS.md
-    pre-flight item 8). The page owns the `length > shown` decision."""
+    pre-flight item 8). The page owns the `length > shown` decision.
+
+    [#2194] The refusal is REPORTED rather than swallowed — a THIRD element carrying the refused
+    text's character count, or None when nothing was refused. The published pair above answers what
+    the PAGE should draw and #2161 settled it in the direction that keeps the page honest; it left
+    the collector author with nothing at all, because a refusal is a producer/consumer mismatch —
+    text this seam could not READ — which is the class #982/#1867/#2039 made loud, and it renders
+    exactly like a fleet whose alarms carry no summaries. The count is the whole diagnostic payload:
+    a caller may name the SHAPE of what it refused (a field name and how many characters) and can
+    never quote the value, which is the log-injection vector the guard exists for. Returned rather
+    than printed HERE because this function has no seam: the announcement belongs to the
+    `_ObsDropLog` of whichever seam published the field, and the drop-diagnostic call sites reached
+    through `_obs_text` must stay silent (their row is already announced).
+
+    None, not 0, for the accept path — a SENTINEL rather than a count, so the call site's
+    `is not None` says exactly what it means. A refused text is always NON-empty today
+    (`"".isprintable()` is true, so an empty or absent value takes the accept path), which makes a
+    truthiness test equivalent for now and is declared as such rather than tested; the sentinel is
+    what keeps the accept path silent if the guard ever grows a case that refuses a zero-length
+    value, and 0 is a count this function legitimately returns beside a published string."""
     text = str(value or "").strip()
-    if not text or not text.isprintable():
-        return "", 0
-    return text[:cap], len(text)
+    if not text.isprintable():
+        return "", 0, len(text)
+    return text[:cap], len(text), None
 
 
 def _obs_capped(rows, cap):
@@ -2383,12 +2498,31 @@ def _obs_trigger_rows(items):
     shape #982 fixed, one seam over, and it reads worse here because a fire row that never arrives
     renders identically to an alarm that never fired.
 
-    Two seams, counted SEPARATELY, for the reason `_ObsDropLog` keeps the queue and evidence seams
+    [#2194] The refused `summary` is announced too, which is the same silence one FIELD over: a
+    collector that starts embedding a control character in its alarm summaries has every summary
+    dropped WHOLE by the `_obs_text_capped` guard — correct, it is an injection vector — and the
+    panel then renders identically to a fleet whose alarms have no summaries at all, with the loss
+    visible nowhere. Unlike #2161's 240-character cut this is text the seam could not READ, so it is
+    the producer/consumer mismatch the `_ObsDropLog` warnings exist for rather than a display
+    contract. Drop-the-FIELD tolerance is unchanged: the row still publishes, with the empty summary
+    and the `summary_length` of 0 that #2161 settled on, so the page cannot draw a cut marker on a
+    value that was never cut.
+
+    THREE seams, counted SEPARATELY, for the reason `_ObsDropLog` keeps the queue and evidence seams
     apart: a malformed ROW never reaches the evidence loop, so one shared budget would let a flood
     of unreadable rows silence every link warning on the same document — trading one invisible loss
-    for another."""
+    for another. The field seam is third rather than folded into the row seam because its rows are
+    KEPT: counting a refused summary into `row_drops` would make the row seam's tail line report N
+    dropped fire rows on a build that dropped none, and a flood of unprintable summaries would then
+    also consume the budget the genuinely-lost rows announce themselves out of.
+
+    The summary-refusal census covers EVERY well-formed fire before `_obs_capped` cuts the published
+    rows to 20, deliberately matching `flow.queue_dropped`, so it may exceed the slice beside it.
+    Deriving it from that slice would hide the broken-summary-formatter flood it exists to announce."""
     rows = []
+    refused_summaries = 0
     row_drops = _ObsDropLog("observability trigger fire rows")
+    field_drops = _ObsDropLog("observability trigger fire fields")
     drops = _ObsDropLog("observability evidence links")
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
@@ -2423,7 +2557,19 @@ def _obs_trigger_rows(items):
         # truncated STRING needs: `summary_length` is the pre-cap character count of the sanitized
         # text, published on every fire, and `dashboard/app.js` turns `summary_length > shown` into
         # an ellipsis marker carrying the count in its title. See `_obs_text_capped`.
-        summary, summary_length = _obs_text_capped(item.get("summary"), 240)
+        #
+        # [#2194] ...and a summary the guard REFUSED names itself on stdout, once per fire. Only the
+        # SHAPE reaches the build log — this build's own field name and a character count it counted
+        # itself — and NOTHING out of the value: an unprintable summary is precisely the string that
+        # can forge a `dashboard-gen:` line into the log diagnosing it, which is why `_obs_text`
+        # bounds even the forms it does quote. Keyed on `is not None`, so the accept path (including
+        # an absent or empty summary, which refuses nothing) stays silent.
+        summary, summary_length, refused_summary = _obs_text_capped(item.get("summary"), 240)
+        if refused_summary is not None:
+            refused_summaries += 1
+            field_drops.drop(f"observability trigger fire field (row `summary` "
+                             f"({refused_summary} characters) is not printable text; the row still "
+                             "publishes with an empty summary)")
         task = item.get("enqueued_task")
         rows.append({
             "rule": rule,
@@ -2436,9 +2582,15 @@ def _obs_trigger_rows(items):
             and OBS_TOKEN_RE.fullmatch(task) else None,
         })
     row_drops.close()
+    # [#2194] Load-bearing, like the two beside it: `items` is unbounded on the way IN (`_obs_capped`
+    # cuts at 20 on the way OUT) and a refused summary KEEPS its row, so nothing else limits how many
+    # fires can announce a refusal — a collector that broke its summary formatter breaks it for every
+    # alarm at once, which is exactly the flood #1570 capped.
+    field_drops.close()
     drops.close()
     rows.sort(key=lambda row: row["fired_at"] or "", reverse=True)
-    return _obs_capped(rows, 20)
+    rows, rows_total = _obs_capped(rows, 20)
+    return rows, rows_total, refused_summaries
 
 
 def _normalize_observability(document):
@@ -2505,7 +2657,8 @@ def _normalize_observability(document):
         document.get("defer_reasons_1h"), "reason", 16)
     exit_classes, exit_classes_total = _obs_exit_rows(document.get("model_exit_classes_1h"))
     flow = _obs_flow(document.get("flow"))
-    trigger_fires, trigger_fires_total = _obs_trigger_rows(document.get("trigger_fires"))
+    trigger_fires, trigger_fires_total, trigger_summary_dropped = _obs_trigger_rows(
+        document.get("trigger_fires"))
     return {
         "generated_at": _utc_iso(document.get("generated_at")),
         "cache": cache,
@@ -2518,6 +2671,7 @@ def _normalize_observability(document):
         "flow": flow,
         "trigger_fires": trigger_fires,
         "trigger_fires_total": trigger_fires_total,
+        "trigger_summary_dropped": trigger_summary_dropped,
         "thresholds": thresholds,
     }
 
@@ -6626,6 +6780,9 @@ esac
              "evidence_total": 1,
              "enqueued_task": "heal-2a-0001"}],
         "trigger_fires_total": 1,
+        # [#2233] No summary was refused in the golden input. The zero census is unconditional so
+        # absence cannot be mistaken for a producer that predates the field.
+        "trigger_summary_dropped": 0,
         "thresholds": {"workflow_failure_rate": 0.5, "defer_reason_hourly": 4,
                        "queue_age_clamp_minutes": 10, "merge_stall_minutes": 90},
     }
@@ -7898,55 +8055,155 @@ esac
     _ASTRAL = "\U0001F600"
 
     def obs_summary(value):
-        """(published `summary`, its `summary_length`) for one fire carrying `value`."""
+        """(published `summary`, its `summary_length`, EVERY `dashboard-gen:` line printed).
+
+        [#2194] The lines are kept — in order, unfiltered — because the build log is the other half
+        of this seam: a refusal announced to the wrong seam, announced unconditionally, or announced
+        with the refused VALUE echoed into it must red these rows rather than slip past a
+        prefix-filtered capture. The FIXTURE is quietened rather than the capture (the golden cache
+        group, queue row and target-CI row are each deliberately malformed and each announces
+        itself), so every line these rows see belongs to the trigger seams under test.
+        """
         fixture = copy.deepcopy(obs_fixture)
+        fixture["cache"] = {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7}
+        fixture["flow"]["queue"] = []
+        fixture["flow"]["target_ci_queue"] = []
         fixture["trigger_fires"] = [{"rule": "summary-rule", "fired_at": now - 300,
                                      "summary": value, "evidence": []}]
-        with contextlib.redirect_stdout(io.StringIO()):
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
             document = obs_normalized(fixture)
         fires = document["trigger_fires"]
         row = fires[0] if isinstance(fires, list) and fires else document
         # `.get`, not a subscript, for the reason `obs_evidence` gives: a mutant that stops
         # publishing the key must red THESE rows, not abort the suite under a KeyError with every
         # check below it unrun (AGENTS.md pre-flight item 4, crash-after-partial-run).
-        return row.get("summary"), row.get("summary_length")
+        return (row.get("summary"), row.get("summary_length"),
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen:")])
 
+    # [#2194] Each row below also pins what reached the BUILD LOG. The empty list on every accept
+    # path is what keeps the loud rows further down non-vacuous: an unconditional announcement, or
+    # one keyed on the count's truthiness rather than on `is not None`, reds these four rows.
     check("[#2161] a 900-character summary publishes 240 characters and STATES that it read 900. "
           "A length derived from the published slice reds at 240, a moved cap reds the slice, and "
-          "dropping the key reds both halves",
-          obs_summary(_LONG_SUMMARY), (_CUT_SUMMARY, 900))
+          "dropping the key reds both halves. [#2194] A CUT is not a refusal: nothing is announced",
+          obs_summary(_LONG_SUMMARY), (_CUT_SUMMARY, 900, []))
     # The accept path and the zero row, which are what keep the row above and the refusal row below
     # non-vacuous: a length emitted only when the cut BIT is the census that never zero-seals
     # (pre-flight item 8), and the page could then no longer tell `240 of 240` from a producer that
     # stopped sending the count at all.
     check("[#2161] a summary UNDER the cut publishes whole and states its length ANYWAY — a cut "
           "that hid nothing is still a reading, and the page owns the `length > shown` decision",
-          obs_summary("twelve chars"), ("twelve chars", 12))
-    check("[#2161] ...and a fire with NO summary publishes its ZERO rather than omitting the count",
-          obs_summary(""), ("", 0))
+          obs_summary("twelve chars"), ("twelve chars", 12, []))
+    check("[#2161] ...and a fire with NO summary publishes its ZERO rather than omitting the count. "
+          "[#2194] An empty summary REFUSES nothing, so it announces nothing: a drop line here would "
+          "fire against every healthy fleet whose alarms carry no summary text",
+          obs_summary(""), ("", 0, []))
     check("[#2161] ...an ABSENT summary key reads the same way — 0 characters, not a missing count",
-          obs_summary(None), ("", 0))
+          obs_summary(None), ("", 0, []))
     # THE DIRECTION THAT KEEPS THIS HONEST. A non-printable summary is REFUSED WHOLE by the existing
     # guard (a control-character injection risk, not a long sentence), so its length is 0 and not
     # 900: publishing 900 beside the empty string would draw `…` and `900 further characters` on a
     # value that was never truncated — a second, WRONG reading of a loss the page cannot repair.
     # Truncation and refusal are different facts, exactly as #1868 keeps a malformed row out of a
     # capped array's total.
+    # ---- [#2194] ...AND THAT REFUSAL MUST NAME ITSELF, which #2161 deliberately left for here. The
+    # guard is correct — a control character in a published string is an injection vector, not a long
+    # sentence — but it was silent in BOTH directions: the fire published `summary: ""` and nothing
+    # reached the build log, so a collector that starts embedding a newline in its alarm summaries
+    # loses every summary on the panel and renders identically to a fleet whose alarms have no
+    # summaries at all. That is the producer/consumer mismatch #982 (`flow.queue`), #1867 (these very
+    # rows) and #2039 (target-CI rows) made loud, one FIELD over. Every expected string here is a
+    # test-side literal (reading it back off the module is pre-flight 2(b)'s tautology) and every
+    # input is a literal whose character count is written out here (2(c)).
+    _FIELD_DROP = ("dashboard-gen: dropped observability trigger fire field (row `summary` "
+                   "({} characters) is not printable text; the row still publishes with an empty "
+                   "summary)")
+    _FIELD_SEAM = "observability trigger fire fields"
     check("[#2161] a non-printable 900-character summary is REFUSED WHOLE and reports length 0 — a "
           "refusal is not a truncation, and a length published beside an empty string would draw a "
-          "cut marker on a value that was never cut",
-          obs_summary("a" * 300 + "\n" + "b" * 599), ("", 0))
+          "cut marker on a value that was never cut. [#2194] ...and it says so on stdout, naming "
+          "the FIELD and the SHAPE it refused, while the row itself still publishes",
+          obs_summary("a" * 300 + "\n" + "b" * 599), ("", 0, [_FIELD_DROP.format(900)]))
+    # THE REGRESSION IN THE SHAPE THE ISSUE NAMES: a collector wrapping its alarm sentence onto two
+    # lines. Both directions in one row — the summary is gone from the panel AND the loss is legible
+    # — and the count is the SANITIZED one (the `\n` is interior, so nothing is stripped).
+    check("[#2194] a collector that wraps its summary onto two lines loses that summary from every "
+          "alarm on the panel, and now says so once per fire instead of publishing an empty string "
+          "in silence — an unannounced refusal renders as a fleet whose alarms have no summaries",
+          obs_summary("worker failure rate 67%\nover 3 consecutive runs"),
+          ("", 0, [_FIELD_DROP.format(47)]))
+    # An interior TAB refuses too, and it is the likelier accident: `strip()` removes the leading and
+    # trailing whitespace this guard would otherwise catch, so a suite testing only surrounding
+    # whitespace would find this guard unreachable.
+    check("[#2194] an interior TAB is refused and announced the same way — `strip()` handles the "
+          "surrounding whitespace, so the guard only ever sees the INTERIOR control characters",
+          obs_summary("worker failure rate\t67%"), ("", 0, [_FIELD_DROP.format(23)]))
+    # ...and the refused value is NEVER quoted, which is the whole reason the guard exists. The
+    # capture is unfiltered, so a message echoing this summary would arrive as a second entry here
+    # — a forged `dashboard-gen:` line in the log that is diagnosing it — and even an escaped `!r`
+    # echo of the value reds the exact-match expectation. Only integers this build counted itself
+    # and this build's own field name may appear.
+    check("[#2194] a summary carrying a forged log line is not echoed into the build log that "
+          "diagnoses it: ONE line, naming the field and a character count, quoting nothing",
+          obs_summary("ok\ndashboard-gen: dropped observability trigger fire input (forged)"),
+          ("", 0, [_FIELD_DROP.format(67)]))
     # ...and the count is taken over the SANITIZED text, the same string that was cut. Read off the
     # raw input it would count the six spaces this seam strips and report 306 for a summary of 300.
     check("[#2161] the length counts the STRIPPED text the cut is applied to, never the raw input — "
           "a length read before `strip()` says 306 where 300 characters were published",
-          obs_summary("   " + "w" * 300 + "   "), ("w" * 240, 300))
+          obs_summary("   " + "w" * 300 + "   "), ("w" * 240, 300, []))
     # ...and both the cut and the count are in CODE POINTS. Pinned here because it is the unit the
     # page is held to below: a count in UTF-16 code units reads 482 for this input, and a cut in
     # them would publish 120 emoji.
     check("[#2161] an astral summary is cut and counted in CODE POINTS — 241 emoji publish 240 "
           "emoji beside a length of 241, never the 482 a UTF-16 code-unit count reports",
-          obs_summary(_ASTRAL * 241), (_ASTRAL * 240, 241))
+          obs_summary(_ASTRAL * 241), (_ASTRAL * 240, 241, []))
+    # THE FIELD SEAM IS ITS OWN, capped and counted apart from the row and evidence seams. It has to
+    # be: its rows are KEPT, so folding it into `row_drops` would make that seam's tail report 20
+    # dropped fire ROWS on a build that dropped none, and a collector whose summary formatter broke
+    # for every alarm at once would then also consume the budget the genuinely-lost rows announce
+    # themselves out of. Sizes and expected strings are literals written here — deriving either from
+    # OBS_DROP_WARN_MAX is #941's tautology — so moving the cap reds these rows.
+    _bad_summaries = [{"rule": f"wrapped-rule-{index}", "fired_at": now - 300,
+                       "summary": "worker failure rate 67%\nover 3 consecutive runs",
+                       "evidence": []} for index in range(20)]
+    _, _flood_fires, _flood_field_lines = obs_drops([], copy.deepcopy(_bad_summaries))
+    check("[#2194] 20 refused summaries print 12 lines and ONE tail naming the field seam and the "
+          "REAL total — and capping the WARNING never caps the DATA: all 20 fires still publish, "
+          "each with the empty summary and the length 0 that #2161 settled on",
+          (len(_flood_fires), sorted({row["summary"] for row in _flood_fires}),
+           sorted({row["summary_length"] for row in _flood_fires}), _flood_field_lines),
+          (20, [""], [0],
+           [_FIELD_DROP.format(47)] * 12 + [_SUPPRESSED.format(8, _FIELD_SEAM, 20)]))
+    # All THREE seams on one document, which is the only shape that pins the whole interleaving: 12
+    # field lines, then the dropped row, then the refused link, then ONE tail — the field seam's,
+    # with its own two numbers. A shared budget silences the row or link line, a merged counter reds
+    # the tail's seam name or its total, and a row-seam tail here would be a claim that fire rows
+    # were dropped on a build that dropped exactly one.
+    check("[#2194] a flooded FIELD seam consumes neither the row seam's budget nor the evidence "
+          "seam's: the unreadable rule and the non-GitHub link each still name themselves, and only "
+          "the seam that actually overflowed writes a tail",
+          obs_drops([], copy.deepcopy(_bad_summaries)
+                    + [{"rule": "bad rule!", "summary": "s"},
+                       {"rule": "kept-rule", "fired_at": now - 300, "summary": "s",
+                        "evidence": ["https://evil.example/exfil"]}])[2],
+          [_FIELD_DROP.format(47)] * 12
+          + [_FIRE_DROP.format("row `rule` 'bad rule!' is not a safe token"), _EVIDENCE_DROP,
+             _SUPPRESSED.format(8, _FIELD_SEAM, 20)])
+    # ONE loss, ONE line. A row the RULE guard already dropped is gone whole — its summary is never
+    # read and must not be announced a second time, which is the same reason `_obs_text`'s three
+    # drop-diagnostic call sites (the queue `class`, the target-CI `repository`, this `rule`) stay
+    # silent about their own refusals: the line that dropped the row named that loss in full. The
+    # trigger `summary` is the only PUBLISHED `_obs_text` call site in this module, which is why this
+    # issue is one field wide.
+    check("[#2194] a fire dropped at the RULE guard announces that ONE loss — its unprintable "
+          "summary is never reached, so a row lost whole cannot write a second line about a field "
+          "nothing published",
+          obs_drops([], [{"rule": "bad rule!", "fired_at": now - 300,
+                          "summary": "worker failure rate 67%\nover 3 consecutive runs"}])[2],
+          [_FIRE_DROP.format("row `rule` 'bad rule!' is not a safe token")])
     # ...and THE PAGE IS WHAT THIS HAS TO DELIVER INTO (pre-flight item 11): a count published into
     # site/data.json that no panel renders leaves the operator exactly where the issue found them.
     # The affordance is deliberately NOT #1868's `showing 240 of 900` — a statistic under a sentence
@@ -7976,7 +8233,9 @@ esac
     const found = [];
     const walk = (el) => {
       if (!el) return;
-      if (el.className === "obs-truncated") found.push(flat(el).join(" ").trim());
+      if (el.className === "obs-truncated" || el.className === "obs-truncation-note bad") {
+        found.push(flat(el).join(" ").trim());
+      }
       for (const kid of el.children || []) walk(kid);
     };
     walk(root);
@@ -8072,12 +8331,34 @@ esac
          "summary": _ASTRAL * 10 + "z" * 1000, "evidence": []}]
     with contextlib.redirect_stdout(io.StringIO()):
         astral_page_doc = obs_normalized(astral_page_input)
+    refused_summary_input = copy.deepcopy(obs_fixture)
+    refused_summary_input["trigger_fires"] = [
+        {"rule": "wrapped-one", "fired_at": now - 300, "summary": "line one\nline two",
+         "evidence": []},
+        {"rule": "wrapped-two", "fired_at": now - 400, "summary": "left\tright",
+         "evidence": []}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        refused_summary_doc = obs_normalized(refused_summary_input)
+    singular_refused_doc = copy.deepcopy(refused_summary_doc)
+    singular_refused_doc["trigger_summary_dropped"] = 1
+    hostile_refusal_docs = {}
+    for label, value in (("string", "2"), ("boolean", True), ("negative", -2),
+                         ("fractional", 2.5), ("null", None)):
+        hostile = copy.deepcopy(refused_summary_doc)
+        hostile["trigger_summary_dropped"] = value
+        hostile_refusal_docs[f"refusal-{label}"] = hostile
+    legacy_refusal_doc = copy.deepcopy(refused_summary_doc)
+    legacy_refusal_doc.pop("trigger_summary_dropped", None)
     summary_page = _executed_page(
         _page_harness("renderObservability", _OBS_SUMMARY_PAGE_BODY),
         {"documents": {"capped": copy.deepcopy(summary_page_doc),
                        "hostile": hostile_summary_doc,
                        "unreachable": unreachable_summary_doc,
-                       "astral": astral_page_doc}})
+                       "astral": astral_page_doc,
+                       "refusal-two": refused_summary_doc,
+                       "refusal-one": singular_refused_doc,
+                       "refusal-legacy": legacy_refusal_doc,
+                       **hostile_refusal_docs}})
 
     def obs_summary_page(name):
         rendered = summary_page.get(name)
@@ -8109,6 +8390,18 @@ esac
           ([[_ASTRAL * 240, summary_cut(1, " is")],
             [_ASTRAL * 120 + "z" * 120, summary_cut(80)],
             [_ASTRAL * 10 + "z" * 230, summary_cut(770)]], [], None))
+    check("[#2233] EXECUTED page script: two summaries refused by the real producer retain their "
+          "empty fire rows and state the distinct FIELD loss beside the trigger panel; one refusal "
+          "takes the singular branch and is never presented as truncation",
+          (obs_summary_page("refusal-two"), obs_summary_page("refusal-one")),
+          (([["", []], ["", []]], ["2 trigger summaries were unreadable"], None),
+           ([["", []], ["", []]], ["1 trigger summary was unreadable"], None)))
+    check("[#2233] EXECUTED page script: a genuine ZERO refusal census draws no loss note",
+          obs_summary_page("capped")[1], [])
+    for label in ("string", "boolean", "negative", "fractional", "null", "legacy"):
+        check(f"[#2233] EXECUTED page script: a {label} summary-refusal count is nothing known and "
+              "draws no fabricated loss note",
+              obs_summary_page(f"refusal-{label}")[1], [])
     # ---- [#1880] A FLOW STAT THE COLLECTOR SENT AND THIS BUILD CANNOT READ MUST NOT PUBLISH AS A
     # HEALTHY NUMBER. `_obs_count(...) or 0` mapped every unreadable park/sample count to 0, so
     # `parks_1h: {"needs_user": "lots", "needs_orchestrator": -3}` published `0 user · 0 orch` on
@@ -8896,6 +9189,30 @@ esac
         check(f"[#2039] a {case} repository is not echoed into the build log that diagnoses it",
               obs_ci_drops([{"repository": repository, "depth": 1}]),
               ([], [_CI_DROP.format(f"row `repository` {quoted} is not an owner/name repository")]))
+    # [#2174] ...and the PUBLISHED value is bounded too, which the build-log cap above cannot reach:
+    # a repository that PARSES is echoed into `site/data.json` and the `CI queue · <repo>` metric
+    # label at whatever length the collector chose. Both sides of each bound, one row each: the
+    # just-over rows red for any widening (measured: reverting to `*` and widening to `{0,999}` each
+    # red them), the at-maximum row reds for any narrowing, and the megabyte row is the one that
+    # also reds a guard made CONDITIONALLY inert (`if len(repository) < 500 and ...`) — the #938
+    # shape a straight deletion cannot see. Every length here is a written literal, NOT derived from
+    # OBS_TARGET_REPO_RE: deriving the input from the constant the code reads is the #941 tautology
+    # that left 76/76 green while the cap itself was mutated to 999.
+    _MAX_OWNER, _MAX_NAME = "a" * 39, "b" * 100
+    check("[#2174] a repository at GitHub's own maximum — a 39-character owner and a 100-character "
+          "name — is PUBLISHED silently, so the bound refuses nothing that exists on GitHub",
+          obs_ci_drops([{"repository": f"{_MAX_OWNER}/{_MAX_NAME}", "depth": 3}]),
+          ([{"repository": f"{_MAX_OWNER}/{_MAX_NAME}", "depth": 3}], []))
+    for case, repository in (
+        ("a 40-character owner", f"{'a' * 40}/sparq"),
+        ("a 101-character name", f"sparq-org/{'b' * 101}"),
+        ("a megabyte-long name", f"sparq-org/{'b' * 1000000}"),
+    ):
+        check(f"[#2174] {case} is REFUSED — charset-safe is not the same as bounded, and an "
+              "unbounded name publishes straight into data.json and the metric label rendering it",
+              obs_ci_drops([{"repository": repository, "depth": 1}]),
+              ([], [_CI_DROP.format(
+                  f"row `repository` {repository[:64]!r} is not an owner/name repository")]))
     # `flow.target_ci_queue` is UNBOUNDED on the way IN — `_obs_capped` truncates it at 12 on the way
     # OUT, after every row has been walked — so nothing but this seam's own `_ObsDropLog` limits the
     # emission: the #1570 flood, exactly. The 21st row still publishes, because capping a WARNING
@@ -9069,6 +9386,85 @@ esac
               "fabricated note — a page reaching this through JavaScript's own `> 0` coercion "
               "states a count it never read",
               ci_loss(f"hostile-{label}"), ([], [], None))
+    # ---- [#2218] ...AND THE STYLESHEET MUST HAVE A RULE TO DRAW IT WITH. --------------------
+    # Both notes above exist so an operator can tell an empty panel from an unreadable one, and both
+    # shipped against a `.obs-truncation-note` class with NO rule in dashboard/styles.css: default
+    # paragraph size, default colour, the `bad` tone dropped — louder and less legible than the
+    # #1868 truncation note beside them, which is the opposite of what a page renders a loss as. The
+    # class string is READ OUT OF app.js rather than typed here (pre-flight item 2c), so a rename on
+    # the page side reds this row instead of quietly unstyling the notes again, and the sheet is
+    # PARSED, never grepped — a substring search for the selector is satisfiable by a comment.
+    try:
+        note_classes = re.findall(
+            r'node\("p",\s*"(obs-truncation-note[^"]*)"',
+            _js_function_body(_repo_file("dashboard", "app.js"), "obsFlowCard"))
+    except DashboardError as error:                 # crash-after-partial-run guard, as above
+        note_classes = [str(error)]
+    check("[#2218] both unreadable-row notes are drawn by obsFlowCard with ONE class string — so "
+          "the rules resolved below are resolved for exactly what the page sets, and a rename on "
+          "the page side reds this suite rather than quietly unstyling the notes again",
+          (sorted(set(note_classes)), len(note_classes)), (["obs-truncation-note bad"], 2))
+    try:
+        styles_css = _repo_file("dashboard", "styles.css")
+        # A regex that matched nothing above already reded its own row; falling back to the shipped
+        # class keeps every row below EXECUTING rather than aborting the run on an IndexError.
+        note_rule = _css_applied(
+            styles_css, "p", (note_classes or ["obs-truncation-note bad"])[0].split())
+        # The sibling display-cap note the loss notes sit next to, and the `bad` tone the congestion
+        # count beside them already renders: both READ OUT OF the sheet, so "as quiet as its
+        # neighbour, in the fleet's own loss colour" is compared against the neighbours themselves
+        # and not against a second copy of the same literals typed into this file.
+        truncated_rule = _css_applied(styles_css, "p", ["obs-truncated"])
+        count_rule = _css_applied(styles_css, "span", ["obs-reason-count", "bad"])
+        bare_bad_rule = _css_applied(styles_css, "p", ["bad"])
+        root_vars = sorted({declaration.split(":")[0].strip()
+                            for prelude, body in _css_rules(styles_css) if prelude == ":root"
+                            for declaration in body.split(";")
+                            if declaration.strip().startswith("--")})
+    except DashboardError as error:                 # same crash-after-partial-run guard as above
+        note_rule = truncated_rule = count_rule = bare_bad_rule = {"refused": str(error)}
+        root_vars = [str(error)]
+    check("[#2218] the loss notes render in the fleet's OWN bad tone — the same one the congested "
+          "queue count beside them uses — and that custom property is really declared, so the "
+          "colour is not a `var()` naming nothing",
+          (note_rule.get("color"), count_rule.get("color"), "--bad" in root_vars),
+          ("var(--bad)", "var(--bad)", True))
+    check("[#2218] ...and they are as quiet as the #1868 truncation note they sit beside: same "
+          "margin, same .68rem, same tabular numerals, rather than the default paragraph the "
+          "missing rule left them as",
+          ((note_rule.get("margin"), note_rule.get("font-size"),
+            note_rule.get("font-variant-numeric")),
+           (truncated_rule.get("margin"), truncated_rule.get("font-size"),
+            truncated_rule.get("font-variant-numeric"))),
+          (("4px 0 12px", ".68rem", "tabular-nums"), ("4px 0 12px", ".68rem", "tabular-nums")))
+    check("[#2218] the tone stays QUALIFIED by the note's own class: a bare `.bad` rule would tint "
+          "every element the page marks bad, which is a change to a shared class and not this fix",
+          bare_bad_rule, {})
+    # The reader itself, in both directions — a resolver that returned `{}` for everything would
+    # make the three rows above pass on an empty stylesheet the day someone deleted the rule.
+    _CSS_FIXTURE = (".obs-truncation-note { margin: 4px 0 12px; font-size: .68rem; }\n"
+                    ".obs-truncation-note.bad { color: var(--bad); }\n")
+    check("[#2218] the stylesheet reader is not a rubber stamp: it reports the tone only for an "
+          "element that carries `bad`, and reports NOTHING once the rules are gone",
+          (_css_applied(_CSS_FIXTURE, "p", ["obs-truncation-note", "bad"]),
+           _css_applied(_CSS_FIXTURE, "p", ["obs-truncation-note"]),
+           _css_applied("", "p", ["obs-truncation-note", "bad"])),
+          ({"margin": "4px 0 12px", "font-size": ".68rem", "color": "var(--bad)"},
+           {"margin": "4px 0 12px", "font-size": ".68rem"}, {}))
+    for label, hostile in (
+            ("an at-rule", "@media (max-width: 620px) { .obs-truncation-note { color: red; } }"),
+            ("a descendant selector", ".obs-card .obs-truncation-note { color: red; }"),
+            ("an unreadable declaration", ".obs-truncation-note { color red }"),
+            ("an unbalanced block", ".obs-truncation-note { color: red;"),
+            ("a dangling selector outside every rule",
+             ".obs-truncation-note { color: red; }\n.obs-truncation-note.bad")):
+        try:
+            unresolved = _css_applied(hostile, "p", ["obs-truncation-note", "bad"])
+        except DashboardError:
+            unresolved = "refused"
+        check(f"[#2218] ...and {label} carrying the note's class is a REFUSAL — reporting 'no rule "
+              "applies' for a rule it could not read is the same false pass as the missing rule",
+              unresolved, "refused")
     try:
         with_observability = build_dashboard(
             issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)

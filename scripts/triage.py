@@ -2268,16 +2268,14 @@ def _self_test():
         chk(f"[#595 f1] area:{keyword} derives the trust-plane role AND escalates in both resolvers",
             resolved(["priority:P1", f"area:{keyword}"]),
             (TRUST_PLANE_ROLE, SOUNDNESS, SOUNDNESS))
-    # DISCRIMINATION: the enumeration above is not vacuously true — a NON-trust-plane kind must NOT
-    # escalate (otherwise the check would pass even if every issue were force-escalated).
-    # [OPUS-5] `kind:research` was the second sample here and now escalates BY DESIGN: the
-    # 2026-07-26 deprecation collapsed role=research to a single rung (opus5), and a one-rung
-    # chain with no `escalate` has no exit at all — on an opus5 outage it could only defer
-    # forever with no human notified. It is replaced by `kind:site`, which is still a genuine
-    # non-escalating route, so the discrimination remains real rather than being dropped.
-    chk("[#595 f1] a non-trust-plane kind is NOT escalated (the enumeration discriminates)",
+    # [SPARQ agent] DISCRIMINATION: the enumeration above is not vacuously true. Non-trust-plane
+    # routes retain their own escalation policy rather than inheriting the trust-plane verdict. Docs
+    # remains non-escalating; site is implementation work and now has the bounded Sol -> Opus
+    # continuity exit. Checking both pins that distinction even though trust-plane work and site
+    # work deliberately agree on the escalation boolean.
+    chk("[#595 f1] non-trust routes retain their declared escalation policy",
         [resolved(["priority:P1", "area:usage", "kind:docs"])[1][2],
-         resolved(["priority:P1", "area:usage", "kind:site"])[1][2]], [False, False])
+         resolved(["priority:P1", "area:usage", "kind:site"])[1][2]], [False, True])
     # ...and research DOES escalate now — asserted so the change above is a pinned decision, not
     # an unnoticed side effect of the deprecation.
     chk("[OPUS-5] role:research escalates (single-rung chain must have a human exit)",
