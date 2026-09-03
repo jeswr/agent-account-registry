@@ -1,9 +1,10 @@
 # [SPARQ agent] REG-5 grooming core: repairs dead-lease in-progress issues, closed-unmerged-PR
 # orphans, exhausted attempt budgets, and stale worker PRs. Extracted as an independently ingested
-# recovery lane for #2076 after the watchdog-heavy workflow remained rejected with zero jobs under
-# a fresh filename. #2256 makes this a manual fallback: groom-sweep.yml is the single scheduled
-# owner of the same full repair, avoiding duplicate API walks while retaining this known-ingesting
-# shape for explicit incident recovery.
+# recovery lane for #2076 after an earlier groom-sweep revision remained rejected with zero jobs.
+# The current groom-sweep ingestion path is proven live: scheduled run 33710403708 on 2026-09-03
+# created seven jobs and succeeded. #2256 therefore makes this a manual fallback: groom-sweep.yml
+# is the single scheduled owner of the same full repair, avoiding duplicate API walks while
+# retaining this known-ingesting shape for explicit incident recovery.
 name: groom-core
 
 on:

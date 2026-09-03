@@ -1565,8 +1565,11 @@ def _self_test():
     chk("READ PATH [#2256]: retry outcomes retain a small stable failure taxonomy",
         tuple(_read_failure_class(status, reason) for status, reason in (
             (429, None), (403, "refused-http-403"), (None, "usage-error"),
-            (502, "transient-502"), (None, "caller-classifier"), (418, "teapot"))),
-        ("throttle", "refusal", "usage", "transient", "transient", "unknown"))
+            (502, "transient-http-502"), (None, "transient-text"),
+            (500, "unparsed-http-500"), (None, "statusless"),
+            (404, "refused-http-404"), (418, "teapot"))),
+        ("throttle", "refusal", "usage", "transient", "transient", "transient",
+         "transient", "refusal", "unknown"))
     independently_unsafe = _safe_read_detail(
         "Authorization: Bearer ghp_not_the_target; "
         "GITHUB_TOKEN=github_pat_also_not_the_target\r\nuseful-cause",

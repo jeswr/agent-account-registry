@@ -13880,16 +13880,16 @@ def _self_test() -> int:
             inside_on = False
             for line in text.splitlines():
                 if not inside_on:
-                    inside_on = line == "on:"
+                    inside_on = bool(re.match(r"^on:\s*(?:#.*)?$", line))
                     continue
                 if line and not line[0].isspace() and not line.lstrip().startswith("#"):
                     break
                 trigger_block.append(line)
-            return sum(1 for line in trigger_block
-                       if re.match(rf"^  {re.escape(trigger)}:\s*(?:\{{\}})?\s*$", line))
+            return sum(1 for line in trigger_block if re.match(
+                rf"^  {re.escape(trigger)}:\s*(?:\{{\}})?\s*(?:#.*)?$", line))
 
-        trigger_decoy = ("on:\n"
-                         "  workflow_dispatch: {}\n"
+        trigger_decoy = ("on:  # harmless inline comment\n"
+                         "  workflow_dispatch: {}  # harmless inline comment\n"
                          "# a column-zero comment does not end the trigger block\n"
                          "jobs:  # an ordinary inline comment is permitted\n"
                          "  schedule:\n"
@@ -13909,6 +13909,37 @@ def _self_test() -> int:
               schedule_counts,
               {"groom-sweep.yml": 1, "groom-core.yml": 0,
                "groom-recovery-minimal.yml": 0})
+
+        ingestion_alarm_yaml = (
+            workflow_root / "ingestion-alarm.yml"
+        ).read_text(encoding="utf-8")
+
+        def _critical_lanes(text: str) -> tuple[str, ...]:
+            assignments = []
+            for line in text.splitlines():
+                match = re.match(r'^\s+CRITICAL_LANES="([^"]*)"\s*(?:#.*)?$', line)
+                if match:
+                    assignments.append(tuple(match.group(1).split()))
+            if len(assignments) != 1:
+                raise ValueError(
+                    f"ingestion-alarm must carry exactly one CRITICAL_LANES assignment; "
+                    f"found {len(assignments)}")
+            if len(assignments[0]) != len(set(assignments[0])):
+                raise ValueError("ingestion-alarm CRITICAL_LANES contains a duplicate")
+            return assignments[0]
+
+        critical_lanes = _critical_lanes(ingestion_alarm_yaml)
+        scheduled_groom_lanes = tuple(
+            name for name, count in schedule_counts.items() if count > 0)
+        manual_only_groom_lanes = tuple(
+            name for name, count in schedule_counts.items() if count == 0)
+        check("YAML seam [#2256]: the unique scheduled full-groom owner is enrolled in the "
+              "fault-independent ingestion alarm",
+              tuple(name for name in scheduled_groom_lanes if name in critical_lanes),
+              ("groom-sweep.yml",))
+        check("YAML seam [#2256]: no manual-only groom fallback remains enrolled in the "
+              "fault-independent ingestion alarm",
+              tuple(name for name in manual_only_groom_lanes if name in critical_lanes), ())
         check("YAML seam [#2256]: both fallback full-sweep workflows remain manually "
               "dispatchable after their duplicate schedules are removed",
               {name: _trigger_count(full_sweep_yaml[name], "workflow_dispatch")

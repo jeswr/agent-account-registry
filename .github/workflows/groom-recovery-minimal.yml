@@ -1,6 +1,8 @@
-# [SPARQ agent] Minimal default-branch recovery lane for #2076. This deliberately starts from the
-# known-ingesting groom-leases.yml shape after both groom-sweep.yml and the independently extracted
-# groom-core.yml were rejected before job creation. It runs the real registry/ledger repair sweep
+# [SPARQ agent] Minimal default-branch recovery lane for #2076. This historical fallback starts
+# from the known-ingesting groom-leases.yml shape after earlier revisions of groom-sweep.yml and
+# the independently extracted groom-core.yml were rejected before job creation. The current
+# groom-sweep ingestion path is proven live: scheduled run 33710403708 on 2026-09-03 created seven
+# jobs and succeeded. This lane runs the real registry/ledger repair sweep
 # without target App credentials: registry-state recovery proceeds, while unavailable target
 # issue/PR repair is logged and skipped. Add credential-bearing target repair only after this
 # exact default-branch workflow has proved that GitHub creates and runs its job. #2256 keeps this
