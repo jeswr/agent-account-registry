@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6312,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4b959c0641296915a77683612b7c0125a0e690c5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new stability text says `PodStore::accessible` returns document IRIs and that the graph names it returns are document IRIs. Clause 4 then says containers with no graph of their own appear in `accessible`, and `containment_is_derived_from_the_graph_name_path` explicitly requires such synthesized container IRIs. Those entries are neither loaded document IRIs nor graph names. This ambiguity is load-bearing for a proposed tier-1 set/view API: an embedding consumer cannot safely interpret the returned set as documents if it also contains virtual inheritance anchors.",
+    "file": "crates/sparq-solid/src/lib.rs",
+    "fix_hint": "Define the set precisely and consistently, e.g. as authorized resource IRIs that may include synthesized container anchors, while separately stating that `view_for` treats the set as a named-graph visibility whitelist and nonexistent graph names contribute no data. Update the corresponding wording in `docs/api-stability.md` and `skills/access-control/SKILL.md`, and add an assertion that distinguishes the advertised resource set from the actually scanned existing named graphs.",
+    "severity": "major",
+    "title": "The documented return type contract contradicts the required synthesized-container behavior"
+   },
+   {
+    "body": "The module and public docs state that clauses 1-4 are pinned here and clause 3 explicitly defines both `<R>.acl` (WAC) and `<R>.acr` (ACP) recognition. Every fixture in this file uses `AclBuilder` and `materialize_wac`; the suffix test only renames `.acl`. Existing ACP tests exercise ACP behavior, but the evidence in this diff does not pin the specific claimed name-recognition/inert-renamed-control-document contract for `.acr`. Thus the stability claim is broader than its stated regression test.",
+    "file": "crates/sparq-solid/tests/embedding_contract.rs",
+    "fix_hint": "Add a focused ACP real-path counterpart using `PodStore::new` -> `materialize_acp` -> `accessible` that proves a correctly named `.acr` grants and an otherwise identical renamed graph is inert, or narrow the contract and all claims that clauses 1-4 are pinned to the WAC/`.acl` behavior actually tested.",
+    "severity": "major",
+    "title": "Clause 3 does not test the advertised `.acr` half of the contract"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposed stability documentation is internally inconsistent about what `accessible` returns, and the focused tests do not fully pin the advertised contract. In particular, the docs call every returned name a document IRI while the new clause-4 test intentionally requires synthesized container anchors with no document graph to be returned. Because this is defining a proposed semver-stable embedding contract, downstream callers cannot tell whether the set denotes documents/graphs or also virtual authorization resources. The test suite also claims to pin `.acl` and `.acr` name recognition but exercises only WAC/`.acl`.",
+  "verdict": "request_changes"
+ }
+}
