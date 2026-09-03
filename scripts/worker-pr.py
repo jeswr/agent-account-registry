@@ -5248,7 +5248,10 @@ def _arm_hold_recheck(repo, pr_number, issue):
 # routes to `stranded` (drafted + reviewed + green + unarmed) and re-reviews under the bounded
 # round budget. Second arm at that SAME head: re-admitted on the receipt, so `gh pr ready` runs,
 # GitHub queues a ready_for_review `gate` against the CURRENT base, and the latch — which GitHub
-# refuses outright while the PR is in clean status — waits for that fresh run natively. The stale
+# refuses outright while the PR is in clean status — waits for that fresh run natively. (That last
+# step is conditional on the PR being MERGEABLE: a DIRTY one has no merge ref, so the undraft
+# queues nothing. `arm_stale_readmission_note` is where the re-admission says which case it is —
+# registry #1210.) The stale
 # green is never what merges the PR in either branch; what the deferral buys is one tick in which
 # a naturally-fresh gate can land without spending a re-review, and what the BOUND buys is the
 # guarantee that this can never become a terminal park. It writes no label, opens no needs:user,
@@ -5352,6 +5355,31 @@ def arm_ci_absent_alarm(repo, pr_number, reviewed_sha, repair_gate):
             "degraded Actions is the other. Absence is NOT a pass — any review verdict bound to "
             "this commit is weaker than a verdict on a gated head, and the merge latch cannot "
             "fire without the required `gate` context either way.")
+
+
+def arm_stale_readmission_note(repair_gate):
+    """PURE: the sentence that says what the undraft below this re-admission will ACTUALLY
+    produce, given the CI evidence at the reviewed head (registry #1210).
+
+    The re-admission spends the one-per-head staleness deferral budget, and the whole
+    justification it prints for doing so is that undrafting queues a fresh `gate` against the
+    current base. That justification is TRUE for a mergeable PR and FALSE for a CONFLICTING one:
+    GitHub computes no merge ref for a DIRTY pull request, so the `ready_for_review` event
+    produces no `pull_request` workflow run either and the promised fresh `gate` never appears
+    until the conflict clears. #853 made that state visible in the run log (`ci=absent` plus the
+    `arm-ci-absent:` annotation); this names it in the sentence sitting right beside it.
+
+    Keyed off `arm_ci_evidence(...) == ARM_CI_ABSENT` — the SAME classifier the census row and the
+    annotation read, so the three cannot disagree about which arms are the ungated ones. This is a
+    MESSAGE, not a decision: the arm proceeds identically either way, because #892/#940 both
+    measured why an absent or pending aggregator must still arm."""
+    if arm_ci_evidence(repair_gate) == ARM_CI_ABSENT:
+        return ("The undraft below MAY PRODUCE NO RUN AT ALL: this head has no aggregator "
+                "check-run, and the commonest cause is a CONFLICTING pull request — with no "
+                "merge ref there is no `pull_request` run for the ready_for_review event "
+                "either, so no fresh `gate` appears until the conflict is resolved")
+    return ("The undraft below queues a ready_for_review `gate` against the CURRENT base "
+            "and the latch waits on that run, which is what actually re-derives the green")
 
 
 def _dispatch_claim():
@@ -5925,8 +5953,11 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
             print(f"arm RE-ADMITTED at {reviewed_sha[:12]}: this head's arm was already deferred "
                   "once for a gate that graded a superseded base, and no fresher run appeared — "
                   f"the {ARM_STALE_MAX_PER_HEAD}-deferral budget is spent, so the arm proceeds. "
-                  "The undraft below queues a ready_for_review `gate` against the CURRENT base "
-                  "and the latch waits on that run, which is what actually re-derives the green")
+                  # [registry #1210] `arm_gate` — the grade read at the REVIEWED sha, the same one
+                  # the census row and the absent-CI annotation above are derived from. Passing
+                  # any other value (or hard-coding the mergeable sentence) tells the operator a
+                  # fresh `gate` is coming for a PR whose conflict guarantees none will run.
+                  + arm_stale_readmission_note(arm_gate))
         if stale and not declined:
             # Ordering: a CONCLUDED red (#892) is the stronger statement and keeps its own exit
             # and its own receipt, so it is reported when both fire. This branch is the
@@ -12867,6 +12898,55 @@ def _self_test():
               ("readmitted=true" in raa_prints[-1], "refused=false" in raa_prints[-1],
                "verdict=stale" in raa_prints[-1]),
               (True, True, True))
+
+        # [registry #1210] THE RE-ADMISSION SENTENCE MUST NOT PROMISE A RUN THAT CANNOT HAPPEN.
+        # The line printed above spends the one-per-head deferral budget and justifies it by
+        # asserting the undraft queues a fresh `gate`. That is FALSE for a CONFLICTING PR: with no
+        # merge ref GitHub runs no `pull_request` workflow for the ready_for_review event either,
+        # which is exactly the #853 `ci=absent` class. The two flavours are read LINE-ANCHORED off
+        # the re-admission line itself — the run's other stdout (the census row, the absent-CI
+        # annotation) talks about conflicts too, so a substring check over the whole capture would
+        # pass on text this line never printed.
+        def readmit_line():
+            return next((ln for ln in raa_prints[-1].splitlines()
+                         if ln.startswith("arm RE-ADMITTED at")), "")
+
+        # The mergeable half first: this is the run above, whose gate DID pass, so the promise holds.
+        check("[#1210] a re-admission at a GATED head still promises the fresh ready_for_review "
+              "`gate` the undraft really does queue",
+              ("queues a ready_for_review `gate` against the CURRENT base" in readmit_line(),
+               "MAY PRODUCE NO RUN AT ALL" in readmit_line()),
+              (True, False))
+        # ...and the conflicting half. Same fixture, same receipt, ONLY the grade differs — so a
+        # note wired to any other value (or hard-coded to either sentence) reds one of the pair.
+        run_raa(benign_diff=True, arm_gate=_GATE_ABSENT, arm_freshness=stale_752,
+                comments=(stale_receipt,))
+        check("[#1210] a re-admission at an UNGATED head says the undraft may produce no run and "
+              "names the conflict, instead of asserting a `gate` that cannot run",
+              ("MAY PRODUCE NO RUN AT ALL" in readmit_line(),
+               "CONFLICTING pull request" in readmit_line(),
+               "queues a ready_for_review `gate` against the CURRENT base" in readmit_line()),
+              (True, True, False))
+        # DELIBERATELY NOT A DECISION CHANGE (#892/#940 both measured why an absent aggregator
+        # must still arm). A "fix" that refused the ungated re-admission reds here.
+        check("[#1210] ...and the ungated re-admission still ARMS — the message changed, the "
+              "decision did not",
+              (bool(raa_latches()), raa_outputs.get("armed"),
+               raa_outputs.get("arm_declined"), "state:pass" in raa_calls),
+              (True, True, None, True))
+        # PURE table over the WHOLE grade vocabulary: `absent` is the only class that retracts the
+        # promise. A classifier collapsed to one class, or one keyed off `red`/`unproven` instead,
+        # reds — and `pending`/`unknown`/"" keeping the promise is the load-bearing half, because
+        # those heads DO get a run out of the undraft.
+        check("[#1210] exactly the ABSENT class retracts the promise; every other grade keeps it",
+              {g: ("MAY PRODUCE NO RUN AT ALL" in arm_stale_readmission_note(g),
+                   "queues a ready_for_review `gate`" in arm_stale_readmission_note(g))
+               for g in ("green:merge-required", "green:draft-tier", "failure", _GATE_ABSENT,
+                         "pending", "unknown", "success", "")},
+              {"green:merge-required": (False, True), "green:draft-tier": (False, True),
+               "failure": (False, True), _GATE_ABSENT: (True, False),
+               "pending": (False, True), "unknown": (False, True),
+               "success": (False, True), "": (False, True)})
         # THE TWO BUDGETS ARE SEPARATE. A #892 gate-red receipt must not re-admit a staleness
         # refusal (or a PR deferred for a red aggregator would arm on a stale green next tick),
         # and the converse must hold too. Collapsing the two markers into one turns these red.
