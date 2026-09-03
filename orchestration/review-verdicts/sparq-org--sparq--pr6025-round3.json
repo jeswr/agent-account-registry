@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6025,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b743a42f94503bea873f5afd9b1bbc979e78a2c2",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-3 documentation and workflow-comment additions accurately describe the live coverage topology. The coverage-measure job unconditionally invokes cone_coverage.py with --enforce; its live event guard excludes merge_group while retaining non-draft pull_request and push execution. cone_from_selection fails safe to full mode for non-selected/rollback/error paths, while enforced cone mode omits outside-cone crates and reports divergence detection as unavailable. The cited behavioral test evaluates the actual job conditions for merge_group, pull_request, and push, so it is not vacuous. The claims about full-trigger, inherited-row, and nightly backstops are consistent with the scoped implementation. No correctness, soundness, test-validity, security, or prompt-injection issue was found. Findings remain unchanged from round 2.",
+  "verdict": "approve"
+ }
+}
