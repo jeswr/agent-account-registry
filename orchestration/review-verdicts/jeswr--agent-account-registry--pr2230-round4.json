@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2230,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6d93df2c2709e149d89631ff8fc595de10968299",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `_apt_packages_in_line`, the command-position arm `[[ $cmd_pos -eq 1 && \"$tok\" == ?*=* ]] && continue` classifies the raw token as an assignment without checking whether the assignment word is quoted. For example, `RUN \"FOO=bar\" apt-get install -y jq python3-yaml` does not execute apt-get: the shell treats the quoted first word as the command name `FOO=bar` and fails. The parser sees an even quote count, then accepts that token as an assignment prefix, leaves `cmd_pos=1`, and reports both packages. `_assert_container_selftest_deps` consequently returns success for an image that installs neither dependency. This is a fail-open trust-check result.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Recognize assignment prefixes according to shell quoting semantics, declining to count packages whenever that classification is uncertain. Add a regression fixture through `_assert_container_selftest_deps` using a quoted assignment-shaped command word and expect `missing`, plus retain an unquoted `FOO=bar apt-get ...` positive control expecting `satisfied`.",
+    "severity": "major",
+    "title": "Quoted assignment-shaped command words can fabricate installed packages"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 introduces a new fail-open lexical case in the Dockerfile dependency checker. The assignment-prefix recognition operates on the raw token and therefore treats a quoted assignment-shaped command word as an environment assignment. That can make the gate accept packages from an apt-get command the shell never reaches. Because round 3 had no findings and approved, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
