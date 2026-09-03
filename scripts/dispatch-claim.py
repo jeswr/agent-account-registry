@@ -8106,17 +8106,21 @@ def _release_failed_dispatch(allocator, registry_repo, claim_id):
 
 
 def escalate_starved(escalate, usage, effective_cap):
-    """Escalation contract (routing.toml `escalate = true`, security/soundness surfaces): those
-    routes pin a RESTRICTED model chain (e.g. opus-only) and must ESCALATE to a human on
-    chain-exhaustion instead of silently starving or degrading to a weaker model. True when the
-    LIVE usage probe is present and shows ZERO accounts able to serve the chain (dynamic
-    concurrency 0). With no usage map the signal is unknown, so the item simply defers (the
-    require_usage fail-closed hold + usage-alert cover that case).
+    """Detect current provider starvation for a route with ``escalate = true``.
 
-    NOTE (issue #116): this predicate only says the route is starved RIGHT NOW — a single usage
-    snapshot. Whether that momentary starvation is handed to a human is a SEPARATE, bounded
-    decision (escalate_persist_decision): transient rate-limit exhaustion is pipeline-owned and
-    refills on its own, so one zero-headroom snapshot must NOT become a permanent human terminal."""
+    Those routes pin a RESTRICTED model chain (for example, Opus-only soundness work) and must
+    stay fail-closed instead of degrading to a weaker or cross-provider model. This returns True
+    only when the LIVE usage probe is present and shows ZERO accounts able to serve that chain
+    (dynamic concurrency 0). With no usage map the signal is unknown: this predicate stays False,
+    and a repository with ``require_usage`` enabled takes the ordinary fail-closed defer instead.
+
+    This predicate reports one snapshot and mutates nothing. The caller feeds it through issue
+    #116's bounded ladder: transient starvation writes/keeps ``status:deferred``; continuous
+    starvation past ``ESCALATE_PERSIST_SECONDS`` adds the machine-owned ``status:parked`` soft
+    hold. Both states remain in the deferred-retry lane, and worker-issue's ``retry`` transition
+    clears them after the allocator proves capacity has returned by granting a claim. Provider
+    capacity alone never writes ``needs:user``; that terminal is reserved for a genuine human
+    question."""
     return bool(escalate) and usage is not None and effective_cap == 0
 
 
@@ -9064,8 +9068,11 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                     f"`{'/'.join(resolved['model_chain'])}` tier, and no account "
                                     "currently has usage headroom to run it. This is transient, "
                                     "pipeline-owned rate-limit exhaustion, so the issue stays "
-                                    "`status:deferred` and auto-retries as capacity recovers — no "
-                                    "human action is needed unless it persists. "
+                                    "`status:deferred` and auto-retries as capacity recovers. The "
+                                    "task never needs a human answer solely for provider capacity; "
+                                    "if the shortage persists, the "
+                                    "machine-owned `status:parked` soft hold makes it loud while "
+                                    "preserving automatic retry. "
                                     f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')} (ops): "
                                     f"escalate-tier capacity is exhausted.{STARVE_ALERT_MARKER}")
                             defer_reasons["escalate-tier-starved-transient"] += 1
@@ -22924,7 +22931,8 @@ agent = "impl"
     # whose restricted tier has ZERO usage-eligible accounts is STARVED — but ONLY on a live usage
     # signal (no probe => defer, the require_usage hold + usage-alert own that), and NEVER for
     # non-escalate routes (they starve fail-closed and retry next tick). Whether that momentary
-    # starvation becomes a human terminal is escalate_persist_decision's bounded call (issue #116).
+    # starvation becomes a machine-owned park is escalate_persist_decision's bounded call (issue
+    # #116); provider capacity alone never becomes needs:user.
     assert escalate_starved(True, {"acct01": {}}, 0) is True
     assert escalate_starved(True, {}, 0) is True            # empty-but-present map still signals
     assert escalate_starved(True, None, 0) is False         # no probe -> unknown -> defer
@@ -22967,9 +22975,10 @@ agent = "impl"
     print("  ok   role:impl is Sol-first AND escalating; starvation defers transiently with "
           "its own counted reason before any park")
 
-    # Issue #116: a starved escalate route must NOT convert one transient usage snapshot into a
-    # permanent human terminal. escalate_persist_decision separates the momentary-starved predicate
-    # (escalate_starved, above) from the bounded, PERSISTENT decision to escalate to needs:user.
+    # Issue #116: a starved escalate route must keep a transient usage snapshot status:deferred.
+    # escalate_persist_decision separates the momentary-starved predicate (escalate_starved, above)
+    # from the bounded, PERSISTENT decision to add machine-owned status:parked; neither path writes
+    # needs:user for provider capacity.
     now116 = 1_800_000_000
     attempt = "<!-- sparq-worker-attempt:v1"  # worker_issue.ATTEMPT_MARKER (durable receipt format)
     iso116 = lambda ago: time.strftime(  # noqa: E731 — trivial epoch->ISO helper for the fixtures
@@ -22982,14 +22991,14 @@ agent = "impl"
     # (ii) a fresh alert (well within the grace) still defers — transient, keep retrying.
     assert escalate_persist_decision([starve(60)], "app[bot]", now116, attempt) \
         == (False, iso116(60))
-    # (iii) an alert streak that has PERSISTED past the grace escalates to a human, reporting the
+    # (iii) an alert streak that has PERSISTED past the grace earns status:parked, reporting the
     # streak's OLDEST receipt (bounded persistent failure, not one blip).
     persisted = [starve(ESCALATE_PERSIST_SECONDS + 120), starve(300)]
     assert escalate_persist_decision(persisted, "app[bot]", now116, attempt) \
         == (True, iso116(ESCALATE_PERSIST_SECONDS + 120))
     # (iv) RECOVERY RESETS the clock: a worker attempt receipt AFTER an old alert means capacity
     # recovered and dispatched; a later alert begins a fresh transient streak, so an old
-    # past-grace alert can no longer force an immediate terminal on the new episode.
+    # past-grace alert can no longer force an immediate machine park on the new episode.
     recovered = [starve(ESCALATE_PERSIST_SECONDS + 600),
                  {"user": {"login": "app[bot]"}, "body": f"{attempt} run=7 -->",
                   "created_at": iso116(ESCALATE_PERSIST_SECONDS + 300)},
@@ -22997,7 +23006,7 @@ agent = "impl"
     assert escalate_persist_decision(recovered, "app[bot]", now116, attempt) \
         == (False, iso116(120))
     # (v) only the bot's own receipts count — a spoofed alert from another login is ignored, so a
-    # third party cannot fabricate persistence to force a needs:user terminal.
+    # third party cannot fabricate persistence to force a machine-owned park.
     spoof = [{"user": {"login": "someone"}, "body": STARVE_ALERT_MARKER,
               "created_at": iso116(ESCALATE_PERSIST_SECONDS + 999)}]
     assert escalate_persist_decision(spoof, "app[bot]", now116, attempt) == (False, "")
@@ -23015,8 +23024,9 @@ agent = "impl"
     assert escalate_persist_decision(recovered_noattempt, "app[bot]", now116, attempt) \
         == (False, iso116(120))
     # (vii) a reset must NOT suppress a GENUINELY persistent NEW streak: an old reset followed by a
-    # post-reset alert that has itself aged past the grace still escalates to a human (fail-closed
-    # toward the human terminal when starvation is truly continuous after recovery).
+    # post-reset alert that has itself aged past the grace still earns status:parked (fail-closed
+    # without degrading the restricted model chain when starvation is truly continuous after
+    # recovery).
     persisted_after_reset = [reset(ESCALATE_PERSIST_SECONDS + 900),
                              starve(ESCALATE_PERSIST_SECONDS + 60)]
     assert escalate_persist_decision(persisted_after_reset, "app[bot]", now116, attempt) \
