@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2234,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ff96d771f76bc978523a276d8b3433291f13dd1d",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 rule 5(b) still mandates a full-label-set PATCH built from a read immediately before the write. Any maintainer or automation label applied after that read is absent from the submitted set and is silently removed, including a new human-owned hold or another security-significant label. The immediate post-write reread cannot identify or reconstruct an unseen label, and `human_hold_deleted_by_machine` is exact-label and actor-specific rather than a detector for arbitrary lost labels. Consequently the later assertion that the drain cannot create hold-gone with an outstanding write, and that this state positively proves third-party removal, is unsound. This remains a fail-open violation of the human-owned-hold invariant.",
+    "file": "research/1997-human-terminal-park-drain.md",
+    "fix_hint": "Specify a transition protocol that preserves unrelated concurrent label changes. If no atomic compare-and-swap operation exists, use additive/removal operations ordered so the enumeration hold remains live until the final operation, then analyze and census the transient pair against every reader. Require adversarial tests that add an unplanned human-owned hold and an unrelated security-significant label after the last read but before each label write, including a crash immediately after the write, and assert both labels survive. Do not rely on a post-write reread or exact-label restoration predicate to recover labels absent from the snapshot and plan.",
+    "severity": "blocker",
+    "title": "Full-label-set PATCH still loses concurrent labels"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 5 leaves the prior blocker materially unchanged. Section 4.1 rule 5(b) still requires each surface transition to use a full-label-set PATCH derived from a read immediately before the write, and the record itself acknowledges that this clobbers labels applied in the intervening window. A post-write reread cannot reveal which labels the PATCH erased if they were absent from the snapshot. This includes a newly applied human-owned hold or an unrelated security-significant label. The cited exact-label forensic predicate cannot recover arbitrary unseen labels and, as the record notes, does not authorize restoration of the drain's proven-human removal. Therefore the asserted invariant that the drain cannot produce hold-gone/outstanding state, and the resulting claim that such a state proves third-party removal, remain false. The required implementation and tests continue to enshrine this fail-open write protocol, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
