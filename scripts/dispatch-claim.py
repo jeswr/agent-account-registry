@@ -9,6 +9,7 @@ import ast
 import base64
 from collections import Counter
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import inspect
@@ -14227,16 +14228,15 @@ def _self_test():
 
     # ---- [#657 ENABLE] THE SHIPPED POLICY, DRIVEN THROUGH THE ENUMERATOR ----------------------
     # `enrolment_enable_error(...) is None` checks WIRING, not READINESS — and it reads None just
-    # as happily when NOBODY is enrolled, which is what it meant for every tree before this one. So
-    # the enable itself is asserted where it is observable: the SHIPPED allowlist, resolved by the
-    # SAME accessor PLAN uses, is fed to the SAME enumerator, and the previously-skipped PR is
-    # enumerated. Emptying `review_enrolment_authors` in policy/repos.toml reds the positive leg;
-    # widening it to every repo reds the control.
+    # as happily when NOBODY is enrolled. Assert #2257 where it is observable: the shipped Sparq
+    # allowlist, resolved by the SAME accessor PLAN uses, is fed to the SAME enumerator. Emptying
+    # it reds the positive leg; the distinct solid-sdk control prevents admit-everything drift.
     _enable_policy = _load_module(
         "registry_policy_resolve_enable",
         Path(__file__).resolve().parents[1] / "scripts" / "policy-resolve.py")
-    _ENABLED_REPO = "jeswr/agent-account-registry"
-    _DEFERRED_REPO = "sparq-org/sparq"
+    _SPARQ_REPO = "sparq-org/sparq"
+    _REGISTRY_REPO = "jeswr/agent-account-registry"
+    _CONTROL_REPO = "jeswr/solid-sdk"
 
     # ---- [#1451] THE SHIPPED MANIFEST MUST EQUAL THE SHIPPED ENABLED SET ----------------------
     # REGRESSION 2026-08-01, a FULL dispatch outage: PR #1535 enabled `jeswr/solid-sdk` in
@@ -14269,14 +14269,21 @@ def _self_test():
         "cannot detect the divergence it exists to catch")
 
 
-    _shipped_authors = _enable_policy.review_enrolment_authors(_ENABLED_REPO, _repos_doc)
-    _deferred_authors = _enable_policy.review_enrolment_authors(_DEFERRED_REPO, _repos_doc)
-    assert _shipped_authors, (
-        "policy/repos.toml must ENABLE review_enrolment_authors for "
-        f"{_ENABLED_REPO} — that is what this change is")
-    assert _deferred_authors == frozenset(), (
-        f"{_DEFERRED_REPO} is deliberately DEFERRED to a follow-up; enabling it here would widen "
-        f"the blast radius past one repo. Found: {sorted(_deferred_authors)}")
+    _shipped_authors = _enable_policy.review_enrolment_authors(_SPARQ_REPO, _repos_doc)
+    _registry_authors = _enable_policy.review_enrolment_authors(_REGISTRY_REPO, _repos_doc)
+    assert _shipped_authors == frozenset({"jeswr"}), (
+        "policy/repos.toml must enrol only jeswr for Sparq; found "
+        f"{sorted(_shipped_authors)}")
+    assert _registry_authors == frozenset({"jeswr"}), (
+        "the established registry enrolment must remain unchanged; found "
+        f"{sorted(_registry_authors)}")
+    _control_doc = copy.deepcopy(_repos_doc)
+    assert _control_doc["repos"][_CONTROL_REPO]["enabled"] is False
+    _control_doc["repos"][_CONTROL_REPO]["enabled"] = True
+    _control_authors = _enable_policy.review_enrolment_authors(_CONTROL_REPO, _control_doc)
+    assert _control_authors == frozenset(), (
+        "the distinct solid-sdk control must remain un-enrolled; found "
+        f"{sorted(_control_authors)}")
 
     def _enable_states(target_repo, authors, *, login, ref="fix/869-question-park-marker",
                        record=None):
@@ -14292,19 +14299,19 @@ def _self_test():
     #     branch, non-draft, in THIS repo — is now enumerated, under the allowlist the shipped
     #     policy actually resolves. Not a hand-written `("jeswr",)`: the literal in the TOML is the
     #     thing under test, and a test that supplies its own allowlist cannot see it disappear.
-    assert _enable_states(_ENABLED_REPO, _shipped_authors,
+    assert _enable_states(_SPARQ_REPO, _shipped_authors,
                           login=sorted(_shipped_authors)[0]) == ["needs-review"], (
-        "the shipped allowlist must make an orchestrator-class PR in this repo reviewable")
+        "the shipped allowlist must make an orchestrator-class Sparq PR reviewable")
     # (2) THE CONTROL, without which (1) could pass by admitting everything. Three PRs that are
     #     genuinely out of scope stay skipped under the SAME shipped policy — one per axis the
     #     enable must not widen: the un-enrolled repo, an un-enrolled author, and a record that is
     #     not orchestrator-attested.
-    assert _enable_states(_DEFERRED_REPO, _deferred_authors,
+    assert _enable_states(_CONTROL_REPO, _control_authors,
                           login=sorted(_shipped_authors)[0]) == [], (
-        "sparq is NOT enrolled by this change — an identical PR there must still be skipped")
-    assert _enable_states(_ENABLED_REPO, _shipped_authors, login="drive-by-contributor") == [], \
+        "an identical PR in the un-enrolled control repo must still be skipped")
+    assert _enable_states(_SPARQ_REPO, _shipped_authors, login="drive-by-contributor") == [], \
         "an author the shipped allowlist does not name is still skipped"
-    assert _enable_states(_ENABLED_REPO, _shipped_authors, login=sorted(_shipped_authors)[0],
+    assert _enable_states(_SPARQ_REPO, _shipped_authors, login=sorted(_shipped_authors)[0],
                           record=provenance[41]) == [], \
         "a machine-attested record is not the orchestrator class — still skipped"
     # (3) ...and the enabled row is otherwise UNREMARKABLE policy. `review_enrolment_authors`
@@ -14315,8 +14322,8 @@ def _self_test():
     assert "review_enrolment_authors" in _enable_policy.OPTIONAL_POLICY_FIELDS
     try:
         _enable_policy.review_enrolment_authors(
-            _ENABLED_REPO,
-            {"repos": {_ENABLED_REPO: {**_repos_doc["repos"][_ENABLED_REPO],
+            _SPARQ_REPO,
+            {"repos": {_SPARQ_REPO: {**_repos_doc["repos"][_SPARQ_REPO],
                                        "review_enrolment_author": ["jeswr"]}}})
     except Exception as _typo_exc:        # noqa: BLE001 — the message is the assertion
         assert "unknown fields" in str(_typo_exc), _typo_exc
@@ -14374,16 +14381,17 @@ def _self_test():
     #     mechanism nowhere encodes `fix/*`, so ANY branch name is already covered.
     for _any_branch in ("fix/anything", "research/knowledge-management-strategy",
                         "ci/auto-arm-workflows-permission", "release-plz-2026-07-27T02-19-35Z"):
-        assert _enable_states(_ENABLED_REPO, _shipped_authors, ref=_any_branch,
+        assert _enable_states(_SPARQ_REPO, _shipped_authors, ref=_any_branch,
                               login=sorted(_shipped_authors)[0]) == ["needs-review"], _any_branch
     print("  ok   [#657 enable] CLASS TAXONOMY: the orchestrator class is enrollable on ANY branch "
           "name; a release PR and a dependency bump are NOT — they declare no implementing model, "
           "so no reviewer side can be INVERTED, and relaxing the allowlist alone would only "
           "manufacture a labelled-but-never-reviewed PR")
 
-    print(f"  ok   [#657 enable] the SHIPPED policy enrols {sorted(_shipped_authors)} for "
-          f"{_ENABLED_REPO} ONLY: a previously-skipped orchestrator-class PR is ENUMERATED there, "
-          f"and the same PR in {_DEFERRED_REPO} — plus an unlisted author and a machine-attested "
+    print(f"  ok   [#657/#2257 enable] the SHIPPED policy enrols "
+          f"{sorted(_shipped_authors)} for {_SPARQ_REPO}: a previously-skipped "
+          f"orchestrator-class PR is ENUMERATED there, while the same PR in {_CONTROL_REPO} — "
+          "plus an unlisted author and a machine-attested "
           "record — are still skipped")
     # (b) ...and (a) alone is UNFALSIFIABLE while no repo enables the key: deleting the interlock
     #     changes no outcome, which a mutation run reports as a surviving mutant. So drive the

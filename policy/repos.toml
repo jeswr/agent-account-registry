@@ -108,6 +108,13 @@ max_review_rounds = 3         # BASE bound; decide_budget may extend to 6 total 
 review_queue_ttl_minutes = 30 # surface a codex-starved review backlog after this age
 cross_provider_fallback = false  # honest default: stay queued + alert, never silently degrade
 
+# [GPT-5.6] #2257: widen the proven orchestrator-class REVIEW-ONLY lane to Sparq for the exact
+# maintainer login that authors its manual `codex/*` orchestration PRs. The canonical safety
+# contract is documented on the registry row below: a self-attested record is still required,
+# review still inverts provider, this class gets no automated fix/rebase lane, and it can never
+# auto-arm. This key authorizes independent review; it does not authorize a merge.
+review_enrolment_authors = ["jeswr"]
+
 # [FABLE-5] Throughput alert thresholds (scripts/metrics.py). sparq is a large, fast repo, so the
 # backlog bar sits above a healthy steady-state (dozens of open + draft PRs is normal); the alert
 # is for GROWTH-with-no-drain, which the 2026-07-18T09:10Z snapshot already trips (52 open PRs,
@@ -208,7 +215,7 @@ max_review_rounds = 3
 review_queue_ttl_minutes = 30
 cross_provider_fallback = false
 
-# [OPUS-5 #657] REVIEW-LANE ENROLMENT, ON, FOR THIS REPO ONLY. The MASTER-protected half of
+# [OPUS-5 #657] REVIEW-LANE ENROLMENT, ON. The MASTER-protected half of
 # orchestrator-PR admission (research/657-orchestrator-pr-admission.md §6, Option 2(b)). #876
 # landed the wiring with this list deliberately EMPTY; this is the line that turns it on.
 #
@@ -237,14 +244,14 @@ cross_provider_fallback = false
 #     the #42 armed-SHA invariant is DETECTED and reported for this class every tick
 #     (dispatch-claim.enumerate_disarm_observations) and acted on by a human.
 #
-# SCOPE: this repo ONLY, deliberately. sparq-org/sparq has the denser population (30 of 34 open
-# non-draft PRs on 2026-07-27) but it is not the repo this lane maintains; a one-repo rollout gives
-# a real signal on the trust plane itself before widening. sparq is a follow-up, not an oversight.
+# SCOPE: this registry row was the deliberate one-repo rollout. After that path produced a real
+# signal on the trust plane, #2257 widened the same exact-author, review-only mechanism to
+# sparq-org/sparq; `jeswr/solid-sdk` remains the shipped un-enrolled control.
 #
 # ORDERING: mint-provenance.py REFUSES to mint an orchestrator record for a repo whose list is
 # empty, so this line is the PRECONDITION for the record half existing at all. On the tick this
-# merges the candidate set is UNCHANGED (there are zero orchestrator-attested records on `ledger`);
-# each PR becomes enumerable only once its record is minted, one explicit gesture at a time.
+# merges the candidate set changes only after an orchestrator-attested record is minted on
+# `ledger`; each PR becomes enumerable only once that separate record exists.
 review_enrolment_authors = ["jeswr"]
 
 # [FABLE-5] Throughput alert thresholds (scripts/metrics.py). The trust plane drains slowly (small
