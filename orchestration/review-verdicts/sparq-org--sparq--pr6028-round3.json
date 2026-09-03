@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6028,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e93a2c159540569521cda8b5c9730acdb9de89e1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. Section 6.1 now defines the publisher check-run as transport state, authenticates it by dedicated-App identity plus external_id, repository/head SHA, phase, and envelope schema, excludes only the unique fully validated row before every verdict transformation, and fails closed on collisions or mismatches. It also requires adversarial multi-invocation coverage for in-progress, completed, and reopened publisher states, including pagination, duplicate, wrong-App, and prior-green cases. Section 6.2 separately authenticates and excludes legacy resident transport so shadow and resident verdicts remain independent. The design remains explicitly design-only and correctly defers unverified platform assumptions to pre-cutover evidence phases. No new correctness, soundness, test-validity, or security defect is apparent in the diff-scoped design.",
+  "verdict": "approve"
+ }
+}
