@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2250,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5fa1faf182f6de74e67d2ddc76577e7d887a5d2d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly threads the resolved gate profile from the existing policy output into the fix step, validates it as a safe atom before prompt interpolation, and uses neutral wording when it is absent. Both CI and rebase prompt claims now reflect the actual profile without changing verdict behavior. The self-tests cover two distinct profile values, the empty fallback, negative cross-profile assertions, the production run_fix call site and arity, and exact step-scoped YAML wiring for both fix and gate, including non-vacuity mutants. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
