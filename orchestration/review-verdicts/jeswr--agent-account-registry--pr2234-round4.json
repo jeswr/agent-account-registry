@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2234,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ff96d771f76bc978523a276d8b3433291f13dd1d",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 rule 5(b) still requires each surface transition to be a full-label-set PATCH derived from a read immediately before the write. A maintainer or automation can apply a new `needs:*`, human hold, or other security-significant label after that read and before the PATCH; because the new label was absent from the snapshot and intent plan, the PATCH silently removes it. The proposed immediate re-read cannot determine which absent live labels were erased, and `human_hold_deleted_by_machine` is exact-label and actor-specific: it neither discovers arbitrary lost labels nor recognizes the drain's proven-human removal as machine deletion. Consequently the claim that the race is bounded like the single-label protocol, and the later claim that hold-gone/outstanding positively proves third-party removal, are unsound. The drain itself can create that state while completing every planned write. This remains a fail-open violation of the human-owned-hold invariant.",
+    "file": "research/1997-human-terminal-park-drain.md",
+    "fix_hint": "Specify a transition protocol that does not overwrite unrelated concurrent label changes. If no atomic server-side operation provides that property, use additive/removal operations ordered so the enumeration hold remains live until the final operation, and analyze/census the transient pair against all readers. Add adversarial tests that apply an unplanned human-owned hold and an unrelated security-significant label after the last read but before every label write, then assert each survives, including a crash immediately after the write. Do not rely on an exact-label restoration predicate to recover labels absent from the snapshot and plan.",
+    "severity": "blocker",
+    "title": "Full-label-set PATCH still loses concurrent labels"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 leaves the prior blocker materially unchanged. The record still mandates full-label-set PATCHes built from a pre-write snapshot. Such a PATCH can erase any label added concurrently after that snapshot, including a new human-owned hold or another security-significant label that was absent from both the snapshot and the recorded plan. The immediate re-read and cited exact-label forensic predicate cannot identify or restore an arbitrary label the drain never observed; the document itself also notes that the predicate cannot authorize recovery for this hand-run writer. The alternative add-then-delete sequence is described only as a fallback, while the unsafe full-set operation remains the required default and the implementation obligations still require interruption tests only for planned writes. Because the same blocker remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
