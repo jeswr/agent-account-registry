@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 2255,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "103c3bd0e957c3bb42b44b44935abe26c42029fd",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Re-confirmed independently. The purge guard is `^RUN .*apt-get (remove|purge)( |.* )${package}([ =;]|$)`, which requires `remove`/`purge` to sit IMMEDIATELY after `apt-get`. I traced `RUN apt-get install -y jq && apt-get -y purge jq` through it by hand: `.*` can reach the second `apt-get `, but the next token is `-y`, not `remove|purge`, and there is no third `apt-get ` position \u2014 so the line passes. Removing python3-yaml by path (`rm -rf /usr/lib/python3/dist-packages/yaml`) also passes: the `rm` special case at :1854 is keyed off a hard-coded `[[ \"$package\" == jq ]]` and only matches `(/usr)?/bin/jq`.\n\nThis is NOT a fail-open trust hole. A bypass yields an image without the dependency, which the host-side ENV-BLOCKED preflight then refuses \u2014 exactly the pre-PR status quo. The gap is the comment: :1809-1810 states 'must not remove one later in that stage' as a flat requirement while the code enforces a proper subset.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Either widen the pattern to tolerate options between `apt-get` and the subcommand (`apt-get( +-[^ ]+)* +(remove|purge)`), or narrow the comment to what is actually matched \u2014 e.g. 'rejects the direct `apt-get remove/purge` and `rm <binary>` forms; a restructured removal is out of scope, the host-side ENV-BLOCKED preflight remains the load-bearing refusal.' The latter is cheaper and matches the honesty standard the rest of this file's comments hold.",
+    "severity": "nit",
+    "title": "Removal detection is best-effort but the comment at :1808-1810 reads as a flat invariant"
+   },
+   {
+    "body": "The install tail is word-split unquoted at :1845, which also enables pathname expansion. For the real instruction the trailing `rm -rf /var/lib/apt/lists/*` sits after the `&&` at which the loop breaks, so today's behaviour is correct \u2014 but the glob expands when `$rest` is expanded, before the loop body runs, not lazily. The protection is therefore the position of the `&&` break, not anything structural: a future install line carrying a `*` AHEAD of a package name would shift the token stream depending on what exists on the runner's filesystem.\n\nHarmless today; noted because a guard whose token stream depends on the host filesystem is a latent flake in a file that otherwise treats purity as load-bearing.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Wrap the loop in `set -f` / `set +f`, or read the tail into an array \u2014 `read -ra toks <<< \"$rest\"` then iterate `\"${toks[@]}\"`, which splits on IFS without globbing.",
+    "severity": "nit",
+    "title": "`for token in $rest` at :1845 is unquoted, so install-line tokens are glob-expanded against the host filesystem"
+   },
+   {
+    "body": "_assert_worker_image_gate_deps returns 1 silently on all five failure paths \u2014 unlike its sibling _assert_dockerfile_pinned, which prints the offending FROM to stderr (:1765, :1784, :1788). The die string at :2436 names the file and the table, so an author learns 'something in SELFTEST_ENV_REQUIREMENTS is unsatisfied' but not WHICH package, not that only the LAST stage counts, and not that an unmapped new requirement row (rather than the Dockerfile) may be the cause. Those are three quite different fixes behind one message.\n\nErgonomics, not correctness: the matcher is tolerant enough that a spurious failure is unlikely.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Print the discriminating detail to stderr before each `return 1`: the unmapped `kind|probe` row, `worker-live: %s not installed in the final stage of %s`, and `worker-live: %s removed after install in %s`. Three one-line printfs turn a bisect into a read.",
+    "severity": "nit",
+    "title": "The refusal names neither the missing package nor the final-stage scoping"
+   },
+   {
+    "body": "The assertion fires only under `[[ \"$name\" == containers/worker-model.Dockerfile ]]` (:2434). Both new wiring chks (:5389-5392) grep `gate_body` for the symbol and the die string, and both of those live INSIDE the `if` body \u2014 so mutating the condition literal (a typo, or renaming the Dockerfile without updating the gate) leaves both chks green while the assertion never runs on any real input. The chk at :5344 also stays green, since it calls the function directly rather than through the gate.\n\nI verified the literal is correct today: _registry_selftest_targets emits repo-relative porcelain paths (:1724-1725), and `containers/` holds exactly one file, worker-model.Dockerfile. So this is a drift vector one level deeper than the wiring chks reach, not a present defect.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Either add a third pin on the condition line (`printf '%s\\n' \"$gate_body\" | grep -c 'containers/worker-model.Dockerfile'` == 1), or drop the conditional and run the assertion on every touched `containers/*` definition \u2014 with one container definition in the tree the path test buys nothing the loop does not already give you.",
+    "severity": "nit",
+    "title": "The path literal that arms the new check is not itself pinned by a wiring chk"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 on an UNCHANGED tree: HEAD is still 103c3bd0e (the round-1 fix commit) and every line number cited in the round-2 record matches the current file byte-for-byte, so no round-2 feedback could have been acted on. I re-derived the verdict independently rather than inheriting it, and land in the same place: approve, with the same four nits at the same severities. Hence progress = stagnant, not improving \u2014 nothing regressed, but nothing moved either.\n\nWhat I re-verified from scratch:\n\n1. The dependency set is derived, not frozen. _selftest_requirement_apt_package (:1799) maps each SELFTEST_ENV_REQUIREMENTS row with `*) return 1`, mirroring _selftest_dep_present's fail-closed unknown-kind arm, and _assert_worker_image_gate_deps splits the table with the same `IFS='|' read -r label kind probe pattern` so the trailing-ERE convention at :1632 is honoured. The synthetic-row fixture (:5361-5367) proves the coupling \u2014 it appends an unmapped row, drives the REAL Dockerfile, requires `absent`, and restores the saved value immediately.\n\n2. The awk pass resets `out` at every FROM, so only the final stage counts. I traced the real multi-line RUN through it: continuation lines append, backslashes are stripped, whitespace collapses, and the result matches the install anchor with `rest` correctly split at the first `&&`. The wrong-stage fixture (:5368) yields an empty instruction set and rejects.\n\n3. The wiring is pinned. `gate_body` is `local` at :4250 and :5388 reassigns inside the same self_test body (no function boundary between 4124 and 9756), so both chks at :5389-5392 read the parsed gate. Deleting :2434-2437 goes red.\n\n4. Fail-closed throughout: every path in _assert_worker_image_gate_deps returns 1 into a `die`, and a missing/unmapped requirement refuses rather than reading as provisioned. No trust check deleted, relaxed, or skipped; no default-allow path opened; no vacuous assertion.\n\nThe four nits below are the round-2 findings, re-confirmed on t\u2026 [truncated 26 chars]",
+  "verdict": "approve"
+ }
+}
