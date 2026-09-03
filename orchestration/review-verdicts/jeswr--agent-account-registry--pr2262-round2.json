@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2262,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ddfedfe708b161d810cb8e3b8e570d91dbee0374",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The required-argument row substring-matches --registry-repo/--policy-file/--policy-resolver/--ledger-root against the joined command text without stripping shell comments. The adjacent orphan-seam helpers deliberately route through dispatch-secrets-guard.strip_shell_comments, with a comment (groom.py:14000-14005) recording the round-19 lesson that 'comment prose must never stand in for a real call site'.\n\nExploitability is low: the continuation collector stops at the first line not ending in a backslash, so a standalone comment line inside the invocation would terminate collection rather than be absorbed. So this is a consistency gap with the file's own stated convention, not a live hole.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Reuse the already-loaded _orphan_shell.strip_shell_comments on each collected command before the flag membership test, so the two YAML seams in this try block share one tokenization rule.",
+    "severity": "nit",
+    "title": "_full_sweep_commands is not comment-blind, unlike its neighbours in the same try block"
+   },
+   {
+    "body": "The transient branch matches reason in (\"statusless\", \"caller-classifier\"). classify_read_failure (gh_retry.py:347+) emits statusless but never caller-classifier. Round 1 flagged this spelling and the fix correctly removed it from the taxonomy row's inputs \u2014 but the literal remains in production code, so it is now an unexercised branch rather than a wrong-but-covered one. Behaviour is unaffected; it is dead vocabulary that could mislead a future reader into thinking it is a contract.",
+    "file": "scripts/latch-watchdog.py",
+    "fix_hint": "Drop \"caller-classifier\" from the tuple so the branch matches only spellings the producer actually emits, keeping the taxonomy a real contract against a gh_retry rename.",
+    "severity": "nit",
+    "title": "_read_failure_class still carries the caller-classifier spelling gh_retry never emits, now untested"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves every round-1 finding, and I verified each fix against the checkout rather than taking the diff's word for it.\n\nBLOCKER + MAJOR #1 (alarm watched a lane that would no longer tick) are fixed at the root: ingestion-alarm.yml:48 now reads CRITICAL_LANES=\"dispatch.yml groom-sweep.yml worker.yml review-fix.yml\", and BOTH self-asserting seam lines (:53-54) moved with it, so the literal-string assertion still bites. groom-sweep.yml retains its own cron '7-59/15' (lines 9-12) and is untouched by this diff, so the consolidation removes duplicate crons from groom-core.yml/groom-recovery-minimal.yml and repoints the alarm, keepalive and #1353 threshold exemption at the lane that was already the real scheduled owner. Critically, groom-sweep.yml is a strict SUPERSET of groom-core.yml's groom job (same checkout/ledger-guard/audit-catalog/orphan-report/per-owner mint/sweep/model-health steps) plus six watchdog jobs, so no scheduled capability is lost; the surviving lane is watched by ingestion-alarm.yml, whose availability does not correlate with the fault.\n\nMAJOR #2 (seam pinned the owner but not its enrollment) is fixed exactly as the fix_hint asked. _critical_lanes() parses ingestion-alarm.yml with the same dependency-free line discipline, and is fail-closed twice over: it raises on !=1 assignment or on a duplicate lane, and the enclosing except at groom.py:14061 converts any exception into check(..., False, True) \u2014 a red, never a skip. Both directions are pinned: the scheduled owner MUST be enrolled, and no manual-only fallback MAY be. I traced the mutations \u2014 dropping groom-sweep.yml from CRITICAL_LANES reds the first row; re-enrolling groom-core.yml reds the second; re-adding a cron to groom-core.yml reds the schedule_counts row.\n\n_trigger_count is non-vacuous: I hand-traced the decoy and it really does yield (1, 0), because `jobs:  # comment` terminates the block before the job named `schedule`, defeating a substring scanner, while c\u2026 [truncated 1234 chars]",
+  "verdict": "approve"
+ }
+}
