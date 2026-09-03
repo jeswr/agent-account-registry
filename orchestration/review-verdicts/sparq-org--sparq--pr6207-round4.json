@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6207,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cdbad6c5d74b19953b9890a5ab8bc1262fec06e9",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete in the changed scope. The extracted poller exhaustively paginates the quarantined issue set, excludes pull requests, fails closed on fetch errors and runaway snapshots, preserves revision-bound maintainer approval, and checks the trust-boundary label removal before downstream triage writes. The hermetic self-test exercises the real driver seam with more than 200 issues, stale and outsider approvals, malformed timestamps, dry-run behavior, PR filtering, and failed un-quarantine behavior; it passes at the PR head. Workflow wiring runs both policy and driver self-tests before the write-enabled poll. No correctness, soundness, security, test-vacuity, or prompt-injection issue was found. Because round 3 also had no findings and the diff is materially unchanged, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
