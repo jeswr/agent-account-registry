@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6328,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "eeca2be61452779d5d674f426b3be2692dbdcce7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ObjectStoreBlobStore reports generation: None, so reconcile_orphans selects DeleteUnconditional after its final stat. BlobStore::put is create-or-replace and this adapter is publicly constructible, so a caller can overwrite the candidate key between stat and delete; the unconditional delete then removes the newly written bytes. CompositeStore's random-key convention does not enforce that invariant for all users of this public BlobStore implementation, and even the added tests demonstrate direct fixed-key writes/overwrites. The end-to-end test only covers a quiescent store, so it does not validate the claimed safety argument.",
+    "file": "crates/sparq-lws-core/src/store/object_blob.rs",
+    "fix_hint": "Either provide an atomic backend-specific conditional delete/version witness, or make/enforce the unique-key invariant at this adapter boundary (for example, reject replacement/create-only writes and document the resulting trait semantics). Add a deterministic race test with a controllable ObjectStore that overwrites the same key after head/stat and before delete, proving live replacement bytes cannot be removed. If the adapter can only be safe behind CompositeStore, restrict its visibility/construction accordingly and test that real path rather than exposing it as a general BlobStore.",
+    "severity": "major",
+    "title": "Versionless reconciliation can delete a concurrent same-key overwrite"
+   }
+  ],
+  "progress": null,
+  "summary": "The adapter's basic object-store mapping and path round-trip tests are substantial, but the new public implementation makes reconciliation unsafe for a usage that its own BlobStore contract permits. Because it exposes no generation, reconciliation performs an unconditional delete after stat; a concurrent overwrite of the same key can therefore be deleted. Unique-per-write key minting is a CompositeStore convention, not enforced by this public adapter, whose put method explicitly supports replacement. The tests do not exercise this load-bearing race.",
+  "verdict": "request_changes"
+ }
+}
