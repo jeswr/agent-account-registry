@@ -12,16 +12,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "1e9a78d8b5214f0a87498e5bd5a15046",
-   "holder": "review:sparq-org/sparq#6344@33812411518.1",
-   "package": "zk-xpath",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1788473928,
-   "expires_at": 1788478128
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "ba2b1acb63274e3f9f55247279e95f04",
    "holder": "review:jeswr/agent-account-registry#2284@33812482106.1",
    "package": "groom",
