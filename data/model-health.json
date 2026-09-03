@@ -196,14 +196,6 @@
    "why_no_diff": "already_done"
   },
   {
-   "ts": 1788383293,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "33683158374.1"
-  },
-  {
    "ts": 1788383408,
    "provider": "anthropic",
    "account": "c0ac92ebee2c590e",
@@ -1819,6 +1811,14 @@
    "model_alias": "",
    "exit_class": "success",
    "run_id": "33766471386.1"
+  },
+  {
+   "ts": 1788446075,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "success",
+   "run_id": "33767363589.1"
   }
  ]
 }
