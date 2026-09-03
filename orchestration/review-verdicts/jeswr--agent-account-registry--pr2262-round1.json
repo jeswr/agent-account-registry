@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 2262,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3677ffe5c06f1d5a1ea61bbdbc4541dace2028ae",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Removing groom-core.yml's cron (and groom-recovery-minimal.yml's) makes groom-sweep.yml the single scheduled instance of the full repair. But ingestion-alarm.yml still watches `CRITICAL_LANES=\"dispatch.yml groom-core.yml worker.yml review-fix.yml\"` (.github/workflows/ingestion-alarm.yml:48), and that lane is the estate's ONLY detector whose availability does not correlate with the fault - its header states the reason explicitly (on 2026-08-01 groom itself was ingestion-rejected and the in-groom detector went down with the lane it watches; a 19h groom outage passed unnoticed).\n\nThe other detector, ci-latency-alert.py M4, is hosted inside groom-sweep.yml itself (`GROOM_WORKFLOW = \".github/workflows/groom-sweep.yml\"`, ci-latency-alert.py:156; `{GROOM_WORKFLOW}::ci-latency::ci-latency` in ALERT_ROUTE_CONSUMERS). research/1373-pr-time-workflow-dispatch-probe.md:135-150 records the intended model: M4 samples `event=schedule` runs, ingestion-alarm.yml covers the case where M4's own host is refused.\n\nAfter this diff: groom-sweep.yml refused => M4 dies with it, and ingestion-alarm.yml is looking at a lane that no longer ticks. dashboard.yml's keepalive would re-dispatch groom-sweep.yml, but a refused file produces zero-job runs, so the kick is non-curative and silent. The redundancy this PR removes was the mitigation for a documented, recurring, SILENT failure mode (9+ instances, #1566/#1706), and the diff cites no `jobs > 0` evidence for the surviving lane. This is a fail-open change to the crash-recovery path.",
+    "file": ".github/workflows/groom-core.yml",
+    "fix_hint": "In the same PR, retarget the independent alarm to the lane that actually ticks: set `CRITICAL_LANES=\"dispatch.yml groom-sweep.yml worker.yml review-fix.yml\"` in .github/workflows/ingestion-alarm.yml and update both self-asserting seam lines (:53-54) that pin the literal string and the `no_completed_marker groom-core.yml` sample. Alternatively, keep ONE redundant scheduled recovery lane (groom-core.yml or groom-recovery-minimal.yml) so the consolidation does not reduce the scheduled recovery path to a single point of silent failure - and say in the PR body which of the two you chose and why.",
+    "severity": "blocker",
+    "title": "Sole remaining scheduled recovery lane is outside the only fault-independent ingestion detector"
+   },
+   {
+    "body": "Second, opposite-direction consequence of the same omission. ingestion-alarm.yml reads `runs?per_page=1&status=completed` for each critical lane. With groom-core.yml now manual-only:\n\n1. Near term it keeps reading the last pre-merge scheduled run, which had jobs > 0, so the lane reports healthy forever regardless of the estate's actual state - the alarm becomes vacuous for groom while an audit of 'do we detect this?' still returns yes, which the file's own header calls out as the worst outcome.\n2. Once that run ages out of run retention (or on a fresh repo state) the query returns empty and the `no completed run` branch fires `::error::INGESTION REJECTED` and upserts a maintainer issue for a lane that is intentionally dispatch-only - a standing false positive on the alarm that is supposed to be the trustworthy one.\n\nNeither state is acceptable for the lane the repo describes as the only crash-recovery path.",
+    "file": ".github/workflows/groom-core.yml",
+    "fix_hint": "Same edit as the blocker: move the alarm's critical-lane entry to the scheduled owner. If a manual-only lane is ever to stay enrolled, it needs an explicit 'dispatch-only' arm in ingestion-alarm.yml that distinguishes 'never scheduled' from 'refused', rather than letting a frozen or absent completed run stand in for health.",
+    "severity": "major",
+    "title": "ingestion-alarm.yml goes vacuously green on groom-core.yml, then false-alarms on it"
+   },
+   {
+    "body": "The added `YAML seam [#2256]` rows are well built and non-vacuous - the decoy exercise for `_trigger_count` really would catch a substring scanner, the invocation/required-arg rows would red if consolidation deleted a recovery invocation, and the enclosing `except` fails closed. But the property they pin ('exactly ONE full groom workflow owns a native schedule') is precisely the property whose safety depends on a fact the seam does not check: that the scheduled owner is enrolled in ingestion-alarm.yml's CRITICAL_LANES.\n\nAs written, this suite is green in exactly the broken state this PR ships, and it would stay green for any future re-pointing of the schedule to a lane no independent detector watches. That mirrors the estate's own convention elsewhere (ci-latency-alert.py's ALERT_ROUTE_CONSUMERS is compared for EQUALITY in both directions specifically so a consumer cannot silently drop out, and ingestion-alarm.yml carries an inline assertion on its own lane string).",
+    "file": "scripts/groom.py",
+    "fix_hint": "Add one row alongside the existing #2256 rows: read .github/workflows/ingestion-alarm.yml, extract the CRITICAL_LANES value with the same dependency-free line discipline, and assert that the unique workflow found to own a native schedule is a member of it (and, in the other direction, that no manual-only groom lane is still enrolled). Keep it fail-closed inside the same try/except so an unreadable alarm file reds rather than skips.",
+    "severity": "major",
+    "title": "New seam pins the single scheduled owner but not that the owner is the watched lane"
+   },
+   {
+    "body": "Lines 1-3 still read: 'This deliberately starts from the known-ingesting groom-leases.yml shape after both groom-sweep.yml and the independently extracted groom-core.yml were rejected before job creation' - and the appended #2256 sentence then names groom-sweep.yml as 'the single scheduled owner of the full repair'. groom-core.yml's rewritten header carries the same tension ('after the watchdog-heavy workflow remained rejected with zero jobs under a fresh filename', that filename being groom-sweep.yml per commit 3ef4af8ec 'ingestion is poisoned per-identity').\n\nA reader cannot tell from the diff whether the historical rejection is resolved or whether the PR is knowingly consolidating onto a lane with a rejection history. Given that ingestion rejection is silent, that distinction is the whole justification for the change.",
+    "file": ".github/workflows/groom-recovery-minimal.yml",
+    "fix_hint": "State the evidence in the header (or the PR body) - e.g. the date and run id of a groom-sweep.yml scheduled run with `jobs > 0` - and reword the stale clauses so the two files no longer assert both 'groom-sweep.yml was rejected before job creation' and 'groom-sweep.yml is the canonical scheduled owner' without reconciling them.",
+    "severity": "minor",
+    "title": "Retained header contradicts the change made in the same diff"
+   },
+   {
+    "body": "The `_read_failure_class` row feeds `(502, \"transient-502\")` and `(None, \"caller-classifier\")`. gh_retry's classify_read_failure actually returns `transient-http-502` / `transient-text` / `unparsed-http-<status>` / `statusless` (scripts/gh_retry.py:347-378). The real spellings are still covered by the `transient-` and `unparsed-http-` prefixes, so behaviour is correct - but the table asserts against a vocabulary the producer does not use, which weakens it as a contract row against a future rename on the gh_retry side.",
+    "file": "scripts/latch-watchdog.py",
+    "fix_hint": "Use the production spellings from classify_read_failure (`transient-http-502`, `transient-text`, `unparsed-http-500`, `statusless`, `refused-http-404`) in the taxonomy row so a rename in gh_retry.py reds here.",
+    "severity": "nit",
+    "title": "Taxonomy table uses reason spellings gh_retry never emits"
+   }
+  ],
+  "progress": null,
+  "summary": "Two independent changes. (A) latch-watchdog.py read-diagnostic work is good: the diagnostic is cleared at the gh_read seam before every call so an injected two-tuple cannot inherit a live result, the scrub runs before truncation, whitespace collapsing plus control-char stripping keeps the string on one line (which is what prevents ::workflow-command injection into the ::error:: annotation it lands in), and the new rows are non-vacuous - they drive the real gh_retry layer through a stubbed process boundary and assert http=403/class=throttle/reason=throttle-403/attempts=5, secret absence, and scrubbing that does NOT depend on the caller supplying the leaked token. _load_gh_retry re-execs the module per read, so the patched time.sleep really is captured by sleep_backoff's `sleeper` default; the comment is accurate. No blocking finding there. (B) The groom schedule consolidation is where this fails. groom-core.yml and groom-recovery-minimal.yml lose their crons, leaving groom-sweep.yml as the only scheduled instance of the ONLY crash-recovery path - but ingestion-alarm.yml's CRITICAL_LANES is still pinned to groom-core.yml (.github/workflows/ingestion-alarm.yml:48,53-54), and its own inline seam assertion pins that literal string, so this diff does not (and cannot silently) move it. After this change the sole scheduled recovery lane is watched only by ci-latency-alert.py M4, whose `ci-latency` job is hosted INSIDE groom-sweep.yml (ci-latency-alert.py:156 GROOM_WORKFLOW, ALERT_ROUTE_CONSUMERS). That is exactly the condition ingestion-alarm.yml was created for - 'an alarm whose availability correlates with the fault is worse than none' - and research/1373 records the same coverage model. A groom-sweep.yml ingestion rejection (silent action_required + jobs=0; 9+ documented instances, #1566/#1706) would now go undetected while the keepalive kicks a refused file forever. The alarm must move to the scheduled owner in this PR, and the new groom.py seam sh\u2026 [truncated 48 chars]",
+  "verdict": "request_changes"
+ }
+}
