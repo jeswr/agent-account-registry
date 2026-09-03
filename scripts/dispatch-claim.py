@@ -22932,11 +22932,9 @@ agent = "impl"
     assert escalate_starved(False, {"acct01": {}}, 0) is False
     assert escalate_starved(None, {"acct01": {}}, 0) is False
 
-    # [OPUS-5] registry #738 — `role:impl` IS NOW ONE OF THOSE ROUTES, and the composition is what
-    # matters, not the predicate in isolation. Removing sol left a single-rung `["opus5"]` impl
-    # chain; without `escalate = true` an opus5 capacity outage could only defer, and defer again,
-    # forever, with nobody notified. So the LIVE routing table's `role:impl` route is resolved here
-    # and its own `escalate` value is fed into the starvation ladder.
+    # [SPARQ agent] The live Sol-first implementation route has an explicit bounded capacity exit. The
+    # composition matters, not only the predicate in isolation: if both frontier providers are
+    # unavailable, the route must not defer forever with nobody notified.
     #
     # MUTANT: delete `escalate = true` from the role:impl route in orchestration/routing.toml, or
     # from a target's, => the first assertion goes red. MUTANT: make `escalate_starved` require a
@@ -22949,11 +22947,10 @@ agent = "impl"
             _impl_route = _r
             break
     assert _impl_route is not None, "the live routing table declares no role:impl route"
-    assert _impl_route["model_chain"] == ["opus5"], _impl_route
+    assert _impl_route["model_chain"] == ["sol", "opus5"], _impl_route
     assert _impl_route.get("escalate") is True, (
-        "role:impl is a SINGLE-RUNG chain: without escalate = true, an opus5 capacity outage is a "
-        "silent permanent stall with no counted reason and no ops alert")
-    # A starved single-rung impl route IS detected as starved (so the defer is attributable) ...
+        "role:impl has no bounded exit when both frontier providers are unavailable")
+    # A starved implementation route IS detected as starved (so the defer is attributable) ...
     assert escalate_starved(_impl_route.get("escalate"), {"acct01": {}}, 0) is True
     # ... and the FIRST such tick is TRANSIENT: no park, no human terminal, keep retrying. This is
     # the "defer must terminate and be attributable, not park" obligation, asserted rather than
@@ -22967,7 +22964,7 @@ agent = "impl"
     _dispatch_src = Path(__file__).resolve().read_text(encoding="utf-8")
     for _reason in ("escalate-tier-starved-transient", "escalate-tier-starved"):
         assert f'defer_reasons["{_reason}"]' in _dispatch_src, _reason
-    print("  ok   #738: role:impl is single-rung AND escalating; starvation defers transiently with "
+    print("  ok   role:impl is Sol-first AND escalating; starvation defers transiently with "
           "its own counted reason before any park")
 
     # Issue #116: a starved escalate route must NOT convert one transient usage snapshot into a

@@ -75,8 +75,10 @@ credential_format = "codex-auth-json"
 [models.sol]
 provider = "openai"
 harness = "codex"
-provider_model = "gpt-5.6-sol"         # Frontier codex model (maintainer 2026-07-18): leads impl/ci/site
-                                       # chains (credit abundance) + reviews anthropic-authored content.
+provider_model = "gpt-5.6-sol"         # Frontier implementation model. The 2026-09-02 maintainer
+                                       # protocol assigns new implementation to Sol and review to
+                                       # Opus 5; historical Anthropic-authored PRs retain
+                                       # provenance-derived cross-provider review.
 credential_format = "codex-auth-json"
 [models.luna]
 provider = "openai"
@@ -130,8 +132,9 @@ fix_capable = true
 fix_capable = false
 
 [defaults]
-model_chain = ["opus5", "sol"]
+model_chain = ["sol", "opus5"]
 agent = "registry-impl"
+escalate = true
 
 # ---------------------------------------------------------------------------------------------------
 # SECURITY-LABEL OVERRIDES (first-match; win over role). On the trust plane the orchestration
@@ -191,26 +194,16 @@ agent_from_role = true
 escalate = true
 
 # ---------------------------------------------------------------------------------------------------
-# ROLE ROUTES. OPUS 5 is the primary code-writer (maintainer directive 2026-07-26: "Opus5 should
-# be prioritised over sol on all tasks for which they are both possible implementors; except for
-# GUI work where sol should remain prioritised"). sol remains the cross-provider fallback on those
-# routes, so an Anthropic outage does not stall them. `role:impl` is the ONE EXCEPTION since
-# 2026-07-26: sol was removed from it outright on the registry #738 measurement (see that route).
-#
-# These chains LED WITH SOL until 2026-07-26, under the 2026-07-18 "credit abundance" directive
-# taken during a high-sol-availability window. That steer never expired, and because
-# select-and-claim.choose_account walks `model_chain` IN ORDER and takes the first available
-# account, a sol-first literal won every route on every tick regardless of later availability.
-# The mechanism was the chain ORDER, not a heuristic — hence the fix is the order.
-#
-# THE `area:gui` CARVE-OUT DOES NOT APPLY HERE: this repo has no `area:gui` (its UI surface is
-# `area:dashboard` -> role:site). The maintainer scoped the carve-out to "area:gui work" only, so
-# this repo's site/dashboard route takes the opus5-first default. Flagged in the PR body.
-#
-# docs -> sol-led (the separate docs-writing directive); role=docs is still the ONLY surface where
-# the docs-only alias terra/sonnet may appear — policy-resolve.py rejects them in any other route.
+# [SPARQ agent] ROLE ROUTES. The 2026-09-02 maintainer protocol separates authorship from review:
+# GPT-5.6 Sol is the primary implementation tier, while Opus 5 remains the review/soundness tier
+# and the cross-provider reviewer for Sol-authored PRs. Opus stays behind Sol as a continuity fallback
+# for current Anthropic-authored repairs and total Sol unavailability. `escalate = true` gives
+# exhausted implementation routes the existing bounded, machine-owned capacity exit. The security
+# override above remains the deliberate trust-surface exception and continues to require Opus 5
+# plus a human arm. Research and docs retain their separately declared policies.
 
-# [OPUS-5] `role:impl` IS OPUS5-ONLY SINCE 2026-07-26 — sol was REMOVED, not demoted.
+# HISTORICAL CONTEXT (superseded by the 2026-09-02 protocol above): `role:impl` was Opus5-only
+# beginning 2026-07-26. The measurements below explain that prior state; they are not current policy.
 #
 # MAINTAINER DECISION 2026-07-26, taken on the measurement in registry #738: "Remove sol from impl
 # fallback." This is a change from PREFERENCE to EXCLUSION and it applies to `role:impl` ONLY. The
@@ -246,7 +239,7 @@ escalate = true
 # — capacity starvation is not a human question (park_policy.py defect 1).
 [[route]]
 role = "impl"
-model_chain = ["opus5"]
+model_chain = ["sol", "opus5"]
 agent = "registry-impl"
 escalate = true
 
@@ -259,30 +252,19 @@ escalate = true
 # unions ALL match_labels keywords, so UI keywords there would human-arm every UI PR.
 [[route]]
 role = "site"
-model_chain = ["opus5", "sol"]
+model_chain = ["sol", "opus5"]
 agent = "registry-impl"
+escalate = true
 
-# [FABLE-5] STANDING RULE — frontier-tier CI/infrastructure authorship (maintainer decision
-# 2026-07-17, same standing-rule pattern as the UI→codex route above): ALL CI/infrastructure work
-# — .github/workflows, gate aggregators, orchestration plumbing, the self-draining pipeline itself
-# — is authored by a FRONTIER-tier model only: sol (GPT-5.6 codex) or the anthropic frontier tier
-# (opus5 primary since 2026-07-24; fable retained as its tail fallback).
-# Cheaper tiers (sonnet/haiku) no longer author infra — and terra/sonnet are docs-only
-# (2026-07-18); cross-provider review is unchanged.
-# FRONTIER-ONLY chain rather than a floor marker: the routing schema has no floor/pin field (the
-# fix-floor pin is a review-loop concept, dispatch-claim.py), and chain exhaustion at the claim
-# step already DEFERS the item (retried next tick) instead of degrading — see dispatch-claim's
-# "a starved pinned chain DEFERS (defer-not-fallback)" self-test. NOT `escalate = true` (that
-# flips a starved item to needs:user; this rule wants defer+retry). On THIS repo most infra
-# surfaces (dispatch/worker/set-up-account/review-loop/groom) are trust surfaces matched by the
-# security override above, which still WINS (opus + human arm) — correct and unchanged; role:ci
-# covers the residual CI plumbing (.github/workflows etc., triage labels area:ci/area:workflows).
-# Repos onboarded to the registry inherit this rule — mirror a frontier-only `role = "ci"` chain
-# into each target's routing.toml (sparq-org/sparq carries it, PR #3422).
+# [SPARQ agent] CI/infrastructure is implementation and therefore uses the same Sol-first lane. Opus 5
+# reviews the resulting OpenAI-authored PR through the existing cross-provider review chain. Most
+# registry control-plane surfaces still match the security override above, which remains Opus + human arm;
+# this role covers residual CI plumbing and has an explicit bounded capacity exit.
 [[route]]
 role = "ci"
-model_chain = ["opus5", "sol"]
+model_chain = ["sol", "opus5"]
 agent = "registry-ci"
+escalate = true
 
 # [OPUS-5] research was ["opus5", "fable", "opus"] until 2026-07-26. Retiring the two tail rungs
 # left a ONE-RUNG chain with no `escalate` — i.e. no exit at all: on an opus5 capacity outage the
