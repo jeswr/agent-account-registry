@@ -9064,6 +9064,47 @@ def _self_test() -> int:
     # on it — the same rule #552 applied to http_transient above. A reader that ships broken must
     # not be adopted silently by its consumer.
     check("#1410 the shared gh_403 taxonomy's own self-test passes", _gh_403._self_test(), True)
+    # [registry #2032] THE MIRROR PIN, and groom is the only place in the tree that can hold it.
+    # gh_403 is a declared sparse-checkout input of dispatch.yml's fail-closed `secrets-guard` job,
+    # so it must NOT `import gh_retry` to share the numeric bound — that would put gh_retry's
+    # subprocess/`gh`-runner surface inside the guard's dependency surface. The cap value and the
+    # Retry-After value grammar are therefore MIRRORED between the two modules, and this file is
+    # the ONE module that loads BOTH, so this is where the mirror is checked rather than asserted.
+    # Change either side alone and this row reds while every behavioural row in both suites — which
+    # each read only their own constant — stays green.
+    check("#2032 the mirrored Retry-After bound is byte-identical across gh_403 and gh_retry",
+          (_gh_403.RETRY_AFTER_CAP == _gh_retry.RETRY_AFTER_CAP,
+           _gh_403._RETRY_AFTER_VALUE_RE.pattern == _gh_retry._RETRY_AFTER_VALUE_RE.pattern,
+           _gh_403._RETRY_AFTER_VALUE_RE.flags == _gh_retry._RETRY_AFTER_VALUE_RE.flags),
+          (True, True, True))
+    # ...and the mirror is a real comparison, not two names that happen to be the same OBJECT
+    # (which is what it would degrade to if someone "fixed" the duplication with an import) and not
+    # two `None`s. Both sides must be present and positive on their own.
+    check("#2032 both sides of the mirror are independently present and positive",
+          (_gh_403.RETRY_AFTER_CAP > 0, _gh_retry.RETRY_AFTER_CAP > 0,
+           bool(_gh_403._RETRY_AFTER_VALUE_RE.pattern)), (True, True, True))
+    # ...and the CONTRACT the mirror exists to keep: gh_403's headers parser and gh_retry's header
+    # parser — the one groom itself delegates to — must answer IDENTICALLY on every shape, absent
+    # sentinel and float type included. Row `2.5` is the divergence #2032 closed: gh_403 answered 0
+    # there (int('2.5') raised) while groom's parser answered 2.5.
+    # NON-VACUITY: an agreement row alone would pass if BOTH sides degenerated to `None`. It cannot
+    # here — the `#1410 …self-test passes` row directly above runs gh_403's own suite, whose
+    # `#2032 contract` row pins that side against LITERALS (7.0 / 2.5 / the cap), and the `#928`
+    # rows above pin gh_retry's side through groom's own adapter.
+    # `7e2` and `1_0` are in the corpus because they are the forms `float()` accepts and RFC 9110's
+    # `delta-seconds` (`1*DIGIT`) does not — i.e. the only inputs on which a full-match grammar and
+    # a prefix-match grammar disagree once both modules fail their conversion closed. Drop them and
+    # the two grammars can diverge into prefix parsing with this whole row still green.
+    _contract_cases = ("7", "2.5", "9999", "0", "0.0", "-5", "soon", "7junk", "7 seconds",
+                       "junk Retry-After: 9999", "Wed, 21 Oct 2015 07:28:00 GMT", "nan",
+                       "7e2", "1_0")
+    check("#2032 gh_403 and gh_retry answer the ONE Retry-After contract identically",
+          [(raw, _gh_403.retry_after_seconds({"Retry-After": raw}),
+            type(_gh_403.retry_after_seconds({"Retry-After": raw})).__name__)
+           for raw in _contract_cases],
+          [(raw, _gh_retry.retry_after_header_seconds(raw),
+            type(_gh_retry.retry_after_header_seconds(raw)).__name__)
+           for raw in _contract_cases])
 
     class _FakeResp:
         def __init__(self, raw: bytes):
