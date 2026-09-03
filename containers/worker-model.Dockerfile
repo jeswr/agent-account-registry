@@ -25,7 +25,9 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 # archive, and NOTHING here decides a verdict: this container only runs the untrusted model, while
 # every gate row is re-run host-side on `ubuntu-latest`. An exact `=<version>` pin would instead
 # break every worker run the moment Debian point-releases either package out of the mirror, which
-# is a strictly worse failure for a sandbox whose contents are not evidence.
+# is a strictly worse failure for a sandbox whose contents are not evidence. Stated the other way
+# round, as #1575 put it: this trades byte-for-byte rebuilds for not breaking after a Debian
+# point-release replacement.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends jq python3-yaml \
-  && rm -rf /var/lib/apt/lists/*
+    && apt-get install --yes --no-install-recommends jq python3-yaml \
+    && rm -rf /var/lib/apt/lists/*

@@ -11519,6 +11519,33 @@ def _self_test() -> int:
             ([], True),
         )
 
+        # ---- [#1849] direction 4: an UNATTRIBUTABLE applier is not permission either ------------
+        # The newest `labeled review:parked` names an actor that is neither this fleet's automation
+        # (no `[bot]` login, no App) nor a maintainer (the collaborator probe answers `none`). Until
+        # park_policy required a POSITIVE machine proof, "not provably human" WAS the answer, so
+        # this read as machine-owned and the sweep deleted a hold nobody can attribute. The bot
+        # event is FIRST, exactly as in the human fixture above, so absence-of-a-bot-event is not
+        # what refuses it: delete the second event and the sweep DOES clear the label.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/45/comments": [_park_receipt_comment(1, 45)],
+            "/repos/owner/repo/issues/45/timeline": [
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]"),
+                _labelled("review:parked", "2026-07-26T12:00:00Z", "some-service")],
+        }
+        unattributable_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(45, "clean", ("review:parked",), fresh=True),),
+            extra_gets={"/repos/owner/repo/collaborators/some-service/permission":
+                        {"permission": "none"}},
+        )
+        check(
+            "#1849 direction 4: a machine park whose LATEST application is an actor that is "
+            "NEITHER proven automation NOR a proven maintainer is not clearable — absence of an "
+            "ATTRIBUTABLE actor is not permission",
+            (terminal_sweep_env["writes"],
+             "not provably machine-applied" in unattributable_log),
+            ([], True),
+        )
+
         # ---- the UNREADABLE timeline, which previously had no red test at all ------------------
         # The PR body claims "unreadable timeline -> stay parked"; before this check that claim was
         # unsupported (deleting the branch left the suite green). A raising timeline read must

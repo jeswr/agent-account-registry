@@ -193,7 +193,7 @@ def resolve(labels, doc):
     # roleless issue can never be injected into — passed explicitly rather than left to the default.
     d = doc.get("defaults", {})
     return (_PREF.apply_preferences(labels, d.get("model_chain", []), preferences, role=None),
-            d.get("agent"), False)
+            d.get("agent"), bool(d.get("escalate")))
 
 
 def _self_test():
@@ -275,51 +275,31 @@ def _self_test():
         raises(f"[#1397] agent_from_role on {_where} refuses to resolve (PLAN must refuse the "
                "tables CLAIM refuses)", ValueError,
                lambda d=_bad: resolve(["role:impl", "area:usage"], d))
-    # [OPUS-5] a NON-trust area (usage) -> plain impl -> OPUS5-ONLY + escalate (maintainer decision
-    # 2026-07-26 on the registry #738 measurement: "Remove sol from impl fallback"; sol converted
-    # 18% vs opus5 86% in-cell, n=74). The FULL tuple is asserted, not just the head, so demoting
-    # sol back to a second rung reds this instead of passing on `mc[0] == "opus5"`.
+    # [SPARQ agent] 2026-09-02 protocol: ordinary implementation is Sol-first, with Opus retained as
+    # the continuity fallback for current Anthropic-authored repairs and total Sol unavailability.
     mc, ag, esc = resolve(["role:impl", "area:usage"], doc)
-    chk("impl+usage -> OPUS5-ONLY, escalating", (mc, ag, esc),
-        (["opus5"], "registry-impl", True))
-    chk("role:impl names NO openai tier at all (exclusion, not a demotion)",
-        sorted({doc["models"][m]["provider"] for m in mc}), ["anthropic"])
-    chk("role:impl ESCALATES, so a single-rung chain has a machine exit rather than deferring "
-        "forever with nobody notified", esc, True)
+    chk("impl+usage -> SOL-FIRST with Opus continuity fallback", (mc, ag, esc),
+        (["sol", "opus5"], "registry-impl", True))
+    chk("role:impl preserves both providers for continuity",
+        sorted({doc["models"][m]["provider"] for m in mc}), ["anthropic", "openai"])
+    chk("role:impl has an explicit total-exhaustion exit", esc, True)
     # [OPUS-5] docs -> SOL-led (maintainer 2026-07-26: "deprecate sonnet and haiku for docs
     # writing in favor of gpt 5.6 sol"). The second assertion is the one that reds if either
     # cheap anthropic tier is put back into the docs chain.
     chk("docs -> sol", resolve(["role:docs", "area:docs"], doc)[0][0], "sol")
     chk("docs chain has no cheap anthropic tier",
         sorted(set(resolve(["role:docs", "area:docs"], doc)[0]) & {"haiku", "sonnet"}), [])
-    # [FABLE-5] frontier-tier infra authorship (standing rule 2026-07-17): ci -> sol-led
-    # (sol/opus5/fable — opus5 primary anthropic tier since 2026-07-24, fable its tail
-    # fallback), FRONTIER-ONLY chain — no sub-frontier model (sonnet/haiku), so
-    # chain exhaustion DEFERS at the claim step (defer-not-fallback) instead of degrading tier.
+    # CI is implementation under the same Sol-first protocol.
     mc, ag, esc = resolve(["role:ci", "area:ci"], doc)
-    chk("ci -> frontier-only opus5-first (terra is docs-only)", (mc, ag, esc),
-        (["opus5", "sol"], "registry-ci", False))
+    chk("ci -> Sol-first implementation", (mc, ag, esc),
+        (["sol", "opus5"], "registry-ci", True))
     chk("ci chain has no sub-frontier tier", sorted(set(mc) & {"sonnet", "haiku"}), [])
-    # [OPUS-5] no role -> defaults, now OPUS5-led (maintainer 2026-07-26: opus5 is preferred over
-    # sol wherever both are viable implementors). This repo has no `area:gui`, so it carries no
-    # sol carve-out — every implementor route here takes the opus5-first default.
-    chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "opus5")
-    # `role:impl` is deliberately NOT in this loop since 2026-07-26 — it is the one implementor
-    # route where sol was REMOVED rather than demoted, and it is asserted separately above. Every
-    # OTHER implementor route keeps sol as a reachable fallback (preference, not exclusion).
-    for _role in ("site", "ci"):
-        _mc = resolve([f"role:{_role}"], doc)[0]
-        chk(f"role:{_role} prefers opus5 over sol", _mc[0], "opus5")
-        chk(f"role:{_role} keeps sol reachable (preference, not exclusion)", "sol" in _mc, True)
-        chk(f"role:{_role} chain is cross-provider (terminates under either outage)",
-            sorted({doc["models"][m]["provider"] for m in _mc}), ["anthropic", "openai"])
-    # ...and the exclusion is EXACTLY role:impl. This is the guard that reds if a future edit
-    # copies the exclusion onto a route the maintainer did not scope it to.
-    chk("the ONLY route with no openai rung among the implementor routes is role:impl",
-        sorted(r for r in ("impl", "site", "ci", "docs")
-               if not any(doc["models"][m]["provider"] == "openai"
-                          for m in resolve([f"role:{r}"], doc)[0])),
-        ["impl"])
+    chk("no role -> Sol-first defaults",
+        resolve(["area:usage"], doc)[0::2], (["sol", "opus5"], True))
+    for _role in ("impl", "site", "ci"):
+        _mc, _agent, _esc = resolve([f"role:{_role}"], doc)
+        chk(f"role:{_role} is Sol-first with Opus continuity fallback",
+            (_mc, _esc), (["sol", "opus5"], True))
     chk("docs KEEPS its sol lead (the separate docs-writing directive)",
         resolve(["role:docs"], doc)[0][0], "sol")
 
@@ -436,16 +416,15 @@ escalate = true
     chk("...but a docs-only lead injected into role:docs still RESOLVES at PLAN (the bound mirrors "
         "the _reject_docs_only EXEMPTION, so it is not a blanket ban)",
         resolve(["area:gui", "role:docs"], _docs_ok)[0], ["terra", "opus5"])
-    # THE LIVE SHAPE sparq SHIPS: `lead = "sol"` + `inject_roles = ["impl"]`. Unchanged by the
-    # bound.
+    # The retained GUI preference is idempotent on the new Sol-first chain and still parses
+    # identically on PLAN and CLAIM.
     _live_shape = _copy.deepcopy(_pref_doc)
     _live_shape["chain_preference"] = [{"labels": ["area:gui"], "lead": "sol",
                                         "requires": ["sol", "opus5"], "inject_roles": ["impl"]}]
-    chk("the LIVE area:gui carve-out (lead = sol, inject_roles = [impl]) still injects sol-first "
-        "into the single-rung impl chain at PLAN",
+    chk("the retained area:gui preference leaves Sol-first implementation unchanged at PLAN",
         resolve(["area:gui", "role:impl"], _live_shape)[0], ["sol", "opus5"])
-    chk("...and a non-gui impl issue is still OPUS5-ONLY under that same declaration",
-        resolve(["area:usage", "role:impl"], _live_shape)[0], ["opus5"])
+    chk("...and non-gui implementation is the same Sol-first lane",
+        resolve(["area:usage", "role:impl"], _live_shape)[0], ["sol", "opus5"])
 
     print("route-resolve self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

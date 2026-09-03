@@ -1,11 +1,13 @@
-# [OPUS-5] The TRIGGER for the #657 `orchestrator`-class provenance record (registry issue #929).
+# [SPARQ agent] Census and fail-closed admission boundary for missing orchestrator provenance.
 #
 # WHY THIS EXISTS. mint-provenance.yml is `workflow_dispatch`-ONLY — no schedule, no
 # repository_dispatch, no programmatic caller anywhere in this repository. #916 turned review-lane
 # enrolment ON for the orchestrator class, but a human still had to fire one dispatch per PR, and
 # nobody ever did: zero orchestrator-attested records on `ledger` while the ledger was otherwise
-# busy with worker verdicts every few seconds. #916 converted "impossible" into "possible but
-# manual"; this workflow is the missing link that makes it automatic.
+# busy with worker verdicts every few seconds. This sweep made that population visible. It no
+# longer writes unattended records: the live Sol-first route has an Opus fallback, and neither
+# enrolment nor route order proves which provider implemented a particular PR. Until a trusted
+# dispatch record is bound to the PR and head SHA, only the explicit manual workflow may attest it.
 #
 # WHY A SCHEDULE AND NOT A `pull_request` TRIGGER. mint-provenance.yml's header states the
 # constraint and it has not changed: a `pull_request`-triggered workflow would have to live in the
@@ -13,24 +15,25 @@
 # The one alternative that repo comment rejected — "a reconciliation sweep would turn a per-PR
 # gesture into a standing 'trust this author' claim" — is answered by keeping the ALLOWLIST as the
 # sole authority on the population: this sweep reads `review_enrolment_authors` and can neither
-# widen nor bypass it, and the record it writes is still the weakest, self-attested class that the
-# arm refuses outright. What becomes standing is the TRIGGER, not the trust.
+# widen nor bypass it. Any future record written from this path must still be the weakest,
+# self-attested class that the arm refuses outright. What is standing today is the census trigger,
+# not an inferred trust claim.
 #
-# WHAT IT CANNOT DO, all of it inherited from scripts/mint-provenance.py, which this sweep IMPORTS
-# rather than re-implements:
+# WHAT IT CANNOT DO:
 #   * it cannot enrol anyone (`review_enrolment_authors`, master-protected, behind the gate);
-#   * it cannot name the implementing model — the alias is a PINNED CONSTANT in
-#     scripts/auto-mint-provenance.py, and this file passes no `--impl-alias`, declares no such
-#     input, and binds no such env var. The lane picks the reviewer by INVERTING `impl_provider`,
-#     so an alias lever here would be the class choosing its own reviewer's side;
+#   * it cannot name or infer the implementing model — this file passes no `--impl-alias`, declares
+#     no such input, and binds no such env var. The lane picks the reviewer by INVERTING
+#     `impl_provider`, so preferred-route inference would make fallback review unsound;
+#   * it cannot write any record without immutable per-PR implementation evidence; currently no
+#     such input exists, so every otherwise-eligible missing record is a visible refusal;
 #   * it cannot accept the serializing `__global__` partition: no `--allow-global-partition`;
 #   * it cannot mint a MACHINE-attested record: the stamp is built inside the script from this
 #     run's own GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT, and no input on this path names a run key;
 #   * it cannot authorise a merge — the arm refuses this class outright (worker-pr.ready_and_arm).
 #
-# BOUNDED, AND NEVER SILENT. Each tick writes at most `DEFAULT_MAX_MINTS` records and posts at most
-# `DEFAULT_MAX_COMMENTS` refusal comments, and EVERY tick prints a census — enrolled-class PRs
-# lacking a record, how many were minted, how many were refused and for which named reason. A
+# BOUNDED, AND NEVER SILENT. Each tick retains the existing `DEFAULT_MAX_MINTS` compatibility cap,
+# posts at most `DEFAULT_MAX_COMMENTS` refusal comments, and prints a census — enrolled-class PRs
+# lacking a record, how many were refused and for which named reason. A
 # refusal is also left ON the pull request (once per distinct reason), because an orchestrator-class
 # PR that cannot be minted is invisible to the review lane again, which is the exact state #916
 # exists to end.
@@ -44,8 +47,9 @@ on:
     inputs:
       apply:
         description: >-
-          Write the records and post the refusal comments (false = census-only preview). The
-          SCHEDULE always applies; this input exists so an operator can read a census first.
+          Post refusal comments (false = census-only preview). Unattended record writes fail
+          closed until per-PR implementation evidence exists. The SCHEDULE always applies; this
+          input exists so an operator can read a census first.
         required: false
         default: false
         type: boolean
@@ -71,7 +75,7 @@ concurrency:
 
 jobs:
   sweep:
-    name: Mint the missing orchestrator-class provenance records (ledger branch)
+    name: Census missing orchestrator provenance (unattended writes fail closed)
     # The salt is a secret: refuse to run from any non-default ref (a modified branch copy of this
     # workflow must never see it — the sol-audit arbitrary-ref class). It is also what stops a
     # branch that adds itself to policy/repos.toml from being read as the enrolment allowlist.
@@ -95,7 +99,7 @@ jobs:
     # environment (deployment-branch policy: default branch only). Complements the ref guard above.
     environment: dispatch-secrets
     permissions:
-      contents: write        # ledger-branch record PUT via github.token
+      contents: read         # policy/routing and existing-record reads; no unattended ledger PUT
       pull-requests: write   # the refusal comment, ON the PR — requirement 4 of #929
       # Deliberately NO `actions: read`. Run-log reading is BACKFILL's identity source; this path's
       # identity source is the live API read of the PR, and granting log access here would blur two

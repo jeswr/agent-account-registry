@@ -15,14 +15,17 @@
 # allowlist; it can only act inside one. Both halves are still required at every consumer.
 """mint-provenance — write the `orchestrator`-class provenance record for ONE orchestrator PR.
 
-Identity source (the ONLY one): the LIVE GitHub API read of the PR itself, performed by this
-script inside a registry Actions run. There is deliberately no operator-supplied identity:
+PR and account identity come only from the LIVE GitHub API read performed by this script inside a
+registry Actions run. Implementer-model identity is different: the manual workflow requires an
+explicit operator attestation for the actual model alias, then derives its provider from the
+target's protected routing catalog. There is deliberately no operator-supplied PR/account identity:
 
   pr_number         the PR the run was pointed at, re-read live and re-validated
   head_sha_at_open  the head sha the API reports for that PR AT MINT TIME
   impl_account_h    sha256("orchestrator:<live PR author login>" + ':' + PROVENANCE_SALT)[:16]
-  impl_provider     DERIVED from the target's protected routing catalog for `--impl-alias`,
-                    and REFUSED unless it is `anthropic` (see ORCHESTRATOR_IMPL_PROVIDER)
+  impl_alias        explicit operator attestation of the model that implemented this PR
+  impl_provider     DERIVED from the target's protected routing catalog for `--impl-alias`, and
+                    REFUSED unless the review consumer has an opposite-provider chain for it
   issue             the operator-named source issue, re-read live and re-validated
   recorded_at_run   `orchestrator:<this run>.<this attempt>`, built from the runner's own
                     GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT — never from an argument
@@ -35,8 +38,8 @@ branch at all). What this script guarantees is narrower and still worth having:
   * it is the only SUPPORTED writer, and it can only ever write the WEAKEST attestation class —
     the escalation to a machine class is refused at `stamp_admission_error`, with no input that
     could reach it;
-  * every field it writes is either read from the live API or pinned by this file, so an operator
-    cannot declare an identity;
+  * the operator explicitly attests only the implementation alias; the provider is a protected
+    catalog lookup, while PR number, head, author identity and source issue are re-read live;
   * it refuses every case it cannot classify, and a refusal leaves the PR exactly as it is today:
     no record, therefore not enumerated, therefore no lane traffic at all.
 
@@ -65,20 +68,13 @@ class MintError(RuntimeError):
 
 
 # ---- WHAT THE RECORD MAY ASSERT ---------------------------------------------------------------
-# The one provider this path will ever record. It is a PIN, not a default, and it is the reason
-# design record §7.4 step 2 ("pin a CONSTANT reviewer side for the class") needs no changes at its
-# five enforcement points: the lane picks the reviewer by INVERTING `impl_provider`
-# (REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus5"]}), so a record that can only
-# ever say `anthropic` can only ever resolve to the openai review side — at the REVIEW_CHAIN
-# subscript, at the `claim_provider == impl_provider` violation, at review-fix.yml's inline chain
-# table and both its re-assertions. Pinning the WRITER is one enforcement point instead of five,
-# and it cannot be half-applied.
-#
-# The pin is also why an openai-harness orchestrator must not use this path: it would be a false
-# declaration, and the review would be same-provider. `alias_mint_refusal` refuses rather than
-# recording it — design record §3's residual risk is an ADVISORY COMMENT, and this keeps even that
-# from being manufactured by the supported writer.
-ORCHESTRATOR_IMPL_PROVIDER = "anthropic"
+# [SPARQ agent] The providers this explicit, human-attested recovery writer may record. These are
+# exactly the providers the review consumer knows how to INVERT; the self-test binds this set to
+# dispatch-claim.IMPL_PROVIDERS and REVIEW_CHAIN so adding one side cannot silently create a record
+# with no opposite-provider reviewer. The alias itself must resolve through the TARGET's protected
+# catalog, so an operator attests the actual model alias but cannot independently declare its
+# provider. The unattended writer remains fail-closed because it has no equivalent per-PR evidence.
+ORCHESTRATOR_IMPL_PROVIDERS = frozenset({"anthropic", "openai"})
 
 # The account-hash preimage is domain-separated from the worker lane's `acctNN` handles. The
 # reviewer != implementer assertion at CLAIM hashes a live account handle the same way and
@@ -120,10 +116,9 @@ CENSUS_RECORDED = "ALREADY-RECORDED"    # a provenance record for this PR alread
 CENSUS_VERDICTS = (CENSUS_MINTABLE, CENSUS_DEAD, CENSUS_NO_ISSUE, CENSUS_RECORDED,
                    CENSUS_OTHER_LANE)
 
-# The implementing alias both the CLI default and the census decide with. ONE literal: a census
-# that judged a different alias from the one a mint would record would report a population the
-# operator cannot act on.
-DEFAULT_IMPL_ALIAS = "opus5"
+# The implementing alias a programmatic census uses by default. The mint CLI and workflow require
+# an explicit per-PR alias; a routing preference is not authorship evidence.
+DEFAULT_IMPL_ALIAS = "sol"
 
 
 class MintDecision(NamedTuple):
@@ -397,10 +392,9 @@ def alias_mint_refusal(impl_alias, routing):
     being a declaration.
 
     The alias must be a safe atom (it flows into workflow outputs and model prompts) AND resolve
-    in the TARGET's protected routing catalog, and the provider it resolves to must be
-    ORCHESTRATOR_IMPL_PROVIDER. So the recorded provider is a CATALOG LOOKUP against a file in the
-    target repository, not a field the operator fills in — and the constant review side follows
-    from it."""
+    in the TARGET's protected routing catalog. Its provider must be one the review consumer can
+    invert. The recorded provider is therefore a CATALOG LOOKUP against a file in the target
+    repository, never a second field the operator can make disagree with the alias."""
     if not isinstance(impl_alias, str) or not SAFE_AREA.fullmatch(impl_alias):
         return "the implementer alias is not a safe atom"
     models = (routing or {}).get("models") if isinstance(routing, dict) else None
@@ -409,10 +403,10 @@ def alias_mint_refusal(impl_alias, routing):
     if provider is None:
         return (f"the implementer alias {impl_alias!r} is not in the target's routing catalog "
                 "(a deprecated or unknown alias is never recorded)")
-    if provider != ORCHESTRATOR_IMPL_PROVIDER:
+    if provider not in ORCHESTRATOR_IMPL_PROVIDERS:
         return (f"the target's routing catalog maps {impl_alias!r} to provider {provider!r}; this "
-                f"writer only ever records {ORCHESTRATOR_IMPL_PROVIDER!r}, which is what pins the "
-                "review side to the opposite provider")
+                f"writer records only providers with an opposite review chain "
+                f"({sorted(ORCHESTRATOR_IMPL_PROVIDERS)})")
     return None
 
 
@@ -483,6 +477,9 @@ def mint_decision(repo, pr_number, issue_number, impl_alias, enrolled_authors, r
     alias_error = alias_mint_refusal(impl_alias, routing)
     if alias_error:
         return MintDecision(ACTION_REFUSE, alias_error, None)
+    # Safe after alias_mint_refusal: every container and field on this path was validated there.
+    # Re-read no external state; use the SAME routing object the refusal inspected.
+    impl_provider = routing["models"][impl_alias]["provider"]
     pr_error = pr_mint_refusal(repo, pull, enrolled_authors)
     if pr_error:
         return MintDecision(ACTION_REFUSE, pr_error, None)
@@ -500,7 +497,7 @@ def mint_decision(repo, pr_number, issue_number, impl_alias, enrolled_authors, r
     document = {
         "pr_number": pr_number,
         "head_sha_at_open": str((pull.get("head") or {}).get("sha", "")),
-        "impl_provider": ORCHESTRATOR_IMPL_PROVIDER,
+        "impl_provider": impl_provider,
         "impl_alias": impl_alias,
         "impl_account_h": account_hash(f"{ACCOUNT_HASH_DOMAIN}:{login}", salt),
         "issue": issue_number,
@@ -1137,6 +1134,10 @@ def mint_workflow_seam_report(workflow=None):
             re.search(r'\[\[\s*"\$ALLOW_GLOBAL"\s*==\s*"true"\s*\]\].*'
                       r'args\+=\(--allow-global-partition\)', run)),
         "global_default": inputs.get("allow_global_partition", {}).get("default"),
+        # The implementation alias is the human attestation this manual path adds. A default would
+        # silently turn omission into a Sol claim, recreating auto-mint's false-attribution bug.
+        "impl_alias_required": inputs.get("impl_alias", {}).get("required") is True,
+        "impl_alias_default_declared": "default" in inputs.get("impl_alias", {}),
         # THE ATTESTATION-CLASS SEAM: the stamp is built from the runner's own run identity inside
         # the script. There must be NO workflow input, env binding or CLI argument on this path
         # that names a run key or an attestation class — that is what makes "this writer can only
@@ -1173,6 +1174,10 @@ def _self_test():                                                       # noqa: 
     lease_schema = _load_lease_schema()
     attestation_class = dispatch_claim.provenance_attestation_class
     orchestrator_class = dispatch_claim.ORCHESTRATOR_CLASS
+    check("the manual writer accepts exactly the providers the review consumer can invert",
+          (set(ORCHESTRATOR_IMPL_PROVIDERS), set(dispatch_claim.IMPL_PROVIDERS),
+           set(dispatch_claim.REVIEW_CHAIN)),
+          (set(dispatch_claim.IMPL_PROVIDERS),) * 3)
 
     # ---- the stamp: the one thing no input may influence -------------------------------------
     # FROZEN literal, not a round-trip through the taxonomy: a rename of ORCHESTRATOR_CLASS would
@@ -1293,10 +1298,11 @@ def _self_test():                                                       # noqa: 
 
     # ---- the alias -> provider catalog lookup -------------------------------------------------
     routing = {"models": {"opus5": {"provider": "anthropic"}, "sol": {"provider": "openai"},
-                          "weird": {"provider": None}}}
-    check("an anthropic catalog alias is recorded", alias_mint_refusal("opus5", routing), None)
-    rejects("an OPENAI catalog alias is refused", "only ever records 'anthropic'",
-            lambda: alias_mint_refusal("sol", routing))
+                          "foreign": {"provider": "other"}, "weird": {"provider": None}}}
+    check("an OpenAI catalog alias is recorded", alias_mint_refusal("sol", routing), None)
+    check("an Anthropic fallback alias is recorded", alias_mint_refusal("opus5", routing), None)
+    rejects("a provider with no inverse review chain is refused", "opposite review chain",
+            lambda: alias_mint_refusal("foreign", routing))
     rejects("an alias absent from the catalog is refused", "not in the target's routing catalog",
             lambda: alias_mint_refusal("fable", routing))
     rejects("an alias with no provider is refused", "not in the target's routing catalog",
@@ -1316,7 +1322,7 @@ def _self_test():                                                       # noqa: 
                          json_type_exact=worker_pr._json_type_exact)
 
     def decide(**over):
-        base = dict(repo=repo, pr_number=41, issue_number=7, impl_alias="opus5",
+        base = dict(repo=repo, pr_number=41, issue_number=7, impl_alias="sol",
                     enrolled_authors=enrolled, routing=routing, stamp="orchestrator:9.1",
                     salt="s", pull=pull(), issue=issue(), existing_body=None)
         base.update(over)
@@ -1326,8 +1332,18 @@ def _self_test():                                                       # noqa: 
     check("a clean case mints", minted.action, ACTION_MINT)
     check("the record binds THIS PR at THIS head, with a pinned provider and a derived hash",
           {k: v for k, v in minted.document.items() if k != "impl_account_h"},
-          {"pr_number": 41, "head_sha_at_open": "a" * 40, "impl_provider": "anthropic",
-           "impl_alias": "opus5", "issue": 7, "recorded_at_run": "orchestrator:9.1"})
+          {"pr_number": 41, "head_sha_at_open": "a" * 40, "impl_provider": "openai",
+           "impl_alias": "sol", "issue": 7, "recorded_at_run": "orchestrator:9.1"})
+    fallback = decide(impl_alias="opus5")
+    check("an explicitly attested Opus fallback mints truthful Anthropic provenance",
+          (fallback.action, fallback.document["impl_provider"],
+           fallback.document["impl_alias"]),
+          (ACTION_MINT, "anthropic", "opus5"))
+    check("...and the review consumer admits that exact fallback record",
+          dispatch_claim.provenance_admission_error(
+              fallback.document, 41, admit_orchestrator=True), None)
+    check("...then inverts Anthropic authorship to the OpenAI review chain",
+          dispatch_claim.REVIEW_CHAIN[fallback.document["impl_provider"]], ["sol", "luna"])
     check("the account hash is domain-separated from the acctNN namespace",
           minted.document["impl_account_h"], worker_pr.account_hash("orchestrator:jeswr", "s"))
     check("...and is NOT the bare-login hash a future acctNN could collide with",
@@ -1365,7 +1381,8 @@ def _self_test():                                                       # noqa: 
     check("a machine-shaped stamp refuses at the decision, not just at the helper",
           decide(stamp="9.1").action, ACTION_REFUSE)
     check("...and no document escapes a refusal", decide(stamp="9.1").document, None)
-    check("an openai alias refuses at the decision", decide(impl_alias="sol").action,
+    check("a provider with no inverse chain refuses at the decision",
+          decide(impl_alias="foreign").action,
           ACTION_REFUSE)
     check("a fork head refuses at the decision",
           decide(pull=pull(head={"repo": {"full_name": "attacker/r"}})).action, ACTION_REFUSE)
@@ -1383,7 +1400,7 @@ def _self_test():                                                       # noqa: 
     for label, stored in (
             ("a different head", {**minted.document, "head_sha_at_open": "b" * 40}),
             ("a different issue", {**minted.document, "issue": 8}),
-            ("a different provider", {**minted.document, "impl_provider": "openai"}),
+            ("a different provider", {**minted.document, "impl_provider": "anthropic"}),
             ("a type-confused pr_number", {**minted.document, "pr_number": True}),
             ("a MACHINE-attested record", {**minted.document, "recorded_at_run": "9.1"}),
             ("an unstamped record", {**minted.document, "recorded_at_run": "x"})):
@@ -1414,10 +1431,11 @@ def _self_test():                                                       # noqa: 
         return True
 
     def run_mint(*, apply_changes=False, env=None, record=None, allow_global=False,
+                 impl_alias="sol",
                  pull_over=None, issue_over=None, record_reader=None,
                  identity_admits=_identity_admits, shell_admits=_shell_admits):
         written = []
-        decision = mint(repo, 41, 7, "opus5", "reg/istry", routing, enrolled,
+        decision = mint(repo, 41, 7, impl_alias, "reg/istry", routing, enrolled,
                         apply_changes=apply_changes, allow_global_partition=allow_global,
                         env=env if env is not None else good_env,
                         read_pull=lambda: pull(**(pull_over or {})),
@@ -1439,6 +1457,11 @@ def _self_test():                                                       # noqa: 
           decision.document["recorded_at_run"], "orchestrator:555.1")
     decision, written = run_mint(apply_changes=True)
     check("--apply writes exactly one record", (decision.action, written), (ACTION_MINT, ["put"]))
+    decision, written = run_mint(apply_changes=True, impl_alias="opus5")
+    check("--apply also delivers an explicitly attested Opus fallback to OpenAI review",
+          (decision.action, decision.document["impl_provider"], written,
+           dispatch_claim.REVIEW_CHAIN[decision.document["impl_provider"]]),
+          (ACTION_MINT, "anthropic", ["put"], ["sol", "luna"]))
     decision, written = run_mint(apply_changes=True, record=body)
     check("an already-minted PR writes nothing", (decision.action, written),
           (ACTION_ALREADY, []))
@@ -1656,7 +1679,7 @@ def _self_test():                                                       # noqa: 
             return dispatch_claim.enumerate_review_items(*args, **kwargs)
 
     _spy = _SpyClaim()
-    mint(repo, 41, 7, "opus5", "reg/istry", routing, enrolled, env=good_env,
+    mint(repo, 41, 7, "sol", "reg/istry", routing, enrolled, env=good_env,
          read_pull=lambda: pull(), read_issue=lambda: issue(labels=[{"name": "area:ci"},
                                                                     {"name": "role:impl"}]),
          read_record=lambda: None, write_record=lambda: None,
@@ -2032,6 +2055,8 @@ def _self_test():                                                       # noqa: 
     check("--allow-global-partition is conditional on its own input",
           seam["global_is_conditional"], True)
     check("...and defaults off", seam["global_default"], False)
+    check("the implementation alias is an explicit operator attestation, never a default",
+          (seam["impl_alias_required"], seam["impl_alias_default_declared"]), (True, False))
     check("no workflow input or env names a run key / attestation class",
           seam["no_run_key_input"], True)
     check("no CLI argument names one either", seam["no_run_key_argument"], True)
@@ -2154,6 +2179,12 @@ def _self_test():                                                       # noqa: 
             ("the dispatch default flips to apply=true",
              lambda d: wf_inputs(d)["apply"].update(default=True),
              "dispatch_default_is_dry_run", True),
+            ("the implementation attestation stops being required",
+             lambda d: wf_inputs(d)["impl_alias"].update(required=False),
+             "impl_alias_required", False),
+            ("the implementation attestation silently defaults to Sol",
+             lambda d: wf_inputs(d)["impl_alias"].update(default="sol"),
+             "impl_alias_default_declared", True),
             # COMMENT-ONLY mutants: the token stays in the text, the CODE is gone.
             ("the self-test invocation survives only as a comment",
              lambda d: comment_out_line(d, "mint-provenance.py --self-test"),
@@ -2238,9 +2269,9 @@ def main():
     parser.add_argument("--registry-repo", help="owner/name of THIS registry repository")
     parser.add_argument("--pr", type=int, help="the orchestrator PR to mint a record for")
     parser.add_argument("--issue", type=int, help="the open source issue the PR names")
-    parser.add_argument("--impl-alias", default=DEFAULT_IMPL_ALIAS,
-                        help="the implementing model alias; must resolve to "
-                             f"{ORCHESTRATOR_IMPL_PROVIDER} in the target routing catalog")
+    parser.add_argument("--impl-alias",
+                        help="explicit operator attestation of the implementing model alias; "
+                             "required for mint and resolved through the target routing catalog")
     parser.add_argument("--routing-file", help="path to the target's routing.toml")
     parser.add_argument("--apply", action="store_true", help="write the record (default: dry run)")
     parser.add_argument("--census", action="store_true",
@@ -2279,11 +2310,11 @@ def main():
         _require("target_repo", "registry_repo", "routing_file")
         routing, enrolled_authors = _resolve_policy()
         census(args.target_repo, args.registry_repo, routing, enrolled_authors,
-               impl_alias=args.impl_alias)
+               impl_alias=args.impl_alias or DEFAULT_IMPL_ALIAS)
         # A census that finds nothing mintable is a REPORT, not a failure — the summary line is the
         # finding. Only an unreadable population fails, and that raises MintError above.
         return 0
-    _require("target_repo", "registry_repo", "pr", "issue", "routing_file")
+    _require("target_repo", "registry_repo", "pr", "issue", "impl_alias", "routing_file")
     routing, enrolled_authors = _resolve_policy()
     decision = mint(args.target_repo, args.pr, args.issue, args.impl_alias, args.registry_repo,
                     routing, enrolled_authors, apply_changes=args.apply,

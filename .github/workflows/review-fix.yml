@@ -1763,6 +1763,10 @@ jobs:
           WORKER_FIX_ROUND: ${{ inputs.review_round }}
           WORKER_FIX_KIND: ${{ inputs.fix_kind }}
           WORKER_FIX_CONTEXT: ${{ inputs.fix_context }}
+          # [#1574] The SAME resolved profile the gate step below runs. The ci/rebase briefs state
+          # which local gate is in play; without this they asserted a hard-coded `crate-scoped`,
+          # which is false on every non-cargo target.
+          GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
           WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
           WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
@@ -2287,8 +2291,11 @@ jobs:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
-          # Privacy routing (locked decision 22c): maintainer-set ALERT_REPO sends the
-          # account-enumerating ops alert to a private repo; unset falls back to the registry.
+          # Privacy routing (locked decision 22c; hardened in #432 round 1): worker-pr.py sends the
+          # account-enumerating ops alert to the maintainer-set ALERT_REPO only when ALERT_TOKEN is
+          # set, the repo is DISTINCT from this registry, AND a live GET /repos/{ALERT_REPO} under
+          # ALERT_TOKEN confirms `"private": true`. Configuration alone is NOT verification — token
+          # presence does not select the private route. Every other shape falls back to the registry.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
@@ -2547,8 +2554,11 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
-          # Privacy routing (locked decision 22c): maintainer-set ALERT_REPO sends the ops alert
-          # to a private repo; unset falls back to the registry.
+          # Privacy routing (locked decision 22c; hardened in #432 round 1): worker-pr.py sends the
+          # ops alert to the maintainer-set ALERT_REPO only when ALERT_TOKEN is set, the repo is
+          # DISTINCT from this registry, AND a live GET /repos/{ALERT_REPO} under ALERT_TOKEN
+          # confirms `"private": true`. Configuration alone is NOT verification — token presence
+          # does not select the private route. Every other shape falls back to the registry.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
