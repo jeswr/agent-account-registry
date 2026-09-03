@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2244,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "de5e967e2dbcc9b23d496d99b6c0c0456d78386f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation matches the implemented producer and consumer behavior. Both refusal counts are derived independently from their seam-specific drop logs, count every rejected row while diagnostics are budgeted separately, treat a present non-list container as one refusal, and are returned unconditionally (including zero). The dashboard renders each note only for a positive numeric count; queue trend sampling additionally requires queue_dropped to be exactly numeric zero, so missing, malformed, or positive counts yield a null gap. The collector boundary and target-CI display-only distinction are also stated accurately. This documentation-only change does not weaken trust-plane behavior, and the diff contains no reviewer-directed instruction.",
+  "verdict": "approve"
+ }
+}
