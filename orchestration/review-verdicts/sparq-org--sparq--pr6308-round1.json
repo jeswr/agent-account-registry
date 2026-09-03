@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6308,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2abb1cdfa218fb6c3b6b2ef5cd20c1cd69ac4cc0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 orders the unchanged graph-level check before the scope-applicability gate, but then says resolve_var_graphs must not run on the full store on the scoped path. The applicability gate itself asks whether any targeted graph has a scope entry. For GRAPH ?var templates, those targets are only discovered by evaluating WHERE (or by shadow-applying), so the implementation cannot safely know that it is on the scoped path before performing the operation that may leak masked data. The two proposed resolutions occur only after this unresolved routing decision. This is the load-bearing W4 boundary, not an implementation detail.",
+    "file": "research/solid-pattern-scoped-update-2026-09.md",
+    "fix_hint": "Specify a pre-evaluation classifier that is a function only of the session scope map and update syntax. A conservative rule would route any update with a dynamic graph target/wildcard to the scoped path whenever the session carries any scope entry that could participate (or simply any scope entry), then perform static graph checks and delta-derived graph authorization without evaluating D. Add this routing condition explicitly to the non-interference acceptance test, including a GRAPH ?var update whose bindings differ only in D outside M. Reconcile the numbered gate ordering with that rule.",
+    "severity": "major",
+    "title": "Scoped-path selection is circular for variable graph targets"
+   }
+  ],
+  "progress": null,
+  "summary": "The shadow-apply direction is well motivated, but the design leaves a load-bearing routing decision circular. It says the unchanged graph-level gate runs first, while also requiring that its variable-graph resolution never run over the full store for a scoped request. Yet the next gate decides whether the request is scoped based on whether a targeted graph has a scope entry, and GRAPH-variable targets are not known until precisely that potentially leaking resolution/evaluation occurs. The document needs a fail-closed, non-interfering rule for selecting the scoped path before any full-store evaluation; otherwise an implementation following the stated ordering can reproduce the W4 oracle the record is intended to prevent.",
+  "verdict": "request_changes"
+ }
+}
