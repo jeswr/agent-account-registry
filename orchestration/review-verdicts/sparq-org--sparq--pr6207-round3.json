@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6207,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cdbad6c5d74b19953b9890a5ab8bc1262fec06e9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The extracted poller preserves the existing approval policy while replacing the silently truncated issue-list query with exhaustive REST pagination, filtering pull requests, failing closed on fetch errors/runaway snapshots, and checking the trust-boundary label-removal result before applying triage writes. The hermetic self-test exercises the real driver seam with more than 200 quarantined issues, an old approved issue, stale and outsider approvals, malformed timestamps, dry-run behavior, PR filtering, and failed un-quarantine behavior; it passes at the PR head. Workflow wiring runs both policy and driver self-tests before the write-enabled poll. No correctness, soundness, security, or vacuity defect was found in the changed scope.",
+  "verdict": "approve"
+ }
+}
