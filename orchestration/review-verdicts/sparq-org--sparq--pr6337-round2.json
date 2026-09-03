@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6337,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e7c8a6c2285c96a3aa1c50d4ad99a9b71b58a828",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently guards decision-driving GitHub CLI enumerations against silent --limit truncation by rejecting boundary-sized results, while explicitly documenting intentionally bounded recency windows and the advisory warn-only path. The new tests exercise the real call paths or injected command seams at both the ceiling and immediately below it, so they are discriminating rather than vacuous. Error propagation is fail-closed in the mutating/authoritative Python paths, and the shell warning path preserves its pre-existing degraded-signal policy. I found no correctness, soundness, security, or test-validity defect in the supplied diff.",
+  "verdict": "approve"
+ }
+}
