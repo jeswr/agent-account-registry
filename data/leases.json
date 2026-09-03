@@ -33,12 +33,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "7eb70afc26bd4ef9bc59ab039990f570",
-   "holder": "review:sparq-org/sparq#6312@dispatch-33715066312.1",
+   "holder": "review:sparq-org/sparq#6312@33715997603.1",
    "package": "sparq-solid",
    "role": "review",
    "model": "sol",
-   "issued_at": 1788410510,
-   "expires_at": 1788414710
+   "issued_at": 1788410545,
+   "expires_at": 1788414745
   }
  ]
 }
