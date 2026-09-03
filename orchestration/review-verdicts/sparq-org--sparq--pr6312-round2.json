@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6312,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "88c833e09a6c9a10bae8260e9d7a5fbde25bb62d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Both rename checks use `String::replace` on the full `<R>.acl` or `<R>.acr` lexical prefix. The builders also embed that prefix in authorization/control/policy/matcher subject IRIs, so the transformed corpus does not contain the same triples or the same subjects under a different graph name, despite the comments claiming exactly that. The ACP path can therefore become inert because required internal ACR links were renamed or made inconsistent, rather than solely because the quad graph name lacks the recognized suffix; the WAC test has the same isolation problem. This makes the tests insufficient evidence for clause 3's name-only recognition contract.",
+    "file": "crates/sparq-solid/tests/embedding_contract.rs",
+    "fix_hint": "Rewrite only the fourth N-Quads term (the graph label) on control-document quads, leaving every subject, predicate, and object byte-for-byte unchanged. Assert that parsing the original and transformed corpora yields identical SPO triples and differs only in graph names, then retain the positive grant and negative inertness assertions for both WAC and ACP.",
+    "severity": "major",
+    "title": "Suffix tests change RDF subjects as well as the control graph name"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The two round-1 findings are addressed: the contract now distinguishes authorized resource names from loaded graphs, and an ACP counterpart was added. However, both suffix tests globally replace the control-document IRI, changing control-node and policy IRIs inside the RDF statements as well as the graph name. They therefore do not prove the documented load-bearing invariant that the same authorization triples under only a different graph name are inert. Because this is the regression evidence used to pin a proposed stable embedding contract, the remaining test-validity issue is major. A new finding remains, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
