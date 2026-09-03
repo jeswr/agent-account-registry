@@ -1828,7 +1828,7 @@ _selftest_requirement_apt_package() {
 # derived from SELFTEST_ENV_REQUIREMENTS, and must not remove one later in that stage. Package order,
 # apt's -y/--yes spelling, extra packages, and separate install instructions are immaterial.
 _assert_worker_image_gate_deps() {
-  local file="$1"
+  local file=$1 table=${2:-$SELFTEST_ENV_REQUIREMENTS}
   [[ -f "$file" ]] || return 1
   local instructions label kind probe pattern package line rest token installed
   local -a packages=()
@@ -1836,7 +1836,7 @@ _assert_worker_image_gate_deps() {
     [[ -n "$label" ]] || continue
     package=$(_selftest_requirement_apt_package "$kind" "$probe") || return 1
     packages+=("$package")
-  done <<< "$SELFTEST_ENV_REQUIREMENTS"
+  done <<< "$table"
   [[ ${#packages[@]} -gt 0 ]] || return 1
 
   # Reset at each FROM: only instructions in the last (runtime) stage can provision the worker.
@@ -2165,9 +2165,11 @@ _workflow_steps_referencing() {
 # sit inside the same checksum boundary as a fresh download.
 # [issue #431] Those pins used to be hard-coded HERE **and** in pr-gate.yml, so a bump could drift
 # the two lint lanes onto different actionlints. They now live in exactly one place —
-# scripts/actionlint.pin — which both lanes PARSE (never source). Still checked-in, still never
-# env-supplied: the path below is derived from SCRIPT_DIR, not from the environment, so nothing
-# PR- or env-controlled can swap in a different artifact.
+# scripts/actionlint.pin — which both lanes PARSE (never source). This default is the orchestrator
+# tree's pin; registry_selftest_gate deliberately overrides it with the TARGET TREE's checked-in
+# pin so the worker and pr-gate lanes grade the same candidate diff. A candidate can therefore
+# select a genuine actionlint release, but cannot change the fixed download host/path or execute
+# unverified bytes: the version shape is constrained and both artifact digests are still verified.
 _ACTIONLINT_PIN_FILE="$SCRIPT_DIR/actionlint.pin"
 
 # PURE (self-tested): _actionlint_pin <key> [pin-file] — print the single-source pinned value for
@@ -2305,8 +2307,10 @@ _fetch_pinned_actionlint_unpack() {
 # cached binary is re-verified against the pinned binary digest on every reuse, and one that fails
 # (tampered, truncated, stale) is DISCARDED and re-provisioned — never executed. The optional
 # params exist only so the self-test can exercise the cache-verification and refusal paths offline
-# via fixtures; the sole production call site passes no arguments, so nothing PR- or
-# env-controlled can swap the pins.
+# via fixtures. The registry gate's sole production call site supplies only the parsed TARGET
+# TREE pin path; that reviewed candidate diff may select the genuine release being checked, while
+# the version-shape constraint and both digest checks keep the artifact inside the verification
+# boundary described above.
 # [issue #431] The defaults are resolved from scripts/actionlint.pin on every call. That resolution
 # is itself fail-closed: an absent/duplicated/malformed pin REFUSES here rather than falling back
 # to some other version — there is no unpinned path to an actionlint binary.
@@ -2463,7 +2467,7 @@ registry_selftest_gate() {
       printf 'worker-live: base-image pin check %s\n' "$name"
       _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
       if [[ "$name" == containers/worker-model.Dockerfile ]]; then
-        SELFTEST_ENV_REQUIREMENTS="$tree_env_requirements" _assert_worker_image_gate_deps "$name" \
+        _assert_worker_image_gate_deps "$name" "$tree_env_requirements" \
           || die "worker model image final stage does not provision every SELFTEST_ENV_REQUIREMENTS dependency for the registry gate: $name"
       fi
       direct=$((direct + 1))
@@ -4291,6 +4295,9 @@ self_test() {
   chk "#1576 requirement reader returns the CANDIDATE script's complete table" \
     "$(_selftest_env_requirements_from_script "$reqfix" | paste -sd, -)" \
     "Candidate|command|candidate-1576|candidate-consumer,Second|pymodule|second_1576|second-consumer"
+  chk "#1576 requirement reader round-trips worker-live.sh's live multi-line table" \
+    "$(_selftest_env_requirements_from_script "$SCRIPT_DIR/worker-live.sh")" \
+    "$SELFTEST_ENV_REQUIREMENTS"
   printf '%s\n' "SELFTEST_ENV_REQUIREMENTS='One|command|one|one'" \
     "SELFTEST_ENV_REQUIREMENTS='Two|command|two|two'" > "$reqfix"
   chk "#1576 duplicated candidate requirement tables REFUSE (no ambiguous policy input)" \
@@ -4312,7 +4319,16 @@ self_test() {
   chk "#1576 wiring: the gate no longer preflights the ORCHESTRATOR requirement table" \
     "$(printf '%s\n' "$gate_body" | grep -c '"$SELFTEST_ENV_REQUIREMENTS" "$SCRIPT_DIR"' || true)" "0"
   chk "#1576 wiring: the gate no longer provisions from the ORCHESTRATOR actionlint pin" \
-    "$(printf '%s\n' "$gate_body" | grep -Ec 'actionlint_bin=\$\(_ensure_actionlint\)$' || true)" "0"
+    "$(printf '%s\n' "$gate_body" | grep -Fc 'actionlint_bin=$(_ensure_actionlint)' || true)" "0"
+  local legacy_actionlint_body='[[ -n "$actionlint_bin" ]] || actionlint_bin=$(_ensure_actionlint) || die refused'
+  chk "#1576 wiring: the legacy bare actionlint provisioning detector is non-vacuous" \
+    "$(printf '%s\n' "$legacy_actionlint_body" | grep -Fc 'actionlint_bin=$(_ensure_actionlint)' || true)" "1"
+  chk "#1576 wiring: the model-image check reads the parsed TARGET-TREE table explicitly" \
+    "$(printf '%s\n' "$gate_source_body" \
+       | grep -Fxc '_assert_worker_image_gate_deps "$name" "$tree_env_requirements" \' || true)" "1"
+  chk "#1576 wiring: the model-image check no longer reads the ORCHESTRATOR table implicitly" \
+    "$(printf '%s\n' "$gate_body" \
+       | grep -Fc '_assert_worker_image_gate_deps "$name" ||' || true)" "0"
   chk "#824 wiring: the gate calls the dependency preflight" \
     "$(printf '%s\n' "$gate_body" | grep -c '_selftest_env_blocked')" "1"
   chk "#824 wiring: an ENV-BLOCKED preflight REFUSES the gate, it does not warn and continue" \
@@ -5415,6 +5431,10 @@ PY
   chk "a worker image missing PyYAML is REJECTED (dependency deletion is non-vacuous)" \
     "$( _assert_worker_image_gate_deps "$tmp/deps-missing.Dockerfile" \
         && echo provisioned || echo absent)" "absent"
+  chk "an explicit CANDIDATE table, not the orchestrator table, drives the image verdict" \
+    "$( _assert_worker_image_gate_deps "$tmp/deps-missing.Dockerfile" \
+        'Candidate|command|jq|candidate-consumer' \
+        && echo provisioned || echo absent)" "provisioned"
   printf '%s\n' \
     'FROM rust:1.88@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
     'RUN false && apt-get update && apt-get install --yes --no-install-recommends jq python3-yaml && rm -rf /var/lib/apt/lists/*' \
