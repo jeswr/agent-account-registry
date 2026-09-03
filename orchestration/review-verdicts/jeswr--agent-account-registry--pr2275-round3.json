@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2275,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e3ae6af37e063a64a39bb41b39fdeece8afc4648",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`definition_time_parts` scans every `type_params` node, but PEP 695 type-parameter bounds and constraints are lazily evaluated in Python 3.12, when the bound or constraints attribute is accessed, rather than while the function or class is defined. Thus a definition such as `def f[T: _load_module(Path(__file__).resolve().with_name(\"lazy.py\"), \"x\")](): ...` is reported as an import-time sibling even though importing the module does not execute that load. This violates the function's import-time-only contract and makes the LIVE declared-vs-derived exactness check demand a phantom checkout dependency. There is also no fixture exercising this newly added `type_params` branch.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Do not scan lazy PEP 695 bound/constraint/default expressions as definition-time parts. Model their actual runtime evaluation semantics for each supported Python version, and add a Python-3.12-capable synthetic fixture proving a loader in a type-parameter bound is excluded while genuinely eager decorators/defaults remain included.",
+    "severity": "major",
+    "title": "Lazy PEP 695 type-parameter bounds are misclassified as import-time loads"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 defect is fixed for decorators, defaults, keyword-only defaults, lambdas, methods, and runtime-evaluated annotations, with non-vacuous boundary fixtures. However, the new PEP 695 handling classifies type-parameter expressions as definition-time execution. On Python 3.12 those bounds and constraints are lazily evaluated, so this can derive a checkout dependency that is not required at module import and contradicts the exactness contract. This is a new major finding, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
