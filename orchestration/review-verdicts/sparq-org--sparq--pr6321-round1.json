@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6321,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0964bb26478eb8bc80a74408c3a02d7ac868a0e5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The command substitution redirects stderr and ignores the exit status: `open_heads=\"$(gh pr list ... 2>/dev/null)\"`. If GitHub is unavailable, authentication expires, the query syntax fails, or `gh` returns any other non-zero status, `open_heads` is usually empty and execution continues to push a new branch and create a PR. This violates the claimed `ONE OPEN RESYNC PR AT A TIME` fail-safe and can produce PR-per-tick spam during an API failure while an earlier resync PR remains open. The existing harness has no failing-`gh pr list` case, so it passes vacuously for this failure mode.",
+    "file": "scripts/beads-export-push.sh",
+    "fix_hint": "Capture and check the status of `gh pr list`; under `--apply`, abort before creating a commit/branch if the query fails. Extend `scripts/tests/test_beads_export_push.sh` so its `gh` stub can fail specifically for `pr list`, then assert exit non-zero, no remote resync branch, and no `pr create` call.",
+    "severity": "major",
+    "title": "Open-PR guard fails open when `gh pr list` errors"
+   }
+  ],
+  "progress": null,
+  "summary": "The git-plumbing path and destructive-export guards are thoughtfully designed, but the apply path does not fail closed when the GitHub open-PR query fails. A transient authentication, API, or jq error is indistinguishable from an empty result, so the cron can create another resync branch/PR despite the documented one-open-PR invariant. The end-to-end test stubs only successful `gh pr list` responses and therefore does not exercise this load-bearing failure mode.",
+  "verdict": "request_changes"
+ }
+}
