@@ -43,12 +43,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "44bf7a03d12f4f69b290a2963e57e134",
-   "holder": "jeswr/agent-account-registry#1507@dispatch-33773856713.1",
+   "holder": "jeswr/agent-account-registry#1507@33776214468.1",
    "package": "ci",
    "role": "ci",
    "model": "sol",
-   "issued_at": 1788451332,
-   "expires_at": 1788454032
+   "issued_at": 1788451364,
+   "expires_at": 1788454064
   }
  ]
 }
