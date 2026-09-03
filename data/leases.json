@@ -33,12 +33,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "01d2dbe4a021485bbe8990879491455d",
-   "holder": "review:sparq-org/sparq#6344@dispatch-33812490018.1",
+   "holder": "review:sparq-org/sparq#6344@33813172167.1",
    "package": "zk-xpath",
    "role": "review",
    "model": "sol",
-   "issued_at": 1788474470,
-   "expires_at": 1788478670
+   "issued_at": 1788474502,
+   "expires_at": 1788478702
   }
  ]
 }
