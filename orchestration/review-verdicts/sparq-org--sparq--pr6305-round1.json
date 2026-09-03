@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6305,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a0380f044106a620da61fb4a92cfce6872784a5d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly neutralizes every run of three or more backticks before untrusted fuzz-case text is embedded in backtick-fenced Markdown, while preserving the raw log as the authoritative artifact. Defense is applied both during parsing and at both rendering sinks, covering callers that bypass the parser. The added hermetic self-test exercises the real parser, issue-body builder, artifact writer, raw-log preservation, non-fence backticks, and idempotence; it passes.",
+  "verdict": "approve"
+ }
+}
