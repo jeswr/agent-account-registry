@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2275,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "daa0257e8a9a11c5ba53e680a90c0a20bce64c75",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`scan` skips every `FunctionDef`, `AsyncFunctionDef`, and `Lambda` wholesale. Only their bodies are deferred: decorators, parameter defaults, keyword-only defaults, and annotations are evaluated when the definition is created (and lambda defaults are evaluated when the lambda expression is evaluated). For example, a module-level `def f(x=_load_module(Path(__file__).resolve().with_name(\"new.py\"), \"n\")):` adds an eager dependency of every invocation, but `import_time_sibling_loads` omits it, so `_pin_derived` remains unchanged and the LIVE exactness row stays green. The same hole applies to method decorators/defaults while a class body executes. The fixture covers only calls inside function and method bodies, not these distinct eager parts of definitions.",
+    "file": "scripts/groom.py",
+    "fix_hint": "For function/async-function nodes, scan decorators, defaults, keyword-only defaults, return/parameter annotations, and any type-parameter expressions supported by the runtime, while excluding only the deferred function body. For lambdas, scan defaults but exclude the body. Add independent synthetic cases proving a default/decorator load is included while a body-local load remains excluded.",
+    "severity": "major",
+    "title": "Definition-time expressions are omitted from import-time dependency derivation"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nBoth round-1 findings are fixed: module-level class bodies are traversed, and each groom invocation now requires an executable qualifying checkout at an earlier step index. However, the AST walk still skips whole function and lambda definition nodes, even though defaults, decorators, and annotations on those definitions execute eagerly when the definition is created. A path load in any of those expressions is therefore a real import-time dependency that remains invisible to the derived set and LIVE exactness assertion. Because this is a new major finding despite resolution of the prior two, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
