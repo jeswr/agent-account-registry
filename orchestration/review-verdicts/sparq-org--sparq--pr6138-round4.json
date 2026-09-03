@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6138,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b0a25464ad1dcc50f96006259632a621180778af",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The new KEEP-list documentation consistently preserves push-to-main coverage measurement as the load-bearing backstop after merge-group demotion. The structural test is non-vacuous: its frozen upstream sets exactly match the live workflow for all three coverage jobs; any added conditional pre-job in `needs:` fails directly, while job-level `needs.<job>...` references are independently rejected. This complements the existing event-envelope assertions and covers the planned `queue-validated` guard shapes without changing production behavior. No correctness, soundness, security, or test-validity issue is evident. The focused unittest could not execute because PyYAML is unavailable, but the test and corresponding live workflow definitions were inspected directly.",
+  "verdict": "approve"
+ }
+}
