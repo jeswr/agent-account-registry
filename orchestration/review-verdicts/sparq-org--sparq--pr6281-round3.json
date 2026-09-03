@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6281,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1a4c158c9e69629701a4aa74aa3c210b84da1993",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`NotifyState` is generic, its public constructor now takes `Arc<LdpState<S>>`, and the three public handler signatures changed. The repository maintenance rule requires the matching `skills/solid-lws-server/SKILL.md` documentation to change in the same PR, but no skill file appears in this diff. Updating the crate README does not satisfy that explicit requirement.",
+    "file": "crates/sparq-lws-core/src/notifications/ws.rs",
+    "fix_hint": "Update `skills/solid-lws-server/SKILL.md` and any referenced examples that construct `NotifyState` or directly invoke these handlers, or avoid exposing these implementation details as public API if they are not intended for consumers.",
+    "severity": "major",
+    "title": "Public API changes still lack the required usage-skill update"
+   },
+   {
+    "body": "`receive_authorized_bound_web_id_reaches_the_upgrade` still only asserts that the response is neither 401 nor 403. An unrelated 400, 404, or 500 before or during authorization would pass, so the test does not establish that token validation and WAC succeeded and that the supplied `WebSocketUpgradeRejection` response was surfaced. The zero-subscriber assertion cannot distinguish those paths because every non-upgrade response leaves the count at zero.",
+    "file": "crates/sparq-lws-core/src/notifications/ws.rs",
+    "fix_hint": "Create one `WebSocketUpgradeRejection`, record its exact expected response status (or response) before passing it to `receive_handler`, and assert exact equality with the handler response. Alternatively, perform a genuine WebSocket upgrade and prove successful registration for an authorized bound WebID.",
+    "severity": "major",
+    "title": "Authorized receive-path test remains vacuous for the claimed outcome"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 is stagnant: both round-2 major findings remain unresolved. The WAC implementation appears coherently fail-closed and the new denial tests cover meaningful paths, but the public notification API changes still have no matching usage-skill update, and the authorized receive-path test still does not prove that the WebSocket extractor's specific rejection was reached.",
+  "verdict": "request_changes"
+ }
+}
