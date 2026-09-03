@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6325,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "283f08a69a7c20d400f4e9cc245cfb31099ebf15",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The shared helper correctly makes label-filtered open-issue listing the primary lookup, preserves the legacy search only as a migration/truncation supplement, distinguishes an unavailable probe from a confirmed miss, and keeps the coverage caller read-only. The three filers now create and apply their load-bearing labels before dedupe, while bench triage uses its existing labels. The hermetic test exercises every real call site, the lagging-index regression, fallback/backfill behavior, failure semantics, and CI wiring; all 23 tests pass. No correctness, soundness, security, or test-validity defects were found in the diff.",
+  "verdict": "approve"
+ }
+}
