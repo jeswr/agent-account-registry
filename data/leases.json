@@ -12,16 +12,6 @@
   },
   {
    "account": "f79434c3ffba014f",
-   "claim_id": "4e39d75255ef43e1949cfc954c5e6593",
-   "holder": "jeswr/agent-account-registry#1022@33733643215.1",
-   "package": "review-loop",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1788424203,
-   "expires_at": 1788426903
-  },
-  {
-   "account": "f79434c3ffba014f",
    "claim_id": "8e5a94e02f6543038647fab8d148c67e",
    "holder": "sparq-org/sparq#5426@33734470750.1",
    "package": "ci",
