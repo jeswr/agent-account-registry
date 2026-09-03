@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2244,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "de5e967e2dbcc9b23d496d99b6c0c0456d78386f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added documentation accurately describes both refusal-count fields and their distinct consumer semantics. The generator derives each count from its own bounded diagnostic seam, counts all refused rows (including a single refusal for a present non-list container), and publishes both keys unconditionally, including zero. The dashboard displays positive counts at the stated locations; queue trend sampling additionally requires queue_dropped to be exactly numeric zero, so missing or refused-count snapshots create a null gap. The collector/output boundary and legacy/hostile-value behavior are also represented correctly. This documentation-only diff neither changes nor weakens trust-plane behavior, and contains no reviewer-directed instruction.",
+  "verdict": "approve"
+ }
+}
