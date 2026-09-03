@@ -13871,11 +13871,34 @@ def _self_test() -> int:
         }
 
         def _trigger_count(text: str, trigger: str) -> int:
-            # Only the top-level `on:` block can schedule/dispatch a workflow. Stop at `jobs:` so
-            # a quoted command or explanatory comment in a step cannot impersonate a trigger.
-            prefix = text.split("\njobs:\n", 1)[0]
-            return sum(1 for line in prefix.splitlines()
+            # Only the top-level `on:` block can schedule/dispatch a workflow. Stop at ANY next
+            # top-level key (including `jobs:  # comment`) so formatting, a job named `schedule`,
+            # or a quoted command cannot impersonate a trigger. Column-zero comments within the
+            # trigger block are intentionally transparent, matching the repository's workflow
+            # commentary style.
+            trigger_block = []
+            inside_on = False
+            for line in text.splitlines():
+                if not inside_on:
+                    inside_on = line == "on:"
+                    continue
+                if line and not line[0].isspace() and not line.lstrip().startswith("#"):
+                    break
+                trigger_block.append(line)
+            return sum(1 for line in trigger_block
                        if re.match(rf"^  {re.escape(trigger)}:\s*(?:\{{\}})?\s*$", line))
+
+        trigger_decoy = ("on:\n"
+                         "  workflow_dispatch: {}\n"
+                         "# a column-zero comment does not end the trigger block\n"
+                         "jobs:  # an ordinary inline comment is permitted\n"
+                         "  schedule:\n"
+                         "    runs-on: ubuntu-latest\n")
+        check("YAML seam [#2256]: trigger scanning ends at a commented next top-level key and "
+              "cannot count a job named schedule as a cron",
+              (_trigger_count(trigger_decoy, "workflow_dispatch"),
+               _trigger_count(trigger_decoy, "schedule")),
+              (1, 0))
 
         schedule_counts = {
             name: _trigger_count(text, "schedule")
