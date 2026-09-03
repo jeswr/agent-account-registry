@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6314,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2b732838266e8a06f12f06547379764f5c84b9f7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ReleaseGuiBundleWasmPackInstall reads and splits all of release.yml. test_matrix_still_has_arm64_rows searches cls.code globally, while _wasm_pack_steps discovers installer steps globally. Consequently, moving the taiki-e wasm-pack step to another job and leaving arm64 runner names elsewhere would satisfy these tests even though gui-bundle no longer installs wasm-pack. The test therefore does not enforce the stated invariant on the real protected job.",
+    "file": "scripts/tests/test_js_wasm_pack_install.py",
+    "fix_hint": "Extract the gui-bundle job block first using an indentation-aware helper, then run the matrix-row checks and split_steps only over that job block. Add a mutation test that removes or moves the installer out of gui-bundle while retaining an equivalent wasm-pack step and arm64 strings in a sibling job, and assert that the guard fails.",
+    "severity": "major",
+    "title": "Release assertions are not scoped to the gui-bundle job"
+   }
+  ],
+  "progress": null,
+  "summary": "The workflow change itself is plausible and the focused test suite passes, but the new release guard does not actually scope its evidence to the gui-bundle job. Its arm64 checks search the entire release workflow, and its wasm-pack-step discovery likewise searches every job. The test can therefore remain green after the installer is removed from gui-bundle, provided matching runner strings and a wasm-pack install-action step exist elsewhere. This makes the load-bearing regression test vacuous with respect to the job it claims to protect.",
+  "verdict": "request_changes"
+ }
+}
