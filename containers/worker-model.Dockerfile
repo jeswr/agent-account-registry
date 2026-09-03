@@ -7,7 +7,9 @@ FROM rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f9
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 
 # The registry self-test gate executes jq filters and parses workflow YAML. Keep both in the model
-# image so an author sees failures from their change before the host-side PR gate runs.
+# image so an author sees failures from their change before the host-side PR gate runs. Package
+# versions intentionally follow the digest-pinned base image's authenticated Debian archive: this
+# trades byte-for-byte rebuilds for avoiding broken pins after Debian point-release replacements.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends jq python3-yaml \
     && rm -rf /var/lib/apt/lists/*
