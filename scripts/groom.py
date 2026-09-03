@@ -1422,6 +1422,225 @@ def _load_module(path: Path, name: str):
     return module
 
 
+# ---- CHECKOUT DEPENDENCY PIN (issue #2033) ------------------------------------------------------
+# [SPARQ agent] Every sibling script this module executes BY PATH at MODULE IMPORT, repository-
+# relative. These are not ordinary imports: `_load_module` / `spec_from_file_location` resolve them
+# beside `__file__` and exec them before `main()` exists, so a checkout missing any ONE of them
+# kills EVERY invocation of this script at import — `--print-owner-repos`, `--report-orphan-claims`,
+# `--self-test` and the sweep alike.
+#
+# Every workflow step that invokes this script takes a FULL checkout today (eight workflows, which
+# the LIVE rows in `--self-test` enumerate), so the exposure is LATENT, not live, and the failure
+# is loud (GroomError at import) rather than fail-open. That is
+# exactly the shape that gets broken later: making any one of those jobs sparse for least-exposure
+# reasons — the pattern this repo already applies widely, including to groom-sweep.yml's own
+# metrics-watchdog / plan-alert / groom-alert jobs — kills the step before it can print why.
+#
+# This is the control dispatch-secrets-guard.py's SELF_TEST_LIVE_INPUTS + sparse_checkout_covers_
+# verdict already provide for the guard job, and it exists here for the same measured reason
+# (#616/#618): a hand-maintained dependency list drifts silently away from the sparse-checkout list
+# nothing compares it to. So this tuple is PINNED here but DERIVED by import_time_sibling_loads
+# from this module's own AST — add a path load without declaring it and the self-test reds; declare
+# a phantom that would over-constrain the sparse lists and it reds too.
+PATH_LOADED_SIBLINGS = (
+    "scripts/gh_403.py",
+    "scripts/gh_retry.py",
+    "scripts/http_transient.py",
+    "scripts/ledger_retry.py",
+    "scripts/lease_schema.py",
+    "scripts/park_policy.py",
+)
+
+# An invocation of this script in workflow `run:` text: `python3 scripts/groom.py`, with the
+# optional checkout-path prefix dispatch.yml's CLAIM uses (`registry/scripts/groom.py`).
+GROOM_INVOCATION = re.compile(r"python3?\s+(?:[A-Za-z0-9_.-]+/)*scripts/groom\.py")
+
+
+def import_time_sibling_loads(source: str) -> tuple[str, ...]:
+    """Pure: the repository-relative siblings `source` loads by path at MODULE IMPORT time, sorted.
+
+    DERIVED, not trusted from a list, because the omission this pins is precisely the one a list
+    cannot catch (#616: a by-path script load added with neither list extended). Matches the
+    `Path(__file__).resolve().with_name("<x>.py")` idiom both load forms in this module use — the
+    `_load_module` calls and the bare `spec_from_file_location` pair at the top of the file.
+
+    Loads nested inside a `def`/`class`/`lambda` are deliberately EXCLUDED: those run on call, not
+    on import (policy-resolve.py, run_name_grammar.py, dispatch-secrets-guard.py), so they are not
+    a checkout dependency of every invocation and declaring them would over-constrain the sparse
+    lists this feeds. Raises SyntaxError on unparseable source — callers surface that as a refusal
+    rather than as an empty set, which would make every coverage check below vacuously true."""
+    found: set[str] = set()
+
+    def scan(node: Any) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+            ):
+                continue
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "with_name"
+                and len(child.args) == 1
+                and isinstance(child.args[0], ast.Constant)
+                and isinstance(child.args[0].value, str)
+                and child.args[0].value.endswith(".py")
+            ):
+                found.add(f"scripts/{child.args[0].value}")
+            scan(child)
+
+    scan(ast.parse(source))
+    return tuple(sorted(found))
+
+
+def workflow_job_steps(workflow_text: str) -> dict[str, list[list[str]]]:
+    """Pure: ``{job name: [step line-blocks]}`` for one workflow document, parsed WITHOUT PyYAML.
+
+    The `groom` job that runs this self-test does not install PyYAML (only the watchdog jobs do),
+    so the workflow seam is read by the same line discipline the burned-slot seam in `_self_test`
+    already uses. Jobs are the 2-space keys inside the `jobs:` mapping ONLY — scanning every
+    2-space key would also collect `on:`'s triggers and the top-level `env:`/`permissions:` keys.
+    An unlocatable `jobs:` mapping yields ``{}`` and the callers refuse: "zero jobs matched" must
+    never read as a pass."""
+    lines = workflow_text.splitlines()
+    try:
+        jobs_start = lines.index("jobs:")
+    except ValueError:
+        return {}
+    jobs_end = next(
+        (index for index in range(jobs_start + 1, len(lines))
+         if re.match(r"^[A-Za-z]", lines[index])),
+        len(lines),
+    )
+    heads = [index for index in range(jobs_start + 1, jobs_end)
+             if re.match(r"^  [A-Za-z_][A-Za-z0-9_-]*:\s*$", lines[index])]
+    jobs: dict[str, list[list[str]]] = {}
+    for position, head in enumerate(heads):
+        stop = heads[position + 1] if position + 1 < len(heads) else jobs_end
+        body = lines[head:stop]
+        starts = [index for index, line in enumerate(body) if re.match(r"^      - ", line)]
+        jobs[lines[head].strip().rstrip(":")] = [
+            body[start:(starts + [len(body)])[order + 1]]
+            for order, start in enumerate(starts)
+        ]
+    return jobs
+
+
+def sparse_checkout_entries(step_lines: list[str]) -> tuple[str, ...] | None:
+    """Pure: one checkout step's `sparse-checkout:` entries, or None when it declares none — i.e. a
+    FULL checkout, which covers every path. An EMPTY block returns ``()`` (covers nothing), so a
+    truncated list fails closed rather than reading as "no sparse checkout declared".
+
+    Both spellings in this repo are handled: the inline scalar (`sparse-checkout: scripts/x.py`)
+    and the block scalar. `sparse-checkout-cone-mode:` cannot match — the pattern requires the `:`
+    immediately after the key."""
+    for index, line in enumerate(step_lines):
+        match = re.match(r"^(\s*)sparse-checkout:(.*)$", line)
+        if match is None:
+            continue
+        indent, inline = match.group(1), match.group(2).strip()
+        if inline and inline.rstrip("+-") not in ("|", ">"):
+            return (inline,)
+        entries = []
+        for follow in step_lines[index + 1:]:
+            if not follow.strip():
+                continue
+            if len(follow) - len(follow.lstrip(" ")) <= len(indent):
+                break
+            text = follow.strip()
+            if not text.startswith("#"):
+                entries.append(text)
+        return tuple(entries)
+    return None
+
+
+def _sparse_entry_covers(entry: str, path: str) -> bool:
+    """Pure: does one sparse-checkout entry materialise `path`? Exact match, or a directory prefix
+    with or without its trailing slash (non-cone mode takes gitignore-style patterns, so a bare
+    `scripts` really does check out `scripts/gh_403.py`).
+
+    NOT `lstrip("./")` — that takes a SET OF CHARACTERS and would eat the leading dot of a dotfile
+    directory, which is how dispatch-secrets-guard's equivalent read `github/workflows/` (a typo
+    that checks out nothing) as covering `.github/workflows/dispatch.yml` (retro-review of #621)."""
+    normalized = entry.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized:
+        return False
+    return path == normalized or path.startswith(normalized.rstrip("/") + "/")
+
+
+def groom_checkout_coverage_verdict(
+    workflow_text: str, workflow_name: str, siblings: tuple[str, ...]
+) -> tuple[bool, str]:
+    """Pure: (ok, reason). Every job in `workflow_text` that invokes this script must check out
+    every path in `siblings` — via a full checkout, or via a sparse-checkout list covering all of
+    them. A workflow that never invokes this script is trivially ok.
+
+    Comments are NOT stripped, deliberately, and that is the fail-closed direction here: this
+    detects the PRESENCE of a dependency, so over-detection (treating a commented-out invocation as
+    real) only over-constrains a checkout, while under-detection would let a live invocation run in
+    a job whose checkout was never proven.
+
+    Checkout steps that pin an explicit `ref:` are EXCLUDED from the coverage decision. Every job
+    below also checks out the `ledger` data-plane branch, which is data-only: counting that
+    ref-pinned full checkout as covering `scripts/*.py` would satisfy this check while the sparse
+    registry checkout beside it materialised none of them. The `ref:` match is indent-tolerant on
+    purpose (#621: an exact-indent requirement makes a check refuse the moment a step is reflowed)
+    and errs toward excluding a step, because excluding one can only make this verdict STRICTER."""
+    invocation_lines = [line for line in workflow_text.splitlines()
+                        if GROOM_INVOCATION.search(line)]
+    if not invocation_lines:
+        return True, "ok (no groom.py invocation)"
+    if not siblings:
+        return False, (f"{workflow_name}: the declared path-loaded sibling set is EMPTY, so this "
+                       "check would pass whatever the checkouts contain — refusing (a coverage "
+                       "assertion over nothing is vacuous, not green)")
+    jobs = workflow_job_steps(workflow_text)
+    invoking: list[tuple[str, list[list[str]]]] = []
+    located = 0
+    for job_name, steps in sorted(jobs.items()):
+        hits = sum(1 for step in steps for line in step if GROOM_INVOCATION.search(line))
+        if hits:
+            located += hits
+            invoking.append((job_name, steps))
+    if located != len(invocation_lines):
+        return False, (
+            f"{workflow_name}: {len(invocation_lines)} line(s) invoke groom.py but only {located} "
+            "landed inside a located job step — the document could not be parsed into jobs and "
+            "steps, so the checkout of an invoking job cannot be proven (fail closed)")
+    problems = []
+    for job_name, steps in invoking:
+        checkouts = [step for step in steps
+                     if any("uses: actions/checkout@" in line for line in step)
+                     and not any(re.match(r"^\s+ref:", line) for line in step)]
+        if not checkouts:
+            problems.append(f"{job_name} invokes groom.py with no ref-less actions/checkout step")
+            continue
+        shortfalls = []
+        for step in checkouts:
+            entries = sparse_checkout_entries(step)
+            if entries is None:
+                shortfalls = []
+                break
+            absent = [path for path in siblings
+                      if not any(_sparse_entry_covers(entry, path) for entry in entries)]
+            if not absent:
+                shortfalls = []
+                break
+            if not shortfalls or len(absent) < len(shortfalls):
+                shortfalls = absent
+        if shortfalls:
+            problems.append(f"{job_name} is sparse and omits " + ", ".join(sorted(shortfalls)))
+    if problems:
+        return False, (
+            workflow_name + ": " + "; ".join(problems) + " — groom.py execs these siblings by path "
+            "at MODULE IMPORT, so the step dies with `groom: cannot load <x>.py` before it can do "
+            "anything. Add every path in PATH_LOADED_SIBLINGS to that job's sparse-checkout list, "
+            "or give the job a full checkout")
+    return True, "ok"
+
+
 def _policy_document(policy_file: Path) -> Any:
     try:
         with policy_file.open("rb") as handle:
@@ -1699,11 +1918,11 @@ _http_transient = _load_module(
 # through. groom's Retry-After adapter used to do its own `headers.get("Retry-After")` — the last
 # hand-written fragment of Retry-After handling left in this file after #928 moved the numeric
 # policy to gh_retry, and the residual half of registry #1410's "three divergent parsers".
-# CHECKOUT DEPENDENCY, same class as the two loads above and no wider: all six steps that invoke
-# this script take a FULL checkout today (groom-core.yml x2, dispatch.yml CLAIM, curate.yml,
-# conflict-resolver.yml, latch-watchdog.yml, reconcile-conflict-park.yml), and nothing yet PINS
-# that. Make one of them sparse without listing these siblings and `_load_module` raises GroomError
-# at import — the step dies LOUDLY, never silently degrading to a private lookup.
+# CHECKOUT DEPENDENCY, same class as the two loads above and no wider. Make an invoking job sparse
+# without listing these siblings and `_load_module` raises GroomError at import — the step dies
+# LOUDLY, never silently degrading to a private lookup. Since #2033 that is PINNED rather than
+# merely true: see PATH_LOADED_SIBLINGS, which is derived from these very call sites and asserted
+# against every invoking job's checkout in `--self-test`.
 _gh_403 = _load_module(Path(__file__).resolve().with_name("gh_403.py"), "registry_gh_403")
 _IDEMPOTENT_METHODS = {"GET", "HEAD"}
 _TRANSIENT_RETRIES = _gh_retry.MAX_ATTEMPTS  # total attempts before a transient failure fails loud
@@ -13894,6 +14113,179 @@ def _self_test() -> int:
         sys.argv = saved_orphan_argv
     check("orphan-claims CLI: --report-orphan-claims without --registry-repo is a usage error, "
           "not a silent pass", orphan_usage_code, 2)
+
+    # ---- THE YAML SEAM for the path-loaded-sibling checkout pin (issue #2033) --------------------
+    #
+    # groom.py execs six siblings BY PATH at module import. Nothing declared them, so making any
+    # invoking job sparse for least-exposure reasons killed every groom invocation at import. The
+    # two directions are pinned separately, on purpose: DERIVED-vs-DECLARED catches a new path load
+    # that nobody declared, and DECLARED-vs-CHECKOUT catches a declared sibling dropped from (or
+    # never added to) a sparse list. Neither subsumes the other.
+    #
+    # The fixtures below are built from SYNTHETIC sibling names, never from PATH_LOADED_SIBLINGS:
+    # an input derived from the constant the code reads would follow it wherever it went, which is
+    # AGENTS.md pre-flight item 2(c) verbatim.
+    _pin_alpha, _pin_beta = "scripts/alpha.py", "scripts/beta.py"
+    _pin_siblings = (_pin_alpha, _pin_beta)
+
+    def _pin_workflow(checkout: str, *, job: str = "groom", invoke: bool = True) -> str:
+        return (
+            "name: fixture\non:\n  schedule:\n    - cron: '0 * * * *'\n"
+            "permissions:\n  contents: read\n"
+            f"jobs:\n  {job}:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - name: Checkout registry\n"
+            "        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n"
+            "        with:\n          persist-credentials: false\n"
+            + checkout
+            + ("      - name: Sweep\n        run: |\n"
+               "          python3 scripts/groom.py --registry-repo o/r\n" if invoke else "")
+        )
+
+    _pin_full = ""
+    _pin_complete = ("          sparse-checkout: |\n            scripts/alpha.py\n"
+                     "            scripts/beta.py\n          sparse-checkout-cone-mode: false\n")
+    _pin_partial = ("          sparse-checkout: |\n            scripts/alpha.py\n"
+                    "          sparse-checkout-cone-mode: false\n")
+    _pin_dir = ("          sparse-checkout: scripts\n"
+                "          sparse-checkout-cone-mode: false\n")
+
+    check("#2033 checkout pin: a FULL checkout covers every path-loaded sibling",
+          groom_checkout_coverage_verdict(_pin_workflow(_pin_full), "fx.yml", _pin_siblings),
+          (True, "ok"))
+    check("#2033 checkout pin: a sparse list naming ALL the siblings passes",
+          groom_checkout_coverage_verdict(_pin_workflow(_pin_complete), "fx.yml", _pin_siblings),
+          (True, "ok"))
+    _pin_dropped = groom_checkout_coverage_verdict(
+        _pin_workflow(_pin_partial), "fx.yml", _pin_siblings)
+    check("#2033 checkout pin: a DROPPED sibling reds, and the refusal NAMES the omitted path and "
+          "ONLY it (the acceptance direction — this is the mutant that used to pass)",
+          (_pin_dropped[0], _pin_beta in _pin_dropped[1], _pin_alpha in _pin_dropped[1],
+           "groom is sparse" in _pin_dropped[1]),
+          (False, True, False, True))
+    check("#2033 checkout pin: a bare directory entry DOES materialise the siblings (non-cone "
+          "mode is gitignore-style) — this pin must not force a spurious rewrite",
+          groom_checkout_coverage_verdict(_pin_workflow(_pin_dir), "fx.yml", _pin_siblings),
+          (True, "ok"))
+    check("#2033 checkout pin: a workflow that never invokes groom.py is not constrained",
+          groom_checkout_coverage_verdict(_pin_workflow(_pin_partial, invoke=False),
+                                          "fx.yml", _pin_siblings)[0],
+          True)
+    check("#2033 checkout pin: an EMPTY sparse block covers nothing (a truncated list must not "
+          "read as `no sparse checkout declared`)",
+          groom_checkout_coverage_verdict(
+              _pin_workflow("          sparse-checkout: |\n"), "fx.yml", _pin_siblings)[0],
+          False)
+    check("#2033 checkout pin: an invoking job with NO ref-less checkout fails CLOSED",
+          groom_checkout_coverage_verdict(
+              "name: fx\njobs:\n  groom:\n    steps:\n      - name: Sweep\n        run: |\n"
+              "          python3 scripts/groom.py --registry-repo o/r\n",
+              "fx.yml", _pin_siblings)[0],
+          False)
+    check("#2033 checkout pin: a full checkout of the ledger DATA branch beside a deficient "
+          "registry checkout does NOT satisfy the pin (a ref-pinned checkout is excluded)",
+          groom_checkout_coverage_verdict(
+              _pin_workflow(
+                  _pin_partial
+                  + "      - name: Checkout ledger\n"
+                    "        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n"
+                    "        with:\n          path: ledger\n          ref: ledger\n"),
+              "fx.yml", _pin_siblings)[0],
+          False)
+    check("#2033 checkout pin: an unparseable document whose invocation lands in no located step "
+          "REFUSES rather than reporting zero invoking jobs",
+          groom_checkout_coverage_verdict(
+              "name: fx\njobs:\n  groom:\n    steps:\n    - name: Sweep\n      run: |\n"
+              "        python3 scripts/groom.py --registry-repo o/r\n",
+              "fx.yml", _pin_siblings)[0],
+          False)
+    check("#2033 checkout pin: a document with NO `jobs:` mapping refuses (an unlocatable job "
+          "set must not report `no invoking jobs`)",
+          groom_checkout_coverage_verdict(
+              "name: fx\nsteps:\n  - run: python3 scripts/groom.py --registry-repo o/r\n",
+              "fx.yml", _pin_siblings)[0],
+          False)
+    check("#2033 checkout pin: a BLANK line inside the sparse block scalar does not truncate the "
+          "list (a blank line does not end a YAML literal scalar — truncating here would red a "
+          "correct workflow and teach the next author to delete this check)",
+          sparse_checkout_entries(
+              "          sparse-checkout: |\n            scripts/alpha.py\n\n"
+              "            scripts/beta.py\n          sparse-checkout-cone-mode: false\n"
+              .splitlines()),
+          ("scripts/alpha.py", "scripts/beta.py"))
+    check("#2033 checkout pin: `./`-prefixed and directory entries cover, while a DEGENERATE "
+          "entry covers NOTHING (`./` must never read as `everything`)",
+          (_sparse_entry_covers("./scripts/alpha.py", _pin_alpha),
+           _sparse_entry_covers("scripts/", _pin_alpha),
+           _sparse_entry_covers("./", _pin_alpha),
+           _sparse_entry_covers("script", _pin_alpha)),
+          (True, True, False, False))
+    check("#2033 checkout pin: an EMPTY declared set is a refusal, never a vacuous pass",
+          groom_checkout_coverage_verdict(_pin_workflow(_pin_partial), "fx.yml", ())[0],
+          False)
+    check("#2033 checkout pin: the CLAIM spelling `registry/scripts/groom.py` is recognised as an "
+          "invocation (a path-prefixed call must not slip the pin)",
+          groom_checkout_coverage_verdict(
+              _pin_workflow(_pin_partial).replace("python3 scripts/groom.py",
+                                                  "python3 registry/scripts/groom.py"),
+              "fx.yml", _pin_siblings)[0],
+          False)
+
+    # DERIVED-vs-DECLARED. The fixture source uses the two real load idioms with invented names.
+    _pin_source = (
+        'import importlib.util\nfrom pathlib import Path\n'
+        '_a = _load_module(Path(__file__).resolve().with_name("alpha.py"), "a")\n'
+        '_spec = importlib.util.spec_from_file_location(\n'
+        '    "b", Path(__file__).resolve().with_name("beta.py"))\n'
+        'def later():\n'
+        '    return _load_module(Path(__file__).resolve().with_name("gamma.py"), "g")\n'
+        'class Holder:\n'
+        '    def load(self):\n'
+        '        return Path(__file__).resolve().with_name("delta.py")\n'
+    )
+    check("#2033 load derivation: BOTH import-time load idioms are seen, and a load nested in a "
+          "def/class (lazy — not a dependency of every invocation) is NOT",
+          import_time_sibling_loads(_pin_source), (_pin_alpha, _pin_beta))
+    check("#2033 load derivation: an UNDECLARED import-time load reds against a declared set that "
+          "omits it (the second acceptance direction)",
+          (import_time_sibling_loads(_pin_source) == (_pin_alpha,),
+           set(import_time_sibling_loads(_pin_source)) - {_pin_alpha}),
+          (False, {_pin_beta}))
+
+    # ---- the LIVE rows: this checkout, these workflows -------------------------------------------
+    try:
+        _pin_root = Path(__file__).resolve().parent.parent
+        _pin_derived = import_time_sibling_loads(
+            Path(__file__).resolve().read_text(encoding="utf-8"))
+        check("#2033 LIVE: PATH_LOADED_SIBLINGS is EXACTLY what groom.py path-loads at import "
+              "(add a load without declaring it, or declare a phantom, and this reds)",
+              _pin_derived, tuple(sorted(PATH_LOADED_SIBLINGS)))
+        check("#2033 LIVE: the derived set is non-empty and includes the #1410 403 taxonomy — a "
+              "derivation that silently resolved empty would make every coverage row vacuous",
+              (len(_pin_derived) >= 3, "scripts/gh_403.py" in _pin_derived), (True, True))
+        _pin_documents = sorted(
+            (path.name, path.read_text(encoding="utf-8"))
+            for path in (_pin_root / ".github" / "workflows").glob("*.yml"))
+        _pin_verdicts = {
+            name: groom_checkout_coverage_verdict(text, name, PATH_LOADED_SIBLINGS)
+            for name, text in _pin_documents
+        }
+        _pin_invoking = sorted(name for name, text in _pin_documents
+                               if GROOM_INVOCATION.search(text))
+        # The REASON, not just the name: a bare workflow name would make the operator re-derive
+        # which sibling is missing from which job, which is the whole diagnostic this pin exists
+        # to hand them.
+        check("#2033 LIVE: every workflow invoking groom.py checks out all of "
+              "PATH_LOADED_SIBLINGS",
+              sorted(reason for _name, (ok_, reason) in _pin_verdicts.items() if not ok_), [])
+        check("#2033 LIVE: the sweep actually FOUND the invoking workflows — zero matched must "
+              "never read as a pass",
+              _pin_invoking,
+              ["conflict-resolver.yml", "curate.yml", "dispatch.yml", "groom-core.yml",
+               "groom-recovery-minimal.yml", "groom-sweep.yml", "latch-watchdog.yml",
+               "reconcile-conflict-park.yml"])
+    except Exception as exc:                       # noqa: BLE001 - fail CLOSED, never skip
+        check(f"#2033 LIVE: the path-loaded-sibling checkout pin is measurable "
+              f"({type(exc).__name__}: {exc})", False, True)
 
     # ---- THE YAML SEAM for the burned-slot report ------------------------------------------------
     # The measured lesson of this estate: the uncaught mutants live one level ABOVE the Python — a
