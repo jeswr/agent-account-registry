@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 6296,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c88a619edb446424b4a0b13f4075a606cd25441d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "package_has_ci_leg() searches for the raw substring `packages/{pkg}`. Therefore a new package whose name is a prefix of an existing package (for example `sparq` when a workflow mentions `packages/sparq-client`) is incorrectly considered to have a CI leg. This defeats the load-bearing requirement that the new package itself be named by a workflow, and the invented `sparq-foo` test does not exercise the collision.",
+    "file": "scripts/gate-new-crate.py",
+    "fix_hint": "Match a package path boundary after the package name (end of token/path, `/`, quote, or YAML delimiter), or parse workflow scalar values sufficiently to compare exact package directory paths. Add a regression test where `packages/foo-bar` is present but `package_has_ci_leg(\"foo\")` must be false.",
+    "severity": "major",
+    "title": "CI package-name check can be satisfied by a different package"
+   },
+   {
+    "body": "evaluate_packages() checks README membership in `changed`, and package_has_tests() scans the same all-status list. `parse_status_lines()` includes deleted paths in that list. If a PR adds package.json to a pre-existing directory while deleting its README or tests, the gate passes those requirements even though the files are absent at HEAD. That contradicts the documented guarantee that a new package ships these artifacts.",
+    "file": "scripts/gate-new-crate.py",
+    "fix_hint": "Require the artifacts to exist as files in the PR-head worktree, or pass a non-deleted/added-and-modified path set into these checks. Add status-D regression tests for both README.md and a recognized test path.",
+    "severity": "major",
+    "title": "Deleted README and test files count as shipped artifacts"
+   },
+   {
+    "body": "package_is_private() treats the string `\"true\"` as private even though package.json's `private` field is a boolean and npm's publication safeguard is `private: true`. This means a malformed manifest can be exempted from tests and CI while not carrying the actual npm publication protection. The docstring's claim that this is npm's publishable predicate is therefore not sound.",
+    "file": "scripts/gate-new-crate.py",
+    "fix_hint": "Return true only for the JSON boolean true. Let malformed or wrongly typed values fail strict as public (or report a manifest error), and add a test asserting that `\"private\": \"true\"` does not receive the exemption.",
+    "severity": "major",
+    "title": "String private value creates a publication-policy escape hatch"
+   }
+  ],
+  "progress": null,
+  "summary": "The npm completeness gate has multiple fail-open cases that let a publishable package merge without the artifacts the new rule claims to require. In particular, CI detection uses an unbounded substring, artifact checks accept deleted paths, and the private predicate treats an npm-invalid string value as an exemption. The added tests do not cover these bypasses.",
+  "verdict": "request_changes"
+ }
+}
