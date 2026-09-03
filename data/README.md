@@ -99,21 +99,29 @@ total is a whole NUMBER OF ROWS greater than the slice beside it — a missing, 
 fractional or already-satisfied total is "no truncation known" and draws nothing, so a document
 published before #1868 or edited by hand degrades to the old silence instead of a fabricated count.
 
-**The two REFUSAL counts ride beside those totals: `flow.queue_dropped` (#1896) and
-`flow.target_ci_queue_dropped` (#2173).** Each is how many rows this build REFUSED at that seam —
-every drop, not the subset that fit the per-seam warning budget, so a flood publishes `20` beside
-the 12 lines it printed — and an array supplied as something other than a list is the ONE drop it
-is, since no row of it was ever read. They are OUTPUT-side keys on the same terms as the totals: a
-collector neither sends them nor is read for them, and both publish on EVERY build, including the
-ones that refused nothing. That zero row is the point (#2039 left this ambiguity standing on the
+**The three REFUSAL counts ride beside those totals: `flow.queue_dropped` (#1896),
+`flow.target_ci_queue_dropped` (#2173), and the top-level `trigger_summary_dropped` (#2233).** The
+first two count how many rows this build REFUSED at their seam — every drop, not the subset that fit
+the per-seam warning budget, so a flood publishes `20` beside the 12 lines it printed — and an array
+supplied as something other than a list is the ONE drop it is, since no row of it was ever read.
+They are OUTPUT-side keys on the same terms as the totals: a collector neither sends them nor is
+read for them, and all three publish on EVERY build, including the ones that refused nothing. That
+zero row is the point (#2039 left this ambiguity standing on the
 page): an empty `flow.queue` is what an idle queue renders as and an empty `flow.target_ci_queue`
 is what a fleet with no congested targets renders as, so without a count the operator reading the
 page cannot tell either from an input the generator threw away — a loss the build log names and
-nobody reads. The PAGE rule is `> 0`, not the totals' `total > shown`: `dashboard/app.js` draws
+nobody reads. `trigger_summary_dropped` counts summaries refused by `_obs_text_capped`; those fire
+rows still publish with an empty `summary` and `summary_length: 0`, so the count describes neither
+a dropped row nor truncation. It covers every well-formed fire before the 20-row display cap and
+may therefore exceed the slice beside it. The row-count PAGE rule is `> 0`, while the trigger
+summary count additionally has to be a whole number; neither uses the totals' `total > shown` rule.
+`dashboard/app.js` draws
 `N queue rows were unreadable` under the queue list and `N target CI rows were unreadable` on the
-flow card only for a positive number, so a missing, non-numeric or zero count draws nothing and a
-document published before #1896/#2173 or edited by hand degrades to silence rather than a
-fabricated refusal. `queue_dropped` has one further consumer, and it reads the key the other way
+flow card for a positive number, or `N trigger summaries were unreadable` under the trigger list for
+a positive integer. Thus a missing, non-numeric or zero count draws nothing; a fractional trigger
+count does too. A document published before #1896/#2173/#2233 or edited by hand degrades to silence
+rather than a fabricated refusal.
+`queue_dropped` has one further consumer, and it reads the key the other way
 round: the queue-depth sparkline plots a point only when the count is EXACTLY `0`, so a build that
 refused rows — or a document with no count at all — contributes `null` and breaks the trend line
 instead of plotting a depth that is quietly missing its refused rows. `target_ci_queue_dropped`
