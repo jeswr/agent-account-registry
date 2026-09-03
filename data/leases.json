@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "f651e5c939a041389623adee1ad2522a",
-   "holder": "jeswr/agent-account-registry#251@33718075106.1",
-   "package": "dashboard",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1788412521,
-   "expires_at": 1788415221
-  },
-  {
    "account": "f79434c3ffba014f",
    "claim_id": "b66134ec2ac84c61b4899547a693c07a",
    "holder": "review:jeswr/agent-account-registry#2267@33718093739.1",
