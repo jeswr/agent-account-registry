@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 2275,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "93dab1701a76229d9a0cfc2d8aec657e1f1b039e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`import_time_sibling_loads` skips every `ast.ClassDef`, but a class body is executed immediately when the module executes; it is not deferred until a call. A module-level class body containing `_load_module(Path(__file__).resolve().with_name(\"new.py\"), ...)` therefore adds a real dependency of every invocation while `_pin_derived` remains unchanged and the LIVE exactness assertion stays green. The fixture only places the path load inside a method, so it does not exercise the distinct class-body case and cannot catch this error.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Traverse the body of module-executed class definitions while continuing to exclude function/async-function/lambda bodies. Add a synthetic class-level `_load_module(...with_name(\"gamma.py\"))` case whose expected derived set includes `scripts/gamma.py`, separately retaining a method-local case that must be excluded.",
+    "severity": "major",
+    "title": "Module-level class bodies are incorrectly excluded from import-time dependency derivation"
+   },
+   {
+    "body": "`groom_checkout_coverage_verdict` collects all checkout steps in an invoking job and accepts any covering checkout, without relating its step position to the step that invokes groom.py. Moving the only registry checkout below the invocation leaves the verdict and LIVE row green even though groom.py runs before any sibling exists and dies at import. A checkout guarded by a statically false step condition is similarly counted. This misses the producer-before-consumer YAML seam the new control is intended to enforce.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Associate each invocation with its step index and require a qualifying, executable ref-less checkout earlier in that same job. Fail closed on checkout steps disabled by `if: false` (and cover the supported condition policy explicitly). Add red fixtures for a covering checkout after the invocation and for a covering checkout step with `if: false`.",
+    "severity": "major",
+    "title": "A checkout after the groom invocation falsely satisfies the coverage verdict"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe checkout pin is not yet sound. Its AST derivation omits a genuine import-time execution context, and its workflow proof treats a checkout anywhere in an invoking job as sufficient without proving that the checkout ran before the invocation. Both defects allow the new LIVE rows to stay green while an invocation can still fail for a missing import-time sibling.",
+  "verdict": "request_changes"
+ }
+}
