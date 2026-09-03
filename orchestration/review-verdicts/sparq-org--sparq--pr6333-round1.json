@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6333,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2e25ac7ddeeeccd1909d1673bf8018883e556cf0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The pagination fix is correct and complete as scoped. `fetch_quarantined` replaces the silently capped issue-list query with exhaustive REST pagination, preserves the cron's expected row shape, excludes pull requests, and fails closed on command failure, missing edit timestamps, or a runaway result set. The workflow consumes the helper consistently, and the focused self-test exercises more than 200 quarantined issues plus the timestamp-to-promotion path and fail-closed cases. The self-test passes. No security, correctness, or test-validity defect was found in the supplied diff.",
+  "verdict": "approve"
+ }
+}
