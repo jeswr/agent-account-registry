@@ -2291,11 +2291,15 @@ jobs:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
-          # Privacy routing (locked decision 22c; hardened in #432 round 1): worker-pr.py sends the
-          # account-enumerating ops alert to the maintainer-set ALERT_REPO only when ALERT_TOKEN is
-          # set, the repo is DISTINCT from this registry, AND a live GET /repos/{ALERT_REPO} under
-          # ALERT_TOKEN confirms `"private": true`. Configuration alone is NOT verification — token
-          # presence does not select the private route. Every other shape falls back to the registry.
+          # Privacy routing (locked decision 22c; hardened in #432 round 1, then #436/#1020) —
+          # setting these names is CONFIGURATION, not verification, so read the contract from
+          # worker-pr._alert_route: the alert issue goes to the maintainer-set ALERT_REPO only when
+          # ALERT_TOKEN is set too, ALERT_REPO is DISTINCT from this registry, AND a live
+          # GET /repos/{ALERT_REPO} under ALERT_TOKEN confirms `"private": true`. Token presence
+          # alone does not select the private route. Every other shape (unset, half-configured,
+          # same-repo, or a set-but-public ALERT_REPO) falls back to this PUBLIC registry, and
+          # _ops_alert redacts the body there — these bodies are not account-enumerating (accounts
+          # cross as the salted hash), and the redaction keeps it that way for future bodies.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
@@ -2554,11 +2558,12 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
-          # Privacy routing (locked decision 22c; hardened in #432 round 1): worker-pr.py sends the
-          # ops alert to the maintainer-set ALERT_REPO only when ALERT_TOKEN is set, the repo is
-          # DISTINCT from this registry, AND a live GET /repos/{ALERT_REPO} under ALERT_TOKEN
-          # confirms `"private": true`. Configuration alone is NOT verification — token presence
-          # does not select the private route. Every other shape falls back to the registry.
+          # Privacy routing (locked decision 22c; hardened in #432 round 1, then #436/#1020):
+          # worker-pr.py sends the ops alert to the maintainer-set ALERT_REPO only when ALERT_TOKEN
+          # is set, the repo is DISTINCT from this registry, AND a live GET /repos/{ALERT_REPO}
+          # under ALERT_TOKEN confirms `"private": true`. Setting the names is configuration, not
+          # verification — token presence does not select the private route. Every other shape falls
+          # back to this PUBLIC registry with the body redacted.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr

@@ -471,6 +471,24 @@ def _repo_confirmed_private(repo, token):
     return isinstance(payload, dict) and payload.get("private") is True
 
 
+# Destinations `_alert_route()` POSITIVELY CONFIRMED private in this process (issue #1020).
+# `_alert_route` is the ONLY producer of a private destination, so membership here means exactly
+# "this repo passed the live GET /repos visibility probe under its own route token" — the fact
+# `_ops_alert` needs at the sink and cannot re-derive there without spending a second API call per
+# alert. Re-deriving it from the env at the sink instead would write the same-repo / half-config
+# rules at a SECOND site, which is the duplicated-guard shape (#945): each copy individually
+# unkillable, and free to drift from the one the route actually applied.
+_VERIFIED_PRIVATE_ALERT_ROUTES = set()
+
+
+def _verified_private_alert_route(alert_repo):
+    """True ONLY for a destination this process's `_alert_route()` confirmed private (#1020).
+    FAIL-CLOSED by construction: the registry fallback, an unconfigured or cleared env, and any
+    caller reaching `_ops_alert` without going through `_alert_route` are all absent from the memo
+    and therefore read as PUBLIC."""
+    return (alert_repo or "").strip().lower() in _VERIFIED_PRIVATE_ALERT_ROUTES
+
+
 def _alert_route(confirmed_private=None):
     """Ops-alert destination (locked decision 22c, hardened for issue #436): a maintainer-set
     ALERT_REPO routes the alert issue to a PRIVATE repo, but ONLY when ALERT_TOKEN is also set,
@@ -481,10 +499,15 @@ def _alert_route(confirmed_private=None):
 
     Presence of the env vars is CONFIGURATION, not verification (#432 round 1): the pair can name
     the public registry itself or any other public repository, and token presence proves nothing
-    about destination visibility. These bodies carry hashed account references rather than raw
-    handles, so the fallback is a delivery choice rather than a redaction one — but a misconfigured
-    ALERT_REPO must not silently stand in for the private channel, and a future body change must
-    not inherit a route that was never verified.
+    about destination visibility. A misconfigured ALERT_REPO must not silently stand in for the
+    private channel, and a future body change must not inherit a route that was never verified.
+
+    The route's verdict is what decides the BODY too (issue #1020): a confirmed-private
+    destination is memoised in `_VERIFIED_PRIVATE_ALERT_ROUTES`, and `_ops_alert` redacts the body
+    for every destination that is not in it. No body composed in this module carries a raw account
+    handle today — accounts cross as the salted 16-hex hash (decision 22a), which the redaction
+    passes through untouched — but the fallback destination IS the public registry, so the sink
+    must apply the same #135 rule `_comment` and the gh stderr excerpt already apply at theirs.
 
     The fallback token prefers REGISTRY_ALERT_TOKEN over ALERT_TOKEN because the fallback
     destination is the REGISTRY repo: ALERT_TOKEN is minted for the private alert repo and a
@@ -501,6 +524,9 @@ def _alert_route(confirmed_private=None):
         same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
         check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
         if not same_repo and check(alert_repo, alert_token):
+            # The probe's verdict is recorded HERE, at the only site that runs it, so the sink
+            # never has to guess (#1020).
+            _VERIFIED_PRIVATE_ALERT_ROUTES.add(alert_repo.strip().lower())
             return alert_repo, alert_token
     return registry_repo, os.environ.get("REGISTRY_ALERT_TOKEN") or alert_token
 
@@ -511,10 +537,26 @@ def _ops_alert(alert_repo, alert_token, title, body):
     and credential-scoped — a missing route or a failed alert call never masks the operational
     error that triggered it: every gh call is check=False AND the whole delivery is wrapped, so
     even a raising path (the issue lookup goes through _gh_json → check=True + JSON parsing, and
-    an unexpected list shape can KeyError) only logs, never propagates into the caller's raise."""
+    an unexpected list shape can KeyError) only logs, never propagates into the caller's raise.
+
+    [#1020] The BODY crosses this sink REDACTED (issue #135 patterns) unless the destination is a
+    route `_alert_route()` positively confirmed private: every other shape — a public or
+    unverifiable ALERT_REPO, ALERT_REPO naming the registry, a half-configured pair, no route at
+    all — delivers to the PUBLIC registry, where a raw acctNN handle or an email may never land
+    and the salted 16-hex account hash may. This sink was the one public body sink in the module
+    without that rule; the unredacted body is now emitted only where the visibility probe said it
+    may be, so a future body change cannot inherit a route that was never verified.
+
+    The TITLE is deliberately left alone: it is the dedupe key this function matches open issues
+    on, and every caller composes it from repo/PR identifiers only — never from free text, model
+    output, or an API error, which are what the body carries."""
     if not (alert_repo and alert_token):
         return
     try:
+        # Inside the wrapper on purpose: the redaction is part of the DELIVERY, and this function
+        # may never propagate anything into the operational error that triggered the alert.
+        if not _verified_private_alert_route(alert_repo):
+            body = _redact_public_text(body)
         env = {"GH_TOKEN": alert_token}
         _run_gh(["label", "create", "ops-alert", "-R", alert_repo, "--color", "d73a4a",
                  "--description", "Autonomous worker availability alert (maintainer action)"],
@@ -11932,6 +11974,94 @@ def _self_test():
               _repo_confirmed_private("private/alerts", "t"), False)
     finally:
         globals()["_run_gh"] = _real_run_gh
+    # [#1020] The alert BODY sink, BOTH directions. A refused/unconfigured route delivers to the
+    # PUBLIC registry, so its body may only cross #135-redacted; the verbatim body is emitted ONLY
+    # over a route the live probe confirmed private. Driven through the REAL _alert_route -> REAL
+    # _ops_alert wiring (no injected "is private" flag at the sink), so the sink's decision stays
+    # bound to the probe's verdict rather than to a second copy of the route rules. The probe body
+    # carries a raw handle, an email AND the salted hash: the hash is the one identifier a public
+    # sink may keep, so a redaction that ate it would be red here too.
+    _leaky_alert_body = f"> 🤖 SPARQ agent — acct07 (ops@example.com) stalled; account {h1}"
+    _delivered = []
+
+    def _alert_sink_run_gh(args, *, input_text=None, check=True, env=None):
+        args = list(args)
+        if "--body" in args:  # the label-create call carries none
+            _delivered.append((args[args.index("-R") + 1], args[args.index("--body") + 1]))
+        return subprocess.CompletedProcess(["gh", *args], 0, "", "")
+
+    def _last_delivery():
+        # A swallowed delivery (_ops_alert is best-effort) must read as a FAILED assertion, never
+        # as an IndexError that aborts the suite mid-run.
+        return _delivered[-1] if _delivered else ("nothing delivered", "nothing delivered")
+
+    _real_sink_run_gh = globals()["_run_gh"]
+    _real_sink_gh_json = globals()["_gh_json"]
+    _saved_verified_routes = set(_VERIFIED_PRIVATE_ALERT_ROUTES)
+    try:
+        globals()["_run_gh"] = _alert_sink_run_gh
+        globals()["_gh_json"] = lambda *a, **kw: []  # no open ops-alert issue -> issue create
+        _VERIFIED_PRIVATE_ALERT_ROUTES.clear()
+        _ops_alert(*_alert_route(confirmed_private=lambda r, t: True),
+                   "⚠️ route probe", _leaky_alert_body)
+        check("[#1020] a CONFIRMED-private route delivers the DETAILED body verbatim",
+              _last_delivery(), ("private/alerts", _leaky_alert_body))
+        # The memo is casefolded on BOTH sides, exactly like the same-repo rule above: ALERT_REPO
+        # is maintainer-typed and GitHub renders owner/name in its own case, so a route the probe
+        # confirmed private must not be redacted merely because the two spellings differ.
+        _delivered.clear()
+        _VERIFIED_PRIVATE_ALERT_ROUTES.clear()
+        os.environ["ALERT_REPO"] = "Private/Alerts"
+        _ops_alert(*_alert_route(confirmed_private=lambda r, t: True),
+                   "⚠️ route probe", _leaky_alert_body)
+        check("[#1020]   ...and still verbatim when that route is typed in mixed case",
+              _last_delivery(), ("Private/Alerts", _leaky_alert_body))
+        os.environ["ALERT_REPO"] = "private/alerts"
+        _delivered.clear()
+        _VERIFIED_PRIVATE_ALERT_ROUTES.clear()
+        _ops_alert(*_alert_route(confirmed_private=lambda r, t: False),
+                   "⚠️ route probe", _leaky_alert_body)
+        _public_dest, _public_body = _last_delivery()
+        check("[#1020] a REFUSED route (public/same-repo/failed lookup) falls back to the PUBLIC "
+              "registry and REDACTS the body — raw handle and email out, salted hash kept",
+              (_public_dest, "acct07" in _public_body, "ops@example.com" in _public_body,
+               "[redacted-account]" in _public_body, "[redacted-email]" in _public_body,
+               h1 in _public_body),
+              ("reg/repo", False, False, True, True, True))
+        _delivered.clear()
+        _VERIFIED_PRIVATE_ALERT_ROUTES.clear()
+        _ops_alert("private/alerts", "t1", "⚠️ route probe", _leaky_alert_body)
+        check("[#1020] a destination that never passed the live probe REDACTS too: the sink fails "
+              "closed for a caller that reaches it without _alert_route",
+              ("acct07" in _last_delivery()[1], "[redacted-account]" in _last_delivery()[1]),
+              (False, True))
+        # The redaction is part of the DELIVERY, so it lives inside _ops_alert's never-propagate
+        # wrapper: a raising redaction drops the alert exactly like a raising issue lookup does,
+        # and never masks the operational error the caller is about to raise. A redaction hoisted
+        # out of that `try` reads as PROPAGATED here.
+        _delivered.clear()
+        _VERIFIED_PRIVATE_ALERT_ROUTES.clear()
+        _real_redact = globals()["_redact_public_text"]
+
+        def _raising_redact(_text):
+            raise RuntimeError("SENTINEL-REDACT-RAISE")
+
+        globals()["_redact_public_text"] = _raising_redact
+        try:
+            _redaction_outcome = (_ops_alert("reg/repo", "t0", "⚠️ route probe",
+                                             _leaky_alert_body), "returned")
+        except Exception:  # noqa: BLE001 — propagation is exactly what this assertion measures
+            _redaction_outcome = (None, "PROPAGATED")
+        finally:
+            globals()["_redact_public_text"] = _real_redact
+        check("[#1020] a RAISING redaction is swallowed like any other delivery failure and "
+              "delivers nothing — it never masks the caller's operational error",
+              (_redaction_outcome, _delivered), ((None, "returned"), []))
+    finally:
+        globals()["_run_gh"] = _real_sink_run_gh
+        globals()["_gh_json"] = _real_sink_gh_json
+        _VERIFIED_PRIVATE_ALERT_ROUTES.clear()
+        _VERIFIED_PRIVATE_ALERT_ROUTES.update(_saved_verified_routes)
     for key in ("REGISTRY_REPO", "REGISTRY_ALERT_TOKEN", "ALERT_REPO", "ALERT_TOKEN"):
         os.environ.pop(key, None)
     # ---- ready_and_arm wiring (Decision 7 revision, sol r1 on #257): approved trust-surface
