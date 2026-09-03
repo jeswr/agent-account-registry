@@ -1793,6 +1793,29 @@ _assert_dockerfile_pinned() {
   return 0
 }
 
+# PURE (self-tested): the model image must provision both executables needed by the registry's
+# enrolled self-test suite. Match the complete normalised RUN instruction so deleting either
+# package, moving the install behind a condition, or retaining apt metadata all fail closed.
+_assert_worker_image_gate_deps() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  local instructions
+  instructions=$(awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*RUN[[:space:]]/ { in_run = 1; run = $0 }
+    in_run && !/^[[:space:]]*RUN[[:space:]]/ { run = run " " $0 }
+    in_run && $0 !~ /\\[[:space:]]*$/ {
+      gsub(/\\/, "", run); gsub(/[[:space:]]+/, " ", run)
+      sub(/^ /, "", run); sub(/ $/, "", run)
+      print run
+      in_run = 0
+    }
+  ' "$file") || return 1
+  grep -Fxq \
+    'RUN apt-get update && apt-get install --yes --no-install-recommends jq python3-yaml && rm -rf /var/lib/apt/lists/*' \
+    <<< "$instructions"
+}
+
 # PURE (self-tested): [issue #524] every non-local `uses:` in a workflow must pin a FULL 40-hex
 # commit sha (docker refs: a 64-hex sha256 digest). This MIRRORS the assertion pr-gate.yml enforces
 # on the whole workflow tree (sol audit #221) — actionlint does not check pinning, so before this
@@ -2366,6 +2389,10 @@ registry_selftest_gate() {
     if [[ "$kind" == dockerfile ]]; then
       printf 'worker-live: base-image pin check %s\n' "$name"
       _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
+      if [[ "$name" == containers/worker-model.Dockerfile ]]; then
+        _assert_worker_image_gate_deps "$name" \
+          || die "worker model image does not provision jq + PyYAML for the registry gate: $name"
+      fi
       direct=$((direct + 1))
     fi
   done
@@ -5267,6 +5294,27 @@ PY
   chk "empty digest is REJECTED" \
     "$( _assert_dockerfile_pinned "$tmp/empty.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
     "unpinned"
+
+  # --- [issue #1575] the author-side registry gate must be runnable in the model image. The
+  # complete instruction is checked, not package-name substrings: the reject fixtures prove that
+  # both a deleted dependency and a conditionally inert install are detected. ---
+  chk "the live worker-model image provisions jq and PyYAML for the registry self-test gate" \
+    "$( _assert_worker_image_gate_deps "$SCRIPT_DIR/../containers/worker-model.Dockerfile" \
+        && echo provisioned || echo absent)" "provisioned"
+  printf '%s\n' \
+    'FROM rust:1.88@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'RUN apt-get update && apt-get install --yes --no-install-recommends jq && rm -rf /var/lib/apt/lists/*' \
+    > "$tmp/deps-missing.Dockerfile"
+  chk "a worker image missing PyYAML is REJECTED (dependency deletion is non-vacuous)" \
+    "$( _assert_worker_image_gate_deps "$tmp/deps-missing.Dockerfile" \
+        && echo provisioned || echo absent)" "absent"
+  printf '%s\n' \
+    'FROM rust:1.88@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'RUN false && apt-get update && apt-get install --yes --no-install-recommends jq python3-yaml && rm -rf /var/lib/apt/lists/*' \
+    > "$tmp/deps-inert.Dockerfile"
+  chk "a conditionally inert jq + PyYAML install is REJECTED" \
+    "$( _assert_worker_image_gate_deps "$tmp/deps-inert.Dockerfile" \
+        && echo provisioned || echo absent)" "absent"
 
   # --- [issue #524] the 40-hex `uses:` pin assertion, mirrored from pr-gate.yml (#221) into the
   # host-side touched-workflow lint. NON-VACUOUS in BOTH directions, and both directions matter for
