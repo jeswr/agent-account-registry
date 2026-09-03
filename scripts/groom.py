@@ -1325,12 +1325,41 @@ def _http_failure_detail(exc: HTTPError, token: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------------------------
+# THE GRAPHQL POINT RESERVE (issue #2165).
+#
+# GraphQL is charged to its own 5,000-POINT bucket, entirely separate from the REST request
+# bucket, and the sweep's ONLY GraphQL spender is the defuse phase's per-candidate merge-latch
+# read (`_merge_latch_state`). A tick with many parked PRs can therefore walk that bucket down
+# with no stop and no gauge.
+#
+# READ FROM THE RESPONSE BODY, NEVER FROM THE HEADER. Both buckets report under the one
+# `x-ratelimit-remaining` name, so a header read cannot say WHICH bucket it measured, and a
+# points-vs-requests comparison is meaningless in either direction. GraphQL's `rateLimit` field
+# is self-describing — it carries this query's `cost` in the same units as its `remaining` —
+# and is the same evidence plan-snapshot.py's `GRAPHQL_RATE_LIMIT_RESERVE` enforces.
+#
+# PER-BUCKET, NOT PER-CLIENT. The latch below gates `/graphql` and nothing else: a spent point
+# budget must never stop REST grooming — issue repair, park/un-park, dead-lease release and the
+# ledger CAS all live in the REST bucket, and they are what an operator needs most on a tick
+# that has been throttled. A REST-side reserve must be its OWN latch for the mirrored reason,
+# with its own gauge beside `graphql_budget_reserve_stops=`: one number cannot say which bucket
+# stopped, and stopping REST on a GraphQL reading (or the reverse) is the unit conflation this
+# reserve exists to avoid.
+GRAPHQL_RATE_LIMIT_RESERVE = 100
+
+
 class GitHubAPI:
     def __init__(self, token: str, purpose: str):
         if not token:
             raise GroomError(f"{purpose} token is missing")
         self._token = token
         self._purpose = purpose
+        # [#2165] The GraphQL point-budget latch: the refusal message once the reserve is
+        # reached, `None` while that bucket is healthy. The refusals are counted separately so
+        # the SUMMARY can report the spend the sweep DECLINED to make.
+        self._graphql_budget_stop: str | None = None
+        self.graphql_reserve_stops = 0
 
     def request(
         self,
@@ -1342,6 +1371,12 @@ class GitHubAPI:
     ) -> Any:
         if not path.startswith("/") or "\n" in path or "\r" in path:
             raise GroomError("unsafe GitHub API path")
+        if path == "/graphql" and self._graphql_budget_stop is not None:
+            # [#2165] Latched. Refuse BEFORE the request is built, so the refusal itself costs
+            # nothing — a reserve enforced after the spend is not a reserve. Only `/graphql`
+            # reaches here; every REST path below carries on against its own bucket.
+            self.graphql_reserve_stops += 1
+            raise GroomError(self._graphql_budget_stop)
         payload = json.dumps(body).encode() if body is not None else None
         request = Request(
             "https://api.github.com" + path,
@@ -1389,11 +1424,51 @@ class GitHubAPI:
                     continue
                 raise GroomError(f"{self._purpose} GitHub API request failed") from exc
         try:
-            return json.loads(raw or b"null")
+            document = json.loads(raw or b"null")
         except json.JSONDecodeError as exc:
             raise GroomError(
                 f"{self._purpose} GitHub API returned malformed JSON"
             ) from exc
+        if path == "/graphql":
+            self._note_graphql_points(document)
+        return document
+
+    def _note_graphql_points(self, document: Any) -> None:
+        """[#2165] Read this response's POINT meter; latch when it has reached the reserve.
+
+        The answer already paid for is HANDED BACK rather than discarded — the spend has
+        happened, and throwing the data away would cost a second query to learn the same
+        thing. What the reading buys is the refusal of the NEXT GraphQL request.
+
+        An UNREADABLE meter refuses this response and does NOT latch. That is deliberate in
+        both halves: unmeterable spend is what this reserve exists to stop, so the caller must
+        not receive data the sweep cannot account for (`_merge_latch_state`'s callers turn the
+        refusal into a per-PR deferral and a whole phase of them is already escalated by
+        `sweep_exit_failure`) — but a single malformed answer, an `errors`-only payload or a
+        deleted PR is not evidence about the BUCKET, and latching the tick's remaining defuse
+        candidates on it would be a stop with no measurement behind it.
+        """
+        rate = None
+        if isinstance(document, dict):
+            data = document.get("data")
+            if isinstance(data, dict):
+                rate = data.get("rateLimit")
+        remaining = rate.get("remaining") if isinstance(rate, dict) else None
+        if not isinstance(remaining, int) or isinstance(remaining, bool):
+            raise GroomError(
+                f"{self._purpose} GitHub GraphQL response carries no readable point budget"
+            )
+        if remaining > GRAPHQL_RATE_LIMIT_RESERVE:
+            return
+        reset = rate.get("resetAt")
+        self._graphql_budget_stop = (
+            f"{self._purpose} GitHub GraphQL point budget is down to the reserve — refusing "
+            f"further GraphQL requests this tick (remaining={remaining} points, resets at "
+            f"{reset if isinstance(reset, str) else 'unknown'}, reserve "
+            f"{GRAPHQL_RATE_LIMIT_RESERVE} points). This is the GraphQL bucket only: REST "
+            "grooming, dead-lease release included, is unaffected and continues."
+        )
+        print(f"ALERT {self._graphql_budget_stop}")
 
     def paginate(self, path: str) -> list[Any]:
         # The page walk continues until a short page; the explicit ceiling only guards a runaway
@@ -2510,7 +2585,12 @@ def _merge_latch_state(api: GitHubAPI, repo: str, number: int) -> tuple[bool, bo
     """Return live ``(queued, auto_merge_requested)`` state, failing closed on shape errors."""
     owner, name = repo.split("/", 1)
     query = (
+        # [#2165] `rateLimit` is the POINT meter the reserve latch enforces, and it is free
+        # (asking for it does not raise the query's cost). Every GraphQL query groom issues must
+        # ask for it: `GitHubAPI.request` refuses a `/graphql` answer that carries no readable
+        # meter, so a query that stops asking fails closed rather than spending unguarded points.
         "query($owner:String!,$name:String!,$number:Int!){"
+        "rateLimit{cost remaining resetAt}"
         "repository(owner:$owner,name:$name){pullRequest(number:$number){"
         "mergeQueueEntry{id} autoMergeRequest{enabledAt}}}}"
     )
@@ -4905,6 +4985,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     )
 
     reclaimed = _release_claims(registry_api, registry_repo, dead_claims)
+    # [#2165] Every client this sweep built, registry and per-owner target alike, so the gauge
+    # below covers whichever one spends GraphQL points rather than only today's spender.
+    graphql_reserve_stops = sum(
+        api.graphql_reserve_stops for api in (registry_api, *target_apis.values())
+    )
     print(
         f"SUMMARY reclaimed={reclaimed} reset={reset} deferred={deferred} "
         f"stale_prs={stale_count} defused_prs={defuse_outcome.changed} "
@@ -4932,6 +5017,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         # from a quiet tick — which is precisely the reading needed to notice a repo that pays for
         # a re-read on every single sweep.
         f"snapshot_rereads={len(reread_budget)} "
+        # [#2165] GraphQL requests this tick REFUSED by the point reserve — spend the sweep
+        # declined to make, in POINTS' bucket and no other. Unconditional, zero row included
+        # (AGENTS.md pre-flight item 8): a gauge that appears only when the bucket is in
+        # trouble cannot be told apart from one that was never wired. A REST-side reserve gets
+        # its own name here; do not fold the two into one number.
+        f"graphql_budget_reserve_stops={graphql_reserve_stops} "
         f"attempt_budget_deferred={len(budget_outcome.deferred)} "
         f"reap_deferred={len(reap_outcome.deferred)}"
     )
@@ -9408,6 +9499,146 @@ def _self_test() -> int:
         globals()["urlopen"] = real_urlopen
         globals()["_sleep_transient"] = real_sleep_transient
 
+    # ---- [#2165] the GraphQL POINT reserve: its own bucket, its own latch ----
+    #
+    # Driven through the LIVE `request()` and the LIVE `_merge_latch_state`, against a stand-in
+    # that METERS THE WAY GITHUB DOES: `rateLimit` comes back only when the query ASKED for it,
+    # and a REST read carries no point meter at all. So these rows cannot be satisfied by a
+    # fixture that volunteers a meter unprompted — drop `rateLimit` from the defuse query and
+    # the healthy row below reds (every candidate refused) instead of the sweep quietly
+    # resuming unguarded point spend, which is the exposure this issue names.
+    #
+    # Every meter is a LITERAL (99 / 100 / 101 / 5000), never `GRAPHQL_RATE_LIMIT_RESERVE ± 1`
+    # (AGENTS.md pre-flight item 2c): an input derived from the constant under test stays green
+    # when that constant moves. The declared value is pinned once, on its own row.
+    points_saved_urlopen = globals()["urlopen"]
+    points_calls: list[tuple[str, str]] = []
+
+    def _points_urlopen(meters: list[Any]) -> Any:
+        pending = list(meters)
+
+        def _open(request, timeout=None):
+            payload = json.loads(request.data.decode()) if request.data else {}
+            query = payload.get("query", "")
+            points_calls.append((request.full_url, query))
+            if not query:                       # a REST read — a different bucket, no meter
+                return _FakeResp(b'{"rest": "served"}')
+            document: dict[str, Any] = {"data": {"repository": {"pullRequest": {
+                "mergeQueueEntry": None, "autoMergeRequest": None}}}}
+            if "rateLimit" in query:
+                document["data"]["rateLimit"] = (
+                    pending.pop(0) if pending
+                    else {"cost": 1, "remaining": 5000, "resetAt": "2026-09-03T12:00:00Z"})
+            return _FakeResp(json.dumps(document).encode())
+
+        return _open
+
+    def _points(remaining: Any) -> dict[str, Any]:
+        return {"cost": 1, "remaining": remaining, "resetAt": "2026-09-03T12:00:00Z"}
+
+    def _points_run(
+        meters: list[Any], latch_reads: int = 1, rest_after: bool = False
+    ) -> tuple[list[Any], int, int, int]:
+        """(outcomes, requests ISSUED, the client's gauge, ALERT lines) for one client.
+
+        TOTAL in the AGENTS.md item-4 sense: every exception is reported as a value, so a
+        mutant that makes a call blow up cannot abort the suite and score itself a kill.
+        """
+        api = GitHubAPI("points-token", "target owner")
+        points_calls.clear()
+        globals()["urlopen"] = _points_urlopen(meters)
+        outcomes: list[Any] = []
+        log, saved_points_stdout = io.StringIO(), sys.stdout
+        sys.stdout = log
+        try:
+            for _ in range(latch_reads):
+                try:
+                    outcomes.append(_merge_latch_state(api, "owner/repo", 21))
+                except GroomError as exc:
+                    outcomes.append(f"REFUSED {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    outcomes.append(f"RAISED {type(exc).__name__}")
+            if rest_after:
+                try:
+                    outcomes.append(api.request("GET", "/repos/owner/repo/pulls/21"))
+                except Exception as exc:  # noqa: BLE001
+                    outcomes.append(f"REFUSED {exc}")
+        finally:
+            sys.stdout = saved_points_stdout
+            globals()["urlopen"] = points_saved_urlopen
+        alerts = sum(
+            1 for line in log.getvalue().splitlines()
+            if line.startswith("ALERT") and "GraphQL point budget" in line
+        )
+        return outcomes, len(points_calls), api.graphql_reserve_stops, alerts
+
+    check(
+        "[#2165] the reserve is 100 POINTS — the unit GraphQL's own `rateLimit` reports, not a "
+        "request count. Every row below feeds LITERAL meters, so moving this number reds them",
+        GRAPHQL_RATE_LIMIT_RESERVE, 100,
+    )
+    healthy = _points_run([_points(5000), _points(4998)], latch_reads=2)
+    check(
+        "[#2165] a HEALTHY point budget grooms normally: both merge-latch reads are ISSUED and "
+        "answered, nothing latches, no ALERT, and the gauge stays at its zero row. This is also "
+        "the WIRING row — the stand-in meters only a query that ASKED for `rateLimit`, so "
+        "dropping that field from the defuse query refuses both reads here",
+        healthy, ([(False, False), (False, False)], 2, 0, 0),
+    )
+    check(
+        "[#2165] ...and the query that was actually SENT asks for the point meter, at the "
+        "GraphQL endpoint (the call site is what has to ask; the reserve cannot read a meter "
+        "no query requested)",
+        (points_calls[0][0], "rateLimit{cost remaining resetAt}" in points_calls[0][1]),
+        ("https://api.github.com/graphql", True),
+    )
+    at_reserve = _points_run([_points(100), _points(5000)], latch_reads=3)
+    check(
+        "[#2165] AT the reserve the latch trips: the answer already paid for is still handed "
+        "back, then EVERY later GraphQL request is refused BEFORE it is issued (1 request for 3 "
+        "reads — a reserve enforced after the spend is not a reserve), the refusal names points "
+        "and the bucket, the gauge counts both declined requests, and the trip ALERTs once",
+        (at_reserve[0][0],
+         [str(row).startswith("REFUSED") and "remaining=100 points" in str(row)
+          and "reserve 100 points" in str(row) for row in at_reserve[0][1:]],
+         at_reserve[1:]),
+        ((False, False), [True, True], (1, 2, 1)),
+    )
+    below_reserve = _points_run([_points(99)], latch_reads=2)
+    above_reserve = _points_run([_points(101), _points(101)], latch_reads=2)
+    check(
+        "[#2165] the boundary, both directions: 99 points latches (the stop is not an equality "
+        "test), 101 does NOT — a client one point above the reserve issues its second read and "
+        "keeps its gauge at zero. Flip `<=` to `<` and the AT-reserve row above reds; widen it "
+        "and this one does",
+        ((str(below_reserve[0][1]).startswith("REFUSED"), below_reserve[1], below_reserve[2]),
+         (above_reserve[0], above_reserve[1], above_reserve[2], above_reserve[3])),
+        ((True, 1, 1), ([(False, False), (False, False)], 2, 0, 0)),
+    )
+    rest_after_stop = _points_run([_points(100)], latch_reads=2, rest_after=True)
+    check(
+        "[#2165] A SPENT POINT BUDGET MUST NOT STOP REST. The same client, latched on GraphQL, "
+        "still issues and serves a REST read — the two buckets are metered separately and a "
+        "stop in one says nothing about the other. Gate every path on this latch instead of "
+        "`/graphql` and the REST leg reds while the GraphQL legs stay green",
+        (rest_after_stop[0][-1], rest_after_stop[1], rest_after_stop[2]),
+        ({"rest": "served"}, 2, 1),
+    )
+    unmeterable = [
+        _points_run([shape, _points(5000)], latch_reads=2)
+        for shape in ({}, {"cost": 1}, {"remaining": "plenty"}, {"remaining": True}, "5000")
+    ]
+    check(
+        "[#2165] an UNREADABLE meter — absent, non-numeric, or the `True` that `isinstance(x, "
+        "int)` alone admits — refuses THAT response (unmeterable spend is what the reserve "
+        "exists to stop) and does NOT latch: the next answer that does carry a meter is issued "
+        "and served, and no refusal is charged to the gauge",
+        [(str(run[0][0]).startswith("REFUSED ")
+          and "carries no readable point budget" in str(run[0][0]),
+          run[0][1], run[1], run[2], run[3]) for run in unmeterable],
+        [(True, (False, False), 2, 0, 0)] * 5,
+    )
+
     # ---- #509 release-side mutation boundary + bounded terminal reaping. ----
     # These fixtures drive the REAL run_sweep entry. The first changes a needs:* issue back to
     # status:ready after planning but before release; removing the fresh issue/PR re-confirmation
@@ -9417,6 +9648,12 @@ def _self_test() -> int:
     class _TerminalSweepAPI:
         def __init__(self, token, purpose):
             self.purpose = purpose
+            # [#2165] The point-reserve gauge run_sweep sums off EVERY client it builds, keyed
+            # by purpose so a scenario can prove the SUMMARY reports the registry client's
+            # refusals AND the target client's — summing only one of the two reds the row.
+            self.graphql_reserve_stops = terminal_sweep_env.get(
+                "graphql_reserve_stops", {}
+            ).get(purpose, 0)
 
         def request(self, method, path, body=None, allow_404=False, **_kwargs):
             # Issue #647: a per-object operation can be refused by GitHub. The refusal raised here
@@ -9598,6 +9835,46 @@ def _self_test() -> int:
             "MUTATION #509 release guard: a freshly UNPARKED issue retains its claim",
             (race_summary[0], terminal_sweep_releases),
             (0, [set()]),
+        )
+
+        # ---- [#2165] the point-reserve gauge, on the SUMMARY line an operator greps ----------
+        #
+        # The gauge is a SUM over every client run_sweep builds, so the two clients are given
+        # DIFFERENT refusal counts: summing only the registry client reads 1, only the target
+        # client reads 2, and hard-coding it reads neither. The zero leg is the unconditional
+        # emission (AGENTS.md pre-flight item 8) — a budget gauge that appears only when the
+        # bucket is in trouble cannot be told apart from one that was never wired.
+        #
+        # Read EXACT-MATCH off the tokenised SUMMARY line, never as a substring (item 6):
+        # `graphql_budget_reserve_stops=3` contains `..._stops=3` for any spelling of the name,
+        # and `=1` is a substring of `=12`.
+        def _summary_gauge(stops: dict[str, int]) -> Any:
+            terminal_sweep_leases[:] = []
+            terminal_sweep_env.update(
+                planned_issues=[], fresh_issues={}, writes=[], graphql_reserve_stops=stops
+            )
+            terminal_sweep_releases.clear()
+            gauge_log, saved_gauge_stdout = io.StringIO(), sys.stdout
+            sys.stdout = gauge_log
+            try:
+                _terminal_sweep()
+            except Exception as exc:  # noqa: BLE001 — a blown-up sweep is a value, not a kill
+                return f"RAISED {type(exc).__name__}"
+            finally:
+                sys.stdout = saved_gauge_stdout
+            return [
+                token
+                for line in gauge_log.getvalue().splitlines() if line.startswith("SUMMARY ")
+                for token in line.split()
+                if token.startswith("graphql_budget_reserve_stops=")
+            ]
+
+        check(
+            "[#2165] run_sweep reports the GraphQL point-reserve refusals of EVERY client it "
+            "built — registry and per-owner target summed, exactly once — and emits the gauge "
+            "unconditionally, zero row included",
+            (_summary_gauge({"registry": 1, "target owner": 2}), _summary_gauge({})),
+            (["graphql_budget_reserve_stops=3"], ["graphql_budget_reserve_stops=0"]),
         )
 
         # ---- #1121: listing ABSENCE alone never confirms a reap ------------------------------
@@ -13195,6 +13472,7 @@ def _self_test() -> int:
 
         def __init__(self, token, purpose):
             self.purpose = purpose
+            self.graphql_reserve_stops = 0        # [#2165] summed onto the SUMMARY gauge
 
         def request(self, method, path, body=None, allow_404=False, **_kwargs):
             if method == "GET":
