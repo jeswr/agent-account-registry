@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2252,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cd86df0f4eddc8a6e9e66916db56517f16366f3a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently adds a later, always()-guarded outcome receipt for each of the nine structurally enrolled continue-on-error alert lanes. The estate scan fails closed on missing/unparseable workflow input and anonymous or ambiguous masked lanes; live-set equality, an evidence floor, exact condition comparison, and rejection of masking on receipt steps cover deletion, unenrolled additions, inert conditions, and vacuous empty-population passes. The two newly identified hard-failure alert steps are correctly given stable ids and the independent route-consumer enrollment is updated to match. The receipt steps preserve the deliberate green workflow/job semantics while restoring a queryable success-versus-skipped step conclusion. Tests exercise membership, ordering, exact polarity, alternate YAML shapes, ambiguity, and the live checkout. No trust check is weakened, no permission or secret handling is expanded, and no reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
