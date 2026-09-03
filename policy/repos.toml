@@ -45,9 +45,8 @@
 #                              verdict, or the re-review of a pushed pinned-floor fix that has
 #                              not been graded yet, before needs-user (2026-07-17)
 #   review_queue_ttl_minutes = positive integer (default 30) # review:needs age before alerting
-#   cross_provider_fallback  = bool (default false)          # opt-in same-provider degrade when the
-#                                                            # opposite provider is starved; false =
-#                                                            # stay queued + alert (honest default)
+# (`cross_provider_fallback` was REMOVED here by issue #1029 — see policy-resolve.py's note. It is
+# no longer an accepted key: declaring it is now an `unknown fields` refusal, not a silent no-op.)
 #   trusted_bots             = [string, ...] (default [])    # issue #111: the EXACT allowlist of
 #                              trusted App bot issue-author logins, added to the OWNER/MEMBER/
 #                              COLLABORATOR associations of `trust = "collaborators"`. CLAIM unions
@@ -106,7 +105,6 @@ trust = "collaborators"
 allow_actions_bot_issues = true # own-workflow drift scanner opens dispatchable issues (#487)
 max_review_rounds = 3         # BASE bound; decide_budget may extend to 6 total (see header)
 review_queue_ttl_minutes = 30 # surface a codex-starved review backlog after this age
-cross_provider_fallback = false  # honest default: stay queued + alert, never silently degrade
 
 # [FABLE-5] Throughput alert thresholds (scripts/metrics.py). sparq is a large, fast repo, so the
 # backlog bar sits above a healthy steady-state (dozens of open + draft PRs is normal); the alert
@@ -173,7 +171,6 @@ max_attempts = 3
 trust = "collaborators"
 max_review_rounds = 3
 review_queue_ttl_minutes = 30
-cross_provider_fallback = false
 
 [repos."jeswr/solid-sdk".throughput]
 target_ready            = 10  # a new target: a small stocked frontier, not sparq's 30
@@ -206,7 +203,6 @@ trust = "collaborators"
 allow_actions_bot_issues = true # own trust-plane workflows open dispatchable issues (#487)
 max_review_rounds = 3
 review_queue_ttl_minutes = 30
-cross_provider_fallback = false
 
 # [OPUS-5 #657] REVIEW-LANE ENROLMENT, ON, FOR THIS REPO ONLY. The MASTER-protected half of
 # orchestrator-PR admission (research/657-orchestrator-pr-admission.md §6, Option 2(b)). #876

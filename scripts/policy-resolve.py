@@ -86,14 +86,23 @@ POLICY_FIELDS = {
 #   usage_safety_margin = float in [0,1) — fraction of EACH rate-limit window that must remain free to
 #                                 admit a worker (point-in-time headroom; burn-rate caveat in
 #                                 select-and-claim.py).
-# Optional cross-provider review-loop controls (defaults 3 / 30 / False -> backward compatible):
+# Optional cross-provider review-loop controls (defaults 3 / 30 -> backward compatible):
 #   max_review_rounds        = positive int — BASE bound on the review<->fix loop; on exhaustion
 #                              worker-pr.py decide_budget may extend to a hard cap of 6 total
 #                              rounds (fix-model-tier escalation / improving progress, 2026-07-17)
 #                              before needs-user.
 #   review_queue_ttl_minutes = positive int — how long a PR may sit review:needs before alerting.
-#   cross_provider_fallback  = bool — opt-in same-provider degrade when the opposite provider is
-#                              starved; default False = stay queued + alert (the honest default).
+# [SPARQ agent, issue #1029] `cross_provider_fallback` USED TO BE DECLARED HERE AND IS DELIBERATELY
+# GONE. It was accepted, type-checked and surfaced through resolve() with ZERO consumers: no script
+# and no workflow ever read the resolved value. Its `false` half was indistinguishable from its
+# absence — CLAIM refuses a same-provider reviewer unconditionally — while its `true` half promised
+# an opt-in same-provider degrade that NOTHING implemented, so a maintainer enabling it got neither
+# the degrade nor an error. A schema that advertises a knob nothing honours is the silent-no-op
+# class this repo keeps paying for, and on the ARM path the false promise is "the cross-provider
+# review assertion can be relaxed by policy", which is the worst possible thing to be wrong about.
+# Removing it from OPTIONAL_POLICY_FIELDS converts a silent no-op into a LOUD `unknown fields`
+# refusal: a row still declaring the key now fails the whole tick closed instead of pretending.
+# Re-introducing it is a design decision that must land WITH its allocator consumer, never before.
 # security_paths (B3 / defects #2,#4): the additive FILE-level trust-surface control
 # for the review lane. A worker PR whose diff touches ANY listed path/prefix routes its ARM to a
 # HUMAN even for a benign-labelled PR — CONSUMED by review-fix.yml (review-outcome + ready-and-arm
@@ -146,7 +155,7 @@ POLICY_FIELDS = {
 # `impl_provider` — for a self-authored PR that field is an assertion by the implementer about
 # itself, and inverting it yields a same-provider review that merely LOOKS cross-provider.
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
-                          "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
+                          "review_queue_ttl_minutes", "security_paths",
                           "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness",
                           "review_enrolment_authors"}
 
@@ -267,8 +276,6 @@ def _policy_row(target_repo, policy_doc):
     for field in ("max_review_rounds", "review_queue_ttl_minutes"):
         if field in row and not _positive_int(row[field]):
             raise PolicyError(f"{field} for {target_repo!r} must be a positive integer")
-    if "cross_provider_fallback" in row and not isinstance(row["cross_provider_fallback"], bool):
-        raise PolicyError(f"cross_provider_fallback for {target_repo!r} must be boolean")
     if ("allow_actions_bot_issues" in row
             and not isinstance(row["allow_actions_bot_issues"], bool)):
         raise PolicyError(f"allow_actions_bot_issues for {target_repo!r} must be boolean")
@@ -549,7 +556,6 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "usage_safety_margin": float(policy.get("usage_safety_margin", 0.10)),
         "max_review_rounds": int(policy.get("max_review_rounds", 3)),
         "review_queue_ttl_minutes": int(policy.get("review_queue_ttl_minutes", 30)),
-        "cross_provider_fallback": bool(policy.get("cross_provider_fallback", False)),
         "security_paths": list(policy.get("security_paths", [])),
         "trusted_bots": list(policy.get("trusted_bots", [])),
         "allow_actions_bot_issues": policy["allow_actions_bot_issues"],
@@ -751,17 +757,49 @@ agent = "docs-agent"
                          impl["max_attempts"]), (2, 90, 2))
     check("usage controls default off/0.10", (impl["require_usage"], impl["usage_safety_margin"]),
           (False, 0.10))
-    check("review-loop controls default 3/30/False",
-          (impl["max_review_rounds"], impl["review_queue_ttl_minutes"],
-           impl["cross_provider_fallback"]), (3, 30, False))
+    check("review-loop controls default 3/30",
+          (impl["max_review_rounds"], impl["review_queue_ttl_minutes"]), (3, 30))
     review_over = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                                 'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
                                 'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
-                                'max_review_rounds=5\nreview_queue_ttl_minutes=45\ncross_provider_fallback=true\n')
+                                'max_review_rounds=5\nreview_queue_ttl_minutes=45\n')
     review_impl = resolve("o/r", "impl", review_over, routing)
     check("review-loop controls overridable",
-          (review_impl["max_review_rounds"], review_impl["review_queue_ttl_minutes"],
-           review_impl["cross_provider_fallback"]), (5, 45, True))
+          (review_impl["max_review_rounds"], review_impl["review_queue_ttl_minutes"]), (5, 45))
+    # [issue #1029] `cross_provider_fallback` IS GONE, and the point of these rows is that its
+    # removal is enforced rather than merely done once. Four independent facts (the refusal is
+    # asserted for BOTH literals), because a partial re-add is the realistic regression — someone
+    # restores the key to the schema "for compatibility" and the silent no-op is back, with a
+    # policy knob that reads as if it can relax the cross-provider review assertion.
+    check("cross_provider_fallback is NOT an accepted policy key",
+          "cross_provider_fallback" in OPTIONAL_POLICY_FIELDS, False)
+    check("resolve() does not surface cross_provider_fallback",
+          "cross_provider_fallback" in impl, False)
+
+    def _cpf(literal):
+        return tomllib.loads(
+            '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+            'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+            'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+            f'cross_provider_fallback={literal}\n')
+
+    # BOTH literals, because they fail differently if only one is refused: `true` is the false
+    # promise (a degrade nothing implements), and `false` is the form that actually shipped in
+    # policy/repos.toml — re-admitting only that one restores a key indistinguishable from its
+    # absence, which is what made this dormant in the first place.
+    for _literal in ("true", "false"):
+        rejects(f"a policy row declaring cross_provider_fallback={_literal} is REFUSED, not ignored",
+                "unknown fields",
+                lambda lit=_literal: resolve("o/r", "impl", _cpf(lit), routing))
+    # ...and the SHIPPED file must not declare it either: the row and the resolver have to move
+    # together, so a re-add to policy/repos.toml alone is a named failure here rather than a
+    # whole-tick `unknown fields` death discovered live.
+    _shipped_cpf = sorted(
+        name for name, row in (tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "policy" / "repos.toml")
+            .read_text(encoding="utf-8")).get("repos") or {}).items()
+        if isinstance(row, dict) and "cross_provider_fallback" in row)
+    check("no SHIPPED policy row declares cross_provider_fallback", _shipped_cpf, [])
     # security_paths (B3 / defects #2,#4): validated + surfaced (consumed by review-fix.yml).
     check("security_paths default empty", impl["security_paths"], [])
     sec_paths = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
