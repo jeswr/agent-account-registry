@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6318,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "12fe4ff35d527339557e90ec171ec600a108962d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. `_dumps` matches the relevant Go `encoding/json` behavior for valid JSON output: raw non-ASCII, HTML-sensitive escaping, U+2028/U+2029 escaping, and compact separators. Its replacement pass cannot alter JSON structure or existing escapes. The mutation path uses it only for changed rows and preserves untouched rows verbatim. Tests are non-vacuous and cover the helper byte-for-byte, the committed corpus, and the real end-to-end close path. The targeted self-test passes with all 1262 corpus lines round-tripping exactly. No hostile instruction is present in the diff.",
+  "verdict": "approve"
+ }
+}
