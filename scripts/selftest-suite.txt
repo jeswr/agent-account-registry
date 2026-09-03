@@ -1,6 +1,7 @@
 account-usage.py
 auto-mint-provenance.py
 backfill-provenance.py
+backfill-targets.py
 broker-refresh.py
 chain_preference.py
 ci-latency-alert.py

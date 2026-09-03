@@ -68,6 +68,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             policy/repos.toml
+            scripts/backfill-targets.py
           sparse-checkout-cone-mode: false
       - name: Resolve
         id: resolve
@@ -75,24 +76,8 @@ jobs:
           REQUESTED: ${{ inputs.target_repo }}
         run: |
           set -euo pipefail
-          python3 - <<'EOF' | tee -a "$GITHUB_OUTPUT"
-          import json, os, tomllib
-          requested = (os.environ.get("REQUESTED") or "").strip()
-          policy = tomllib.load(open("policy/repos.toml", "rb"))["repos"]
-          enabled = sorted(n for n, r in policy.items()
-                           if isinstance(r, dict) and r.get("enabled"))
-          # A manual run keeps its explicit single target; a scheduled run sweeps EVERY enabled
-          # repo. Fail loud on an unknown manual target rather than silently sweeping everything.
-          if requested:
-              if requested not in enabled:
-                  raise SystemExit(f"target_repo {requested!r} is not an ENABLED policy row: {enabled}")
-              repos = [requested]
-          else:
-              repos = enabled
-          if not repos:
-              raise SystemExit("policy enables no repos — refusing to run with an empty matrix")
-          print("repos=" + json.dumps(repos))
-          EOF
+          python3 scripts/backfill-targets.py --self-test
+          python3 scripts/backfill-targets.py | tee -a "$GITHUB_OUTPUT"
 
   backfill:
     needs: targets

@@ -1202,6 +1202,9 @@ def backfill_workflow_seam_report(workflow=None):
     targets_job = jobs.get("targets") or {}
     resolve_step = next((s for s in (targets_job.get("steps") or [])
                          if isinstance(s, dict) and s.get("id") == "resolve"), None)
+    targets_checkout = next((s for s in (targets_job.get("steps") or [])
+                             if isinstance(s, dict) and str(s.get("uses") or "")
+                             .startswith("actions/checkout@")), None)
     resolve_run = str((resolve_step or {}).get("run") or "")
     needs = job.get("needs")
     strategy = job.get("strategy") or {}
@@ -1272,6 +1275,8 @@ def backfill_workflow_seam_report(workflow=None):
                              if isinstance(s, dict) and s.get("id")],
         "resolver_requested_binding": str(((resolve_step or {}).get("env") or {})
                                           .get("REQUESTED")),
+        "resolver_checkout_paths": sorted(str(((targets_checkout or {}).get("with") or {})
+                                               .get("sparse-checkout") or "").split()),
         "resolver_step_unconditional": (resolve_step is not None and "if" not in resolve_step
                                         and not resolve_step.get("continue-on-error")),
         # EVERY command the runner's shell executes, in order — the heredoc body is stdin DATA,
@@ -1280,45 +1285,23 @@ def backfill_workflow_seam_report(workflow=None):
         # straight after it, and THAT tree turns a resolver refusal into `refuse | tee` — tee
         # exits 0, so the step and the whole targets job report SUCCESS publishing no `repos`
         # (AGENTS.md pre-flight 6: exact-match at the YAML seam, never containment).
-        "resolver_shell_commands": _split_heredoc(resolve_run)[0],
+        "resolver_shell_commands": [line for line in resolve_run.splitlines() if line.strip()],
         # Without the `| tee -a "$GITHUB_OUTPUT"` the resolver computes the right answer and
         # discards it: `steps.resolve.outputs.repos` renders empty and the matrix sweeps nothing,
         # with every text assertion above still green.
         "resolver_emits_to_step_output": bool(
-            re.search(r"""^python3 - <<'EOF' \| tee -a "\$GITHUB_OUTPUT"$""", resolve_run, re.M)),
+            re.search(r'^python3 scripts/backfill-targets\.py \| tee -a "\$GITHUB_OUTPUT"$',
+                      resolve_run, re.M)),
     }
 
 
-def _split_heredoc(run_text):
-    """`(shell_command_lines, heredoc_body_lines, reason)` for a `run:` block with one heredoc.
-
-    The shell lines are what the runner's shell EXECUTES; the heredoc body is stdin data. Split
-    once, here, so the seam report and the resolver extractor below cannot drift apart (#958).
-    `reason` is a string when the block does not carry exactly one terminated `<<'EOF'`, and then
-    `heredoc_body_lines` is None — but `shell_command_lines` is still every non-blank line, so an
-    exact-match assertion on it stays meaningful (and red) for such a tree rather than vacuous."""
-    lines = str(run_text or "").split("\n")
-    # Containment, not `endswith`: the shipped opener pipes (`<<'EOF' | tee -a "$GITHUB_OUTPUT"`).
-    opens = [i for i, line in enumerate(lines) if "<<'EOF'" in line]
-    if len(opens) != 1:
-        return ([line for line in lines if line.strip()], None,
-                f"the resolver must run exactly one `<<'EOF'` heredoc, found {len(opens)}")
-    body = lines[opens[0] + 1:]
-    closes = [i for i, line in enumerate(body) if line.strip() == "EOF"]
-    if not closes:
-        return ([line for line in lines if line.strip()], None,
-                "the resolver's heredoc is unterminated")
-    shell = lines[:opens[0] + 1] + body[closes[0] + 1:]
-    return [line for line in shell if line.strip()], body[:closes[0]], None
-
-
 def backfill_targets_resolver_source():
-    """The `targets` job's `resolve` step: `(heredoc_source, whole_run_block, None)`.
+    """The `targets` job's helper: `(script_source, whole_run_block, None)`.
 
     Returns `(None, None, reason)` when there is no resolver to extract. Every seam assertion
     above reads workflow TEXT, and text cannot tell a policy-derived resolver from
     `echo 'repos=["one/hardcoded-repo"]'` — which is exactly the defect #1544 exists to kill. So
-    the self-test EXECUTES this source against synthetic policy fixtures and asserts the row it
+    the self-test EXECUTES this helper against synthetic policy fixtures and asserts the row it
     emits, and executes the whole `run` block in a shell to assert the step's own exit status.
 
     It returns a reason rather than raising ON PURPOSE: the headline mutant here (a hardcoded
@@ -1330,10 +1313,14 @@ def backfill_targets_resolver_source():
     if len(found) != 1:
         return None, None, f"expected exactly one `id: resolve` step in `targets`, found {len(found)}"
     run_text = str(found[0].get("run") or "")
-    _, body, reason = _split_heredoc(run_text)
-    if reason is not None:
-        return None, None, reason
-    source = textwrap.dedent("\n".join(body))
+    command = 'python3 scripts/backfill-targets.py | tee -a "$GITHUB_OUTPUT"'
+    if command not in [line.strip() for line in run_text.splitlines()]:
+        return None, None, "the resolve step does not invoke backfill-targets.py at its output seam"
+    helper = Path(__file__).resolve().with_name("backfill-targets.py")
+    try:
+        source = helper.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, None, f"cannot read backfill-targets.py: {exc}"
     try:
         compile(source, "<targets.resolve>", "exec")
     except SyntaxError as exc:
@@ -1820,6 +1807,9 @@ def _self_test():
           seam["targets_step_ids"], ["resolve"])
     check("the resolver reads the requested target from the workflow_dispatch input",
           seam["resolver_requested_binding"], "${{ inputs.target_repo }}")
+    check("the thin checkout includes BOTH resolver inputs (policy plus executable helper)",
+          seam["resolver_checkout_paths"],
+          ["policy/repos.toml", "scripts/backfill-targets.py"])
     check("the resolver step is UNCONDITIONAL (an `if:`/`continue-on-error` here fails it green)",
           seam["resolver_step_unconditional"], True)
     # Exact-match the shell's whole command SEQUENCE, not a `"set -euo pipefail" in run` probe.
@@ -1830,7 +1820,8 @@ def _self_test():
     # pipeline alike; the two execution-seam rows further down prove the resulting exit status.
     check("the resolver's shell runs errexit+pipefail and NOTHING that could turn them back off",
           seam["resolver_shell_commands"],
-          ["set -euo pipefail", "python3 - <<'EOF' | tee -a \"$GITHUB_OUTPUT\""])
+          ["set -euo pipefail", "python3 scripts/backfill-targets.py --self-test",
+           "python3 scripts/backfill-targets.py | tee -a \"$GITHUB_OUTPUT\""])
     check("the resolver's stdout is APPENDED to $GITHUB_OUTPUT (else `repos` publishes nothing)",
           seam["resolver_emits_to_step_output"], True)
 
@@ -1860,14 +1851,20 @@ def _self_test():
                     os.environ["REQUESTED"] = requested
                 buffer = io.StringIO()
                 try:
+                    namespace = {"__name__": "backfill_targets"}
+                    exec(_resolver_src, namespace)  # noqa: S102 — the workflow's checked-in helper
+                    result = namespace["resolve_file"]("policy/repos.toml",
+                                                        os.environ.get("REQUESTED", ""))
                     with contextlib.redirect_stdout(buffer):
-                        exec(_resolver_src, {"__name__": "__main__"})  # noqa: S102 — the step
+                        print("repos=" + json.dumps(result))
                 except SystemExit as exc:
                     # A refusal is a NONZERO exit: `raise SystemExit("...")` exits with the
                     # message. `SystemExit(0)` is a silent success emitting nothing, which is a
                     # different (and equally wrong) outcome, so it is named separately.
                     return "REFUSED" if exc.code not in (0, None) else "EXITED-CLEAN"
                 except BaseException as exc:       # noqa: BLE001 — a mutant must red, not abort
+                    if type(exc).__name__ == "TargetResolutionError":
+                        return "REFUSED"
                     return f"ABORTED: {type(exc).__name__}"
                 printed = [line for line in buffer.getvalue().split("\n") if line.strip()]
                 if len(printed) != 1 or "=" not in printed[0]:
@@ -1899,6 +1896,10 @@ def _self_test():
             return f"NO-RESOLVER: {_resolver_why}"
         with tempfile.TemporaryDirectory() as workdir:
             os.makedirs(os.path.join(workdir, "policy"))
+            os.makedirs(os.path.join(workdir, "scripts"))
+            with open(os.path.join(workdir, "scripts", "backfill-targets.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write(_resolver_src)
             with open(os.path.join(workdir, "policy", "repos.toml"), "w",
                       encoding="utf-8") as handle:
                 handle.write(policy_toml)
