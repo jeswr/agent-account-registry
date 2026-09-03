@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6149,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d481ac2b3dddb36f69115527a4882806573e2232",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 confirms the prior approval. The change remains fail-closed: the carve-out is enabled only when the merge base resolves, both blobs can be read, all non-comment lines match verbatim, and PyYAML parses both revisions to equal structures. This conjunction conservatively rejects code-line changes, trailing-comment edits, YAML-normalization ambiguities, malformed or missing inputs, and comment/blank-line changes that alter block-scalar content. Selector wiring preserves independent crate changes and unrelated full-run triggers, while dependency/setup and proof failures retain the pre-change full-run behavior. The tests exercise both proof halves, the actual divergent-history merge-base/blob path, decline and eligibility paths, memoization, audit output, and mixed-path selection; they are non-vacuous and include negative controls. The implementation is consistent with the CI selection design's proof-of-non-interference and fail-closed posture. No correctness, soundness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
