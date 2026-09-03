@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6301,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5c71f3d3e5d4f6d1db4796f87cdb98f9d9026817",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_on_block` ignores the value captured after the top-level `on:` key and only scans indented following lines. Consequently, valid YAML forms such as `on: workflow_run` and `on: {workflow_run: {types: [completed]}}` produce zero offences even though they declare `workflow_run` without a non-empty `workflows` filter. This contradicts the stated every-trigger invariant and makes the gating check bypassable.",
+    "file": "scripts/check-workflow-run-filter.py",
+    "fix_hint": "Parse and validate supported scalar/flow forms of the top-level `on` value, preferably with a real YAML parser or a deliberately complete structural parser. Add red self-test fixtures for `on: workflow_run`, `on: [workflow_run]`, and top-level flow mappings with missing or empty `workflows`.",
+    "severity": "major",
+    "title": "Top-level scalar and flow-style `on` declarations bypass the guard"
+   },
+   {
+    "body": "The inline-form regex alternation accepts an empty flow list: the first branch rejects `[]`, but the scalar fallback `workflows\\s*:\\s*[^\\s,}]` matches its opening `[`. Running `check_text` on `on:\\n  workflow_run: {workflows: []}\\n` returns an empty offence list. The block-form equivalent is tested and rejected, so the two syntaxes enforce different semantics.",
+    "file": "scripts/check-workflow-run-filter.py",
+    "fix_hint": "Replace the ambiguous regex with structural parsing of the inline mapping/list, or ensure the scalar branch cannot consume `[` and explicitly reject empty flow sequences. Add the inline-empty-list case to `_self_test` and require it to red.",
+    "severity": "major",
+    "title": "Inline `workflow_run: {workflows: []}` is incorrectly accepted"
+   }
+  ],
+  "progress": null,
+  "summary": "The guard is fail-open for valid YAML trigger forms. Empirical checks against check_text show that it returns no offences for both `on: workflow_run` / top-level flow syntax and `workflow_run: {workflows: []}`. These bypass the exact invariant the new gating check claims to enforce, while the self-test suite omits those cases.",
+  "verdict": "request_changes"
+ }
+}
