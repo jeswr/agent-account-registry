@@ -210,6 +210,14 @@ GRAPHQL_RATE_LIMIT_RESERVE = 100
 # provoke a secondary rate limit, so the back-off must honour what GitHub asks for — but a
 # long suggestion must fail the read CLOSED inside the job's 15-minute timeout rather than
 # park the whole sweep on a sleep.
+#
+# [#2032] THIS IS THE ONE CEILING ON THIS PATH, and it is deliberately TIGHTER than the fleet's
+# `gh_403.RETRY_AFTER_CAP` (60s): this walk runs inside a 15-minute job and retries three times per
+# read, so the fleet bound would let a single throttled read spend three of those minutes asleep.
+# `_retry_delay` PASSES this value to `gh_403.retry_after_seconds` instead of re-applying its own
+# `min()` on top of the parser's — one application, at one site. `the_two_retry_after_caps_are
+# _reconciled_not_stacked` pins both halves: that this value is what binds, and that it stays
+# inside the fleet bound.
 RETRY_AFTER_CAP_SECONDS = 30
 
 # THE REQUEST-BUDGET RESERVE (issue #819 / #796). Every REST response carries the authoritative
@@ -689,10 +697,19 @@ def _retry_delay(exc, attempt):
     response instead of being retried into the same empty bucket twice more. Note also that
     `GET /rate_limit` reports a DIFFERENT bucket and will happily say thousands remain while
     every read 403s (#796) — which is why every budget number here comes off the RESPONSE.
+
+    ONE CAP, APPLIED ONCE (registry #2032). `RETRY_AFTER_CAP_SECONDS` is this JOB's ceiling and is
+    tighter than the fleet's `gh_403.RETRY_AFTER_CAP`, deliberately — see that constant's note. It
+    is now handed to the shared parser rather than re-applied here on top of the parser's own cap:
+    two `min()`s in two files agreed today but neither site could be read for the bound actually in
+    force, and a later loosening of either would have been invisible at the other. The
+    `if seconds:` truthiness stays (rather than `is not None`) for the same fail-closed reason
+    `classify_403` keeps it: a wait that somehow arrived as `0` must fall back to the ladder below,
+    never become a zero-second retry against an endpoint that is already throttling us.
     """
-    seconds = _retry_after_seconds(getattr(exc, "headers", None))
+    seconds = _retry_after_seconds(getattr(exc, "headers", None), RETRY_AFTER_CAP_SECONDS)
     if seconds:
-        return min(seconds, RETRY_AFTER_CAP_SECONDS)
+        return seconds
     return 5 * (attempt + 1)
 
 
@@ -2334,6 +2351,13 @@ def _self_test():
         assert _retry_delay(http_error(403, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
                             1) == 10
         assert _retry_delay(http_error(403, {"Retry-After": "0"}), 0) == 5
+        # [#2032] A FRACTIONAL wait is honoured, not discarded. RED on the pre-#2032 tree, where
+        # `int("2.5")` raised inside the shared parser and the header read as absent: this
+        # assertion returned the ladder's 5.
+        assert _retry_delay(http_error(403, {"Retry-After": "2.5"}), 0) == 2.5
+        # ...and a malformed field value is still NOT mined for the number it contains — `7junk`
+        # must fall to the ladder, not become a 7-second wait.
+        assert _retry_delay(http_error(403, {"Retry-After": "7junk"}), 0) == 5
 
         # THE CALL SITE: make_fetch must actually wait what the header asked for.
         attempts = {"n": 0}
@@ -2354,6 +2378,76 @@ def _self_test():
         assert attempts["n"] == 3, attempts
         assert [call.args[0] for call in slept.call_args_list] == [7, 7], \
             slept.call_args_list
+
+    def the_two_retry_after_caps_are_reconciled_not_stacked():
+        """#2032. Two ceilings bounded this one back-off — the fleet's `gh_403.RETRY_AFTER_CAP`
+        (60s) inside the shared parser and this file's `RETRY_AFTER_CAP_SECONDS` (30s) re-applied
+        on top. Stacked `min()`s agree while the tighter one is this file's, so neither site could
+        be READ for the bound actually in force, and loosening this file's would have been
+        invisible: 60 would have silently kept binding.
+
+        The rows above cannot see the difference — 30 < 60, so a stacked implementation answers 30
+        too. Two levers here can: this file's cap made LOOSER than the fleet's (90, which no
+        production value is and no other row constructs), and the parser's answer pinned to reach
+        the caller UNMODIFIED, which is the only thing a self-stacked `min` cannot satisfy."""
+        def http_error(code, headers):
+            return HTTPError("https://api.github.com/x", code, "throttled", headers, None)
+
+        _MISSING = object()
+        module = sys.modules[__name__]
+        # DELEGATION, not a second cap: the parser must receive this file's ceiling as its `cap`.
+        seen = []
+        real_parser = _retry_after_seconds
+
+        def _recording_parser(headers, cap=_MISSING):
+            """The shared parser, recording the cap it was HANDED.
+
+            `cap` is DEFAULTED (to a sentinel, not to a number) on purpose: a `_retry_delay` that
+            stopped passing the cap would raise TypeError against a required parameter, and an
+            exception raised by the mutated call itself is malformedness, not detection — it would
+            record as a kill while proving nothing. Defaulting turns the omission into a VALUE the
+            row below kills by comparison; the sentinel keeps the delegated call well-formed."""
+            seen.append(cap)
+            return real_parser(headers) if cap is _MISSING else real_parser(headers, cap)
+
+        with patch.object(module, "_retry_after_seconds", _recording_parser):
+            assert _retry_delay(http_error(403, {"Retry-After": "3600"}), 0) \
+                == RETRY_AFTER_CAP_SECONDS
+        assert seen == [RETRY_AFTER_CAP_SECONDS], (
+            "_retry_delay must hand its own ceiling to the shared parser, not cap afterwards: "
+            f"{seen!r}")
+
+        # ...and the cap in force is THIS file's, not the fleet default the parser applies when it
+        # is handed none. With the cap argument dropped this reads 60.0.
+        with patch.object(module, "RETRY_AFTER_CAP_SECONDS", 90):
+            assert _retry_delay(http_error(429, {"Retry-After": "3600"}), 0) == 90.0, (
+                "the ceiling in force must be this file's — falling back to the parser's fleet "
+                "default would clamp this to 60.0")
+
+        # APPLIED ONCE. Neither row above can see a re-STACKED `min(parser(...), <same constant>)`:
+        # `min` is idempotent, so stacking one cap on itself is behaviourally invisible — and that
+        # invisibility IS the defect, because the day the two constants stop agreeing the bound in
+        # force changes at a site that does not name it. So pin the SHAPE instead: what the parser
+        # returns must reach the caller UNMODIFIED. 4242.0 is far above every cap in this file and
+        # appears nowhere else in this harness, so any re-introduced post-parse `min(...)` reds
+        # this row at whatever ceiling it re-applies.
+        with patch.object(module, "_retry_after_seconds", lambda headers, cap=None: 4242.0):
+            assert _retry_delay(http_error(403, {"Retry-After": "3600"}), 0) == 4242.0, (
+                "_retry_delay must return the shared parser's answer unmodified — a second cap "
+                "here is the stacking #2032 removed")
+        # The production value must stay INSIDE the fleet bound, which is what makes the tighter
+        # ceiling a job-scoped narrowing rather than a second, divergent policy.
+        assert RETRY_AFTER_CAP_SECONDS <= gh_403.RETRY_AFTER_CAP, (
+            f"{RETRY_AFTER_CAP_SECONDS} exceeds the fleet ceiling {gh_403.RETRY_AFTER_CAP}")
+        # And the contract itself: `float | None`, never the pre-#2032 `int`-or-`0`. `0 == None` is
+        # False and `int` is not `float`, so this row reds on a revert that every equality
+        # assertion above would absorb.
+        assert _retry_after_seconds({}) is None and _retry_after_seconds({"Retry-After": "0"}) \
+            is None, "absent must be the None sentinel, not 0"
+        assert isinstance(_retry_after_seconds({"Retry-After": "7"}, RETRY_AFTER_CAP_SECONDS),
+                          float)
+        assert isinstance(_retry_after_seconds({"Retry-After": "3600"},
+                                               RETRY_AFTER_CAP_SECONDS), float)
 
     def the_three_403s_are_told_apart():
         """#819. Until this landed every 403 was retried three times, so the read that proved the
@@ -3368,6 +3462,7 @@ def _self_test():
         sweep_fatal_listing_failure_is_still_fatal,
         a_pagination_race_duplicate_is_dropped_keep_first_and_announced,
         retry_after_is_honoured_and_capped,
+        the_two_retry_after_caps_are_reconciled_not_stacked,
         the_three_403s_are_told_apart,
         the_classifier_is_the_SHARED_one_not_a_local_copy,
         the_retry_status_policy_is_the_SHARED_one,
