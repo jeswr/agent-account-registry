@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6025,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b743a42f94503bea873f5afd9b1bbc979e78a2c2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only change remains accurate and complete. The live coverage-measure job unconditionally invokes cone_coverage.py with --enforce, and its event guard excludes merge_group while retaining non-draft pull_request and push execution. In enforced cone mode, outside-cone crates are omitted and divergence detection is explicitly unavailable; in full mode the emitted filter is empty, so the whole shard is measured and no meaningful cone-vs-full divergence corpus accrues. The cited behavioral test exercises the live job conditions for merge_group, pull_request, and push rather than merely matching text. The described full-trigger, selector-error, inherited-row, and nightly backstops are consistent with the scoped implementation. No correctness, soundness, test-validity, security, or prompt-injection issue is present.",
+  "verdict": "approve"
+ }
+}
