@@ -1464,36 +1464,73 @@ def import_time_sibling_loads(source: str) -> tuple[str, ...]:
     `Path(__file__).resolve().with_name("<x>.py")` idiom both load forms in this module use — the
     `_load_module` calls and the bare `spec_from_file_location` pair at the top of the file.
 
-    Loads nested inside a `def`/`lambda` are deliberately EXCLUDED: those run on call, not on
-    import (policy-resolve.py, run_name_grammar.py, dispatch-secrets-guard.py), so they are not a
-    checkout dependency of every invocation and declaring them would over-constrain the sparse
-    lists this feeds. A `class` body is NOT deferred that way — it EXECUTES as the module executes,
-    so a load written directly in a class body is a dependency of every invocation exactly like a
-    module-level one, and this descends into it (round-1 review of #2033: skipping ClassDef let a
-    class-body load add a real dependency with the exactness assertion still green). Method bodies
-    inside that class are still excluded — the FunctionDef skip applies at every depth.
+    Only a `def`/`lambda` BODY is deferred to call time, and only the body is EXCLUDED here: those
+    loads run on call, not on import (policy-resolve.py, run_name_grammar.py,
+    dispatch-secrets-guard.py), so they are not a checkout dependency of every invocation and
+    declaring them would over-constrain the sparse lists this feeds. The rest of a definition is
+    NOT deferred — decorators, parameter defaults and keyword-only defaults are evaluated when the
+    definition is created (a lambda's defaults when the lambda expression is evaluated), so a load
+    written there is a dependency of every invocation exactly like a module-level one, and this
+    descends into them (round-2 review of #2033: skipping the whole def let a default/decorator
+    load add a real dependency with the exactness assertion still green). A `class` body is not
+    deferred either — it EXECUTES as the module executes — so this descends into it too, which
+    reaches the decorators and defaults of its methods while still excluding their bodies (round-1
+    review of #2033).
+
+    ANNOTATIONS count only when the module actually evaluates them: under PEP 563
+    (`from __future__ import annotations`, which groom.py itself uses) they are stored as strings
+    and never evaluated, so counting them would declare a phantom; without it they are evaluated
+    with the rest of the signature and are a real import-time dependency.
 
     Raises SyntaxError on unparseable source — callers surface that as a refusal rather than as an
     empty set, which would make every coverage check below vacuously true."""
     found: set[str] = set()
+    tree = ast.parse(source)
+    annotations_evaluated = not any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "__future__"
+        and any(alias.name == "annotations" for alias in statement.names)
+        for statement in tree.body
+    )
+
+    def definition_time_parts(node: Any) -> list[Any]:
+        """The subexpressions of a `def`/`lambda` evaluated when the DEFINITION is created."""
+        parts: list[Any] = list(getattr(node, "decorator_list", []))
+        parts.extend(getattr(node, "type_params", None) or [])   # PEP 695, 3.12+
+        signature = node.args
+        parts.extend(signature.defaults)
+        parts.extend(default for default in signature.kw_defaults if default is not None)
+        if annotations_evaluated:
+            if getattr(node, "returns", None) is not None:
+                parts.append(node.returns)
+            parts.extend(
+                argument.annotation
+                for argument in (list(getattr(signature, "posonlyargs", []))
+                                 + list(signature.args) + list(signature.kwonlyargs)
+                                 + [signature.vararg, signature.kwarg])
+                if argument is not None and argument.annotation is not None
+            )
+        return parts
 
     def scan(node: Any) -> None:
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "with_name"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and node.args[0].value.endswith(".py")
+        ):
+            found.add(f"scripts/{node.args[0].value}")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for part in definition_time_parts(node):
+                scan(part)                             # ... but NOT `node.body`: that is deferred.
+            return
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                continue
-            if (
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr == "with_name"
-                and len(child.args) == 1
-                and isinstance(child.args[0], ast.Constant)
-                and isinstance(child.args[0].value, str)
-                and child.args[0].value.endswith(".py")
-            ):
-                found.add(f"scripts/{child.args[0].value}")
             scan(child)
 
-    scan(ast.parse(source))
+    scan(tree)
     return tuple(sorted(found))
 
 
@@ -14410,6 +14447,59 @@ def _self_test() -> int:
           (import_time_sibling_loads(_pin_source) == (_pin_alpha,),
            set(import_time_sibling_loads(_pin_source)) - {_pin_alpha}),
           (False, {_pin_beta, _pin_gamma}))
+
+    # DEFINITION-TIME vs BODY. Only a `def`/`lambda` BODY is deferred; the decorators, defaults and
+    # keyword-only defaults of that same definition run when the definition is CREATED, so a load
+    # written there is a dependency of every invocation (round-2 review of #2033: skipping the whole
+    # definition let such a load stay invisible with the LIVE exactness row green). Each eager
+    # position carries its OWN sibling name and each is paired with a body-local load in the SAME
+    # definition, so an implementation that swept the definition back in wholesale — or that lost
+    # any single position — reds on a named row rather than on a set that could pass by accident.
+    _pin_eager_source = (
+        'from pathlib import Path\n'
+        '@_load_module(Path(__file__).resolve().with_name("deco.py"), "d")\n'
+        'def decorated(arg=_load_module(Path(__file__).resolve().with_name("default.py"), "df"),\n'
+        '              *, kw=_load_module(Path(__file__).resolve().with_name("kwdef.py"), "kw")):\n'
+        '    return _load_module(Path(__file__).resolve().with_name("body.py"), "b")\n'
+        'async def fetched(arg=_load_module(Path(__file__).resolve().with_name("adef.py"), "a")):\n'
+        '    return _load_module(Path(__file__).resolve().with_name("abody.py"), "ab")\n'
+        'make = lambda seed=_load_module(Path(__file__).resolve().with_name("lamdef.py"), "l"): (\n'
+        '    _load_module(Path(__file__).resolve().with_name("lambody.py"), "lb"))\n'
+        'class Holder:\n'
+        '    @_load_module(Path(__file__).resolve().with_name("mdeco.py"), "md")\n'
+        '    def method(\n'
+        '            self,\n'
+        '            arg=_load_module(Path(__file__).resolve().with_name("mdefault.py"), "mdf")):\n'
+        '        return _load_module(Path(__file__).resolve().with_name("mbody.py"), "mb")\n'
+    )
+    check("#2033 load derivation: decorators and parameter/keyword-only/lambda defaults are "
+          "EAGER (they run when the definition is created) and are derived, at module level and "
+          "on a method of an executing class body alike",
+          import_time_sibling_loads(_pin_eager_source),
+          ("scripts/adef.py", "scripts/deco.py", "scripts/default.py", "scripts/kwdef.py",
+           "scripts/lamdef.py", "scripts/mdeco.py", "scripts/mdefault.py"))
+    check("#2033 load derivation: the BODY of that SAME def/async def/lambda/method stays "
+          "EXCLUDED (a lazy load must not be declared — it would over-constrain the sparse lists)",
+          sorted({"scripts/body.py", "scripts/abody.py", "scripts/lambody.py", "scripts/mbody.py"}
+                 & set(import_time_sibling_loads(_pin_eager_source))),
+          [])
+    # ANNOTATIONS are eager only where the module evaluates them. The two rows share ONE fixture
+    # body and differ ONLY by the `__future__` line, so neither can pass by construction.
+    _pin_annotated = (
+        'from pathlib import Path\n'
+        'def annotated(arg: _load_module(Path(__file__).resolve().with_name("ann.py"), "an")) -> (\n'
+        '        _load_module(Path(__file__).resolve().with_name("ret.py"), "rt")):\n'
+        '    return arg\n'
+    )
+    check("#2033 load derivation: parameter and return ANNOTATIONS are eager when the module "
+          "evaluates them",
+          import_time_sibling_loads(_pin_annotated), ("scripts/ann.py", "scripts/ret.py"))
+    check("#2033 load derivation: the SAME annotations are NOT dependencies under PEP 563 "
+          "(`from __future__ import annotations` stores them as strings — groom.py's own case, so "
+          "counting them would pin a phantom into PATH_LOADED_SIBLINGS)",
+          import_time_sibling_loads(
+              "from __future__ import annotations\n" + _pin_annotated),
+          ())
 
     # ---- the LIVE rows: this checkout, these workflows -------------------------------------------
     try:
