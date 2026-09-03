@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6278,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7204436dd44572fe839cadb9510f1f5e13e5537d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes the sparq-side structural reachability predicate used by both the review-state writer and census, fails closed on missing GraphQL inputs, withdraws only the informational `review:unreviewed` label for unreachable PRs, and preserves valid human verdict promotion. The alarm adds an always-present drift counter and explicit dispositions without treating the informational label as enrollment. The new tests exercise the real GraphQL parse_node -> decide path, cover stale-label withdrawal, fork/human/missing-field cases, and include a reachable control to prevent vacuous success. The standalone reachability self-test passes. The two broader Python test files could not be executed in this checkout because PyYAML is unavailable, but review of the changed test paths found no correctness or security defect.",
+  "verdict": "approve"
+ }
+}
