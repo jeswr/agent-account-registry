@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2272,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "68eb6b4c0794def41cf0142a30f065ab86505abb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change consistently removes the unused cross_provider_fallback policy contract from the shipped policy, accepted-key schema, validation, and resolved output. Existing declarations now fail closed as unknown fields, while the new self-tests independently verify schema exclusion, output exclusion, rejection of both TOML boolean literals, and absence from every shipped repository row. Repository-wide references show no remaining consumer or contradictory live declaration. No correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
