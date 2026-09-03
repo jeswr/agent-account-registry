@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6318,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "12fe4ff35d527339557e90ec171ec600a108962d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The serializer change correctly matches the relevant Go encoding/json behavior: UTF-8 non-ASCII remains raw, HTML-sensitive characters and U+2028/U+2029 are escaped, and compact separators are retained. The replacement pass is safe over valid JSON output, and close_beads_in_jsonl applies it only to mutated rows while preserving untouched rows verbatim. Tests are non-vacuous: they pin each encoding rule, validate the full committed corpus byte-for-byte, and exercise the real end-to-end mutation path including untouched-line preservation. The targeted self-test passes.",
+  "verdict": "approve"
+ }
+}
