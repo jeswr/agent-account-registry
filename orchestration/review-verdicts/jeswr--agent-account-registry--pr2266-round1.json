@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 2266,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7c5312ac761131670dcd2b38100c9d065a424aaa",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "enrolled_targets() now yields sparq-org/sparq, but target_sweep_refusal() refuses any target != annotate_repo, so the sweep hits `SKIP target sparq-org/sparq [target-not-annotatable]` on EVERY tick, forever. That is fail-closed and censused (counters['skipped_targets']), and nothing outside this file consumes it, so there is no outage \u2014 but two things are now untrue in the tree:\n\n1. The docstring at scripts/auto-mint-provenance.py:1054-1064 still asserts \"the registry is, deliberately, the only enrolled target (#916 scoped the rollout to one repo)\" and describes enrolling a second one as the hypothetical future. It is now describing the shipped state incorrectly, in the exact function whose job is to explain why a second target is refused.\n2. The operational consequence is not disclosed in the new policy comment: sparq orchestrator PRs get NO automatic minting and, because the refusal is target-level, NO PR-visible annotation either. Every sparq record must come from a manual mint-provenance dispatch. That matches the PR's \"a self-attested record is still required\" framing, but a reader of policy/repos.toml cannot tell that the auto-mint half is inert for this repo.\n\n(Related, outside the diff so not filed separately: .github/workflows/mint-provenance.yml:48 still says review_enrolment_authors \"names only this repo today\", and scripts/backfill-provenance.py:786 still says \"Empty for every repo today\".)",
+    "file": "scripts/auto-mint-provenance.py",
+    "fix_hint": "Update the target_sweep_refusal docstring to state the shipped fact \u2014 two enrolled targets, one of which (sparq) is refused pending the target-scoped App token plumbing \u2014 and add one line to the new sparq comment in policy/repos.toml noting that auto-mint cannot sweep this target, so records for it come only from a manual mint-provenance dispatch.",
+    "severity": "minor",
+    "title": "target_sweep_refusal's docstring now contradicts shipped policy; sparq becomes a permanently un-sweepable enrolled target"
+   },
+   {
+    "body": "_enable_states passes `target_repo` only into enumerate_review_items and the fixture's head_repo, so the control at line 14309 discriminates purely on `_control_authors == frozenset()` \u2014 the same axis the `login='drive-by-contributor'` assertion below it already covers from the other side. The repo identity itself is never the thing that makes it skip. This is unchanged from the pre-diff shape (the old sparq control worked identically), so it is not a regression, but the rewritten comment (\"one per axis ... the un-enrolled repo\" / \"the distinct solid-sdk control prevents admit-everything drift\") claims slightly more separation than the code provides.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Either reword the comment to say what the leg actually proves (\"a repo whose SHIPPED row carries no allowlist resolves empty, and an empty allowlist admits nothing\"), or make the repo axis real by asserting that the fixture PR is skipped when head_repo is the control repo while the enumerator is handed the sparq allowlist.",
+    "severity": "nit",
+    "title": "The \"un-enrolled repo\" control leg is really the empty-allowlist leg"
+   },
+   {
+    "body": "policy/repos.toml documents flipping jeswr/solid-sdk to enabled=true as a one-line follow-up once solid-sdk#23 merges. On that day, mint-provenance's `check(\"...the shipped control row is disabled before the test enables only that flag\", ..., False)` fails, and the bare `assert _control_doc['repos'][_CONTROL_REPO]['enabled'] is False` in scripts/dispatch-claim.py:14281 fails with no message at all. Failing loudly is the right direction, but the dispatch-claim assert gives the next maintainer no hint that the fix is \"pick a still-disabled control row / drop the flip\" rather than \"the enrolment broke\".",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Give the dispatch-claim assert a message naming why the row must currently be disabled and what to do when solid-sdk is enabled; consider deriving the control row as \"the first shipped row with no review_enrolment_authors key\" so both tests survive the planned enable without an edit.",
+    "severity": "nit",
+    "title": "Both new controls hard-depend on jeswr/solid-sdk staying disabled \u2014 a planned one-line follow-up will red them with no explanation"
+   }
+  ],
+  "progress": null,
+  "summary": "Widening the #657 orchestrator-class REVIEW-ONLY lane to sparq-org/sparq for login `jeswr`, plus the three self-tests that pin the shipped population. Verified statically against the checkout (self-tests could not be executed in this read-only review environment; all findings below are from reading the code and the shipped policy).\n\nCorrect and fail-closed. The enrolment key is resolved PER TARGET REPO at every runtime site (dispatch.yml:1316, dispatch-claim.py:8559/9220, review-fix.yml:359) through policy-resolve.review_enrolment_authors, which validates the whole row and rejects non-canonical / `[bot]` logins, so the widening cannot reach a permissive default. The safety contract asserted in the new sparq comment holds and is NOT repo-keyed: the arm refusal is a property of the self-attested record class (worker-pr.decide_review(self_attested=True) != 'arm', ready_and_arm raises), so sparq's `arm_auto_merge = true` does not create an auto-arm path; the fix/rebase lane still refuses the class (resolve-conflicts.owned_by_review_rebase_lane, review_fix_pr_admission waives shape gates for review mode only); backfill-provenance SKIPS the class rather than minting it; groom's park suppression is record-gated via _orchestrator_admission. Blast radius stays one explicit gesture at a time because every PR still needs a separately minted `orchestrator` record on `ledger`.\n\nTests are non-vacuous. auto-mint pins the exact (repo, authors) population in sorted order and keeps its disabled-row / enrols-nobody / `enabled is not True` controls. dispatch-claim keeps a real positive leg driven by the SHIPPED TOML literal plus three negative legs, and the new solid-sdk control is a real shipped row (enabled=false, no allowlist key \u2014 exactly what policy/repos.toml:152 reserved it for) rather than a hand-written fixture; the deepcopy+flip is required because _policy_row raises on a disabled row. mint-provenance's probe now performs a genuine empty -> ['jeswr'] tr\u2026 [truncated 239 chars]",
+  "verdict": "approve"
+ }
+}
