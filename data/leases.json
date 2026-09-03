@@ -21,16 +21,6 @@
    "expires_at": 1788433092
   },
   {
-   "account": "f79434c3ffba014f",
-   "claim_id": "2cec357a47b44bd0bda0e327aeb697db",
-   "holder": "jeswr/agent-account-registry#1029@33737731420.1",
-   "package": "review-loop",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1788426879,
-   "expires_at": 1788429579
-  },
-  {
    "account": "dc2d751954080e13",
    "claim_id": "756a104ac06540f4a891024aff72ceee",
    "holder": "jeswr/agent-account-registry#1608@33738468034.1",
@@ -48,7 +38,7 @@
    "role": "impl",
    "model": "opus5",
    "issued_at": 1788428181,
-   "expires_at": 1788430881
+   "expires_at": 1788432577
   }
  ]
 }
