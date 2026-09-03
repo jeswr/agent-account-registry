@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6149,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d481ac2b3dddb36f69115527a4882806573e2232",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 5 confirms the prior approval. The selector remains fail-closed: only eligible .github YAML paths can reach the carve-out, and they are skipped only when both revisions are readable, every non-comment line is verbatim-identical, and PyYAML parses both documents to equal structures. This conservatively rejects code edits, trailing-comment changes, malformed or missing blobs, YAML normalization mismatches, and comment or blank-line edits that change block-scalar content. The real path uses the same merge base as the three-dot changed-path diff; failures disable the optimization or force the existing full-run behavior. Selection wiring preserves independent crate changes and unrelated full triggers. The tests exercise both proof halves, fail-closed cases, actual divergent-history blob resolution, memoization, audit rendering, and mixed-path selection, with meaningful negative controls. This is consistent with the change-selection design's proof-of-non-interference invariant. No correctness, soundness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
