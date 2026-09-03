@@ -995,7 +995,7 @@ function obsCard(title) {
   return card;
 }
 
-function obsRenderTriggers(fires, total) {
+function obsRenderTriggers(fires, total, summaryDropped) {
   const host = byId("obs-triggers");
   host.replaceChildren();
   for (const fire of fires) {
@@ -1076,6 +1076,13 @@ function obsRenderTriggers(fires, total) {
   }
   const note = obsTruncationNote(fires, total, "trigger fires");
   if (note) host.append(note);
+  // Issue #2233: a refused summary keeps its fire row with an empty summary and length zero, so it
+  // is neither a missing row nor a truncation. State that distinct loss on the panel operators read.
+  const dropped = obsNum(summaryDropped);
+  if (dropped !== null && dropped > 0) {
+    host.append(node("p", "obs-truncation-note bad",
+      `${dropped} trigger ${dropped === 1 ? "summary was" : "summaries were"} unreadable`));
+  }
 }
 
 // Issue #1839. USAGE-DERIVED ONLY: `warm_drain_rate_1h`, `drained_1h` and `chain_length_histogram`
@@ -1274,7 +1281,8 @@ function renderObservability(o) {
   byId("obs-time").textContent = o.generated_at
     ? `Collected ${relative(o.generated_at)} · ${utc(o.generated_at)}` : "Collection time unknown";
   const thresholds = obsThresholds(o);
-  obsRenderTriggers(Array.isArray(o.trigger_fires) ? o.trigger_fires : [], o.trigger_fires_total);
+  obsRenderTriggers(Array.isArray(o.trigger_fires) ? o.trigger_fires : [], o.trigger_fires_total,
+    o.trigger_summary_dropped);
   const grid = byId("obs-grid");
   grid.replaceChildren();
   if (o.cache && typeof o.cache === "object") grid.append(obsCacheCard(o.cache));
