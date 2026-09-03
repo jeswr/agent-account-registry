@@ -2515,8 +2515,13 @@ def _obs_trigger_rows(items):
     for another. The field seam is third rather than folded into the row seam because its rows are
     KEPT: counting a refused summary into `row_drops` would make the row seam's tail line report N
     dropped fire rows on a build that dropped none, and a flood of unprintable summaries would then
-    also consume the budget the genuinely-lost rows announce themselves out of."""
+    also consume the budget the genuinely-lost rows announce themselves out of.
+
+    The summary-refusal census covers EVERY well-formed fire before `_obs_capped` cuts the published
+    rows to 20, deliberately matching `flow.queue_dropped`, so it may exceed the slice beside it.
+    Deriving it from that slice would hide the broken-summary-formatter flood it exists to announce."""
     rows = []
+    refused_summaries = 0
     row_drops = _ObsDropLog("observability trigger fire rows")
     field_drops = _ObsDropLog("observability trigger fire fields")
     drops = _ObsDropLog("observability evidence links")
@@ -2562,6 +2567,7 @@ def _obs_trigger_rows(items):
         # an absent or empty summary, which refuses nothing) stays silent.
         summary, summary_length, refused_summary = _obs_text_capped(item.get("summary"), 240)
         if refused_summary is not None:
+            refused_summaries += 1
             field_drops.drop(f"observability trigger fire field (row `summary` "
                              f"({refused_summary} characters) is not printable text; the row still "
                              "publishes with an empty summary)")
@@ -2584,7 +2590,8 @@ def _obs_trigger_rows(items):
     field_drops.close()
     drops.close()
     rows.sort(key=lambda row: row["fired_at"] or "", reverse=True)
-    return _obs_capped(rows, 20)
+    rows, rows_total = _obs_capped(rows, 20)
+    return rows, rows_total, refused_summaries
 
 
 def _normalize_observability(document):
@@ -2651,7 +2658,8 @@ def _normalize_observability(document):
         document.get("defer_reasons_1h"), "reason", 16)
     exit_classes, exit_classes_total = _obs_exit_rows(document.get("model_exit_classes_1h"))
     flow = _obs_flow(document.get("flow"))
-    trigger_fires, trigger_fires_total = _obs_trigger_rows(document.get("trigger_fires"))
+    trigger_fires, trigger_fires_total, trigger_summary_dropped = _obs_trigger_rows(
+        document.get("trigger_fires"))
     return {
         "generated_at": _utc_iso(document.get("generated_at")),
         "cache": cache,
@@ -2664,6 +2672,7 @@ def _normalize_observability(document):
         "flow": flow,
         "trigger_fires": trigger_fires,
         "trigger_fires_total": trigger_fires_total,
+        "trigger_summary_dropped": trigger_summary_dropped,
         "thresholds": thresholds,
     }
 
@@ -6772,6 +6781,9 @@ esac
              "evidence_total": 1,
              "enqueued_task": "heal-2a-0001"}],
         "trigger_fires_total": 1,
+        # [#2233] No summary was refused in the golden input. The zero census is unconditional so
+        # absence cannot be mistaken for a producer that predates the field.
+        "trigger_summary_dropped": 0,
         "thresholds": {"workflow_failure_rate": 0.5, "defer_reason_hourly": 4,
                        "queue_age_clamp_minutes": 10, "merge_stall_minutes": 90},
     }
@@ -8222,7 +8234,9 @@ esac
     const found = [];
     const walk = (el) => {
       if (!el) return;
-      if (el.className === "obs-truncated") found.push(flat(el).join(" ").trim());
+      if (el.className === "obs-truncated" || el.className === "obs-truncation-note bad") {
+        found.push(flat(el).join(" ").trim());
+      }
       for (const kid of el.children || []) walk(kid);
     };
     walk(root);
@@ -8318,12 +8332,34 @@ esac
          "summary": _ASTRAL * 10 + "z" * 1000, "evidence": []}]
     with contextlib.redirect_stdout(io.StringIO()):
         astral_page_doc = obs_normalized(astral_page_input)
+    refused_summary_input = copy.deepcopy(obs_fixture)
+    refused_summary_input["trigger_fires"] = [
+        {"rule": "wrapped-one", "fired_at": now - 300, "summary": "line one\nline two",
+         "evidence": []},
+        {"rule": "wrapped-two", "fired_at": now - 400, "summary": "left\tright",
+         "evidence": []}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        refused_summary_doc = obs_normalized(refused_summary_input)
+    singular_refused_doc = copy.deepcopy(refused_summary_doc)
+    singular_refused_doc["trigger_summary_dropped"] = 1
+    hostile_refusal_docs = {}
+    for label, value in (("string", "2"), ("boolean", True), ("negative", -2),
+                         ("fractional", 2.5), ("null", None)):
+        hostile = copy.deepcopy(refused_summary_doc)
+        hostile["trigger_summary_dropped"] = value
+        hostile_refusal_docs[f"refusal-{label}"] = hostile
+    legacy_refusal_doc = copy.deepcopy(refused_summary_doc)
+    legacy_refusal_doc.pop("trigger_summary_dropped", None)
     summary_page = _executed_page(
         _page_harness("renderObservability", _OBS_SUMMARY_PAGE_BODY),
         {"documents": {"capped": copy.deepcopy(summary_page_doc),
                        "hostile": hostile_summary_doc,
                        "unreachable": unreachable_summary_doc,
-                       "astral": astral_page_doc}})
+                       "astral": astral_page_doc,
+                       "refusal-two": refused_summary_doc,
+                       "refusal-one": singular_refused_doc,
+                       "refusal-legacy": legacy_refusal_doc,
+                       **hostile_refusal_docs}})
 
     def obs_summary_page(name):
         rendered = summary_page.get(name)
@@ -8355,6 +8391,18 @@ esac
           ([[_ASTRAL * 240, summary_cut(1, " is")],
             [_ASTRAL * 120 + "z" * 120, summary_cut(80)],
             [_ASTRAL * 10 + "z" * 230, summary_cut(770)]], [], None))
+    check("[#2233] EXECUTED page script: two summaries refused by the real producer retain their "
+          "empty fire rows and state the distinct FIELD loss beside the trigger panel; one refusal "
+          "takes the singular branch and is never presented as truncation",
+          (obs_summary_page("refusal-two"), obs_summary_page("refusal-one")),
+          (([["", []], ["", []]], ["2 trigger summaries were unreadable"], None),
+           ([["", []], ["", []]], ["1 trigger summary was unreadable"], None)))
+    check("[#2233] EXECUTED page script: a genuine ZERO refusal census draws no loss note",
+          obs_summary_page("capped")[1], [])
+    for label in ("string", "boolean", "negative", "fractional", "null", "legacy"):
+        check(f"[#2233] EXECUTED page script: a {label} summary-refusal count is nothing known and "
+              "draws no fabricated loss note",
+              obs_summary_page(f"refusal-{label}")[1], [])
     # ---- [#1880] A FLOW STAT THE COLLECTOR SENT AND THIS BUILD CANNOT READ MUST NOT PUBLISH AS A
     # HEALTHY NUMBER. `_obs_count(...) or 0` mapped every unreadable park/sample count to 0, so
     # `parks_1h: {"needs_user": "lots", "needs_orchestrator": -3}` published `0 user · 0 orch` on

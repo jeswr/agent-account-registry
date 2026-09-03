@@ -1793,6 +1793,71 @@ _assert_dockerfile_pinned() {
   return 0
 }
 
+# PURE: map each enrolled-suite environment requirement to the Debian package that provisions it
+# in the model image. An unknown row is a refusal: extending SELFTEST_ENV_REQUIREMENTS without
+# teaching the image how to satisfy it must never read as provisioned.
+_selftest_requirement_apt_package() {
+  local kind=$1 probe=$2
+  case "$kind|$probe" in
+    command\|jq) printf '%s\n' jq ;;
+    pymodule\|yaml) printf '%s\n' python3-yaml ;;
+    *) return 1 ;;
+  esac
+}
+
+# PURE (self-tested): the FINAL model-image stage must unconditionally apt-install every package
+# derived from SELFTEST_ENV_REQUIREMENTS, and must not remove one later in that stage. Package order,
+# apt's -y/--yes spelling, extra packages, and separate install instructions are immaterial.
+_assert_worker_image_gate_deps() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  local instructions label kind probe pattern package line rest token installed
+  local -a packages=()
+  while IFS='|' read -r label kind probe pattern; do
+    [[ -n "$label" ]] || continue
+    package=$(_selftest_requirement_apt_package "$kind" "$probe") || return 1
+    packages+=("$package")
+  done <<< "$SELFTEST_ENV_REQUIREMENTS"
+  [[ ${#packages[@]} -gt 0 ]] || return 1
+
+  # Reset at each FROM: only instructions in the last (runtime) stage can provision the worker.
+  instructions=$(awk '
+    /^[[:space:]]*FROM[[:space:]]/ { out = ""; in_run = 0; next }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*RUN[[:space:]]/ { in_run = 1; run = $0 }
+    in_run && !/^[[:space:]]*RUN[[:space:]]/ { run = run " " $0 }
+    in_run && $0 !~ /\\[[:space:]]*$/ {
+      gsub(/\\/, "", run); gsub(/[[:space:]]+/, " ", run)
+      sub(/^ /, "", run); sub(/ $/, "", run)
+      out = out run "\n"
+      in_run = 0
+    }
+    END { printf "%s", out }
+  ' "$file") || return 1
+
+  for package in "${packages[@]}"; do
+    installed=0
+    while IFS= read -r line; do
+      # A conditional prefix (for example `false && apt-get install`) is not unconditional.
+      [[ "$line" =~ ^RUN[[:space:]]+apt-get[[:space:]]+(update[[:space:]]+\&\&[[:space:]]+apt-get[[:space:]]+)?install[[:space:]]+ ]] \
+        || continue
+      rest=${line#* install }
+      for token in $rest; do
+        [[ "$token" == '&&' || "$token" == ';' || "$token" == '||' ]] && break
+        [[ "$token" == "$package" || "$token" == "$package="* ]] && installed=1
+      done
+    done <<< "$instructions"
+    [[ $installed -eq 1 ]] || return 1
+    if grep -Eq "^RUN .*apt-get (remove|purge)( |.* )${package}([ =;]|$)" <<< "$instructions"; then
+      return 1
+    fi
+    if [[ "$package" == jq ]] && grep -Eq '^RUN .*rm([[:space:]]+-[^[:space:]]+)*[[:space:]]+([^;&|]*[[:space:]])?(/usr)?/bin/jq([[:space:];&|]|$)' <<< "$instructions"; then
+      return 1
+    fi
+  done
+  return 0
+}
+
 # PURE (self-tested): [issue #524] every non-local `uses:` in a workflow must pin a FULL 40-hex
 # commit sha (docker refs: a 64-hex sha256 digest). This MIRRORS the assertion pr-gate.yml enforces
 # on the whole workflow tree (sol audit #221) — actionlint does not check pinning, so before this
@@ -2366,6 +2431,10 @@ registry_selftest_gate() {
     if [[ "$kind" == dockerfile ]]; then
       printf 'worker-live: base-image pin check %s\n' "$name"
       _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
+      if [[ "$name" == containers/worker-model.Dockerfile ]]; then
+        _assert_worker_image_gate_deps "$name" \
+          || die "worker model image final stage does not provision every SELFTEST_ENV_REQUIREMENTS dependency for the registry gate: $name"
+      fi
       direct=$((direct + 1))
     fi
   done
@@ -5267,6 +5336,60 @@ PY
   chk "empty digest is REJECTED" \
     "$( _assert_dockerfile_pinned "$tmp/empty.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
     "unpinned"
+
+  # --- [issue #1575] the author-side registry gate must be runnable in the model image. The
+  # expectation is derived from SELFTEST_ENV_REQUIREMENTS: the reject fixtures prove dependency
+  # deletion, an unmapped new row, a conditionally inert install, wrong-stage installation, and
+  # later removal are all detected. ---
+  chk "the live worker-model image provisions jq and PyYAML for the registry self-test gate" \
+    "$( _assert_worker_image_gate_deps "$SCRIPT_DIR/../containers/worker-model.Dockerfile" \
+        && echo provisioned || echo absent)" "provisioned"
+  printf '%s\n' \
+    'FROM rust:1.88@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'RUN apt-get update && apt-get install --yes --no-install-recommends jq && rm -rf /var/lib/apt/lists/*' \
+    > "$tmp/deps-missing.Dockerfile"
+  chk "a worker image missing PyYAML is REJECTED (dependency deletion is non-vacuous)" \
+    "$( _assert_worker_image_gate_deps "$tmp/deps-missing.Dockerfile" \
+        && echo provisioned || echo absent)" "absent"
+  printf '%s\n' \
+    'FROM rust:1.88@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'RUN false && apt-get update && apt-get install --yes --no-install-recommends jq python3-yaml && rm -rf /var/lib/apt/lists/*' \
+    > "$tmp/deps-inert.Dockerfile"
+  chk "a conditionally inert jq + PyYAML install is REJECTED" \
+    "$( _assert_worker_image_gate_deps "$tmp/deps-inert.Dockerfile" \
+        && echo provisioned || echo absent)" "absent"
+  local saved_env_requirements=$SELFTEST_ENV_REQUIREMENTS
+  SELFTEST_ENV_REQUIREMENTS="$SELFTEST_ENV_REQUIREMENTS
+Synthetic|command|synthetic-1575|synthetic"
+  chk "an unmapped new environment requirement is REJECTED (dependency set stays coupled)" \
+    "$( _assert_worker_image_gate_deps "$SCRIPT_DIR/../containers/worker-model.Dockerfile" \
+        && echo provisioned || echo absent)" "absent"
+  SELFTEST_ENV_REQUIREMENTS=$saved_env_requirements
+  printf '%s\n' \
+    'FROM debian:bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS unused' \
+    'RUN apt-get install --yes jq python3-yaml' \
+    'FROM rust:1.88@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+    > "$tmp/deps-wrong-stage.Dockerfile"
+  chk "dependencies installed only in a discarded stage are REJECTED" \
+    "$( _assert_worker_image_gate_deps "$tmp/deps-wrong-stage.Dockerfile" \
+        && echo provisioned || echo absent)" "absent"
+  printf '%s\n' \
+    'FROM rust:1.88@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'RUN apt-get install -y python3-yaml jq curl' \
+    'RUN apt-get purge --yes jq' \
+    > "$tmp/deps-purged.Dockerfile"
+  chk "a dependency removed after installation is REJECTED" \
+    "$( _assert_worker_image_gate_deps "$tmp/deps-purged.Dockerfile" \
+        && echo provisioned || echo absent)" "absent"
+  chk "equivalent apt spelling, package order, and extra packages are accepted" \
+    "$(sed '$d' "$tmp/deps-purged.Dockerfile" > "$tmp/deps-flexible.Dockerfile"; \
+       _assert_worker_image_gate_deps "$tmp/deps-flexible.Dockerfile" \
+        && echo provisioned || echo absent)" "provisioned"
+  gate_body=$(declare -f registry_selftest_gate)
+  chk "#1575 wiring: the dockerfile lint calls the model-image dependency assertion" \
+    "$(printf '%s\n' "$gate_body" | grep -c '_assert_worker_image_gate_deps')" "1"
+  chk "#1575 wiring: an under-provisioned model image REFUSES the gate, it does not warn" \
+    "$(printf '%s\n' "$gate_body" | grep -c 'die \"worker model image final stage does not provision')" "1"
 
   # --- [issue #524] the 40-hex `uses:` pin assertion, mirrored from pr-gate.yml (#221) into the
   # host-side touched-workflow lint. NON-VACUOUS in BOTH directions, and both directions matter for
