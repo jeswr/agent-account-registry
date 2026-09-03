@@ -42,16 +42,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "dd157eb9243949bf940277060f0b0527",
-   "holder": "review:sparq-org/sparq#6312@33782760027.1",
-   "package": "sparq-solid",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1788455323,
-   "expires_at": 1788459523
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "29fa5c705b45421dbab6060a43b81df2",
    "holder": "review:jeswr/agent-account-registry#2282@33782856064.1",
    "package": "review-loop",
