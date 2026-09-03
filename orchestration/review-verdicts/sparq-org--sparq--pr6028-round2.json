@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6028,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d528b1e7e21ffed4c6e04042ca5346b5cc1dad80",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 5-7 require the event driver to reuse the existing step/verdict semantics and say every invocation re-reads all check-runs, but they never specify removing the evaluator-owned gate-shadow/gate check from that observation. The current is_self predicate is tied to details_url containing the current workflow run ID. An API-created check-run identified by external_id persists across evaluator invocations, so it cannot reliably match each new SELF_RUN_ID. If included while in_progress, it makes the observed set permanently non-terminal; if included after a previous completion, it can feed a stale verdict into a replacement generation. This defeats the architecture's core liveness and stale-green claims.",
+    "file": "research/ci-gate-slotless-aggregation.md",
+    "fix_hint": "Specify and test an explicit transport-owned-check exclusion before calling step/render_verdict, keyed by the validated same-App external_id plus repository/head SHA/schema identity rather than display name alone. Add an adversarial multi-invocation test showing the publisher check is excluded when in_progress and after reopening, while duplicate same-name or mismatched-App checks still fail closed. Clarify whether exclusion occurs before supersession and workflow-run resolution so it cannot forgive or supersede real lanes.",
+    "severity": "major",
+    "title": "The evaluator's own persistent check-run is not excluded from verdict observations"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 directly fixes both prior major findings: it uses an explicit workflow_run inventory and separates untrusted PR/merge-ref doorbells from the default-branch checks:write evaluator. However, the proposed reuse of the existing verdict path omits a load-bearing exclusion for the evaluator-owned API check-run itself. The current is_self logic excludes checks by the current Actions run URL; a persistent API-created gate/gate-shadow check has its own external_id and survives across multiple evaluator workflow runs. Unless it is explicitly removed from each observation, its in_progress status prevents the all-terminal condition, while a stale completed status can contaminate subsequent generations. This new major finding makes progress regressing under the required scale despite resolution of the earlier findings.",
+  "verdict": "request_changes"
+ }
+}
