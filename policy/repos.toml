@@ -108,7 +108,7 @@ max_review_rounds = 3         # BASE bound; decide_budget may extend to 6 total 
 review_queue_ttl_minutes = 30 # surface a codex-starved review backlog after this age
 cross_provider_fallback = false  # honest default: stay queued + alert, never silently degrade
 
-# [GPT-5.6] #2257: widen the proven orchestrator-class REVIEW-ONLY lane to Sparq for the exact
+# [SPARQ agent] #2257: widen the proven orchestrator-class REVIEW-ONLY lane to Sparq for the exact
 # maintainer login that authors its manual `codex/*` orchestration PRs. The canonical safety
 # contract is documented on the registry row below: a self-attested record is still required,
 # review still inverts provider, this class gets no automated fix/rebase lane, and it can never
@@ -215,7 +215,7 @@ max_review_rounds = 3
 review_queue_ttl_minutes = 30
 cross_provider_fallback = false
 
-# [OPUS-5 #657] REVIEW-LANE ENROLMENT, ON. The MASTER-protected half of
+# [SPARQ agent] #657 REVIEW-LANE ENROLMENT, ON. The MASTER-protected half of
 # orchestrator-PR admission (research/657-orchestrator-pr-admission.md §6, Option 2(b)). #876
 # landed the wiring with this list deliberately EMPTY; this is the line that turns it on.
 #
