@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2259,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e831fc17b3d1d79801e44a22f188f4fcb19d55c6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The rewritten paragraph leaves three short lines that break the file's otherwise consistent ~100-column fill: `dashboard/app.js` draws (:118, ~24 chars), `rather than a fabricated refusal.` (:123) followed by a new line starting mid-sentence-group at :124, and the wrap after `standing on the` (:109). It renders as one paragraph so nothing is factually wrong; it is purely a diff-shaped artifact of editing around the inserted sentences, and it makes the next edit to this paragraph noisier than it needs to be.",
+    "file": "data/README.md",
+    "fix_hint": "Re-fill the paragraph at :102-128 to the surrounding ~100-column width so the inserted sentences are indistinguishable from the original prose.",
+    "severity": "nit",
+    "title": "Ragged mid-paragraph line breaks in the rewritten refusal-count paragraph"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 closes all three round-1 findings and introduces no new defects. (1) BLOCKING MAJOR FIXED: data/README.md no longer asserts \"two REFUSAL counts\" \u2014 it now documents three, and the new paragraph is accurate against the code on every claim I checked: `trigger_summary_dropped` is top-level rather than under `flow.` (scripts/dashboard-gen.py:2674), OUTPUT-side, published on EVERY build including the zero one, counts summaries refused at `_obs_text_capped` whose rows still publish with an empty `summary` and `summary_length: 0`, is taken over every well-formed fire before `_obs_capped` cuts at 20 so it may exceed the slice, and degrades to silence on a missing/non-numeric/zero/fractional count. The input root-shape list at :77 is correctly left alone \u2014 this is not a collector-sent key. (2) MINOR FIXED, and fixed in the stricter direction: the page guard is now `Number.isInteger(dropped) && dropped > 0` (dashboard/app.js:1082), so `2.5` can no longer draw `2.5 trigger summaries were unreadable`; the divergence from `queue_dropped`/`target_ci_queue_dropped` (which keep the bare `> 0` rule at :1183/:1198 and :1243) is now stated explicitly in the contract doc rather than left to the reader, and a `refusal-fractional` document was added to the hostile loop so the rule is pinned \u2014 deleting `Number.isInteger` reds it. (3) NIT FIXED: the `_obs_trigger_rows` docstring (:2519-2521) now states the census is pre-cap on the `flow.queue_dropped` precedent and that deriving it from the published slice would hide the flood it announces. Tests remain non-vacuous. `refusal-two`/`refusal-one` are real `_normalize_observability` output \u2014 \"line one\\nline two\" and \"left\\tright\" both fail `.isprintable()` \u2014 so the 2 is producer-derived, not hand-set; the golden `obs_expected` pins the unconditional 0 and is compared WHOLE at :6819 and :9474; the widened panel collector still walks only `obs-triggers`, so flow-card notes cannot leak in and falsely satisfy the `[]`\u2026 [truncated 389 chars]",
+  "verdict": "approve"
+ }
+}
