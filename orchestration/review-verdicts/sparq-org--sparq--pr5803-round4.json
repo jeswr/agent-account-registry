@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5803,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bc94ac86d7434e3049423691811ecc8d00c78a1a",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently fails closed when GitHub CLI list results saturate their configured caps, and the added self-tests exercise both the real call sites and the boundary immediately below each cap. Requested and enforced caps are pinned together across the Python and shell paths, while the explicitly bounded merged-omnibus query is documented as a recency window rather than complete enumeration. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
