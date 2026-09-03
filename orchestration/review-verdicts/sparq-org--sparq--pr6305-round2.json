@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6305,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a0380f044106a620da61fb4a92cfce6872784a5d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. Every run of three or more backticks is neutralized before untrusted first-case text reaches either Markdown sink, with defense both at parsing and at rendering for callers that bypass parsing. The raw fuzz log remains byte-preserving. The hermetic self-test exercises the real parser, issue-body builder, artifact writer, direct-dict bypass path, raw-log preservation, non-fence backticks, and idempotence, and it passes. No hostile reviewer-directed instruction was present in the diff. Findings are materially unchanged from round 1: none.",
+  "verdict": "approve"
+ }
+}
