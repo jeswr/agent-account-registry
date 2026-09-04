@@ -380,6 +380,29 @@ jobs:
     name: WATCHDOG (is the metrics snapshot still being delivered?)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # [SPARQ agent] THE RING OBSERVES ITSELF (issue #1391). Read this block once; the four sibling
+    # watchdogs below carry the same output for the same reason.
+    #
+    # The live alert step below is `continue-on-error: true` — deliberate, and KEPT: a watchdog
+    # fault must never red the sweep it rides on. But it also means a script that crashes on every
+    # tick leaves this JOB's result at `success`, and nothing keys on these jobs at all (they have
+    # no dependents, and `groom-alert` read only `needs.groom.result`). A watchdog that is down
+    # forever therefore presented as a green tick forever while the lane it watches went
+    # unobserved: the ring silently loses a node, which is strictly worse than the outage each node
+    # exists to page on, because the ring is what makes the other alarms trustworthy.
+    #
+    # The step OUTCOME is the pre-continue-on-error result — the ONLY surviving signal — so it is
+    # published here for `groom-alert`, which now alarms on it AND on this job's own result. The
+    # two legs are not redundant: the job result covers the checkout, the PyYAML install, the
+    # NOT-continue-on-error `--self-test` step and the 10-minute timeout; the step outcome covers
+    # the one step whose failure the job result structurally cannot see.
+    #
+    # scripts/groom-alert.py's --self-test pins this output, the step `id` it names, that step's
+    # deliberate `continue-on-error`, and the `needs:`/env wiring that carries it — in BOTH
+    # directions against this very file, so a watchdog job added here without being wired into the
+    # alarm goes red in the gate instead of joining the ring unwatched.
+    outputs:
+      alert_outcome: ${{ steps.metrics-stale.outcome }}
     # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO, so it is bound to the
     # default-branch-only `dispatch-secrets` environment where those secrets live, exactly like the
     # `groom` and `groom-alert` jobs.
@@ -463,6 +486,10 @@ jobs:
     name: WATCHDOG (is the dispatcher still completing ticks?)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Issue #1391 — see the `metrics-stale` job above for why every watchdog publishes its alert
+    # step's outcome and what `groom-alert` does with it.
+    outputs:
+      alert_outcome: ${{ steps.dispatch-stall.outcome }}
     # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO, so it is bound to the
     # default-branch-only `dispatch-secrets` environment where those secrets live, exactly like
     # `groom`, `groom-alert` and `metrics-stale`.
@@ -562,6 +589,10 @@ jobs:
     name: WATCHDOG (is CI execution latency inside its measured band?)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Issue #1391 — see the `metrics-stale` job above for why every watchdog publishes its alert
+    # step's outcome and what `groom-alert` does with it.
+    outputs:
+      alert_outcome: ${{ steps.ci-latency.outcome }}
     # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO (the private-alert routing
     # secrets), so it is bound to the default-branch-only `dispatch-secrets` environment where those
     # secrets live, exactly as groom-alert and dispatch-stall are.
@@ -651,6 +682,11 @@ jobs:
     name: WATCHDOG (is the shared REST request budget heading toward exhaustion?)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Issue #1391 — see the `metrics-stale` job above for why every watchdog publishes its alert
+    # step's outcome and what `groom-alert` does with it. This job postdates #1391's report (which
+    # named four watchdogs); it has the identical shape, so it is wired identically.
+    outputs:
+      alert_outcome: ${{ steps.ratelimit-budget.outcome }}
     # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO (the private-alert routing
     # secrets), so it is bound to the default-branch-only `dispatch-secrets` environment where
     # those secrets live, exactly as groom-alert, dispatch-stall and ci-latency are.
@@ -743,6 +779,10 @@ jobs:
     name: WATCHDOG (can groom still mint a target token for every owner?)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Issue #1391 — see the `metrics-stale` job above for why every watchdog publishes its alert
+    # step's outcome and what `groom-alert` does with it.
+    outputs:
+      alert_outcome: ${{ steps.mint-gap.outcome }}
     # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO, so it is bound to the
     # default-branch-only `dispatch-secrets` environment where those secrets live, exactly like
     # `groom`, `groom-alert`, `metrics-stale`, `dispatch-stall` and `ci-latency`.
@@ -812,12 +852,23 @@ jobs:
         run: python3 registry/scripts/groom-mint-alert.py
 
   groom-alert:
-    name: ALERT (hard GROOM-job failure)
-    needs: [groom]
+    name: ALERT (hard GROOM-job failure + watchdog-ring faults)
+    # The sweep, plus EVERY watchdog job this file hosts (issue #1391). The watchdog edges are what
+    # give the ring an alarm at all: nothing else keys on those jobs, so before this they could
+    # crash on every tick and stay green forever. KEEP IN SYNC — scripts/groom-alert.py's
+    # --self-test derives the watchdog set from groom.yml's own job map and asserts this list is
+    # exactly `groom` plus that set, in both directions, so a watchdog added without an edge here
+    # (or an edge here naming a job that no longer exists) goes red in the gate.
+    needs: [groom, metrics-stale, dispatch-stall, ci-latency, ratelimit-budget, mint-gap]
     # Runs every tick regardless of the GROOM result so a healthy GROOM can auto-close a prior
     # alert; scripts/groom-alert.py keys on needs.groom.result — close happens ONLY on an explicit
     # success (a skipped GROOM is not a recovery), and a success tick with no open alert does only a
     # bare `gh issue list`, so a green tick stays cheap and side-effect-free.
+    #
+    # always() became LOAD-BEARING with the #1391 edges above: GitHub's implicit `success()` skips a
+    # job whose `needs:` contains a FAILED one, so without this gate the very failures this job
+    # now exists to report would be the failures that suppress it — the dispatch.yml `plan-alert`
+    # defect (#819) reintroduced one level up. The self-test pins the expression exactly.
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -828,17 +879,23 @@ jobs:
     environment: dispatch-secrets
     permissions:
       contents: read  # minimum for the sparse checkout below — the job runs a script from the repo
-      issues: write   # upsert/close the rolling groom-failure ops-alert issue
+      issues: write   # upsert/close the rolling groom-failure + per-watchdog ops-alert issues
     steps:
-      # The alert logic lives in scripts/groom-alert.py, but only that one file is needed —
-      # sparse-checkout scopes the working copy to it, pinned and with no persisted token, so
-      # nothing else from the repo reaches this job.
-      - name: Check out ONLY scripts/groom-alert.py (pinned, sparse, no persisted token)
+      # The alert logic lives in scripts/groom-alert.py; groom.yml itself is the second INPUT, not
+      # incidental — the script's --self-test derives the watchdog ring from this very file and
+      # asserts the whole #1391 seam (each watchdog's `outputs:`, the step `id` it names, that
+      # step's deliberate `continue-on-error`, this job's `needs:` and the env line below) against
+      # it. A trimmed list would make that entire section unreachable on the live path instead of
+      # red. KEEP IN SYNC with REQUIRED_FILES in scripts/groom-alert.py. Pinned, no persisted
+      # token; nothing else from the repo reaches this job.
+      - name: Check out ONLY the alert's inputs (pinned, sparse, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
           persist-credentials: false
-          sparse-checkout: scripts/groom-alert.py
+          sparse-checkout: |
+            scripts/groom-alert.py
+            .github/workflows/groom.yml
           sparse-checkout-cone-mode: false
 
       - name: Alert maintainer that the scheduled GROOM job hard-failed
@@ -847,6 +904,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
           GROOM_RESULT: ${{ needs.groom.result }}
+          # Issue #1391: the whole `needs` context, so each watchdog's job RESULT and its published
+          # `alert_outcome` reach the script together. toJSON(needs) rather than one hand-written
+          # env line per watchdog on purpose — a per-job line is a place to forget a job, and the
+          # forgetting is silent. The script filters this map by the NON_WATCHDOG_JOBS partition
+          # its --self-test asserts against groom.yml's own job map, and treats an unreadable or
+          # absent payload as NO evidence: no page, and — the leg that matters — no close.
+          WATCHDOG_NEEDS: ${{ toJSON(needs) }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MAINTAINER_HANDLE: jeswr
           # Privacy routing (locked decision 22c, issue #39; hardened in #432 round 1):
