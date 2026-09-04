@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6318,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "12fe4ff35d527339557e90ec171ec600a108962d",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The serializer correctly matches the Go encoding/json conventions relevant to the committed bead corpus: UTF-8 non-ASCII remains raw, HTML-sensitive characters and U+2028/U+2029 are escaped, and compact separators are retained. The focused self-tests exercise each encoding rule, verify byte-for-byte round-tripping across all 1,262 committed bead rows, validate the real close-and-rewrite path, and confirm untouched lines remain byte-identical. The self-test passes. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
