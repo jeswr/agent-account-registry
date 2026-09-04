@@ -1,33 +1,33 @@
 {
-  "generated_at": "2026-09-04T04:26:39Z",
+  "generated_at": "2026-09-04T04:58:41Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 2422,
-      "issues_ready": 266,
+      "issues_ready": 264,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 11,
+      "issues_closed_24h": 10,
       "prs_open": 172,
       "prs_draft": 145,
-      "prs_opened_1h": 1,
-      "prs_closed_1h": 2,
+      "prs_opened_1h": 0,
+      "prs_closed_1h": 1,
       "prs_merged_1h": 0,
-      "prs_merged_24h": 3,
+      "prs_merged_24h": 2,
       "review_changes_backlog": 20,
       "needs_user_parked": 16,
-      "review_lane_health": "ok",
-      "review_lane_runs_1h": 25,
-      "worker_attempts_1h": 4,
-      "worker_success_rate_1h": 0.25,
-      "pr_open_rate": 1.0,
-      "pr_close_rate": 2.0,
+      "review_lane_health": "unknown",
+      "review_lane_runs_1h": null,
+      "worker_attempts_1h": 0,
+      "worker_success_rate_1h": null,
+      "pr_open_rate": 0.0,
+      "pr_close_rate": 1.0,
       "net_pr_flow": -1.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 1057,
+      "issues_open": 1056,
       "issues_ready": 709,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 7,
+      "issues_closed_1h": 2,
+      "issues_closed_24h": 8,
       "prs_open": 50,
       "prs_draft": 34,
       "prs_opened_1h": 0,
@@ -36,9 +36,9 @@
       "prs_merged_24h": 3,
       "review_changes_backlog": 6,
       "needs_user_parked": 17,
-      "review_lane_health": "stalled",
-      "review_lane_runs_1h": 3,
-      "worker_attempts_1h": 3,
+      "review_lane_health": "idle",
+      "review_lane_runs_1h": 0,
+      "worker_attempts_1h": 1,
       "worker_success_rate_1h": 0.0,
       "pr_open_rate": 0.0,
       "pr_close_rate": 0.0,
@@ -50,30 +50,9 @@
       "target": "sparq-org/sparq",
       "classification": "ready-starved",
       "fire": true,
-      "summary": "ready frontier 266 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "ready frontier 264 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
       "metrics": {
-        "issues_ready": 266,
-        "issues_closed_1h": 0
-      }
-    },
-    {
-      "target": "jeswr/agent-account-registry",
-      "classification": "review-lane-stalled",
-      "fire": true,
-      "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=6 waits",
-      "metrics": {
-        "review_changes_backlog": 6,
-        "review_lane_runs_1h": 3,
-        "prs_merged_1h": 0
-      }
-    },
-    {
-      "target": "jeswr/agent-account-registry",
-      "classification": "ready-starved",
-      "fire": true,
-      "summary": "ready frontier 709 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
-      "metrics": {
-        "issues_ready": 709,
+        "issues_ready": 264,
         "issues_closed_1h": 0
       }
     }
