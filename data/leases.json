@@ -59,6 +59,16 @@
    "model": "opus5",
    "issued_at": 1788561760,
    "expires_at": 1788565960
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "a815783533ff42e4b79acf6f7d0a32f8",
+   "holder": "fix:sparq-org/sparq#6411@dispatch-33925685041.1",
+   "package": "ci",
+   "role": "fix",
+   "model": "sol",
+   "issued_at": 1788561771,
+   "expires_at": 1788568071
   }
  ]
 }
