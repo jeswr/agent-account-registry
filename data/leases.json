@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "dc2d751954080e13",
-   "claim_id": "355ed0f34c7e4c1c924b24ffe517263c",
-   "holder": "sparq-org/sparq#4985@33859757293.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "sol",
-   "issued_at": 1788515036,
-   "expires_at": 1788521336
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "0d3f3df865e14223a3452cada14e47bb",
    "holder": "review:sparq-org/sparq#6356@33859787103.1",
    "package": "sparq-lws-core",
