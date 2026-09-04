@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 2267,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7bab8b1c23d38d473ad81d9fcd92a2491de93150",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Line 2455 now resolves the actionlint pin from $tree_scripts/actionlint.pin, so the diff under review selects the linter that judges it. The constraints hold as documented \u2014 _actionlint_pin's version shape is '[0-9]+(\\.[0-9]+)*' (no slashes, no '..'), the host/path are fixed literals, and both the tarball and the extracted-binary sha256 are verified \u2014 so a candidate cannot execute arbitrary bytes. What it CAN do is name a genuine but ANCIENT actionlint release (e.g. 1.0.0) with matching digests, and lint its own workflow change with a linter that lacks the rule that would have caught it.\n\nThis is not a regression introduced here: pr-gate.yml lines 176-199 already read the PR checkout's pin, so the downgrade was reachable at the merge gate before this diff, and aligning the worker lane is the stated point of #431/#1576. It is also review-visible (a pin edit is a diff hunk). Recording it because the accompanying comment rewrite at 2166-2172 asserts the artifact stays 'inside the verification boundary' \u2014 true for integrity, but silent about VERSION monotonicity, which is the remaining lever.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Optional hardening, not required for this PR: have registry_selftest_gate compare the tree pin's ACTIONLINT_VERSION against the orchestrator pin's with the existing numeric comparator (_python_version_at_least is already component-wise numeric and returns 'unknown' fail-closed) and refuse a strictly LOWER candidate version, or require that a lowered pin also carry the trust-surface label. Either way, extend the comment at 2166-2172 to state explicitly that version monotonicity is NOT enforced, so the next reader does not infer it from 'the version shape is constrained'.",
+    "severity": "minor",
+    "title": "Candidate-controlled actionlint.pin permits a lint DOWNGRADE (bounded, but unconstrained in version)"
+   },
+   {
+    "body": "Line 2470 now feeds the candidate's table into _assert_worker_image_gate_deps, but that function still resolves packages through the ORCHESTRATOR revision's _selftest_requirement_apt_package (line 1818), which hard-codes only command|jq and pymodule|yaml and returns 1 on anything else.\n\nConsequence: a PR that legitimately adds a row to SELFTEST_ENV_REQUIREMENTS, teaches _selftest_requirement_apt_package the new package, AND provisions it in containers/worker-model.Dockerfile is still refused by its own author-side gate, because the mapping consulted is the pre-merge one. The die string then says 'worker model image final stage does not provision every SELFTEST_ENV_REQUIREMENTS dependency', which names the wrong culprit \u2014 the image is fine; the orchestrator's mapping is stale. This is the same misattribution class that #1834 fixed for the behind-base manifest case.\n\nFail-closed, narrow (only fires when the Dockerfile is touched), and the ENV-BLOCKED preflight would refuse such a PR anyway, so this is not blocking.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Either distinguish the two failure modes inside _assert_worker_image_gate_deps \u2014 return a distinct status (or print a distinct line) when _selftest_requirement_apt_package refuses a row, and have the gate die naming 'the gate's package mapping does not know requirement <label>; this row cannot be graded until the orchestrator revision learns it' \u2014 or parse the mapping's case arms out of the target tree's worker-live.sh the same way _selftest_env_requirements_from_script parses the table.",
+    "severity": "minor",
+    "title": "Requirement TABLE moved to the tree but the apt-package MAPPING did not \u2014 a PR adding a dependency row cannot pass its own gate, and the refusal misattributes the cause"
+   },
+   {
+    "body": "Lines 4320 and 4329 assert grep counts of 0 against `declare -f` output. A 0-count assertion is vacuous unless the pattern is shown to be capable of matching the rendered form of the code it forbids. Line 4323-4325 does exactly that for the actionlint detector via `legacy_actionlint_body`; the SELFTEST_ENV_REQUIREMENTS/SCRIPT_DIR detector (4320) and the `_assert_worker_image_gate_deps \"$name\" ||` detector (4329) have no such fixture.\n\nBoth patterns look like they would match bash's declare -f re-rendering (quotes around expansion-bearing words are preserved, and continuations are folded onto one line), so I do not believe they are actually vacuous today \u2014 but that is inference, not an assertion the suite makes. Note also that 4323-4325's fixture greps a hand-written literal rather than declare -f output, so even that one proves the pattern is matchable, not that declare -f renders the legacy code that way.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Add two one-line fixtures alongside `legacy_actionlint_body` and, better, build them by actually defining a throwaway function with the legacy body and grepping `declare -f` of it \u2014 that pins the rendering, not just the pattern. E.g. define `_legacy_gate_shape() { ... }` in the self-test with the pre-#1576 lines, then assert grep -c over `$(declare -f _legacy_gate_shape)` is 1 for each of the two forbidden patterns.",
+    "severity": "nit",
+    "title": "Two negative wiring assertions lack the non-vacuity fixture their sibling has"
+   },
+   {
+    "body": "Line 1831 uses `:-`, which treats an explicitly-passed empty string identically to an omitted argument and substitutes the orchestrator-revision table. The gate's only production call site passes $tree_env_requirements, which _selftest_env_requirements_from_script guarantees is non-empty (it refuses when matches[0].strip() is falsy), so the path is unreachable today. But the whole point of the parameter is 'grade with the CANDIDATE's policy, never the orchestrator's', and `:-` is the one spelling that quietly violates that if a future caller ever passes through an unset variable.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Use `${2-$SELFTEST_ENV_REQUIREMENTS}` (omitted-only default) so an explicitly empty table reaches the `[[ ${#packages[@]} -gt 0 ]] || return 1` refusal at line 1840 instead of silently reverting to the orchestrator table.",
+    "severity": "nit",
+    "title": "`table=${2:-$SELFTEST_ENV_REQUIREMENTS}` silently falls back to the orchestrator table on an EMPTY explicit argument"
+   }
+  ],
+  "progress": null,
+  "summary": "Sound fix for a real fail-open. scripts/worker-live.sh line 11 sets SCRIPT_DIR from $0 (the orchestrator checkout) while line 34 cd's to TARGET_DIR (the candidate checkout), so for a self-managed target the registry gate was grading the ORCHESTRATOR's scripts: run_enrolled_selftest defaulted root to $SCRIPT_DIR, so a candidate's changed self-test was never the one executed. The diff routes every suite-describing input through the tree under test (tree_suite, tree_env_requirements, tree_scripts, tree actionlint.pin) while keeping the CHECKS themselves on the trusted orchestrator side (_registry_selftest_targets, _assert_dockerfile_pinned, _assert_workflow_actions_pinned, _selftest_requirement_apt_package). That trusted-check / candidate-data split is the right line.\n\nFail-closed verified: the new reader parses and never sources (re.findall on a literal assignment); missing/duplicated/unterminated/empty tables all return 1 and the gate dies. _derive_full_selftest_suite on the tree only greps, never executes. _ensure_actionlint's arch guard keys on $# -eq 0, so the env-prefix override preserves it; both digests and the fixed github.com/rhysd/actionlint release path still bound the artifact (version regex is digits+dots, no traversal). The env-prefix override mechanism is already proven at line 5356.\n\nTests are non-vacuous: the reader has accept + three distinct refusal fixtures; the round-trip against the live multi-line table would red on any non-multiline parser (and, because the suite runs the CANDIDATE's worker-live.sh, it also catches a static-parse-vs-runtime divergence in the candidate itself); line 5434 exercises the new explicit-table parameter and would red if the default were still used. The DISPATCH exact-block pin (line 8912) and the _shell_function_body wiring pins were updated consistently \u2014 I traced _registry_gate_selftest_dispatch's block filter and confirmed the same two loops are still selected and no bare '}' truncates the bod\u2026 [truncated 600 chars]",
+  "verdict": "approve"
+ }
+}
