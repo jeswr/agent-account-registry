@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6372,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b1abb20e6b7a99dbbfb6d66020fd20e168e26589",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "mint_guard_agrees_with_sparq_solid says it covers every name sanitise_slug can produce and that widening either predicate makes the test fail, but it iterates only RAW_SLUGS. For example, changing one predicate to additionally reject a new suffix not represented in this list would leave the test green. Thus the security regression guard is materially weaker than its stated invariant, and the non-vacuity counters only rule out constant predicates; they do not establish domain-wide equivalence.",
+    "file": "crates/sparq-lws-core/src/ldp/handler.rs",
+    "fix_hint": "Make the shared decision vocabulary/predicate available without pulling the heavy optional graph (for example, move the tiny pure predicate into an appropriately lean shared crate), or use a property/exhaustive strategy that genuinely covers the relevant normalized suffix space and mutation classes. If only a regression corpus is intended, narrow the comments and add targeted cases derived from a defined shared suffix set; do not claim universal agreement or that any widening must fail.",
+    "severity": "major",
+    "title": "Finite corpus does not prove the claimed no-drift invariant"
+   }
+  ],
+  "progress": null,
+  "summary": "The .acr guard itself is consistent with sparq-solid for the examples added, and the end-to-end POST test exercises the real denial path. However, the advertised no-drift invariant is not established: the differential test checks only a small hand-written corpus, while the documentation repeatedly claims agreement for every sanitise_slug output and claims that widening either predicate necessarily makes the test fail. An unlisted suffix or edge case can drift without being detected. Because this test is presented as the mechanism preventing recurrence of a privilege-escalation class, that gap is security-relevant and should be fixed before approval.",
+  "verdict": "request_changes"
+ }
+}
