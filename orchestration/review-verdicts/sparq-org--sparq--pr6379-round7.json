@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6379,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d5d5c1c441f648ed7fdb055281464b9b46af8424",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces position-dependent blank-node skolemization with an injective document-IRI-based key. The length-prefixed encoding prevents shifted-separator collisions, non-blank terms remain unchanged, and all loader call sites consistently pass the containing document IRI. The tests are non-vacuous: they confirm a skolemized matcher reaches the materialized auth view and affects authorization, directly permute named-graph order, exercise the real put_acl_acp swap-remove/push path, compare cached results with a fresh AuthIndex rebuild, and preserve separation for identical blank labels across documents. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
