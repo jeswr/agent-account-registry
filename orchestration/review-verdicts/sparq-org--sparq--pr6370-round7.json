@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6370,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0d4c9cc0cc5af7a02f061552600ee621b24ddf36",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "yaml.safe_load is not a semantics-preserving model of GitHub Actions workflow YAML. In particular, PyYAML's default YAML 1.1 resolver coerces keys such as `on` and `true` to the same boolean key. Thus changing a workflow's top-level `on:` key to `true:` can produce equal Python objects even though GitHub Actions interprets the files differently. Other lossy normalization and duplicate-key cases create the same general risk. Because membership in yaml_inert bypasses the `.github/` full-run trigger, this is a wrong-skip soundness bug, contradicting the stated fail-closed contract.",
+    "file": "scripts/ci_select.py",
+    "fix_hint": "Prove that the edit itself consists only of comments/whitespace outside scalar content, using a token- or diff-based method that preserves YAML spelling, tags, duplicate keys, and parser dialect semantics; do not infer GitHub Actions equivalence from PyYAML object equality. Add a regression test demonstrating that `on:` versus `true:` (and preferably duplicate-key/normalized-scalar collisions) is not inert. If retaining parsing, use a parser/configuration matching the consumer and reject any ambiguous or lossy construct before allowing the carve-out.",
+    "severity": "major",
+    "title": "PyYAML equality can falsely classify behavior-changing workflow edits as inert"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposed parsed-YAML equality check is not a sound proof of GitHub Actions behavioral equivalence. PyYAML safe_load applies YAML 1.1 coercions and discards representation details, while GitHub Actions uses different workflow parsing semantics. Consequently, a behavior-changing workflow edit can compare equal and be labeled YAML-INERT, incorrectly suppressing the full Rust matrix. The tests cover ordinary comments, block scalars, and a simple value change, but do not exercise parser-dialect or lossy-normalization collisions.",
+  "verdict": "request_changes"
+ }
+}
