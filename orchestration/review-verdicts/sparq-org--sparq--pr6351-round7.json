@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6351,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a3bdf4ea1e97359993287505ea8435061b0d6421",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "GateStep.gating is derived only from workflow triggers and advisory-job membership. S3 then adds every script from such a step to gating_scripts even when the step-level condition makes it unreachable on pull_request/merge_group, for example `if: github.event_name == 'push'` or the registered main-only condition. Therefore a checker whose sole occurrence is a permanently skipped PR step passes S3, contradicting the claimed invariant that each checker can red the PR gate. Byte-exact registration prevents silent condition drift but does not make the invocation gating.",
+    "file": "scripts/check-workflow-gate-steps.py",
+    "fix_hint": "Make S3 distinguish conditions proven eligible for pull_request/merge_group from conditions that exclude those events, or require a separate explicit `unwired`/non-PR declaration for conditionally non-gating invocations. Add a hermetic mutant where a PR-triggered workflow's only checker step has `if: github.event_name == 'push'` and assert S3 fails.",
+    "severity": "major",
+    "title": "S3 counts steps that cannot run on pull requests as gating"
+   },
+   {
+    "body": "_SELFTEST_RE is not anchored to a shell command boundary, unlike _INVOKE_RE. Text such as `echo \"scripts/check-thing.py --self-test\"` or a comment containing that phrase is therefore returned by _invoked_scripts and can satisfy S3 after the real invocation is deleted. The existing mere-mention test omits `--self-test`, so it does not expose this false positive.",
+    "file": "scripts/check-workflow-gate-steps.py",
+    "fix_hint": "Apply the same command-boundary/interpreter anchoring to self-test detection, ideally by parsing candidate command invocations once and then classifying checker paths or `--self-test`. Add negative tests for both an echo and a comment containing `scripts/tool.py --self-test`.",
+    "severity": "major",
+    "title": "Self-test regex counts mentions as executable invocations"
+   }
+  ],
+  "progress": null,
+  "summary": "The new guard has two acceptance-set holes that undermine its central S3 guarantee. A conditionally unreachable step is still treated as a PR-gating invocation, and the separate self-test matcher can mistake non-command text for an invocation. The test suite does not exercise either case. Progress is null because no prior-round findings were supplied for comparison.",
+  "verdict": "request_changes"
+ }
+}
