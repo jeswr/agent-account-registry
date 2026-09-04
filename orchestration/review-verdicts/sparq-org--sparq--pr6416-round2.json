@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 6416,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "68e19a3da3f5aac343356edf79c814f878b5b2eb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The third production hunk (the `authoritative` list comprehension in `WorkflowRunResolver.__call__`) has zero test coverage. Mutation check: delete `and r.get(\"event\") != \"schedule\"` and the entire suite still passes (191 tests, OK). All three new schedule tests call `resolve_newest_workflow_runs` directly and never construct a `WorkflowRunResolver`, so no test reaches this code path.\n\nIt is not cosmetic. Reproduced against the PR head: a single concurrency-cancelled nightly on the head SHA, `W(104, 7, conclusion=\"cancelled\", event=\"schedule\")`, driven through the resolver for 3 polls.\n  - WITH the filter:    no error, redispatch POSTs = []\n  - WITHOUT the filter: redispatch POSTs = [104], then SupersededLegsError -> run_gate returns 1\n\nSo the unpinned hunk is what prevents a cancelled cron run from (a) causing the gate to POST an unrequested workflow re-run of a scheduled workflow, and (b) hard-REDding the gate \u2014 the highest-blast-radius member of exactly the bug class #6292 addresses. An untested branch with an external side effect is the one that gets refactored away silently.\n\nNote also the two filters are spelled differently (`id not in schedule_ids` vs `r.get(\"event\") != \"schedule\"`). They agree today, but nothing enforces that they stay in sync.",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Add a WorkflowRunResolver-level test to scripts/tests/test_ci_summary_gate.py that pins the redispatch/SupersededLegsError path, e.g.:\n\n  def test_cancelled_schedule_run_is_never_redispatched_or_red(self):\n      nightly = W(104, 7, conclusion=\"cancelled\", event=\"schedule\")\n      posted = []\n      r = g.WorkflowRunResolver(\n          self_run_id=\"999\", fetch_checks=lambda: [],\n          fetch_workflows=lambda: [nightly],\n          fetch_attempt_jobs=lambda rid, att: [],\n          redispatch=lambda rid: posted.append(rid),\n          redispatch_settle_polls=2)\n      for _ in range(3):\n          r()                      # must not raise SupersededLegsError\n      self.assertEqual(posted, [])\n\nVerify it is non-vacuous by deleting `and r.get(\"event\") != \"schedule\"` and confirming the test goes RED. Consider also factoring the predicate into one helper (e.g. `_is_schedule_run(r)`) used by both call sites so they cannot drift.",
+    "severity": "major",
+    "title": "WorkflowRunResolver's `event != \"schedule\"` filter is load-bearing but pinned by no test (survives deletion with 191/191 green)"
+   },
+   {
+    "body": "  pending = sum(\n      1 for r in [*runs, *schedule_legs]\n      if r.get(\"status\") != \"completed\"\n      and r.get(\"_out_of_scope_schedule\") is not True\n  )\n\n`runs` derives from `forgive_superseded([r for r in raw if r.get(\"_out_of_scope_schedule\") is not True])`, so no element of `runs` can ever carry the marker; and every element of `schedule_legs` carries it by construction, so the added `*schedule_legs` term is filtered straight back out by the added condition. The expression is exactly equivalent to the pre-PR `sum(1 for r in runs if r.get(\"status\") != \"completed\")`.\n\nMutation-confirmed: reverting to the original one-liner leaves all 191 tests green. This is dead code whose apparent purpose (weighing schedule legs into `pending`) is the opposite of what it does, which is a trap for the next reader. The same file already states the norm it violates, at the `no_leg_ids` branch: \"Deliberately NOT an extra `run_id in no_leg_ids` branch here: it would be unreachable, and a guard that no input can distinguish is a guard no test can pin (it survived every mutant).\"",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Restore `pending = sum(1 for r in runs if r.get(\"status\") != \"completed\")` and, if the exclusion is worth documenting, express it as a comment (\"schedule legs were removed from `runs` above and never count toward pending\") rather than a self-cancelling filter.",
+    "severity": "minor",
+    "title": "Rewritten `pending` expression is a provable no-op; reads as if schedule legs are considered when they can never be"
+   },
+   {
+    "body": "Both jq projections in `make_fetch_workflow_runs` gained `event`. Mutation check: remove `, event` from the list-endpoint projection and the suite stays green (191, OK). If the projection ever loses the field, `r.get(\"event\")` is None everywhere, no run is ever classified as a schedule run, and the feature degrades to a complete no-op with no test signal. The degradation is fail-closed (schedule legs go back to gating), so severity is limited to \"fix silently stops working\", not \"unsafe\".",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Add a cheap structural assertion alongside the existing fetch-layer tests, e.g. assert that the argv built by `make_fetch_workflow_runs` contains `event` in both `--jq` strings (mirroring how other wiring tests in this file assert on workflow YAML/argv content).",
+    "severity": "minor",
+    "title": "The `event` field added to both jq projections is unpinned \u2014 dropping it silently reverts the whole fix"
+   },
+   {
+    "body": "1. `reported_schedule_legs` exists to log each leg once rather than once per poll (the `scripted` helper repeats the last batch, so every test polls the same leg repeatedly). Mutation check: replace `fresh_schedule_legs` with `list(schedule_legs)` \u2014 report on every poll \u2014 and the suite stays green (191, OK). The new tests use `assertIn`, which cannot distinguish one emission from N.\n\n2. The dedup key is `(id, name, str(conclusion))` but the rendered text embeds `status`: `f\"none (status={leg.get('status')})\"`. A leg observed as `queued` and later `in_progress` has the same key both times (conclusion is None throughout), so it is suppressed as already-reported and the summary keeps showing the stale `status=queued`.",
+    "file": "scripts/tests/test_ci_summary_gate.py",
+    "fix_hint": "For (1): assert emission count rather than presence, e.g. `self.assertEqual(out.count(\"out-of-scope (schedule-triggered)\"), 1)` in test_pending_schedule_leg_does_not_hold_or_exhaust_budget, then confirm it goes RED when the dedup guard is removed. For (2): include `status` in the dedup key so a status transition re-reports, since status is part of the rendered line.",
+    "severity": "minor",
+    "title": "Once-only schedule-leg reporting is unpinned, and the dedup key ignores `status` so the printed line can go stale"
+   },
+   {
+    "body": "The exclusion is unconditional on event, so if a workflow that produces a required check is ever triggered by `schedule` on the gated SHA (a `on: [push, schedule]` workflow whose cron head_sha coincides with a main-branch push SHA), its legs become non-gating and the gate can conclude green over a smaller sibling set. That is the deliberate policy of #6292 and the legs are at least surfaced in the summary, so this is a documented-tradeoff note rather than a defect \u2014 but nothing (e.g. the advisory registry, or a required-names allowlist) verifies the assumption that no required check ever arrives via `schedule`.",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Optional: record the assumption in the docstring/header of resolve_newest_workflow_runs (\"required checks are never produced by schedule-triggered runs\"), or cross-check excluded leg names against the advisory/required registry and warn loudly if a non-advisory required name is dropped as out-of-scope.",
+    "severity": "nit",
+    "title": "No cross-check that a genuinely required check is not produced by a schedule-triggered workflow"
+   }
+  ],
+  "progress": null,
+  "summary": "The intent (schedule-triggered runs are diagnostics on the SHA, not gate siblings) is right and the exclusion is fail-closed: only the API's literal event==\"schedule\" is dropped; missing/empty/unknown events stay authoritative. I ran the suite at the PR head (191/191 green) and mutation-tested each production hunk in a sandbox copy. Three of the new tests are genuinely non-vacuous: deleting the newest-candidacy exclusion, the _out_of_scope_schedule marking, the emit loop, or widening the predicate to `event != \"push\"` each turns tests RED. Two problems remain. (1) MAJOR: the third production hunk \u2014 the `event != \"schedule\"` filter on WorkflowRunResolver.authoritative \u2014 survives deletion with all 191 tests still green, so it is completely unpinned. It is load-bearing: I reproduced it. A concurrency-cancelled nightly (event=schedule, conclusion=cancelled) on the head SHA is, without that filter, the newest run of its workflow key, so the resolver POSTs a re-run request for the scheduled workflow and then raises SupersededLegsError -> gate exit 1. With the filter: no POST, no error. That is the most damaging schedule-triggered failure mode this PR is meant to close, it has an external side effect, and nothing stops a refactor from silently dropping it. (2) The rewritten `pending` expression is a provable no-op: `runs` is built from a list already filtered on `_out_of_scope_schedule is not True`, and every element of `schedule_legs` carries the marker, so the added `*schedule_legs` term is removed again by the added condition. Reverting it to the original one-liner leaves the suite green. The file itself states the repo norm this breaks (\"a guard that no input can distinguish is a guard no test can pin\"). Smaller gaps: the jq `event` projection and the once-only report dedup are both unpinned (deleting either keeps the suite green). Code correctness looks sound otherwise; the ask is coverage for the resolver hunk plus removal of the dead expression.",
+  "verdict": "request_changes"
+ }
+}
