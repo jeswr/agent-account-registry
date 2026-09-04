@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6421,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7e27cb0c51178d922bc2d46555267b3b6f65fcad",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The bench hard-zone gate immediately below (docs-quality.yml:596) is protected by scripts/tests/test_bench_hardzone_wiring.py, which asserts its own step exists, is unconditional, and that the job is not conditioned away \u2014 so the seam cannot be silently un-wired one level up. The two steps added here have no equivalent guard: a future edit could delete them, or attach an `if:` that never fires, and nothing would go red. This is the exact failure mode the PR is fixing, one level up.\n\nStrictly a consistency gap, not a defect in this change \u2014 the steps as written do run on every PR today. Noting it because the surrounding file has already established the stronger pattern.",
+    "file": ".github/workflows/docs-quality.yml",
+    "fix_hint": "Optional follow-up (a bead, not a change to this PR): extend an existing wiring test \u2014 or add a small stdlib-only one modelled on scripts/tests/test_bench_hardzone_wiring.py's TestSelfTestRunsOnPullRequests class \u2014 to assert that the two `--self-test` call sites are present in docs-quality.yml, carry no step-level `if:`, and live in a job with no job-level `if:`.",
+    "severity": "nit",
+    "title": "New self-test steps lack the self-anchoring wiring test the neighbouring hard-zone gate has"
+   },
+   {
+    "body": "The added comment says the filers \"previously self-tested only in schedule/workflow_dispatch lanes\". That is true but incomplete: at differential.yml:231, metamorph.yml:189 and differential-update.yml:197 the self-test lines sit inside a step guarded `if: failure()`. So they ran only when that nightly lane had already failed \u2014 strictly narrower than \"in schedule/workflow_dispatch lanes\", which reads as \"on every nightly run\".\n\nThe comment's conclusion is correct and the fix is right; only the stated rationale is weaker than the real one.",
+    "file": ".github/workflows/docs-quality.yml",
+    "fix_hint": "Optionally tighten the wording, e.g. \"...previously self-tested only inside the nightly lanes' `if: failure()` filing step, so their logic was exercised only once a lane had already gone red \u2014 never on a PR.\" Cosmetic; safe to leave as-is.",
+    "severity": "nit",
+    "title": "Comment understates the prior gap: the old self-tests were also behind `if: failure()`"
+   }
+  ],
+  "progress": null,
+  "summary": "CI-only change adding two hermetic self-test steps to the unconditional `quick-gates` job in docs-quality.yml, so the differential and metamorph auto-filer scripts have their pure logic exercised on every PR. Verified empirically rather than by inspection alone.\n\nPremise is accurate and in fact understated. The prior call sites (differential.yml:231, metamorph.yml:189, differential-update.yml:197) are not merely in schedule/workflow_dispatch-only workflows \u2014 each is also nested under `if: failure()`, so the self-tests previously ran ONLY after a nightly lane had already gone red. A regression in a filer was therefore undetectable until the moment it was needed to file a bug.\n\nCorrectness checks performed:\n- Both scripts exist and expose `--self-test` (argparse at :343/:347, dispatch at :346/:350).\n- Ran both: exit 0, `self-test OK`.\n- YAML parses; `quick-gates` has NO job-level `if:`; both new steps appear in the parsed step list with no step-level `if:`; docs-quality.yml triggers on pull_request/merge_group/push, so they genuinely run on every PR.\n- Hermeticity confirmed: stdlib-only imports (argparse/datetime/hashlib/json/os/pathlib/re/subprocess/sys/tempfile); self-tests use TemporaryDirectory, no gh invocation, no network, no repo writes. Job already sets up Python 3.12, so no missing dependency.\n- Non-vacuity confirmed by reading both self_test bodies: real assertions on log parsing, seed dedup/order-preservation, deterministic bead-id derivation AND collision extension, append-only JSONL round-trip that asserts prior lines are untouched, dedupe lookup with both positive and negative cases, issue-body content, and artifact-writer round-trip. Metamorph additionally pins honest oracle framing (\"single-engine\", not \"vs Oxigraph\") and replay-command derivation. These are not smoke tests.\n- Ran scripts/tests/test_bench_hardzone_wiring.py (the one wiring test that indexes into this job's steps): 20/20 OK \u2014 the insertion does not perturb its ord\u2026 [truncated 113 chars]",
+  "verdict": "approve"
+ }
+}
