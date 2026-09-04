@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2286,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "18bf1a5901cddd3ad5dbd884fb4ae141b3f76c05",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The arm now defers before any PR mutation when the fresh pre-mutation REST snapshot explicitly reports `mergeable: false`. That predicate is co-extensive with the existing strict tri-state used by conflict enumeration and live rebase admission; unknown or malformed values do not manufacture a conflict. The conflict exit precedes both CI exits, leaves their per-head budgets unspent, emits a SHA-bound App-authenticated receipt, and does not bind the reviewed SHA. The added tests exercise the pure decision, both fresh-read race directions, mutation-free end-to-end refusal, mergeable and unknown controls, CI precedence, receipt idempotency, census reporting, and dispatch-claim parity with locally specified expectations. No reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
