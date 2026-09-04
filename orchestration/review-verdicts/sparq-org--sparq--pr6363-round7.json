@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6363,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8e4cae15faf265615526e4ee441ff9cf646f6a15",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow changes correctly bound the nightly Miri and Kani matrix admission rates while preserving fail-fast:false and the complete matrices. The new audit consistently counts capped matrix legs plus plain jobs, enforces per-lane and combined ceilings, rejects critical-path triggers, checks Miri partition coverage, and is wired into docs-quality. Its hermetic, live-workflow, and real-document mutation tests are non-vacuous; all 19 tests pass. No correctness, soundness, security, or test-validity defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
