@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6108,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ed1a303d8f8176e9db5e0cdb623a062e706390a4",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In _evaluate_main, an empty PR_NUMBER makes fetch_pr_draft None, and resolve_eval_tier(..., None) unconditionally returns full. The workflow deliberately permits PR_NUMBER to be empty by swallowing failure of the same-SHA PR lookup with `|| true`; its own comments also say fork workflow_run payloads lack the PR number. For a pull_request-triggered run, an API failure or unresolved association therefore publishes ci-gate (including on the requested seed path) without establishing that the PR is ready. A draft PR could consequently receive the eventual required context from its reduced matrix. The existing test_no_pr_is_full_tier covers merge_group only and misses this real wiring path.",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Preserve whether the triggering event is pull_request. If it is and no PR number can be resolved, return an unknown tier and publish nothing; only merge_group/non-PR events may infer full tier from the absence of a PR. Add an integration-level unit test driving the empty-PR_NUMBER pull_request path (or a refactored helper) and assert that neither requested nor completed evaluation publishes ci-gate. Consider making the resolver step fail explicitly or emit a resolved/unresolved signal instead of erasing lookup errors with `|| true`.",
+    "severity": "major",
+    "title": "Unresolved pull-request identity defaults to full tier"
+   }
+  ],
+  "progress": null,
+  "summary": "The slotless evaluator has a fail-open draft-tier path. When a pull_request workflow_run payload does not provide a PR number and the fallback PR lookup fails or returns no result, the workflow passes an empty PR_NUMBER. The evaluator then treats the absence of a draft probe as full tier and may publish the required ci-gate context for a draft head. This contradicts the documented no-information/no-write invariant and is not covered by the added tier tests.",
+  "verdict": "request_changes"
+ }
+}
