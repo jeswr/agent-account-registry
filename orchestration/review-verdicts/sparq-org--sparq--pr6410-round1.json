@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6410,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6bfb4e37ba7d263f0f8db4ce2a759e97ccc12508",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Adds scripts/promote.py to ci_select.py's _ORCHESTRATION_SAFE allowlist plus a classify-only regression test. Verified the inertness obligation empirically: promote.py is referenced only by .github/workflows/promote-on-approval.yml (its own cron), a prose comment in triage-issue.yml, and docs-quality.yml \u2014 none of which appear in OrchestrationSafeInertnessTests._RUST_CI_WORKFLOWS \u2014 and no workspace crate include_str!/include_bytes!/reads it (grep over crates/**/*.rs is empty). The existing inertness and existence tests therefore continue to pass, and the allowlist can only ever REMOVE a proven-inert path from the full set (it is consulted before _trigger_match; a non-match still hits the scripts/ trigger => full), so the fail-safe posture is preserved. Coverage is not lost by the skip: docs-quality.yml runs `python3 scripts/promote.py --self-test` and is NOT selection-gated (it does not reuse ci-select.yml and carries no selection-derived if:), so a promote.py-only PR still executes promote.py's self-test \u2014 the same arrangement already relied on for the sibling triage.py/retriage.py entries. The docker_changed=false consequence is harmless: the runtime image copies only the built sparq-server binary from the builder stage, so scripts/ never lands in the image. The new test is non-vacuous \u2014 a mutation check (removing the \"scripts/promote.py\" entry in a scratch copy of the repo) turned exactly test_promote_script_classifies_as_orchestration_only RED and nothing else, confirming both that it exercises the real classify_change() path and that no pre-existing test covered promote.py. Full suites run green locally: scripts/tests/test_ci_select.py 123 tests OK (14 skipped), scripts/tests/test_ci_select_wiring.py 88 tests OK. No honesty or overclaim concerns; no ZK/MPC/perf claims; no hard-coded performance numbers. The diff contains no text directed at the reviewer.",
+  "verdict": "approve"
+ }
+}
