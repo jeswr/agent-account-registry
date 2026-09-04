@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2295,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0669dbb4cc8c8e4b9dd47188f04b11db1d2dc99f",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_note_graphql_points` raises for a missing or malformed `remaining` value but does not set `_graphql_budget_stop`. `_collect_defuse_prs` catches that refusal per PR and continues its loop, so the next PR issues another `/graphql` request. If GitHub repeatedly returns an errors-only payload, omits `rateLimit`, or returns a malformed meter, every candidate still causes a network request even though none provides evidence that the point bucket remains above reserve. This is fail-open with respect to the resource the new control is intended to preserve: rejecting the response data does not prevent the spend. The `unmeterable` self-test explicitly requires the second request to be issued, so it cannot catch this failure mode.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Latch GraphQL on an unreadable meter (while still refusing the current response), so later `/graphql` calls on that bucket/client are declined before issuance and REST remains unaffected. Change the unmeterable test to perform multiple latch reads and assert one issued GraphQL request, subsequent pre-request refusals, and the corresponding refusal gauge/one-time alert behavior.",
+    "severity": "major",
+    "title": "Unreadable rate meter leaves unbounded GraphQL spending enabled"
+   }
+  ],
+  "progress": null,
+  "summary": "The measured-boundary behavior, GraphQL-only latch, REST independence, and unconditional summary gauge are well tested. However, the unreadable-meter path defeats the reserve's core fail-closed purpose: it rejects each returned answer but deliberately leaves the latch open, so every remaining candidate can issue another unmetered GraphQL request. A sustained errors-only or malformed-meter response can therefore consume requests/points through the whole defuse population with no reserve stop. The self-test currently codifies this unsafe behavior rather than testing that subsequent GraphQL spends are prevented.",
+  "verdict": "request_changes"
+ }
+}
