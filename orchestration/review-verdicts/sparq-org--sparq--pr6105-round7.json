@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6105,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7c62182be9c39fd3a8750269777d3a0ae810444c",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "gated_test_modules() detects an inline `#[cfg(all(test, feature = \"x\"))]`, or a plain `#[cfg(test)]` only when a path component's parent `mod name;` declaration is feature-gated. It does not associate a local stacked `#[cfg(feature = \"x\")]` with a following `#[cfg(test)] mod tests { ... }`, a normal equivalent Rust spelling. Such a module can be added under an otherwise ungated source file and this gating check will still return no gap, contradicting the claimed guarantee that every feature-gated lib-test module has a CI executor. The current non-vacuity tests exercise only lane parsing, not this detector false-negative.",
+    "file": "scripts/tests/test_conformance_lib_lanes.py",
+    "fix_hint": "Parse adjacent cfg attributes on test-module declarations (including the stacked `cfg(feature)` plus `cfg(test)` form), and add a synthetic source-tree test proving that this spelling is reported uncovered without a matching `--lib` lane and covered with one. Either support the broader cfg forms claimed by the test or narrow the documented invariant explicitly and enforce the repository's permitted spelling separately.",
+    "severity": "major",
+    "title": "Detector misses locally feature-gated plain test modules"
+   }
+  ],
+  "progress": null,
+  "summary": "The CI command changes are sensible and the new Python test passes, but the structural gate is incomplete for a common Rust cfg spelling and can therefore report success while feature-gated lib tests remain unexecuted. Its stated invariant is broader than what its detector enforces.",
+  "verdict": "request_changes"
+ }
+}
