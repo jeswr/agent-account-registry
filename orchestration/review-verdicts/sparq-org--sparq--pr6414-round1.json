@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 6414,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "93921bc97d7647287ed3132db9b36fd8a64a9bde",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Every comparable structural/alarm suite in this repo asserts that docs-quality.yml still invokes it. scripts/tests/test_mergequeue_cache_posture.py:282 states the rule outright: \"A structural test that never runs is a comment. Pin its own call site.\" scripts/tests/test_alarm_lanes_non_gating.py:43 and scripts/tests/test_ci_execution_latency_alarm.py:680 both implement it (the latter reds with \"docs-quality.yml no longer invokes this suite \u2014 it would stop running\").\n\nThis suite does not: I confirmed the string \"docs-quality\" does not appear anywhere in the new file. If the step added at .github/workflows/docs-quality.yml:1084-1085 is later deleted, renamed, given an `if:`, or set `continue-on-error: true` during an unrelated refactor, the archive-feature parity gate stops running and nothing goes red. The three declarations then drift silently \u2014 which is exactly the failure mode this PR exists to prevent, so the gate protecting against drift is itself unprotected. This matters more than usual here because the gate's only value is as a tripwire; a tripwire that can be removed without a signal provides false assurance that parity is enforced.",
+    "file": "scripts/tests/test_archive_feature_parity.py",
+    "fix_hint": "Add a DOCS_QUALITY = REPO_ROOT / \".github\" / \"workflows\" / \"docs-quality.yml\" constant and a test that reads it and asserts the exact invocation line is present, e.g. `self.assertIn(\"python3 scripts/tests/test_archive_feature_parity.py\", dq)` with a failure message naming the consequence. Match by exact string rather than containment/substring-of-a-longer-command, and follow test_ci_execution_latency_alarm.py's precedent of also asserting the step carries no `if:` and no `continue-on-error:` so the call site cannot be neutered in place.",
+    "severity": "major",
+    "title": "New drift gate does not pin its own call site in docs-quality.yml, so it can silently leave CI"
+   },
+   {
+    "body": "The PR centralizes the executable declarations but leaves three prose copies of the same literal that the new gate does not cover:\n\n- .github/workflows/ci.yml:511 \u2014 \"The archive runs `--features approx-ann,filtered-ann,vec-predicate` (#363, LOAD-BEARING)\"\n- .github/workflows/heavy-set-alarm.yml:92 \u2014 \"`--features approx-ann,filtered-ann,vec-predicate` MIRRORS ci.yml's\"\n- scripts/ec2-buildfarm.sh:25 \u2014 \"4. cargo test --workspace --features approx-ann,filtered-ann,vec-predicate (CI archive opt-in set)\"\n\nAll three are load-bearing documentation (the ci.yml:511 block is the GUARD that tells contributors which suites the archive reaches and directs anything else to feature-matrix.yml). When someone edits ARCHIVE_FEATURES the gate will force the two executable consumers into sync, but these comments will keep asserting the old set with no signal \u2014 turning the repo's most explicit guidance about archive coverage into a stale claim. This is a honesty-drift surface of the same kind the parity gate was written to close.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Either (a) extend parity_errors/the suite with a scan asserting that no file outside the three canonical declaration sites contains the literal feature triple in a context that claims to describe the archive set, or (b) cheaper and adequate: reword the three comments to reference ARCHIVE_FEATURES by name instead of restating the value (e.g. \"the archive runs the opt-in set declared in this job's ARCHIVE_FEATURES (#363, LOAD-BEARING)\"), so there is exactly one place the value is written.",
+    "severity": "minor",
+    "title": "Prose comments still hard-code the literal feature triple and are outside the parity gate"
+   },
+   {
+    "body": "_CI_FEATURES pins `^\\s{6}` and _ALARM_FEATURES pins `^\\s{10}`, so the gate is tied to the current nesting depth of each declaration. Hoisting heavy-set-alarm.yml's ARCHIVE_FEATURES from the step to the job level \u2014 a behavior-preserving refactor \u2014 makes extract() find 0 matches and raise \"expected exactly one archive feature declaration, found 0\". Similarly, quoting the value in YAML (`ARCHIVE_FEATURES: \"approx-ann,...\"`) makes `[^#\\s]+` capture the quote characters, producing a spurious mismatch against the unquoted buildfarm default.\n\nSeparately, parity_errors compares canonical strings byte-for-byte, so a semantically identical reordering (`filtered-ann,approx-ann,vec-predicate`) reds and forces mechanical edits in two other files.\n\nThese all fail LOUD rather than silently passing, so the gate is fail-closed and this is not a correctness defect \u2014 just avoidable friction and a confusing error message for a maintainer who did nothing wrong.",
+    "file": "scripts/tests/test_archive_feature_parity.py",
+    "fix_hint": "Relax the anchors to `^\\s+ARCHIVE_FEATURES:` and disambiguate ci.yml vs heavy-set-alarm.yml by file rather than by indentation width (they are already read from separate paths, so the depth pin buys nothing). Strip surrounding quotes and whitespace from the captured value, and compare normalized sets \u2014 e.g. `frozenset(v.strip() for v in features.split(\",\"))` \u2014 so ordering is not spuriously load-bearing. Keep the exactly-one-declaration fail-loud as is.",
+    "severity": "nit",
+    "title": "Extraction regexes are coupled to exact indentation and YAML scalar style; comparison is order-sensitive"
+   }
+  ],
+  "progress": null,
+  "summary": "The change is functionally correct and the new gate genuinely works. Verified against the checkout at PR head: both workflows parse as valid YAML; ARCHIVE_FEATURES is job-scoped in ci.yml (line 403, no duplicate `env:` key) so both the archive and doctest steps see it, and step-scoped on the measure step in heavy-set-alarm.yml (line 109); the docs-quality `quick-gates` job that invokes the new suite does a full (non-sparse) actions/checkout with Python 3.12, so all three files the script reads are present. `python3 scripts/tests/test_archive_feature_parity.py` passes 5/5 locally. The tests are NOT vacuous: the two drift tests use `str.replace(..., 1)` and assert a non-empty error list, so a replace that silently matched nothing would leave the text unchanged and fail the assertion; I separately drove `parity_errors` with a realistic ci.yml-only mutation (adding a 4th feature) and confirmed it reports both consumers as drifted. `extract` fails loud (ValueError) rather than silently returning on a 0- or 2-match declaration count, and the regexes correctly discriminate ci.yml (6-space job-level) from heavy-set-alarm.yml (10-space step-level). No security concern: the env values are workflow literals, not attacker-controlled, and `\"${ARCHIVE_FEATURES}\"` is properly quoted in both workflow run steps; the unquoted `${ARCHIVE_FEATURES}` in ec2-buildfarm.sh is pre-existing and harmless for a comma-list with no spaces. I found no other executable consumer of the feature triple that was missed (vectors-aarch64.yml's VECTORS_FEATURES is a deliberately different set; feature-matrix.yml is out of scope by ci.yml's own GUARD block). One major gap: the new suite does not pin its own call site in docs-quality.yml, contrary to this repo's explicit convention for structural gates, so the gate is silently removable.",
+  "verdict": "request_changes"
+ }
+}
