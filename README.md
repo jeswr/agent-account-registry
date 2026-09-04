@@ -778,6 +778,23 @@ longer also restores the sampling `_no_change_limit_view`, the decline ladder an
 `no_change_routing.retry_decision` were specified against; all three move in the deny direction and
 keep their own bounds.
 
+Those same retained rows are what the dashboard's **tier-crossover census** ([issue
+#77](https://github.com/jeswr/agent-account-registry/issues/77),
+`dashboard-gen._tier_crossover_census` → `model_health.tier_crossovers` → the *Model changeovers*
+panel) is computed over. A crossover is a target issue whose retained health records carry **more
+than one model alias** — the observable side of `retry_decision` returning `RETRY_OTHER_TIER`, which
+`orchestration/routing.toml` already calls a *same-issue crossover* — and the panel publishes how
+many of the issues it could attribute crossed, plus each ordered pair (`sol → opus5`) and its count.
+Two limits are part of the contract, not oversights. It can only see **no-change** runs, because
+`issue` is a no-change-only record field (`model-health._validate_record` refuses the other
+no-change fields on any other exit class), so a chain that moved because an account outage took a
+tier out from under the whole fleet does not appear. And it deliberately counts **no cancellations**:
+a cancelled run folds to `CLASS_UNKNOWN` at the producer — `_EXIT_CLASS_MAP` maps the raw `other`
+class and names "an unrecognised nonzero exit / timeout / cancellation / pre-launch abort" as one
+bucket — so no reader downstream can separate one from a timeout, and a row labelled "cancellations"
+would be a number this repo cannot support. Closing that half is producer-first: give the harness a
+raw cancellation class, then census it.
+
 **The probe must PROVE its materialization** (same issue). `dispatch.yml`'s probe — the lane that
 spends real capacity — now applies the ledgergate the dashboard lane got in #219/#612: the ACCT_*
 materialization step carries **no** `continue-on-error`, the probe step **parses** the token subset

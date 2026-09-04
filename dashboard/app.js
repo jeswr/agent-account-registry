@@ -430,6 +430,55 @@ function renderNoChangeCensus(census) {
   panel.append(strip);
 }
 
+// Issue #77: how often work moved off the model it was routed to. dashboard-gen's
+// `_tier_crossover_census` decides what a crossover IS (a target issue whose retained health
+// records span more than one model alias) and which ordered pairs to publish; this draws exactly
+// what it is served, including the all-zero reading, and invents no bucket of its own.
+function renderTierCrossovers(census) {
+  const panel = byId("health-crossovers");
+  panel.replaceChildren();
+  // A NULL census means the snapshot carried no health LEDGER (the legacy model-health shapes
+  // carry no per-run target), which is a different fact from a ledger in which nothing crossed —
+  // that one renders below, with its zeroes visible.
+  if (!census || !Array.isArray(census.pairs)) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const crossed = Number.isFinite(census.crossed) ? census.crossed : null;
+  const issues = Number.isFinite(census.issues) ? census.issues : null;
+  const span = census.since ? `since ${utc(census.since)}` : "in the retained health ledger";
+  panel.append(node("p", "census-caption", crossed === null || issues === null
+    ? `Model changeovers — count unknown ${span}`
+    : `Model changeovers — ${crossed} of ${issues} target issue${issues === 1 ? "" : "s"}`
+      + ` ran on more than one model ${span}`));
+  // The truncation note is drawn BEFORE the empty-state return for the reason #2008 gives one
+  // card up: `pairs: []` beside a positive total is what a hand-edited data.json looks like, and
+  // `showing 0 of 30 crossover pairs` is its honest render.
+  const note = obsTruncationNote(census.pairs, census.pairs_total, "crossover pairs");
+  if (note) panel.append(note);
+  if (!census.pairs.length) {
+    panel.append(node("p", "empty subtle", "No model changeover is recorded in this window."));
+    return;
+  }
+  const strip = node("div", "health-strip");
+  for (const row of census.pairs) {
+    const item = node("article", "health-item");
+    // A pair whose aliases are not strings is a malformed payload, not a model called "null":
+    // say the label cannot be read rather than printing the coercion, and keep the row — a pair
+    // dropped here would silently shorten the distribution.
+    const from = row && typeof row.from === "string" ? row.from : "—";
+    const to = row && typeof row.to === "string" ? row.to : "—";
+    item.append(node("p", "health-model", `${from} → ${to}`));
+    const meta = node("div", "health-meta");
+    meta.append(node("span", "", "changeovers"),
+                node("span", "badge", Number.isFinite(row && row.count) ? String(row.count) : "—"));
+    item.append(meta);
+    strip.append(item);
+  }
+  panel.append(strip);
+}
+
 function renderHealth(health) {
   const section = byId("health-section");
   if (!health) {
@@ -444,6 +493,10 @@ function renderHealth(health) {
   // precisely the tick whose reason distribution an operator wants; a census placed after that
   // return would vanish on the boards that most need it.
   renderNoChangeCensus(health.no_change_reasons);
+  // [#77] Drawn before the per-model strip's empty-state return for the same placement reason as
+  // the census above it: a ledger whose only rows are `no_change` publishes no per-model check at
+  // all, and that is exactly the tick whose changeovers an operator came to read.
+  renderTierCrossovers(health.tier_crossovers);
   const strip = byId("model-health");
   strip.replaceChildren();
   // [#2008] The per-model strip is a top-20 DISPLAY slice of the WELL-FORMED provider/model pairs

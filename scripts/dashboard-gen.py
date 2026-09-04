@@ -1653,6 +1653,81 @@ def _no_change_reason_census(records, health):
     }
 
 
+def _tier_crossover_census(records, health):
+    """Issue #77 — how often work LEAVES the model it was routed to, and WHICH pair it crossed.
+
+    THE THING BEING COUNTED. This fleet's downgrade is not a provider-side event the dashboard
+    could observe directly; it is a DISPATCH decision, and it has exactly one implementation:
+    `no_change_routing.retry_decision` returns `RETRY_OTHER_TIER` when a target issue's no-change
+    evidence retires a tier from its chain, and the next tick dispatches that issue on the next
+    model in the chain. `orchestration/routing.toml` calls the result a *same-issue crossover*
+    (#738's "4/4 same-issue crossovers", the measurement that moved `role:impl` off `sol`). So a
+    crossover is an issue whose retained health records carry MORE THAN ONE model alias, and the
+    ordered pair `(earlier, later)` is the changeover an operator would name "sol and opus5" —
+    which is the naming #77 asks the run to carry.
+
+    THE POPULATION IS THE NO-CHANGE RUNS, AND THAT IS NOT A CHOICE THIS READER MADE. `issue` is a
+    NO-CHANGE-ONLY record field — `model-health._validate_record` refuses any of
+    `RECORD_NO_CHANGE_FIELDS` on another exit class — so a no-change run is the only run this
+    ledger can attribute to a target at all. It is also the only run the retry rule acts on, so the
+    population and the mechanism coincide; the honest cost is that a chain that moved for any OTHER
+    reason (an `auth`/`limit` account outage taking a tier out from under the whole fleet) is
+    invisible here, and this census must not be read as counting those.
+
+    WHAT IS DELIBERATELY *NOT* COUNTED: the cancellation half of #77. A cancelled worker run folds
+    to `CLASS_UNKNOWN` at the producer — `model-health._EXIT_CLASS_MAP` maps the raw `other` class,
+    and its comment names "an unrecognised nonzero exit / timeout / cancellation / pre-launch
+    abort" as one bucket — so no reader downstream can separate a cancellation from a timeout, and
+    a row here labelled "cancellations" would be a number this repo cannot support. That gap is
+    producer-side and is filed, not papered over.
+
+    An ALIAS-LESS record (the empty `model_alias` a fleet signal carries) is dropped: it names no
+    tier, so keeping it would manufacture `fable -> "" -> opus5` out of one real changeover. An
+    issue whose every record is alias-less therefore leaves no trace here at all, which is why
+    `issues` is its own denominator rather than `no_change_reasons.runs`.
+
+    `crossed`/`issues`/`pairs` publish UNCONDITIONALLY, zeroes included (AGENTS.md pre-flight item
+    8): a fleet that crossed nothing this window is the reading an operator interrogates the panel
+    for, and a census that emits only when it has something to say is one a mutant can silence on
+    exactly that tick. `since` is the oldest COUNTED record, i.e. the honest span of this census
+    rather than the ledger's own.
+
+    Nothing model-authored reaches the page: the aliases are catalog tokens re-checked against
+    `SAFE_MODEL_RE` here, and no account hash, run id or issue title crosses into the output."""
+    per_issue = {}
+    for index, record in enumerate(records):
+        if record.get("exit_class") != health.CLASS_NO_CHANGE:
+            continue
+        alias = str(record.get("model_alias") or "")
+        if SAFE_MODEL_RE.fullmatch(alias) is None:
+            continue
+        # `index` breaks ts ties in LEDGER order rather than alphabetically: two records stamped
+        # the same second must not have their crossover direction decided by which alias sorts
+        # first, which is what a bare `(ts, alias)` sort would do.
+        per_issue.setdefault(record["issue"], []).append((record["ts"], index, alias))
+
+    crossed, oldest, pairs = 0, None, {}
+    for rows in per_issue.values():
+        rows.sort()
+        aliases = [alias for _, _, alias in rows]
+        if len(set(aliases)) > 1:
+            crossed += 1
+        for earlier, later in zip(aliases, aliases[1:]):
+            if earlier != later:
+                pairs[(earlier, later)] = pairs.get((earlier, later), 0) + 1
+        oldest = rows[0][0] if oldest is None else min(oldest, rows[0][0])
+
+    # A DISPLAY cap on the same terms as every other array on this document (`_obs_capped`): a
+    # 2-3 rung chain can only make a handful of ordered pairs, so this bites only on a catalog
+    # that has churned — and the pre-cap count publishes beside the slice either way.
+    ordered, pairs_total = _obs_capped(
+        sorted(({"from": earlier, "to": later, "count": count}
+                for (earlier, later), count in pairs.items()),
+               key=lambda row: (-row["count"], row["from"], row["to"])), 12)
+    return {"issues": len(per_issue), "crossed": crossed, "since": _utc_iso(oldest),
+            "pairs": ordered, "pairs_total": pairs_total}
+
+
 def _normalize_ledger_health(document):
     """Canonical model-health ledger, {"records": [...]} (issue #218): validate with the shared
     model-health validator — a malformed ledger fails LOUD, never renders a fabricated check —
@@ -1664,7 +1739,11 @@ def _normalize_ledger_health(document):
 
     Issue #1827: the same validated records also carry the declared no-diff reason, censused by
     `_no_change_reason_census` into `no_change_reasons` — a bounded 6-row distribution, always
-    present on this (ledger) path."""
+    present on this (ledger) path.
+
+    Issue #77: and the same records carry which TIER each attempt ran on, censused by
+    `_tier_crossover_census` into `tier_crossovers` — how often a target issue's work moved off the
+    model it was routed to, and which ordered pair it crossed. Also always present on this path."""
     health = _model_health_module()
     try:
         records = health.validate_ledger(document)
@@ -1707,7 +1786,8 @@ def _normalize_ledger_health(document):
         key=lambda check: (check["provider"], check["model"]))
     generated_at = _utc_iso(max((record["ts"] for record in records), default=None))
     return {"generated_at": generated_at, "checks": checks, "checks_total": checks_total,
-            "no_change_reasons": _no_change_reason_census(records, health)}
+            "no_change_reasons": _no_change_reason_census(records, health),
+            "tier_crossovers": _tier_crossover_census(records, health)}
 
 
 def _normalize_model_health(document):
@@ -1757,8 +1837,11 @@ def _normalize_model_health(document):
     # [#1827] NULL IS NOT ZERO. These legacy/ad-hoc shapes carry no health RECORDS, so there is no
     # population to census — publishing an all-zero distribution here would read as "no worker has
     # produced a no-change run", which is a measurement this input cannot support.
+    # [#77] Same for the crossover census, and for the same reason one step further along: these
+    # shapes carry no per-run TARGET either, so `0 of 0 issues crossed` would read as "the fleet
+    # never moved a task off its routed model" out of an input that could not have seen one.
     return {"generated_at": generated_at, "checks": checks, "checks_total": checks_total,
-            "no_change_reasons": None}
+            "no_change_reasons": None, "tier_crossovers": None}
 
 
 def _live_leases(leases, now):
@@ -3220,13 +3303,23 @@ _HEALTH_CENSUS_PAGE_BODY = r"""
   const out = {};
   for (const [name, health] of Object.entries(input.cases)) {
     for (const id of ["health-section", "health-time", "model-health", "health-no-change",
-                      "health-truncated"]) {
+                      "health-crossovers", "health-truncated"]) {
       ids[id] = element("div#" + id);
     }
     scope.renderHealth(health);
     const panel = ids["health-no-change"];
     const caption = panel.children[0];
     const strip = panel.children[1];
+    // [#77] The crossover panel, collected from the SAME executed `renderHealth`. Its strip is
+    // located by className rather than by index: unlike the census above it, this panel may put a
+    // truncation note and an empty-state line between the caption and the rows, and a positional
+    // read would report those as the first chip.
+    const cross = ids["health-crossovers"];
+    const crossCaption = cross.children[0];
+    const crossLine = crossCaption === undefined || crossCaption === null
+      ? null : String(crossCaption.textContent);
+    const crossCut = crossLine === null ? -1 : crossLine.indexOf(" since ");
+    const crossStrip = (cross.children || []).filter((kid) => kid.className === "health-strip")[0];
     // Every field below is a SCALAR or a whole array: the rows that read them must never index
     // into a value a mutant can turn null, or the mutant aborts the suite and scores as a kill
     // with every later check unrun (AGENTS.md pre-flight item 4, *crash-after-partial-run* —
@@ -3248,6 +3341,18 @@ _HEALTH_CENSUS_PAGE_BODY = r"""
       ]) : null,
       models: ids["model-health"].children.map((kid) => flat(kid).filter(Boolean).join("|")),
       truncation: byClass(ids["health-truncated"], "obs-truncated"),
+      crossovers: {
+        hidden: cross.hidden === true,
+        caption: crossCut < 0 ? crossLine : crossLine.slice(0, crossCut),
+        stamp: crossCut < 0 ? null : crossLine.slice(crossCut + " since ".length),
+        pairs: crossStrip ? crossStrip.children.map((item) => [
+          item.children[0] ? item.children[0].textContent : null,
+          item.children[1] && item.children[1].children[1]
+            ? item.children[1].children[1].textContent : null,
+        ]) : null,
+        empty: byClass(cross, "empty subtle"),
+        truncation: byClass(cross, "obs-truncated"),
+      },
     };
   }
   // [#2008] ...and the SAME container rendered twice, which the per-case loop above cannot see
@@ -3255,24 +3360,34 @@ _HEALTH_CENSUS_PAGE_BODY = r"""
   // note that is not cleared outlives the snapshot that earned it — the card would keep stating a
   // truncation the current fleet does not have, which is a worse lie than the silence it replaced.
   for (const id of ["health-section", "health-time", "model-health", "health-no-change",
-                    "health-truncated"]) {
+                    "health-crossovers", "health-truncated"]) {
     ids[id] = element("div#" + id);
   }
   scope.renderHealth(input.rerender[0]);
   const firstNote = byClass(ids["health-truncated"], "obs-truncated");
+  const firstCross = byClass(ids["health-crossovers"], "health-model");
   scope.renderHealth(input.rerender[1]);
   out["re-rendered"] = {
     first: firstNote,
     second: byClass(ids["health-truncated"], "obs-truncated"),
+    // [#77] The same property for the crossover panel, which the tick above filled: a renderer
+    // that hid the panel without clearing it (or cleared it without hiding it) leaves the last
+    // snapshot's changeovers standing under a header the current one does not support.
+    firstCross,
+    secondCross: byClass(ids["health-crossovers"], "health-model"),
+    secondCrossHidden: ids["health-crossovers"].hidden === true,
   };
   process.stdout.write(JSON.stringify(out));
 """
 
 
-def _self_test_health_census(check, published, zero_census):
+def _self_test_health_census(check, published, zero_census, crossovers):
     """Issue #1827 — the declared-reason census on the PAGE, including the tick that has no
     per-model check at all. Issue #2008 adds the model-health card's display-cap note, rendered by
-    the same EXECUTED `renderHealth` and driven off the same payloads."""
+    the same EXECUTED `renderHealth` and driven off the same payloads. Issue #77 adds the
+    tier-crossover panel, on the same terms: `crossovers` is the census `_normalize_model_health`
+    really produced for a ledger that DID cross, so the page half cannot be vacuous on both sides
+    at once (pre-flight item 6)."""
     # The vocabulary as this suite expects to SEE it — written out, never imported from
     # `NO_CHANGE_REASONS` (pre-flight item 2(b)). The "published" row below still spells its six
     # chips out in full, so this tuple cannot mask a wrong vocabulary: that row and these two would
@@ -3336,12 +3451,52 @@ def _self_test_health_census(check, published, zero_census):
                          "checks": model_checks(20), "checks_total": "40"},
         "fractional-total": {"generated_at": None, "no_change_reasons": None,
                              "checks": model_checks(20), "checks_total": 20.5},
+        # [#77] The census `_normalize_model_health` really produced for a crossed ledger, on a
+        # snapshot with NO per-model check — the placement branch, again: a ledger whose only rows
+        # are no-change publishes no check at all, and it is precisely the ledger whose
+        # changeovers an operator came to read.
+        "crossed": {"generated_at": None, "checks": [], "no_change_reasons": None,
+                    "tier_crossovers": crossovers},
+        # A window in which nothing crossed. The zero reading has to be legible AS a reading:
+        # `0 of 7` beside an explicit line, never an absent panel.
+        "uncrossed": {"generated_at": None, "checks": [], "no_change_reasons": None,
+                      "tier_crossovers": {"issues": 7, "crossed": 0, "since": None,
+                                          "pairs": [], "pairs_total": 0}},
+        # The singular, and a span that renders.
+        "one-issue": {"generated_at": None, "checks": [], "no_change_reasons": None,
+                      "tier_crossovers": {"issues": 1, "crossed": 1,
+                                          "since": "2025-06-15T14:41:40Z",
+                                          "pairs": [{"from": "sol", "to": "opus5", "count": 1}],
+                                          "pairs_total": 1}},
+        # [#77] A truncated pair slice. 30 is a LITERAL that appears nowhere else in this suite
+        # and is not the cap the generator reads (pre-flight 2(b)/2(c)).
+        "crossover-truncated": {
+            "generated_at": None, "checks": [], "no_change_reasons": None,
+            "tier_crossovers": {"issues": 40, "crossed": 30, "since": None,
+                                "pairs": [{"from": "sol", "to": "opus5", "count": 4}],
+                                "pairs_total": 30}},
+        # Unreadable values inside an otherwise well-formed census: said to be unknown, never
+        # printed as a number or an alias the payload does not contain, and never dropped.
+        "crossover-unreadable": {
+            "generated_at": None, "checks": [], "no_change_reasons": None,
+            "tier_crossovers": {"issues": "several", "crossed": 2, "since": None,
+                                "pairs": [{"from": "sol", "to": None, "count": 3},
+                                          {"from": 5, "to": "opus5", "count": "many"}],
+                                "pairs_total": 2}},
+        # No `pairs` array at all: hidden, not raised.
+        "crossover-no-rows": {"generated_at": None, "checks": [], "no_change_reasons": None,
+                              "tier_crossovers": {"issues": 3, "crossed": 1}},
     }
     page = _executed_page(
         _page_harness("renderHealth", _HEALTH_CENSUS_PAGE_BODY),
         # [#2008] `rerender` drives the two payloads through ONE container, in this order: the
-        # truncated fleet, then the same card once the fleet fits under the cap.
-        {"cases": cases, "rerender": [cases["truncated"], cases["equal-total"]]})
+        # truncated fleet, then the same card once the fleet fits under the cap. [#77] The first
+        # of the two additionally carries a crossover census and the second carries none, so the
+        # same container is asserted to lose the changeovers it drew a tick earlier.
+        {"cases": cases,
+         "rerender": [{**cases["truncated"], "tier_crossovers": cases["one-issue"]
+                       ["tier_crossovers"]},
+                      cases["equal-total"]]})
     check("[#1827] EXECUTED: the census dashboard-gen really publishes reaches the page — one chip "
           "per vocabulary reason IN ORDER, zero rows drawn rather than dropped, the counted runs "
           "in the caption and a readable span stamp beside them",
@@ -3426,6 +3581,77 @@ def _self_test_health_census(check, published, zero_census):
            _js_code_count(_js_function_body(_repo_file("dashboard", "app.js"), "renderHealth"),
                           'byId("health-truncated")')),
           (1, 1))
+
+    # ---- [#77] the tier-crossover panel, through the SAME executed `renderHealth` --------------
+    # Every expected string is a literal written here, never read back off the page (pre-flight
+    # 2(b)), and the "crossed" case is driven by the census `_normalize_model_health` really
+    # produced — so a rename or reshape on either side of that seam reds a row rather than
+    # leaving two agreeing fixtures green.
+    check("[#77] EXECUTED page script: the crossover census a real crossed ledger produces "
+          "reaches the page — the caption names how many issues moved off their routed model out "
+          "of how many were seen, and each ordered pair is a chip an operator can read as "
+          "'sol and opus5', busiest first, with its count",
+          (page["crossed"]["crossovers"]["hidden"], page["crossed"]["crossovers"]["caption"],
+           page["crossed"]["crossovers"]["stamp"] in (None, "", "unknown"),
+           page["crossed"]["crossovers"]["pairs"], page["crossed"]["crossovers"]["empty"]),
+          (False, "Model changeovers — 2 of 4 target issues ran on more than one model", False,
+           [["sol → opus5", "2"], ["opus5 → sol", "1"]], []))
+    check("[#77] THE PLACEMENT ROW: the panel draws on a ledger with NO per-model check at all — "
+          "the branch a renderer called after the strip's empty-state return would be skipped by, "
+          "which is the defect #1827 fixed one panel over",
+          (page["crossed"]["crossovers"]["hidden"], page["crossed"]["models"]),
+          (False, ["No recognized model checks in the snapshot."]))
+    check("[#77] a window in which NOTHING crossed publishes the zero AS A READING — `0 of 7` "
+          "with an explicit line where the chips would be, its span named as the ledger rather "
+          "than as a stamp. A panel that emitted only when it had something to say would be "
+          "silent on exactly the tick an operator interrogates it (pre-flight item 8)",
+          (page["uncrossed"]["crossovers"]["hidden"],
+           page["uncrossed"]["crossovers"]["caption"], page["uncrossed"]["crossovers"]["stamp"],
+           page["uncrossed"]["crossovers"]["pairs"], page["uncrossed"]["crossovers"]["empty"]),
+          (False, "Model changeovers — 0 of 7 target issues ran on more than one model "
+                  "in the retained health ledger", None, None,
+           ["No model changeover is recorded in this window."]))
+    check("[#77] NULL IS NOT ZERO on the page either: a snapshot whose crossover census is null "
+          "(every non-ledger model-health shape) hides the panel, while the strip it sits under "
+          "still renders; and one issue reads '1 target issue', not '1 target issues'",
+          (page["no-census"]["crossovers"]["hidden"], page["no-census"]["crossovers"]["caption"],
+           page["no-census"]["models"], page["one-issue"]["crossovers"]["caption"]),
+          (True, None, ["fable|anthropic|healthy"],
+           "Model changeovers — 1 of 1 target issue ran on more than one model"))
+    check("[#77] a truncated pair slice STATES what the cap hid, beside the rows it accounts "
+          "for — the #1868/#2008 contract on this panel too, so a catalog that churned through 30 "
+          "pairs no longer renders identically to one with 12",
+          (page["crossover-truncated"]["crossovers"]["truncation"],
+           page["crossover-truncated"]["crossovers"]["pairs"]),
+          (["showing 1 of 30 crossover pairs"], [["sol → opus5", "4"]]))
+    check("[#77] an unreadable issue count, pair alias or pair count is SAID to be unknown — "
+          "never rendered as a number or a model name the payload does not contain, and never "
+          "dropped, which would shorten the distribution — and a census with no `pairs` array at "
+          "all hides the panel instead of raising out of the render",
+          (page["crossover-unreadable"]["crossovers"]["caption"],
+           page["crossover-unreadable"]["crossovers"]["pairs"],
+           page["crossover-no-rows"]["crossovers"]["hidden"],
+           page["crossover-no-rows"]["crossovers"]["pairs"]),
+          ("Model changeovers — count unknown in the retained health ledger",
+           [["sol → —", "3"], ["— → opus5", "—"]], True, None))
+    check("[#77] ...and the panel does not OUTLIVE the snapshot that earned it. The page "
+          "re-renders into the SAME container on every refresh tick, so changeovers that are not "
+          "cleared go on naming a downgrade the current ledger does not show — the one failure "
+          "mode a per-case harness handing out fresh elements cannot see",
+          (page["re-rendered"]["firstCross"], page["re-rendered"]["secondCross"],
+           page["re-rendered"]["secondCrossHidden"]),
+          (["sol → opus5"], [], True))
+    check("[#77] the container this panel renders into exists on the page, and the renderer "
+          "reaches for THAT id — one declaration in index.html, one lookup in "
+          "renderTierCrossovers; and renderHealth really CALLS it, at a code position a comment "
+          "cannot stand in for",
+          (len(re.findall(r'id="health-crossovers"', _repo_file("dashboard", "index.html"))),
+           _js_code_count(
+               _js_function_body(_repo_file("dashboard", "app.js"), "renderTierCrossovers"),
+               'byId("health-crossovers")'),
+           _js_code_count(_js_function_body(_repo_file("dashboard", "app.js"), "renderHealth"),
+                          "renderTierCrossovers(health.tier_crossovers)")),
+          (1, 1, 1))
 
 
 def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar):
@@ -4348,7 +4574,11 @@ def _self_test():
     check("canonical records ledger -> per-provider/model checks, and [#1827] the declared "
           "no-change reason census beside them: counted (not set-ified), zero rows kept, an "
           "absent declaration folded to `unspecified`, an unattributable run still counted, and "
-          "`since` reading the OLDEST no-change run rather than the ledger's own span",
+          "`since` reading the OLDEST no-change run rather than the ledger's own span. "
+          "[#77] ...and the tier-crossover census, on a fleet where NOTHING crossed: the zero "
+          "reading publishes rather than being omitted, and it is not vacuous — `issues` is 3, "
+          "not the census's 4 runs, because issue 1595's only record is alias-less and names no "
+          "tier, which is the one row that distinguishes this denominator from the one beside it",
           ordered["model_health"], {
         "generated_at": _utc_iso(now - 120),
         "checks": [
@@ -4373,6 +4603,10 @@ def _self_test():
                 {"reason": "already_done", "count": 1},
                 {"reason": "other", "count": 0},
             ],
+        },
+        "tier_crossovers": {
+            "issues": 3, "crossed": 0, "since": _utc_iso(now - 1500),
+            "pairs": [], "pairs_total": 0,
         },
     })
     # [#2008] THE OVER-CAP DIRECTION, which no fixture above could reach: every health ledger in
@@ -4471,10 +4705,92 @@ def _self_test():
                        {"reason": "too_large", "count": 0},
                        {"reason": "already_done", "count": 0},
                        {"reason": "other", "count": 0}]})
+
+    # [#77] THE POSITIVE DIRECTION of the crossover census. The production ledger above crosses
+    # NOTHING, so on its own it is satisfied by a census hard-wired to `crossed: 0` — this ledger
+    # is the control that reds that mutant. Every issue number, alias and offset is a LITERAL
+    # (pre-flight 2(b)): nothing here is derived from the code under test.
+    #
+    #   * 4101 crosses TWICE, sol -> opus5 -> sol. Two ordered pairs off one issue, and the issue
+    #     counts ONCE toward `crossed` — a `crossed` that counted pairs would read 3 below, and a
+    #     `pairs` that de-duplicated per issue would lose the return leg.
+    #   * 4102 crosses sol -> opus5 as well, so that pair's count is 2 and the sort's primary key
+    #     (descending count) has something to order.
+    #   * 4103 runs TWICE ON THE SAME TIER. It is in `issues` and out of `crossed`: a repeat
+    #     attempt on one model is not a changeover, and dropping the `earlier != later` guard
+    #     manufactures a `sol -> sol` row.
+    #   * 4104 has ONE record, the ordinary single-attempt issue, likewise counted and uncrossed.
+    #   * 4105's only record is ALIAS-LESS: it names no tier, so it is in NEITHER number — an
+    #     issue this reader cannot attribute must not inflate the denominator its rate is read
+    #     against.
+    #   * 4101's records are stamped OUT OF LEDGER ORDER on purpose (the opus5 leg is written last
+    #     but stamped in the middle), so a census that trusted array order rather than sorting by
+    #     `ts` would publish the crossover backwards.
+    crossover_census = _normalize_model_health({"records": [
+        {"ts": now - 5000, "provider": "openai", "account": "7" * 16, "model_alias": "sol",
+         "exit_class": "no_change", "run_id": "c1", "issue": 4101},
+        {"ts": now - 4800, "provider": "openai", "account": "7" * 16, "model_alias": "sol",
+         "exit_class": "no_change", "run_id": "c3", "issue": 4101},
+        {"ts": now - 4900, "provider": "anthropic", "account": "6" * 16, "model_alias": "opus5",
+         "exit_class": "no_change", "run_id": "c2", "issue": 4101},
+        {"ts": now - 4700, "provider": "openai", "account": "7" * 16, "model_alias": "sol",
+         "exit_class": "no_change", "run_id": "c4", "issue": 4102},
+        {"ts": now - 4600, "provider": "anthropic", "account": "6" * 16, "model_alias": "opus5",
+         "exit_class": "no_change", "run_id": "c5", "issue": 4102},
+        {"ts": now - 4500, "provider": "openai", "account": "7" * 16, "model_alias": "sol",
+         "exit_class": "no_change", "run_id": "c6", "issue": 4103},
+        {"ts": now - 4400, "provider": "openai", "account": "7" * 16, "model_alias": "sol",
+         "exit_class": "no_change", "run_id": "c7", "issue": 4103},
+        {"ts": now - 4300, "provider": "anthropic", "account": "6" * 16, "model_alias": "opus5",
+         "exit_class": "no_change", "run_id": "c8", "issue": 4104},
+        {"ts": now - 4200, "provider": "fleet", "account": "5" * 16, "model_alias": "",
+         "exit_class": "no_change", "run_id": "c9", "issue": 4105},
+        # A SUCCESS on a third alias for an issue that also crossed. It carries no `issue` (the
+        # validator refuses no-change fields on another class), so it cannot be attributed to
+        # 4102 — and a reader that folded every record's alias together would invent a pair here.
+        {"ts": now - 4100, "provider": "openai", "account": "7" * 16, "model_alias": "luna",
+         "exit_class": "success", "run_id": "c10"},
+    ]}).get(  # `.get`, not `[...]`: a mutant that DROPS the key reds the row below BY NAME rather
+              # than aborting the suite with every later check unrun (pre-flight item 4).
+        "tier_crossovers")
+    check("[#77] a ledger that DID cross tiers: the issue that went sol -> opus5 -> sol counts "
+          "once as crossed but contributes BOTH ordered pairs, a second issue makes sol -> opus5 "
+          "the busier pair and orders the rows, a same-tier retry is counted-but-uncrossed, an "
+          "alias-less issue is in neither number, a non-no-change record on a third alias is "
+          "attributed to no issue at all, and `since` is the oldest COUNTED record",
+          crossover_census,
+          {"issues": 4, "crossed": 2, "since": _utc_iso(now - 5000),
+           "pairs": [{"from": "sol", "to": "opus5", "count": 2},
+                     {"from": "opus5", "to": "sol", "count": 1}],
+           "pairs_total": 2})
+
+    # [#77] THE OVER-CAP DIRECTION, which no fixture above can reach: a live 2-3 rung chain makes
+    # at most a handful of ordered pairs, so the cut would otherwise never execute and a catalog
+    # that had churned through 15 pairs would render identically to one with 12. 15 is a LITERAL,
+    # never derived from the cap the code reads (pre-flight 2(c)) — an input sized off that
+    # constant moves with it and stays green through a re-tuning.
+    churn_records = []
+    for index in range(15):
+        churn_records.extend([
+            {"ts": now - 3000 - (2 * index), "provider": "openai", "account": "7" * 16,
+             "model_alias": f"tier-{index:02d}", "exit_class": "no_change",
+             "run_id": f"k{index:02d}a", "issue": 4200 + index},
+            {"ts": now - 2999 - (2 * index), "provider": "anthropic", "account": "6" * 16,
+             "model_alias": "opus5", "exit_class": "no_change",
+             "run_id": f"k{index:02d}b", "issue": 4200 + index},
+        ])
+    churn = _normalize_model_health({"records": churn_records}).get("tier_crossovers")
+    check("[#77] 15 distinct crossover pairs publish the top 12 WITH the pre-cap count beside "
+          "them. Dropping the cut reds the left number; deriving the total from the slice it "
+          "published reds the right one; and the issue/crossed counts stay whole, because the cap "
+          "is a DISPLAY slice over pairs and not a bound on what was censused",
+          (len(churn["pairs"]), churn["pairs_total"], churn["issues"], churn["crossed"]),
+          (12, 15, 15, 15))
+
     # The PAGE half, driven by the two payloads pinned immediately above rather than by fixtures
     # written to match it (pre-flight item 11: a census that normalizes perfectly and is never
     # drawn has delivered nothing).
-    _self_test_health_census(check, ordered["model_health"], quiet_census)
+    _self_test_health_census(check, ordered["model_health"], quiet_census, crossover_census)
     try:
         _normalize_model_health({"records": [
             {"ts": now, "provider": "anthropic", "account": "acct01",
@@ -6669,16 +6985,17 @@ esac
         "generated_at": now,
         "models": [{"model": "fable", "provider": "anthropic", "status": "ok"}],
     })
-    check("optional model-health normalization, and [#1827] NULL IS NOT ZERO: a non-ledger shape "
-          "carries no records to census, so the census is null — an all-zero distribution here "
-          "would publish 'no worker has produced a no-change run' off an input that cannot say it",
+    check("optional model-health normalization, and [#1827]/[#77] NULL IS NOT ZERO: a non-ledger "
+          "shape carries no records to census, so BOTH censuses are null — an all-zero "
+          "distribution here would publish 'no worker has produced a no-change run' / 'the fleet "
+          "never moved a task off its routed model' off an input that cannot say either",
           health,
           {"generated_at": "2025-06-15T15:06:40Z",
            "checks": [{"model": "fable", "provider": "anthropic",
                        "status": "healthy", "checked_at": None}],
            # [#2008] the under-cap direction on this path too: one model, one published total.
            "checks_total": 1,
-           "no_change_reasons": None})
+           "no_change_reasons": None, "tier_crossovers": None})
 
     # --- observability normalization (issue #246): accept path is a GOLDEN fixture (every field
     # class exercised, every malformed row visibly dropped), reject paths are explicit. ---------
