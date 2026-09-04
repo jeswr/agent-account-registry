@@ -1,51 +1,72 @@
 {
-  "generated_at": "2026-09-04T01:16:46Z",
+  "generated_at": "2026-09-04T01:58:51Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 2418,
       "issues_ready": 272,
-      "issues_closed_1h": 5,
+      "issues_closed_1h": 0,
       "issues_closed_24h": 13,
-      "prs_open": 173,
-      "prs_draft": 146,
+      "prs_open": 172,
+      "prs_draft": 145,
       "prs_opened_1h": 1,
-      "prs_closed_1h": 0,
+      "prs_closed_1h": 1,
       "prs_merged_1h": 0,
       "prs_merged_24h": 5,
       "review_changes_backlog": 20,
       "needs_user_parked": 16,
-      "review_lane_health": "stalled",
-      "review_lane_runs_1h": 7,
-      "worker_attempts_1h": 3,
-      "worker_success_rate_1h": 0.3333,
+      "review_lane_health": "unknown",
+      "review_lane_runs_1h": null,
+      "worker_attempts_1h": 4,
+      "worker_success_rate_1h": 0.25,
       "pr_open_rate": 1.0,
-      "pr_close_rate": 0.0,
-      "net_pr_flow": 1.0
+      "pr_close_rate": 1.0,
+      "net_pr_flow": 0.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 1056,
+      "issues_open": 1057,
       "issues_ready": 709,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 13,
+      "issues_closed_24h": 10,
       "prs_open": 50,
       "prs_draft": 34,
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
-      "prs_merged_24h": 8,
+      "prs_merged_24h": 6,
       "review_changes_backlog": 6,
       "needs_user_parked": 17,
       "review_lane_health": "stalled",
-      "review_lane_runs_1h": 2,
-      "worker_attempts_1h": 0,
-      "worker_success_rate_1h": null,
+      "review_lane_runs_1h": 5,
+      "worker_attempts_1h": 1,
+      "worker_success_rate_1h": 0.0,
       "pr_open_rate": 0.0,
       "pr_close_rate": 0.0,
       "net_pr_flow": 0.0
     }
   },
   "alerts": [
+    {
+      "target": "sparq-org/sparq",
+      "classification": "worker-failing",
+      "fire": true,
+      "summary": "worker success rate 25% < 50% floor over 2 snapshots (4 attempts this hour)",
+      "metrics": {
+        "worker_success_rate_1h": 0.25,
+        "worker_attempts_1h": 4
+      }
+    },
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "review-lane-stalled",
+      "fire": true,
+      "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=6 waits",
+      "metrics": {
+        "review_changes_backlog": 6,
+        "review_lane_runs_1h": 5,
+        "prs_merged_1h": 0
+      }
+    },
     {
       "target": "jeswr/agent-account-registry",
       "classification": "ready-starved",
