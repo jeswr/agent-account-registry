@@ -1946,13 +1946,9 @@ def _self_test():                                                       # noqa: 
               "no raise", "MintError")
 
     # ---- the enrolment ordering constraint ----------------------------------------------------
-    # [#657 enable] This assertion used to read "the shipped policy enrols NOBODY" — the correct
-    # statement while the minting path shipped ahead of the enable. The enable has now landed, and
-    # the guard is REPOINTED rather than deleted: it pins the exact enabled SET, so it still goes
-    # red on the two changes that matter — a SECOND repo enabled alongside a minting change (the
-    # blast-radius widening this rollout deliberately deferred), or this repo's list emptied,
-    # which would silently make every mint refusal permanent again. A guard that only ever says
-    # "empty" cannot survive the feature it guards; one that names the population can.
+    # [#657 enable / #2257 widening] Pin the exact enrolled set rather than merely its size. This
+    # guard now names the reviewed second-stage widening to Sparq and still reds if either list is
+    # emptied or a third repository is enrolled without updating the reviewed population.
     import tomllib
 
     policy_doc = tomllib.loads(
@@ -1972,32 +1968,23 @@ def _self_test():                                                       # noqa: 
     enrolled_live = sorted(
         (name, sorted(policy_resolve.review_enrolment_authors(name, policy_doc)))
         for name in _enabled_rows)
-    check("the shipped policy enrols EXACTLY the registry, and only `jeswr` (one-repo rollout; "
-          "sparq is a deliberate follow-up)",
+    check("the shipped policy enrols EXACTLY Sparq + registry, and only `jeswr`",
           [row for row in enrolled_live if row[1]],
-          [("jeswr/agent-account-registry", ["jeswr"])])
-    # NON-VACUOUS in the other direction too: the same reader, over the same LIVE rows, surfaces an
-    # EMPTY list for a repo that is not enrolled — so the assertion above is a fact about the
-    # shipped policy rather than about a reader that returns whatever it is given.
-    check("...and the reader still reports an un-enrolled repo as empty",
-          sorted(policy_resolve.review_enrolment_authors("sparq-org/sparq", policy_doc)), [])
+          [("jeswr/agent-account-registry", ["jeswr"]),
+           ("sparq-org/sparq", ["jeswr"])])
 
-
+    # NON-VACUOUS control: all currently enabled rows are now enrolled, so clone the shipped
+    # disabled `jeswr/solid-sdk` row and change only `enabled`. Its missing allowlist must resolve
+    # EMPTY before the positive transition below. This is a distinct real policy row, not a
+    # hand-written row that could omit a newly required field or derive its expectation from the
+    # same value under test.
+    probe_repo = "jeswr/solid-sdk"
     probe_doc = copy.deepcopy(policy_doc)
-    # ...and the probe must pick an ENABLED row that does NOT already carry the key. Round-1
-    # review: picking `sorted(_enabled_rows)[0]` selects the registry, which ALREADY resolves to
-    # ["jeswr"], so setting it to ["jeswr"] is a value-identical no-op and the check below proves
-    # nothing about the reader. A real transition needs a row whose CURRENT value is empty.
-    # (A disabled row cannot serve either: it RAISES instead of reporting empty, testing the
-    # exception rather than the reader.)
-    _probe_candidates = [name for name in sorted(_enabled_rows)
-                         if not policy_resolve.review_enrolment_authors(name, policy_doc)]
-    assert _probe_candidates, (
-        "the positive-transition probe needs an ENABLED policy row with NO review_enrolment_authors; "
-        "every enabled row already carries one, so this probe can no longer prove a transition")
-    probe_repo = _probe_candidates[0]
-    check("...the probe row genuinely starts EMPTY, so the check below is a real transition",
-          sorted(policy_resolve.review_enrolment_authors(probe_repo, policy_doc)), [])
+    check("...the shipped control row is disabled before the test enables only that flag",
+          probe_doc["repos"][probe_repo]["enabled"], False)
+    probe_doc["repos"][probe_repo]["enabled"] = True
+    check("...and the distinct enabled control resolves an absent allowlist as EMPTY",
+          sorted(policy_resolve.review_enrolment_authors(probe_repo, probe_doc)), [])
     probe_doc["repos"][probe_repo]["review_enrolment_authors"] = ["jeswr"]
     check("...and the same reader WOULD surface one",
           sorted(policy_resolve.review_enrolment_authors(probe_repo, probe_doc)), ["jeswr"])

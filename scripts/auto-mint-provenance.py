@@ -2831,12 +2831,12 @@ def _self_test():                                                       # noqa: 
     policy_doc = _read_policy()
     policy_resolve = _load_policy_resolve()
     live_targets = enrolled_targets(policy_doc, policy_resolve.review_enrolment_authors)
-    # The SAME freeze control mint-provenance carries, at the sweep's own enumeration: this names
-    # the population rather than merely asserting it is small, so it reds on a SECOND repo being
-    # enrolled alongside a trigger change (the blast-radius widening #916 deliberately deferred)
-    # AND on the list being emptied, which would make every sweep vacuous forever.
-    check("the sweep's population is EXACTLY the registry, and only `jeswr`",
-          live_targets, [("jeswr/agent-account-registry", ("jeswr",))])
+    # The SAME freeze control mint-provenance carries, at the sweep's own enumeration: name the
+    # exact shipped population so either allowlist disappearing or an unreviewed third-repo
+    # widening turns this red. #2257 intentionally adds Sparq after the registry-only rollout.
+    check("the sweep's population is EXACTLY Sparq + registry, and only `jeswr`",
+          live_targets, [("jeswr/agent-account-registry", ("jeswr",)),
+                         ("sparq-org/sparq", ("jeswr",))])
     check("...and a disabled row is never a target",
           enrolled_targets({"repos": {"o/r": {"enabled": False,
                                               "review_enrolment_authors": ["x"]}}},
