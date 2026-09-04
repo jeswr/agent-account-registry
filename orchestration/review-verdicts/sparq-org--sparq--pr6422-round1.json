@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6422,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "98afb763e8a4cf6f4b1c068fec0f020f53e91e77",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The updated permanent-divergence rationale is accurate and materially improves the prior explanation. The CRs3 path in classify.rs derives the self-restriction concept from a same-nominal self-link, and the focused converse test exercises that real path by proving a named superclass typing and self-loop. The ABox readoff then handles self-restriction concepts through the self-loop branch, while dict_of only exposes named class concepts for rdf:type output; the anonymous restriction node therefore cannot be emitted for the conformance conclusion. This is a documentation-only correction with no correctness, security, or test-validity defect.",
+  "verdict": "approve"
+ }
+}
