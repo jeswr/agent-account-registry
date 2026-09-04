@@ -5354,6 +5354,102 @@ def arm_ci_absent_alarm(repo, pr_number, reviewed_sha, repair_gate):
             "fire without the required `gate` context either way.")
 
 
+# ---- registry #1211: THE ARM MUST NOT UNDRAFT A PR THE REBASE LANE ALREADY OWNS --------------
+# Everything above reads CI. NOTHING above reads MERGEABILITY, and `ready_and_arm` never did: it
+# re-derives the head, the base ref, the draft bit, the author, the hold surfaces and two
+# independent CI readings from the fresh pre-mutation read, and then drops that same read's
+# `mergeable` field on the floor. A PR that became CONFLICTING during the review round therefore
+# reached `gh pr ready` + the auto-merge latch.
+#
+# THIS IS NOT A MERGE-SAFETY HOLE, and saying so is what keeps the fix proportionate. Branch
+# protection requires `gate`, and a DIRTY head publishes no `gate` run at all (#853: GitHub
+# computes no merge ref for a conflicting PR, so its `pull_request` workflows never fire on any
+# head pushed while the conflict stands), so the latch cannot fire. What the arm produces instead
+# is a LANE COLLISION: a READY, `review:pass`, armed PR that the review lane has finished with,
+# while `enumerate_review_items` routes it — `conflicting is True`, GAP-B, ahead of every review
+# state — to `needs-rebase`. The rebase repair then lands on a PR the arm has already undrafted
+# and labelled, so it must first DEFUSE it (`decide_repair_admission` -> ("defuse", "rebase") ->
+# disarm + redraft + relabel) before it can do any work. That undraft/label/latch/disarm/redraft
+# churn is pure waste, and for the width of that window the verdict is published as `review:pass`
+# bound to a head no gate ever evaluated.
+#
+# THE READING IS THE LANE'S OWN, EXACTLY. The refusal fires on an explicit `mergeable is False`
+# and on nothing else — the same strict tri-state `pr_ci_status` maps to `conflicting is True`,
+# and the same one `decide_repair_admission` admits the rebase repair on. That co-extensiveness
+# IS the argument: this guard's entire job is to leave the PR to the lane that owns it, so
+# refusing on a reading that lane does not admit would invent a third state with no owner.
+# GitHub's `mergeable` is null while the background mergeability computation runs, and a null is
+# not evidence of a conflict. So the fail direction here is #892's (unknown ARMS), not #940's
+# (unknown REFUSES) — deliberately, and for a reason about OWNERSHIP rather than about strength
+# of evidence: arming releases nothing, because the required `gate` context is what the latch
+# waits on either way.
+#
+# NO RE-ADMISSION BUDGET, AND THAT IS THE ONE PLACE THIS CLASS DEPARTS FROM #892/#940. Both of
+# those bound their refusal to once per head because the refusal SUPPRESSED THE MECHANISM THAT
+# WOULD REFUTE IT — the `gh pr ready` below is what queues the fresh gate run whose absence or
+# staleness they refused on, so an unbounded refusal there is a permanent stall. Nothing of that
+# shape holds here: undrafting a PR does not resolve a conflict, and the events that DO refute
+# this refusal (a merge/rebase pushed onto the head, or a base move that dissolves the conflict)
+# happen entirely outside this function, driven by the very lane the refusal leaves the PR in. A
+# budget would therefore buy no liveness at all; it would only mean that the SECOND arm at a head
+# that is STILL conflicting undrafts and latches it — this issue verbatim, one tick later. The
+# receipt below is a RECORD, not a counter, so a forged or stale one buys nothing.
+#
+# AND IT IS NOT AN ABSORBING STATE. `conflicting is True` outranks every review state in GAP-B,
+# so the deferred PR is enumerated as `needs-rebase` on the very next tick, and the conflict lane
+# carries its own bounded exits (resolve-conflicts.py escalates a mechanically unresolvable
+# conflict to a VISIBLE `needs:user`, which reconcile-conflict-park.py retires once the stated
+# cause recovers). This refusal parks nothing, labels nothing and holds nothing.
+ARM_DECLINE_CONFLICTING = "base-conflicting"
+ARM_CONFLICT_MARKER_PREFIX = "<!-- sparq-arm-conflicting:v1 sha="
+
+
+def arm_conflict_decision(mergeable):
+    """PURE: may the merge latch be placed, given GitHub's mergeability tri-state for the PR the
+    arm is about to undraft?
+
+    Returns `ARM_DECLINE_CONFLICTING` on an EXPLICIT `mergeable is False` and "" (proceed) on
+    every other value — True, the null GitHub returns while it is still computing mergeability,
+    an absent field, and any hostile/garbage shape alike. The identity test is the whole
+    function: `not mergeable` would refuse on every one of those unknowns, and refusing on an
+    unknown withholds the arm from a PR that `enumerate_review_items` will NOT route to
+    `needs-rebase` (it reads the same strict `conflicting is True`), which is a state with no
+    owning lane. See the block comment above for why "unknown arms" is the right direction here
+    and the inverse of `arm_freshness_decision`'s."""
+    return ARM_DECLINE_CONFLICTING if mergeable is False else ""
+
+
+def _record_arm_conflict_decline(repo, pr_number, reviewed_sha, bot_login=""):
+    """The durable, SHA-bound receipt for a conflict deferral — the record on the PR itself
+    rather than only in a run log that ages out.
+
+    Idempotent on exactly `_record_arm_decline`'s terms (EXACT App identity + a marker carrying
+    THIS reviewed sha), and best-effort for the same reason: a failed receipt must not convert a
+    correct refusal into a raised arm step. Unlike the #892 and #940 receipts this one is NOT a
+    budget — no path re-admits an arm on it — so the only consequence of losing or forging one is
+    a duplicate comment, never an unearned latch."""
+    marker = f"{ARM_CONFLICT_MARKER_PREFIX}{reviewed_sha} -->"
+    if arm_decline_receipted(_paginated_comments(repo, pr_number), reviewed_sha, bot_login,
+                             marker_prefix=ARM_CONFLICT_MARKER_PREFIX):
+        return
+    body = ("> 🤖 SPARQ agent — the cross-provider review APPROVED this PR, and the arm was "
+            f"DEFERRED: GitHub reports the base as CONFLICTING at the reviewed head "
+            f"{reviewed_sha[:12]}, so this PR is owned by the rebase lane, not by the arm.\n\n"
+            "A conflicting pull request has no merge ref, so `pr-gate` never runs on it "
+            "(registry #853) and the merge latch could not fire even if it were placed — but the "
+            "undraft would still publish `review:pass` on an ungated head and hand the rebase "
+            "repair a PR it has to disarm and re-draft before it can start. The PR is therefore "
+            "left EXACTLY as the review found it: an unmodified, correctly-labelled draft, which "
+            "`enumerate_review_items` enumerates as `needs-rebase`, ahead of every review "
+            "state.\n\n"
+            "**No human action is required and nothing is parked.** The auto-rebase lane advances "
+            "the head, the moved head is re-reviewed, and the arm is taken there. This deferral "
+            "is not bounded per head, because undrafting the PR would not resolve the conflict: "
+            "it stands for as long as the conflict does, and it is re-derived from live state "
+            "every tick.\n\n" + marker)
+    _run_gh(["pr", "comment", str(pr_number), "-R", repo, "--body", body], check=False)
+
+
 def _dispatch_claim():
     """The shared dispatch predicates module (dispatch-claim.py). Loaded lazily so only the
     paths that need it pay the import — the same idiom as `_park_policy` above, and the same
@@ -5503,7 +5599,7 @@ def arm_freshness_decision(freshness):
 
 
 def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, readmitted=False,
-                             gate=""):
+                             gate="", mergeable=None):
     """PURE: the ONE census line emitted for EVERY arm attempt that reaches the freshness read —
     admitted, refused, or re-admitted. A per-stage success rate cannot express a missing edge, so
     this is a POPULATION row: every arm attempt produces exactly one, and `refused=` partitions
@@ -5526,13 +5622,24 @@ def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, 
     (`gate=missing ci=absent`) countable — and distinguishable from one at a head whose gate
     passed (`ci=green`) — on the ADMITTED path too, where nothing previously recorded the grade
     at all. A caller that has no grade in scope passes none and gets `gate=unread ci=unproven`:
-    the absence of a reading is never rendered as a green."""
+    the absence of a reading is never rendered as a green.
+
+    [registry #1211] `mergeable=` is GitHub's mergeability tri-state at the same head, carried on
+    this SAME row for the reason `gate=` is: the population stays one line per arm attempt, and
+    "how many arms were taken at a head whose `mergeable` was False" — the question #1211 opens
+    with — becomes countable from a run log without re-deriving anything, on the ADMITTED path
+    too. Only an explicit True/False renders as such; a null (GitHub is still computing), an
+    absent field and any garbage shape all render `unknown`, never a clean read."""
     state = freshness.get("state") if isinstance(freshness, dict) else None
     gap = freshness.get("gap_seconds") if isinstance(freshness, dict) else None
     run_base = (freshness.get("run_base_sha") or "") if isinstance(freshness, dict) else ""
     tip = (freshness.get("base_tip_sha") or "") if isinstance(freshness, dict) else ""
+    # IDENTITY, not truthiness, and total over every shape: an unhashable or hostile value must
+    # render `unknown` rather than crash the census line the refusal is reported on.
+    merge_state = "true" if mergeable is True else "false" if mergeable is False else "unknown"
     return (f"{ARM_FRESHNESS_CENSUS_PREFIX} repo={repo} pr={pr_number} "
-            f"head={reviewed_sha[:12]} gate={gate or 'unread'} ci={arm_ci_evidence(gate)} "
+            f"head={reviewed_sha[:12]} mergeable={merge_state} "
+            f"gate={gate or 'unread'} ci={arm_ci_evidence(gate)} "
             f"verdict={state or 'unprovable'} "
             f"gap_seconds={'none' if gap is None else gap} "
             f"gate_base={run_base[:12] or 'none'} base_tip={tip[:12] or 'none'} "
@@ -5576,18 +5683,24 @@ def arm_freshness_report(repo, pr_numbers, log=print):
     answer that question with silence on exactly the population that has no CI. The grade is
     read tier-appropriately for the PR's LIVE draft state through dispatch-claim's own walk (the
     same containment `_live_arm_gate` cites), and it decides nothing here — the refusal is still
-    `arm_freshness_decision`'s alone."""
+    `arm_freshness_decision`'s alone.
+
+    [registry #1211] It reports the MERGEABILITY of each head on the same terms and for the same
+    reason: the by-hand arm is the surface with no machine guard in front of it, and a
+    CONFLICTING PR is the population whose `gate` is absent rather than red. It decides nothing
+    here either — `ready_and_arm`'s own conflict refusal is the machine-lane guard."""
     rows = []
     for pr_number in pr_numbers:
         live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
         head = str((live.get("head") or {}).get("sha", "")) if isinstance(live, dict) else ""
         base_ref = str((live.get("base") or {}).get("ref", "")) if isinstance(live, dict) else ""
         draft = bool(live.get("draft")) if isinstance(live, dict) else True
+        mergeable = live.get("mergeable") if isinstance(live, dict) else None
         gate = _dispatch_claim()._live_repair_gate(repo, head, draft)
         freshness = _dispatch_claim().live_gate_freshness(repo, head, base_ref, draft, pr_number)
         refused = bool(arm_freshness_decision(freshness))
         log(arm_freshness_census_row(repo, pr_number, head, freshness, refused=refused,
-                                     gate=gate))
+                                     gate=gate, mergeable=mergeable))
         alarm = arm_ci_absent_alarm(repo, pr_number, head, gate)
         if alarm:
             log(alarm)
@@ -5754,6 +5867,12 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     trail (_apply_trust_surface_audit: trust-surface label + one idempotent marker comment),
     applied only after a successful live arm, with loud failures.
 
+    [registry #1211] MERGEABILITY is read from that same fresh snapshot and is an arm precondition
+    in its own right: an explicitly CONFLICTING base DEFERS the arm (unbounded, unlike the two CI
+    deferrals) rather than undrafting and latching a PR that `enumerate_review_items` routes to
+    the rebase lane — see the ARM_DECLINE_CONFLICTING block for why the direction on an unprovable
+    reading is "arm", and why this class carries no re-admission budget.
+
     [issue #153] the LABEL-derived security posture is re-derived LIVE here too (PR + source
     issue labels vs the routing keywords), not just at resolve: a security label added mid
     review folds into the same audit trail (a True posture appends SECURITY_LABEL_AUDIT_HIT),
@@ -5902,6 +6021,14 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # sharing one name in one scope is how a later edit silently reads the wrong one.
         gate_evidence = _live_arm_gate_freshness(repo, pr_number, reviewed_sha, live_base)
         stale = arm_freshness_decision(gate_evidence)
+        # [registry #1211] THE MERGEABILITY READING — see the ARM_DECLINE_CONFLICTING block.
+        # `fresh`, NOT the entry read and not a third round trip: mergeability is a field of the
+        # very PR object the pre-mutation re-read already fetched, and taking it from the entry
+        # read would grade a state that predates the changed-file/label queries — the exact
+        # staleness window issue #139 re-reads to close. Pinned by an assertion over the CALL
+        # SITE (a mid-run flip is injected between the two reads), because a direct test of
+        # `arm_conflict_decision` can only pin its own argument.
+        conflicting = arm_conflict_decision(fresh.get("mergeable"))
         # THE BOUND (see ARM_DECLINE_GATE_STALE). Its own marker, its own budget: a #892 gate-red
         # receipt must not spend this one, or a PR deferred for a red aggregator would arm on a
         # stale green the very next tick.
@@ -5910,16 +6037,46 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
             marker_prefix=ARM_STALE_MARKER_PREFIX)
         print(arm_freshness_census_row(repo, pr_number, reviewed_sha, gate_evidence,
                                        refused=bool(stale) and not stale_readmitted,
-                                       readmitted=stale_readmitted, gate=arm_gate))
+                                       readmitted=stale_readmitted, gate=arm_gate,
+                                       mergeable=fresh.get("mergeable")))
         # [registry #853] THE ABSENT-CHECK ANNOTATION. Placed HERE — after the census row and
-        # above all three exits (staleness deferral, gate-red deferral, and the arm itself) — so
-        # every arm attempt at an ungated head emits it. Moving it below any `return` would make
+        # above all four exits ([#1211] the conflict deferral, the staleness deferral, the
+        # gate-red deferral, and the arm itself) — so every arm attempt at an ungated head emits
+        # it. Moving it below any `return` would make
         # it report only the subset of absences that happened to arm, which is the same
         # partial-population defect the census row above exists to avoid. `arm_gate` is the grade
         # read at the REVIEWED sha, which is the commit the verdict binds and the latch names.
         absent_alarm = arm_ci_absent_alarm(repo, pr_number, reviewed_sha, arm_gate)
         if absent_alarm:
             print(absent_alarm)
+        if conflicting:
+            # [registry #1211] FIRST of the four exits, and above the two CI ones on purpose: a
+            # conflicting head is why they read what they read (no merge ref -> no `pr-gate` run
+            # -> `gate=missing` and an unprovable freshness), so reporting either of those as the
+            # cause would name a symptom. Exiting here also leaves the #892 and #940 budgets
+            # UNSPENT: neither of their receipts is written, so a PR that is merely waiting on a
+            # rebase does not arrive at its next clean head with a deferral already consumed.
+            _record_arm_conflict_decline(repo, pr_number, reviewed_sha, bot_login=bot_login)
+            # NO `bind_reviewed_sha`, and this is the one routing difference from the #892/#940
+            # exits. Both of those bind because binding is what routes them (needs-ci-fix reads a
+            # marker-bound head; so does `stranded`). This exit needs no such help — GAP-B reads
+            # `conflicting is True` and outranks every review state and every marker — while
+            # binding would actively hurt: this population is BY CONSTRUCTION the one with no
+            # aggregator run at all (#853), so a bound marker on a head whose conflict later
+            # clears without a head move satisfies neither GAP-A (the gate is missing, not red)
+            # nor `stranded` (which requires a concluded green), and the PR would be enumerable
+            # by nothing. Left unbound it re-enters as `needs-review` on any tick the conflict
+            # signal is not provable — a lane that exists — and while the conflict IS provable
+            # GAP-B pre-empts that anyway, so the unbound marker costs no review round.
+            _write_outputs({"armed": False, "head_moved": False, "arm_complete": False,
+                            "arm_declined": conflicting, "arm_gate": arm_gate})
+            print(f"arm DEFERRED ({conflicting}): GitHub reports the base as CONFLICTING at the "
+                  f"reviewed head {reviewed_sha[:12]} — no ready, no latch, no review-state "
+                  "mutation; the PR stays exactly as the review found it and is enumerated as "
+                  "`needs-rebase` (GAP-B outranks every review state). The rebase lane advances "
+                  "the head and the arm is taken at the head it produces; nothing is parked and "
+                  "no human action is required")
+            return
         if stale_readmitted:
             stale = ""
             print(f"arm RE-ADMITTED at {reviewed_sha[:12]}: this head's arm was already deferred "
@@ -12099,6 +12256,12 @@ def _self_test():
         labels_payload = raa_state.get("labels_payload")
         return {"state": raa_state.get("state", "open"), "node_id": "PR_kwTESTNODE",
                 "draft": raa_state.get("draft", True),
+                # [registry #1211] GitHub's mergeability tri-state. DEFAULT None — the null a
+                # real read returns while the background computation runs, and the shape every
+                # pre-existing check in this block ran against before the guard existed. A
+                # regression that refused on anything short of an explicit False therefore turns
+                # this whole block red rather than passing behind an already-clean default.
+                "mergeable": raa_state.get("mergeable"),
                 "user": {"login": raa_state.get("author", "sparq[bot]")},
                 "labels": (labels_payload if labels_payload is not None
                            else [{"name": name} for name in raa_state.get("labels", ())]),
@@ -12150,7 +12313,7 @@ def _self_test():
                 benign_diff=False, security_keywords=(), merge_script=None,
                 hold_after_fail=None, draft=True, author="sparq[bot]", head_repo="o/r",
                 state="open", late_after_read=None, arm_gate="pending", undo_fails=False,
-                arm_freshness=None):
+                arm_freshness=None, mergeable=None):
         raa_calls.clear(); raa_outputs.clear(); raa_kwargs.clear(); raa_prints.clear()
         sha = "b" * 40
         raa_state.update(undo_fails=undo_fails,
@@ -12161,7 +12324,10 @@ def _self_test():
                          hold_after_fail=hold_after_fail, draft=draft, author=author,
                          head_repo=head_repo, state=state, late_after_read=late_after_read,
                          pr_reads=0, arm_gate=arm_gate, arm_gate_args=[],
-                         arm_freshness=arm_freshness, freshness_args=[])
+                         arm_freshness=arm_freshness, freshness_args=[],
+                         # [#1211] RESET every run: raa_state outlives one call, and a leaked
+                         # `mergeable=False` would silently refuse every later arm in this block.
+                         mergeable=mergeable)
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
@@ -12843,7 +13009,8 @@ def _self_test():
               (False, ARM_DECLINE_GATE_STALE, True, True))
         check("...and a verdict carrying NO sibling reading censuses `unread`, never `clear`",
               arm_freshness_census_row("o/r", 41, "b" * 40, {"state": "fresh"}, refused=False),
-              f"{ARM_FRESHNESS_CENSUS_PREFIX} repo=o/r pr=41 head=bbbbbbbbbbbb gate=unread "
+              f"{ARM_FRESHNESS_CENSUS_PREFIX} repo=o/r pr=41 head=bbbbbbbbbbbb "
+              "mergeable=unknown gate=unread "
               "ci=unproven verdict=fresh "
               "gap_seconds=none gate_base=none base_tip=none siblings=unread refused=false "
               "readmitted=false")
@@ -13083,7 +13250,13 @@ def _self_test():
         try:
             globals()["_gh_json"] = lambda a, **k: (
                 report_gh.append(a[1]) or {"head": {"sha": "f" * 40}, "base": {"ref": "master"},
-                                           "draft": False})
+                                           "draft": False,
+                                           # [#1211] only the ungated head reads CONFLICTING, so
+                                           # the two rows must DIFFER; dropping the read (or
+                                           # wiring the field to a constant) collapses them and
+                                           # reds the mergeability check below.
+                                           **({"mergeable": False}
+                                              if a[1].endswith("/900") else {})})
             globals()["_dispatch_claim"] = lambda: types.SimpleNamespace(
                 live_gate_freshness=lambda repo, head, base, draft, pr: (
                     report_dc.append((repo, head, base, draft, pr))
@@ -13127,6 +13300,166 @@ def _self_test():
         check("...and it is READ-ONLY: an all-fresh tick exits 0 and mutates nothing",
               (arm_freshness_report("o/r", [], log=lambda _line: None), raa_latches()),
               (0, []))
+        # [#1211] the by-hand surface reports mergeability per PR too — it is the arm with no
+        # machine guard in front of it, and a CONFLICTING PR is exactly the population whose gate
+        # is ABSENT rather than red. One row of each, so a constant cannot satisfy both.
+        check("[#1211] the by-hand arm report distinguishes a CONFLICTING head from an unread one",
+              (sum(1 for line in report_lines if "mergeable=false" in line),
+               sum(1 for line in report_lines if "mergeable=unknown" in line),
+               sum(1 for line in report_lines if "mergeable=true" in line)),
+              (1, 1, 0))
+        # ---- [registry #1211] THE ARM READS MERGEABILITY BEFORE IT UNDRAFTS --------------------
+        # THE PURE TABLE. The identity test IS the guard: any truthiness form of it also refuses
+        # on the null GitHub returns while it is still computing mergeability, and that is a
+        # reading `enumerate_review_items` does NOT route to `needs-rebase` — a refusal into no
+        # lane at all. Expected values are local literals, never read back out of the constant
+        # the code under test writes from.
+        check("[#1211] arm_conflict_decision refuses on an EXPLICIT False and on nothing else",
+              {str(v): arm_conflict_decision(v) for v in (
+                  False, True, None, 0, 1, "", "false", [], {}, ())},
+              {"False": "base-conflicting", "True": "", "None": "", "0": "", "1": "",
+               "": "", "false": "", "[]": "", "{}": "", "()": ""})
+        # END TO END, the defect exactly. `arm_gate` is a graded GREEN and the freshness verdict
+        # is the harness default `fresh`, so NEITHER CI guard could have produced this refusal —
+        # only the mergeability read can. benign_diff is left OFF so the reviewed sha DOES carry a
+        # trust-surface hit: "no audit was written" is then a real assertion about the refusal
+        # sitting above every mutation, rather than a statement about an empty hit set.
+        run_raa(arm_gate="green:merge-required", mergeable=False)
+        check("[#1211] a CONFLICTING head DEFERS the arm: no ready, no latch, no review:pass",
+              (any(c.startswith("pr ready") for c in raa_calls), bool(raa_latches()),
+               "state:pass" in raa_calls, raa_outputs.get("armed"),
+               raa_outputs.get("arm_complete"), raa_outputs.get("arm_declined")),
+              (False, False, False, False, False, "base-conflicting"))
+        check("[#1211] ...above EVERY mutation: the trust-surface audit is not written either",
+              (any("trust-surface" in c for c in raa_calls),
+               any(TRUST_AUDIT_MARKER_PREFIX in c for c in raa_calls)),
+              (False, False))
+        check("[#1211] ...leaving its OWN sha-bound receipt, and spending neither CI budget",
+              (any(ARM_CONFLICT_MARKER_PREFIX + sha in c and c.startswith("pr comment")
+                   for c in raa_calls),
+               any(ARM_STALE_MARKER_PREFIX in c for c in raa_calls),
+               any(ARM_DECLINE_MARKER_PREFIX in c for c in raa_calls)),
+              (True, False, False))
+        # NOT bound, and deliberately unlike the #892/#940 exits: GAP-B routes this PR off
+        # `conflicting is True` with no marker involved, while a bound marker on a head that (by
+        # #853) has no aggregator run at all satisfies neither GAP-A nor `stranded` if the
+        # conflict later clears without a head move.
+        check("[#1211] ...and it does NOT bind the reviewed sha",
+              raa_outputs.get("bind_reviewed_sha"), None)
+        # ...and the same statement AT THE YAML SEAM, which no behavioural test of this module can
+        # reach: neither operand review-fix.yml's bind step admits on is satisfied by this exit.
+        # Containment is sound here only because the check above pins that whole condition
+        # EXACTLY; this one names which two operands the outputs above are answering.
+        check("[#1211] neither operand of review-fix.yml's bind condition is satisfied, so the "
+              "marker is left unbound at the seam too",
+              (raa_outputs.get("arm_complete"), raa_outputs.get("bind_reviewed_sha"),
+               "steps.arm.outputs.arm_complete == 'true' || "
+               "steps.arm.outputs.bind_reviewed_sha == 'true'"
+               in arm_decline_workflow_seam_report()["condition"]),
+              (False, None, True))
+        check("[#1211] the census row carries the mergeability that decided",
+              (ARM_FRESHNESS_CENSUS_PREFIX in raa_prints[-1],
+               "mergeable=false" in raa_prints[-1]),
+              (True, True))
+        # default "": a MISSING receipt must turn the prose check below RED, not crash the suite
+        # on a StopIteration — a mutant that aborts the run records as KILLED while every check
+        # under it never executes (AGENTS.md, crash-after-partial-run).
+        conflict_text = next((c for c in raa_calls if c.startswith("pr comment")), "")
+        check("[#1211] the receipt names the conflict and the lane that owns it, asks for no "
+              "human, and claims NO per-head bound (it has none)",
+              ("CONFLICTING" in conflict_text, "needs-rebase" in conflict_text,
+               "No human action is required" in conflict_text,
+               "at most once per head" in conflict_text),
+              (True, True, True, False))
+        # THE CONTROL, and the load-bearing half: without it every check above is satisfied by a
+        # guard that refuses every arm. Same run, mergeability explicitly True — the arm completes
+        # end to end, audit and all, and writes no conflict receipt.
+        run_raa(arm_gate="green:merge-required", mergeable=True)
+        check("[#1211] CONTROL: an explicitly MERGEABLE head still arms end to end",
+              (any(c.startswith("pr ready") for c in raa_calls), bool(raa_latches()),
+               raa_outputs.get("armed"), "state:pass" in raa_calls,
+               any("trust-surface" in c for c in raa_calls),
+               any(ARM_CONFLICT_MARKER_PREFIX in c for c in raa_calls),
+               "mergeable=true" in raa_prints[-1]),
+              (True, True, True, True, True, False, True))
+        # THE SECOND CONTROL — the fail direction, which is INVERTED relative to #940 on purpose.
+        # A null mergeability (GitHub still computing) is not evidence of a conflict, and the
+        # rebase lane will not enumerate it, so refusing on it would strand the PR between lanes.
+        run_raa(arm_gate="green:merge-required", mergeable=None)
+        check("[#1211] CONTROL: an UNPROVABLE mergeability ARMS, and censuses `unknown`",
+              (bool(raa_latches()), raa_outputs.get("armed"),
+               raa_outputs.get("arm_declined"), "mergeable=unknown" in raa_prints[-1]),
+              (True, True, None, True))
+        # THE CALL SITE, both directions (the P12 blind spot: the table above can only pin the
+        # function's own argument). The reading must come from the FRESH pre-mutation re-read —
+        # `late_after_read` lands its overrides from the SECOND PR read onward, i.e. exactly
+        # inside the #139 read-to-arm window. Sourcing the field from the ENTRY read `live`
+        # passes every check above and reds both of these.
+        run_raa(arm_gate="green:merge-required", late_after_read={"mergeable": False})
+        check("[#1211] a conflict that lands DURING the run is seen (the fresh read decides)",
+              (bool(raa_latches()), raa_outputs.get("arm_declined"),
+               "mergeable=false" in raa_prints[-1]),
+              (False, "base-conflicting", True))
+        run_raa(arm_gate="green:merge-required", mergeable=False,
+                late_after_read={"mergeable": True})
+        check("[#1211] ...and a conflict RESOLVED in that same window arms (the entry read never "
+              "decides)",
+              (bool(raa_latches()), raa_outputs.get("armed"),
+               raa_outputs.get("arm_declined"), "mergeable=true" in raa_prints[-1]),
+              (True, True, None, True))
+        # PRECEDENCE over the two CI exits. A conflicting head is WHY they read what they read
+        # (no merge ref -> no `pr-gate` run at all, #853), so naming a stale-or-absent gate as
+        # the cause would name a symptom — and exiting first is also what leaves the #892/#940
+        # budgets UNSPENT, so a PR merely waiting on a rebase does not arrive at its next clean
+        # head with a deferral already consumed. Re-ordering the exits reds these two.
+        run_raa(arm_gate=_GATE_ABSENT, arm_freshness=stale_752, mergeable=False)
+        check("[#1211] conflicting + a stale/absent gate: the conflict exit wins, no stale "
+              "receipt is written, and the absent-CI annotation still fires from above it",
+              (raa_outputs.get("arm_declined"),
+               any(ARM_CONFLICT_MARKER_PREFIX + sha in c for c in raa_calls),
+               any(ARM_STALE_MARKER_PREFIX in c for c in raa_calls),
+               f"::warning::{ARM_CI_ABSENT_PREFIX}" in raa_prints[-1],
+               raa_outputs.get("bind_reviewed_sha")),
+              ("base-conflicting", True, False, True, None))
+        run_raa(arm_gate="failure", mergeable=False)
+        check("[#1211] conflicting + a concluded-RED gate: same, and the #892 budget is unspent",
+              (raa_outputs.get("arm_declined"), bool(raa_latches()),
+               any(ARM_DECLINE_MARKER_PREFIX in c for c in raa_calls)),
+              ("base-conflicting", False, False))
+        # NO RE-ADMISSION — the one place this class departs from #892/#940, and the check that
+        # goes red if a later hand "harmonises" it onto their bounded-budget pattern. A second arm
+        # at the SAME still-conflicting head must refuse again: re-admitting it undrafts and
+        # latches a CONFLICTING PR, which is this issue verbatim one tick later. The same run pins
+        # the receipt's idempotency, so being a record rather than a counter does not make it a
+        # comment per tick.
+        run_raa(arm_gate="green:merge-required", mergeable=False,
+                comments=({"body": f"x {ARM_CONFLICT_MARKER_PREFIX}{sha} -->",
+                           "user": {"login": "sparq[bot]"}},))
+        check("[#1211] a conflict receipt for THIS head does NOT re-admit the arm, and is not "
+              "re-posted",
+              (bool(raa_latches()), raa_outputs.get("armed"),
+               raa_outputs.get("arm_declined"),
+               any(ARM_CONFLICT_MARKER_PREFIX in c and c.startswith("pr comment")
+                   for c in raa_calls)),
+              (False, False, "base-conflicting", False))
+        # CO-EXTENSIVENESS WITH THE LANE, as a red test rather than as prose. The whole safety
+        # argument for "unknown arms" is that this refusal fires on EXACTLY the reading
+        # `enumerate_review_items` routes to `needs-rebase` and `decide_repair_admission` admits
+        # the rebase repair on. If either side ever drifts, the refusal starts withholding arms
+        # from PRs no lane will pick up. Asserted against dispatch-claim's own functions over the
+        # whole tri-state, with local literals on the expected side.
+        _dc1211 = _dispatch_claim()
+
+        def _dc_conflicting(mergeable):
+            return _dc1211.pr_ci_status({"head_sha": "b" * 40, "mergeable": mergeable,
+                                         "auto_merge": None, "check_runs": []})["conflicting"]
+
+        check("[#1211] the arm refuses on exactly the tri-state that routes to needs-rebase",
+              [(str(m), _dc_conflicting(m), arm_conflict_decision(m) != "",
+                _dc1211.decide_repair_admission("needs-rebase", m, None, True)[0])
+               for m in (False, True, None)],
+              [("False", True, True, "proceed"), ("True", False, False, "defer"),
+               ("None", None, False, "defer")])
         run_raa(benign_diff=True)
         check("benign-path diff with NO security posture ARMS with NO audit (#153 control)",
               (any(LATCH_MUTATION in c for c in raa_calls),
