@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6348,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "587ec80bb88af81482dd0a27f93f349ebb589cb1",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The paginated reaction fetch is correctly wired into the live promotion path, uses gh api --paginate --slurp with a larger page size, normalizes the exact shape consumed by should_promote, and aborts fail-closed on a failed API read. The focused self-test is non-vacuous: its only qualifying maintainer approval is on page 2, so removing pagination or slurping makes the asserted promotion fail; it also covers revision binding, normalization, empty output, and API failure. The helper-call-shape split preserves fetch_quarantined's existing argv-list interface while matching the workflow's injected varargs gh function. The PR-time and pre-mutation workflow self-test wiring is coherent, and no hostile embedded instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
