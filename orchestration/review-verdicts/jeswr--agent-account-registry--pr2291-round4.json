@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2291,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8a1f7062d45dbc1f5b6ce685b844431391f59765",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "LIVE_ONLY_REASONS contains only reference-is-a-pull-request, reference-is-closed, and no-issue-reference, and the emitted message says auto-mint can still refuse the pull as that list. But auto-mint-provenance.derive_issue_number can return body-render-unavailable or body-shape-not-understood while rendering a body with exactly one raw reference, reference-not-resolved when GitHub renders that declaration without resolving it, and source-issue-unreadable when the issue read fails or returns the wrong object. These are reader-owned, censused refusal spellings produced by the same live work the notice says it enumerates. In particular, treating every rendered disappearance as no-issue-reference contradicts the reader's explicit reference-not-resolved branch. The new tests compare LIVE_ONLY_REASONS to a hand-written three-item tuple and exercise only a quoted-context no-issue-reference case, so they enforce the incomplete taxonomy instead of validating it against each production refusal path.",
+    "file": "scripts/pr-body-ref.py",
+    "fix_hint": "Either make the notice explicitly non-exhaustive and remove the EXACT/all-live-outcomes claims, or import and name every applicable authoritative reason. Add independent tests that start with one raw closing reference and drive the real reader to reference-not-resolved, render unavailable, unknown rendered shape, unreadable issue, PR target, closed issue, and quoted-context/no-reference; assert that every resulting reason is represented by the notice without deriving expected values from LIVE_ONLY_REASONS. Mirror the corrected scope in AGENTS.md and the research decision record.",
+    "severity": "major",
+    "title": "The notice's supposedly exact live-refusal list omits authoritative outcomes"
+   }
+  ],
+  "progress": null,
+  "summary": "The pending notice is separated cleanly from the certain offline warnings, remains scoped to the orchestrator class, and its entry-point tests cover output-level distinction and annotation injection. However, the marquee claim that it names exactly the refusals still decided live is false against auto-mint-provenance's actual derivation path. A one-raw-reference pull can refuse under additional reader-owned reasons, including reference-not-resolved, body-render-unavailable, body-shape-not-understood, and source-issue-unreadable. The current exact-membership tests merely pin the incomplete list rather than checking all authoritative outcomes, so this is not complete enough to approve.",
+  "verdict": "request_changes"
+ }
+}
