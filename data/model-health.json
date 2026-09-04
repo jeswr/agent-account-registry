@@ -1838,6 +1838,14 @@
    "wall_seconds": 205,
    "issue": 252,
    "why_no_diff": "other"
+  },
+  {
+   "ts": 1788561504,
+   "provider": "anthropic",
+   "account": "f79434c3ffba014f",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "33925909131.1"
   }
  ]
 }
