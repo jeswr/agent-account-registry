@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 6413,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "873c329db40a4221c963d0251964e5d2abe60009",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The PR corrects the false non-gating rationale in the workflow header, but the canonical doc still states it for this same workflow. AGENTS.md (in the `.github/workflows/merge-group-watchdog.yml` + `scripts/merge-group-watchdog.py` bullet, around line 561) reads: \"The sweep runs on a 5-minute cron (never on a PR head, so it can never gate)\". Per CLAUDE.md, AGENTS.md is the single source of truth, so the disproved safety reasoning survives in the place a future maintainer is most likely to read it. The new test structurally prevents a regression for this workflow, so the harm is documentation-honesty drift rather than a live gating hole \u2014 hence minor, not blocking.",
+    "file": ".github/workflows/merge-group-watchdog.yml",
+    "fix_hint": "Update that AGENTS.md sentence to match the corrected header: the sweep never runs on a PR head, but its check-run does land on the main head SHA that the push-triggered ci-summary polls, and the `.github/advisory-registry.json` declaration (job `watch`, key `recover zero-dispatch merge groups`) is what makes it non-gating.",
+    "severity": "minor",
+    "title": "AGENTS.md still carries the exact rationale this PR disproves ('never on a PR head, so it can never gate')"
+   },
+   {
+    "body": "If the premise behind this entry holds, it is a class property, not a property of this one workflow. Several other schedule/dispatch-only workflows assert the same reasoning in their headers and have no registry entry, so a red scheduled run would contribute a gating check-run to the push-triggered ci-summary on the main head SHA: nightly-full-sweep.yml ('never produces a check-run on any commit the gate...'), slsa-builder-pin-review.yml, triage-area.yml, pr-backlog.yml, batch-merge.yml, verdict-bridge.yml. This is arguably outside the bead's scope (#6269 names the watchdog), which is why it is minor rather than a completeness blocker, but the PR's own rationale text generalises and the exposure should not be left unrecorded.",
+    "file": ".github/advisory-registry.json",
+    "fix_hint": "Per the repo's out-of-scope-discovery rule, file a `self-improvement` issue (dedupe first) to audit every schedule/workflow_dispatch-only workflow for check-runs landing on the main head SHA, and either declare each in the advisory registry or correct its header rationale. Do not expand this PR.",
+    "severity": "minor",
+    "title": "Sibling schedule-only workflows still rely on the same disproved 'schedule-only therefore never gates' reasoning and are undeclared"
+   },
+   {
+    "body": "Two small points. (1) The assertion `assertIsNone(re.search(r\"\\b(advisory|informational)\\b\", name))` runs unconditionally over all jobs, so a future watchdog leg that IS declared and legitimately named e.g. `... (advisory)` would fail here even though registry C2 explicitly permits a declared job to carry the token \u2014 a local convention stricter than the documented policy, worth a one-line comment. (2) `declared` is built as a dict keyed on (workflow, job_id), so two registry entries sharing one identity would silently keep only the last; the checker's C4 catches that today, but the test would not. Neither affects the current single-job workflow.",
+    "file": "scripts/tests/test_merge_group_watchdog.py",
+    "fix_hint": "Optionally add a comment stating the token ban is a deliberate local convention (the watchdog should never look advisory-by-name), and, if cheap, assert `len(self.wf[\"jobs\"]) > 0` so the loop can never pass vacuously if the YAML parse shape changes.",
+    "severity": "nit",
+    "title": "Test is stricter than repo policy (bans the advisory name token even for a declared job) and silently collapses duplicate identities"
+   }
+  ],
+  "progress": null,
+  "summary": "Verified the premise and the mechanism end-to-end. ci-summary.yml does trigger on `push: branches: [main]` and scripts/ci_summary_gate.py polls every check-run on that head SHA, excluding a check ONLY if its name is a key in .github/advisory-registry.json (name tokens have been diagnostic-only since #3773). A scheduled merge-group-watchdog run therefore lands a check-run on the main head SHA that the push-triggered gate reads, so the old workflow-header claim ('never produces a check-run the ci-summary aggregator can see') was false and the registry declaration is the correct and only fix. The new entry is well-formed: all five REQUIRED_FIELDS present, key 'recover zero-dispatch merge groups' exactly equals the live `jobs.watch.name` (C4 identity binding satisfied), the key has a literal anchor, and no gate_script_waiver is needed because the job's scripts (merge-group-watchdog.py, gh_retry.py) carry no gate/ratchet/tripwire/guard token. `scripts/check-advisory-registry.py` exits 0 ('all clear (C2 + C3 + C4)'). Ran the full affected suites locally: test_merge_group_watchdog (229 tests), test_ci_summary_gate + test_alarm_lanes_non_gating + test_mergequeue_lane_inventory (200 tests), plus the other registry-touching modules \u2014 all green, and no dangling reference to the removed test remains. The replacement test is NOT vacuous: I re-executed its logic against three mutations (drop the registry entry, rename the YAML job name, add a second undeclared job) and each goes red, while the baseline is clean; it also generalises from the single `watch` job to every job in the workflow, so a future leg cannot silently gate main. Run-level exposure is also covered: resolve_newest_workflow_runs()'s `advisory_only_failure` branch suppresses the synthetic 'workflow-run verdict' check when the Jobs-API inventory shows the failure is advisory-only, matching the pattern used by every other wholly-advisory lane. Two documentation/scope observations only, both minor.",
+  "verdict": "approve"
+ }
+}
