@@ -1,8 +1,8 @@
 # [SPARQ agent] INDEPENDENT ingestion-rejection alarm (registry #1706).
 #
 # WHY A SEPARATE FILE. `ci-latency-alert.py` already classifies this exact condition
-# (`rejected-zero-jobs`), but it is invoked from groom-core.yml among others — and on 2026-08-01
-# groom itself was ingestion-rejected, so the detector went down with the lane it watches.
+# (`rejected-zero-jobs`), but it is invoked from groom-sweep.yml — and on 2026-08-01 groom itself
+# was ingestion-rejected, so the detector went down with the lane it watches.
 # A 9h dispatch outage and a 19h groom outage both passed unnoticed as a result. An alarm
 # whose availability correlates with the fault is worse than none, because auditing "do we
 # detect this?" returns yes.
@@ -45,13 +45,13 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          CRITICAL_LANES="dispatch.yml groom-core.yml worker.yml review-fix.yml"
+          CRITICAL_LANES="dispatch.yml groom-sweep.yml worker.yml review-fix.yml"
           no_completed_marker() { printf ' %s(no completed run)' "$1"; }
 
           # Dependency-free executable seam tests: a typo or future edit that drops the recovery
           # lane, or that turns an absent run back into a silent pass, fails this alarm itself.
-          [ "$CRITICAL_LANES" = "dispatch.yml groom-core.yml worker.yml review-fix.yml" ]
-          [ "$(no_completed_marker groom-core.yml)" = " groom-core.yml(no completed run)" ]
+          [ "$CRITICAL_LANES" = "dispatch.yml groom-sweep.yml worker.yml review-fix.yml" ]
+          [ "$(no_completed_marker groom-sweep.yml)" = " groom-sweep.yml(no completed run)" ]
 
           BAD=""
           for wf in $CRITICAL_LANES; do

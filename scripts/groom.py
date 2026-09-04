@@ -13903,8 +13903,120 @@ def _self_test() -> int:
     # job that runs this self-test (only the watchdog jobs install it). Anything that cannot be
     # located fails CLOSED — "zero steps matched" must never read as a pass.
     try:
+        workflow_root = Path(__file__).resolve().parent.parent / ".github" / "workflows"
+        full_sweep_files = ("groom-sweep.yml", "groom-core.yml",
+                            "groom-recovery-minimal.yml")
+        full_sweep_yaml = {
+            name: (workflow_root / name).read_text(encoding="utf-8")
+            for name in full_sweep_files
+        }
+
+        def _trigger_count(text: str, trigger: str) -> int:
+            # Only the top-level `on:` block can schedule/dispatch a workflow. Stop at ANY next
+            # top-level key (including `jobs:  # comment`) so formatting, a job named `schedule`,
+            # or a quoted command cannot impersonate a trigger. Column-zero comments within the
+            # trigger block are intentionally transparent, matching the repository's workflow
+            # commentary style.
+            trigger_block = []
+            inside_on = False
+            for line in text.splitlines():
+                if not inside_on:
+                    inside_on = bool(re.match(r"^on:\s*(?:#.*)?$", line))
+                    continue
+                if line and not line[0].isspace() and not line.lstrip().startswith("#"):
+                    break
+                trigger_block.append(line)
+            return sum(1 for line in trigger_block if re.match(
+                rf"^  {re.escape(trigger)}:\s*(?:\{{\}})?\s*(?:#.*)?$", line))
+
+        trigger_decoy = ("on:  # harmless inline comment\n"
+                         "  workflow_dispatch: {}  # harmless inline comment\n"
+                         "# a column-zero comment does not end the trigger block\n"
+                         "jobs:  # an ordinary inline comment is permitted\n"
+                         "  schedule:\n"
+                         "    runs-on: ubuntu-latest\n")
+        check("YAML seam [#2256]: trigger scanning ends at a commented next top-level key and "
+              "cannot count a job named schedule as a cron",
+              (_trigger_count(trigger_decoy, "workflow_dispatch"),
+               _trigger_count(trigger_decoy, "schedule")),
+              (1, 0))
+
+        schedule_counts = {
+            name: _trigger_count(text, "schedule")
+            for name, text in full_sweep_yaml.items()
+        }
+        check("YAML seam [#2256]: exactly ONE full groom workflow owns a native schedule, and it "
+              "is the canonical groom-sweep.yml lane",
+              schedule_counts,
+              {"groom-sweep.yml": 1, "groom-core.yml": 0,
+               "groom-recovery-minimal.yml": 0})
+
+        ingestion_alarm_yaml = (
+            workflow_root / "ingestion-alarm.yml"
+        ).read_text(encoding="utf-8")
+
+        def _critical_lanes(text: str) -> tuple[str, ...]:
+            assignments = []
+            for line in text.splitlines():
+                match = re.match(r'^\s+CRITICAL_LANES="([^"]*)"\s*(?:#.*)?$', line)
+                if match:
+                    assignments.append(tuple(match.group(1).split()))
+            if len(assignments) != 1:
+                raise ValueError(
+                    f"ingestion-alarm must carry exactly one CRITICAL_LANES assignment; "
+                    f"found {len(assignments)}")
+            if len(assignments[0]) != len(set(assignments[0])):
+                raise ValueError("ingestion-alarm CRITICAL_LANES contains a duplicate")
+            return assignments[0]
+
+        critical_lanes = _critical_lanes(ingestion_alarm_yaml)
+        scheduled_groom_lanes = tuple(
+            name for name, count in schedule_counts.items() if count > 0)
+        manual_only_groom_lanes = tuple(
+            name for name, count in schedule_counts.items() if count == 0)
+        check("YAML seam [#2256]: the unique scheduled full-groom owner is enrolled in the "
+              "fault-independent ingestion alarm",
+              tuple(name for name in scheduled_groom_lanes if name in critical_lanes),
+              ("groom-sweep.yml",))
+        check("YAML seam [#2256]: no manual-only groom fallback remains enrolled in the "
+              "fault-independent ingestion alarm",
+              tuple(name for name in manual_only_groom_lanes if name in critical_lanes), ())
+        check("YAML seam [#2256]: both fallback full-sweep workflows remain manually "
+              "dispatchable after their duplicate schedules are removed",
+              {name: _trigger_count(full_sweep_yaml[name], "workflow_dispatch")
+               for name in ("groom-core.yml", "groom-recovery-minimal.yml")},
+              {"groom-core.yml": 1, "groom-recovery-minimal.yml": 1})
+
+        def _full_sweep_commands(text: str) -> list[str]:
+            lines = text.splitlines()
+            commands = []
+            for start, line in enumerate(lines):
+                if line.strip() != "python3 scripts/groom.py \\":
+                    continue
+                command = [line.strip()]
+                for continuation in lines[start + 1:]:
+                    command.append(continuation.strip())
+                    if not continuation.rstrip().endswith("\\"):
+                        break
+                commands.append("\n".join(command))
+            return commands
+
+        required_full_args = ("--registry-repo", "--policy-file", "--policy-resolver",
+                              "--ledger-root")
+        full_commands = {name: _full_sweep_commands(text)
+                         for name, text in full_sweep_yaml.items()}
+        check("YAML seam [#2256]: every canonical/fallback workflow retains exactly ONE real "
+              "full repair invocation (the schedule consolidation must not remove recovery)",
+              {name: len(commands) for name, commands in full_commands.items()},
+              {name: 1 for name in full_sweep_files})
+        check("YAML seam [#2256]: every retained full invocation carries the registry, policy, "
+              "resolver and durable-ledger arguments",
+              {name: [flag for flag in required_full_args if flag not in commands[0]]
+               for name, commands in full_commands.items() if commands},
+              {name: [] for name in full_sweep_files})
+
         orphan_yaml = (
-            Path(__file__).resolve().parent.parent / ".github" / "workflows" / "groom-core.yml"
+            workflow_root / "groom-core.yml"
         ).read_text(encoding="utf-8")
         orphan_yaml_lines = orphan_yaml.splitlines()
         orphan_job_start = orphan_yaml_lines.index("  groom:")
