@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6385,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c78d9e02f04d130c8033ecf4b47859e81ed91c7e",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new gate correctly compares immediate crates/ Cargo.toml directories against floor rows and explicit declarations, rejects untracked crates, stale declarations, and orphan floor rows, and is wired into the no-compile CI job. The focused self-tests exercise each failure mode plus the end-to-end floor-file/tree path; the repository's real --check-untracked invocation also passes with a complete 68-crate accounting. No correctness, soundness, test-validity, or security defects were found in the diff.",
+  "verdict": "approve"
+ }
+}
