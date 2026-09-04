@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6090,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ee5fe534813c1651ffd4ab3f8987e69c9b885bda",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`unresolved_threads()` always starts at the first pull-request page and requests only `reviewThreads(first: 50)` without a thread cursor. When `reviewThreads.pageInfo.hasNextPage` is true, it records a warning but still processes only that same first page. Resolved threads remain part of the connection, so resolving entries from page one does not guarantee that later pages ever move into view; the claimed 'tail waits for a later tick' is therefore false. The same starvation occurs beyond `MAX_PR_PAGES`: every hourly run restarts from the newest PRs, so older PRs beyond 400 may never be examined. A qualifying orphan in either tail can stay blocked forever, contrary to the feature's load-bearing completeness claim. The tests only assert that truncation is reported; they do not prove eventual reachability of the omitted entries.",
+    "file": "scripts/orphan-thread-sweeper.py",
+    "fix_hint": "Implement cursor pagination for reviewThreads and continue through all open-PR pages, or persist/rotate cursors so every omitted page is eventually visited. If API-cost bounds are required, bound work per tick while recording a durable continuation point. Add a multi-tick test showing an eligible thread beyond thread page 1 and a PR beyond the PR-page ceiling are eventually classified and resolved. Do not describe truncation as deferred until that invariant is real.",
+    "severity": "major",
+    "title": "Fixed pagination ceilings can permanently starve eligible threads"
+   }
+  ],
+  "progress": null,
+  "summary": "The eligibility logic is generally fail-closed and the tests cover the principal mutation preconditions, but the enumeration bounds do not merely defer work as claimed. Because every run restarts both connections from the first page and resolved review threads remain in the reviewThreads connection, review threads beyond the first 50 on a PR can remain permanently invisible. Likewise, once there are more than 400 open PRs against the base, older PRs beyond the fixed pull-request page ceiling can remain permanently invisible. That defeats the stated purpose of providing an automated exit for every qualifying orphaned thread and makes the census materially incomplete without eventual progress.",
+  "verdict": "request_changes"
+ }
+}
