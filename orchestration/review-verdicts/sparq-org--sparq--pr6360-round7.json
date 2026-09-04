@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6360,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fcc630b4c8181cbfaeae069a9cd96a78e384bd06",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly keeps group authorization fail-closed: only authenticated requesters with positively resolved, exact group-IRI membership receive modes; missing, malformed, remote, over-cap, or unrelated group documents cannot grant access. Resolution is scoped to applicable ACL rules and origin constraints, de-duplicates document reads, propagates non-NotFound store failures, preserves the public audience, and is exercised through the real sequential and planned authorization paths. The public-surface documentation is updated consistently.",
+  "verdict": "approve"
+ }
+}
