@@ -685,6 +685,21 @@ jobs:
       # The sanitized session-limit reset time worker-live.sh extracts (review defect #9); empty
       # for every other class. Feeds the provider-capped alert's "earliest known reset".
       reset_hint: ${{ steps.exit-class.outputs.reset_hint }}
+      # [registry #569] 'true' iff the provider container invocation was ENTERED. worker-live.sh
+      # writes it at the invocation boundary itself (_mark_model_launched), so it is the ONLY
+      # signal that survives a kill mid-CLI — the in-job exit-class step below does not run when
+      # the job is cancelled or hits worker_timeout_minutes. `model_health` gates on THIS, not on a
+      # non-empty exit_class: a pre-launch abort must record nothing (an `unknown` that no provider
+      # ever saw still counts toward the persistent-transient alert), while a started attempt whose
+      # class was lost to the kill must still be recorded.
+      model_started: ${{ steps.model.outputs.launched }}
+      # [registry #569 review r2] 'true' iff `docker run` itself failed BEFORE the container command
+      # executed (its reserved 125/126/127 statuses: daemon/mount/runtime fault, or the pinned CLI
+      # path not invocable). Such a run COMPLETES, so this retraction is host-observed and needs no
+      # in-container handshake — and it proves NO provider CLI ever started. It is the second half of
+      # the admission gate below: a runner-infrastructure fault is not account health, and recording
+      # it would fabricate the same persistence-counting `unknown` #569 exists to remove.
+      model_startup_failed: ${{ steps.model.outputs.startup_failed }}
       # THIS job's run attempt, stamped beside the class (review round 1 of #425): the recorder's
       # idempotency key must track the attempt that PRODUCED the outcome, not the recorder's own.
       # A recorder-only retry replays this preserved output (same attempt -> dedup no-op); a full
@@ -1168,28 +1183,45 @@ jobs:
       # Model-access health (registry #32): capture the sanitized exit CLASS so the separate
       # no-target-code `model_health` job can record it. worker-live.sh sets WORKER_EXIT_CLASS
       # (+ WORKER_RESET_HINT on session-limit) in $GITHUB_ENV on a FAILED launch only; a
-      # successful model step means `success`. always() with NO skipped-guard (review defect #4):
-      # a pre-launch abort (prep/attempt failure) or a job timeout/cancellation leaves the model
-      # step skipped/cancelled with no host-observed CLI exit — that records class=unknown
-      # (counted toward persistence, never a provider-outage) instead of recording nothing.
+      # successful model step means `success`.
+      #
+      # [registry #569] The blanket `unknown` fallback on a NON-ATTEMPT is gone. A pre-launch abort
+      # (budget exhaustion, trust failure, an unclassified prep failure) never contacted a provider,
+      # so attributing an `unknown` failure to one FABRICATES data — and `unknown` counts toward the
+      # persistent-transient alert (model-health.py PERSISTENCE_CLASSES), so a burst of such aborts
+      # could page a provider outage that never happened. It now yields an EMPTY class and
+      # `model_health` records nothing. What survives unchanged: worker-prep's host-side credential
+      # pre-flight (issue #596) still classifies its OWN failures into WORKER_EXIT_CLASS
+      # (credential-remint-required / credential-refresh-transient) before the model step can run —
+      # those are genuine, host-observed account-health facts and are still captured and recorded.
+      # `unknown` is now reserved for its true meaning: a CLI that ran and whose failure the host
+      # could not attribute, including one killed mid-run with its class lost.
+      #
+      # The empty class is also what `attempt-void` below already treats as non-outage
+      # (worker-pr.is_credential_outage: '' and 'unknown' are both False), so the attempt stays
+      # CHARGED exactly as before — this changes what is RECORDED, never what is charged.
       - name: Capture model exit class
         id: exit-class
         if: ${{ always() && !inputs.dry_run }}
         env:
           MODEL_OUTCOME: ${{ steps.model.outcome }}
+          MODEL_LAUNCHED: ${{ steps.model.outputs.launched }}
+          MODEL_STARTUP_FAILED: ${{ steps.model.outputs.startup_failed }}
         run: |
           set -uo pipefail
           if [[ "$MODEL_OUTCOME" == "success" ]]; then
             cls=success
-          elif [[ "$MODEL_OUTCOME" == "skipped" ]]; then
-            # Pre-launch abort: no CLI ever ran. worker-prep's host-side credential pre-flight
-            # (issue #596) nonetheless classifies its own failures into WORKER_EXIT_CLASS before the
-            # model step can run, so prefer that over a blanket `unknown`.
+          elif [[ "$MODEL_LAUNCHED" == "true" && "$MODEL_STARTUP_FAILED" != "true" ]]; then
+            # A provider CLI DID run. Use the host-observed class when worker-live.sh got far
+            # enough to write one; an attempt that started and died unattributably is `unknown`.
             cls="${WORKER_EXIT_CLASS:-unknown}"
           else
-            # failure OR cancellation/timeout: use the host-observed class when worker-live.sh
-            # got far enough to write one; otherwise unknown.
-            cls="${WORKER_EXIT_CLASS:-unknown}"
+            # No CLI ever ran — a pre-launch abort, or a docker startup failure that retracted its
+            # launch marker (review r2 of #569). Record ONLY a genuine pre-launch class (worker-prep's
+            # credential pre-flight, #596); never invent one. The `unknown` default MUST stay out of
+            # this arm: it would flow into exit_class and re-admit the record through model_health's
+            # `exit_class != ''` arm, undoing the retraction.
+            cls="${WORKER_EXIT_CLASS:-}"
           fi
           # outcome_attempt: the attempt that produced this outcome — the recorder's dedup key
           # (review r1 of #425). Grouped redirect (SC2129): one append, three keys.
@@ -2153,7 +2185,20 @@ jobs:
   # via env (salted before it reaches the ledger — decision 22a), and never fails the pipeline.
   model_health:
     name: Record model-access health (no target code runs here)
-    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.worker.outputs.exit_class != '' }}
+    # [registry #569] The admission gate is the LAUNCH MARKER, not a non-empty exit_class. The
+    # marker is written at the provider-invocation boundary itself, so it is the only signal that
+    # survives the worker job being killed by its timeout mid-CLI (which stops even an in-job
+    # always() step, so exit_class is empty there and the old gate silently DROPPED that genuine
+    # failure). The `exit_class != ''` arm is retained only for the pre-launch classes worker-prep's
+    # credential pre-flight produces before the model step can run (issue #596): those are
+    # host-observed account-health facts, not fabrications. A non-attempt with no class at all
+    # matches NEITHER arm and records nothing — the fabricated-`unknown` path this closes.
+    #
+    # [review r2 of #569] The marker arm is ANDed with `model_startup_failed != 'true'`: a `docker
+    # run` that died before exec'ing the container command entered the invocation (so the marker is
+    # set) but ran no provider CLI, and a runner-infrastructure fault is not account health. Its
+    # exit_class is suppressed host-side too, so it matches neither arm.
+    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && ((needs.worker.outputs.model_started == 'true' && needs.worker.outputs.model_startup_failed != 'true') || needs.worker.outputs.exit_class != '') }}
     # [issue #575] Deliberately NOT rewired onto `publish`. This job records the MODEL LAUNCH
     # outcome, which is fully determined before the gate and carries no PR identity — the exit
     # class it consumes is a pre-gate worker step output. The classes that matter most here
@@ -2200,11 +2245,18 @@ jobs:
           # outcome countable. The empty-output fallback below fails toward RECORDING (a rare
           # duplicate beats a silently dropped outcome).
           OUTCOME_ATTEMPT: ${{ needs.worker.outputs.outcome_attempt }}
+        # Values still reach this contents:write + PROVENANCE_SALT job through env ONLY (issue #199
+        # template-injection hardening); the `unknown` below is a literal in the shell, not an
+        # interpolated expression. [registry #569] It is reached only when the launch marker
+        # admitted the record but the worker job was killed before the in-job exit-class step could
+        # run — a started attempt whose class was lost. Defaulting it RETAINS that genuine failure
+        # as unattributable (`unknown` counts toward persistence, never a provider outage) instead
+        # of dropping it from the ledger entirely.
         run: |
           python3 registry/scripts/model-health.py record \
             --provider "$PROVIDER" \
             --model-alias "$MODEL_ALIAS" \
-            --exit-class "$EXIT_CLASS" \
+            --exit-class "${EXIT_CLASS:-unknown}" \
             --reset-hint "$RESET_HINT" \
             --run-id "$GITHUB_RUN_ID.${OUTCOME_ATTEMPT:-$GITHUB_RUN_ATTEMPT}"
 
