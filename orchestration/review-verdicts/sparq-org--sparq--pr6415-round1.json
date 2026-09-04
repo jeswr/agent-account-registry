@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6415,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d995c6595b5609f0dc219e5484cf8ad3f4706755",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The corrected BACKGROUND now states that ci.yml's archive DOES activate approx-ann, filtered-ann and vec-predicate, i.e. tests gated on those features are genuinely executed by the ci.yml test shards. But the 'CI EXECUTORS' enumeration immediately below (lines 27-36) still lists only three executor sources \u2014 feature-matrix legs, coverage.sh, and the allowlist \u2014 and does not credit ci.yml's archive. The consequence is visible in scripts/check-feature-test-execution.allowlist.json, where three sparq-vectors entries (features [approx-ann], [approx-ann, filtered-ann], [approx-ann, vec-predicate]) carry reasons of the form 'No feature-matrix leg ... yet. Tracked gap', implying those tests never run in CI. Under the newly-documented reality they DO run, via the archive. Those 'tracked gap' reasons are therefore misleading, and a future engineer could either close a non-existent gap or, worse, trust the stale framing. This is not a correctness defect in the gate: not modelling ci.yml as an executor makes the check strictly MORE conservative (it demands a leg or allowlist entry for tests that are in fact covered), so the fail-closed invariant in the header is preserved and no unmapped test can slip through. Flagging as documentation drift, not a functional bug.",
+    "file": "scripts/check-feature-test-execution.py",
+    "fix_hint": "Either add a fourth bullet to the CI EXECUTORS block noting that ci.yml's nextest archive activates approx-ann/filtered-ann/vec-predicate for sparq-vectors but is deliberately NOT modelled as an executor (fail-closed conservatism \u2014 say why), or model it explicitly. If the former, also amend the three sparq-vectors allowlist reasons so 'Tracked gap' becomes something like 'covered by ci.yml's archive features; a dedicated leg is still wanted for feature-isolation, not for basic execution.'",
+    "severity": "minor",
+    "title": "New BACKGROUND contradicts the unchanged 'CI EXECUTORS' list and several allowlist reasons"
+   },
+   {
+    "body": "The exact misstatement this PR fixes is duplicated verbatim in at least two other places that the diff does not touch \u2014 .github/feature-matrix.d/sparq-vectors.yml contains 'the `cargo test --workspace` / `--all-targets` archive, which passes NO `--features`' (around the compose and neuro-symbolic leg comments). Leaving those behind means the repo now documents two mutually contradictory descriptions of the same command, and the next reader may hit the stale copy first. Out of scope for this diff as submitted, and it does not make the change under review wrong \u2014 the change is a strict improvement \u2014 but the fix is incomplete as a repo-wide correction.",
+    "file": "scripts/check-feature-test-execution.py",
+    "fix_hint": "Run `grep -rn 'passes NO .--features' .github/ scripts/ research/` and update the remaining copies in the same PR, or file a follow-up issue so the two descriptions do not stay divergent. ci.yml:506-519 already carries the correct GUARD wording that the other sites can be pointed at instead of restating.",
+    "severity": "nit",
+    "title": "Identical stale 'archive passes NO --features' claim survives in .github/feature-matrix.d/sparq-vectors.yml"
+   }
+  ],
+  "progress": null,
+  "summary": "Comment-only change to scripts/check-feature-test-execution.py that corrects a stale, factually WRONG BACKGROUND claim. The old text asserted ci.yml runs `cargo nextest archive --workspace --all-targets` with NO `--features`; the actual command at .github/workflows/ci.yml:521 is `cargo nextest archive --workspace --all-targets --features approx-ann,filtered-ann,vec-predicate --archive-file nextest.tar.zst`. The new text matches that verbatim. I verified each factual sub-claim: (1) the three features are named exactly and in the same form as ci.yml:521 (also mirrored at ci.yml:559 doctests and heavy-set-alarm.yml:109); (2) all three are default-OFF \u2014 they are defined only in crates/sparq-vectors/Cargo.toml (filtered-ann:97, approx-ann:138, vec-predicate:147) and appear in no crate's `default = [...]` list, so 'default-OFF' is accurate; (3) the retained claim that tests behind `#![cfg(feature = \"X\")]` for other default-OFF features compile to an empty binary and report a false-green remains true. No executable code, regex, control flow, allowlist, or exit-code path is touched \u2014 the diff is confined to lines 11-18 of the module docstring. I ran both entry points at PR head: `--check` exits 0 ('all feature-gated tests have a CI executor or an allowlist entry') and `--self-test` exits 0, correctly reporting the ghost-feature violation in the negative fixture, so the guard is non-vacuous and unregressed. No security surface: no new I/O, subprocess, or parsing. Two non-blocking observations follow \u2014 both concern documentation consistency that this PR surfaces but does not fully propagate, neither creates a false-green, since the script's omission of ci.yml as an executor is fail-closed (over-strict) rather than permissive.",
+  "verdict": "approve"
+ }
+}
