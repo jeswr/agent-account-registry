@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6409,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4cb4cdd6b2c75284039cba5c363875395f8f282f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`next(step for step in steps if str(step.get(\"name\", \"\")).startswith(\"Cone coverage report\"))` raises StopIteration if the step is ever renamed, which unittest reports as an opaque error instead of a message explaining what drifted. This matches the existing idiom in the file (e.g. the `by_name[...]` lookups, which raise KeyError the same way), so it is consistent rather than wrong \u2014 noting only for readability of a future failure.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Optionally use `next((s for s in steps if ...), None)` followed by `self.assertIsNotNone(report, \"the coverage-measure job must keep a 'Cone coverage report' step\")` so a rename fails with an explanatory assertion instead of StopIteration.",
+    "severity": "nit",
+    "title": "next() without a default turns a step rename into a StopIteration error rather than a readable failure"
+   }
+  ],
+  "progress": null,
+  "summary": "Removes the `--divergence-log` flag from the enforced `Cone coverage report` step in ci.yml and pins the removal with a wiring test. Verified the removal is correct and lossless: (1) the CI cone doc is always built by cone_from_selection() with enforce=True, so mode is either `full` (every crate has in_cone=True, so the divergence branch at scripts/cone_coverage.py:348 can never fire) or `cone` (COVERAGE_CONE is non-empty, coverage.sh intersects the shard selection with it, so coverage-summary.json contains only in-cone crates and, again, no crate can reach the `not in_cone and lines_pct is not None` divergence condition). The list written to the log was therefore structurally always `[]`, exactly as the step's own comment and shadow_report()'s `divergence_detection: \"unavailable (enforce...)\"` field already state. (2) The artifact was never consumed: `grep -rn coverage-cone-divergence` over the repo returns nothing \u2014 no upload-artifact step, no downstream reader \u2014 so it was written to the runner workspace and discarded. (3) No detection capability is lost even on the fail-safe path: `_render_report` still emits a `DIVERGENCES (n) \u2014 INVESTIGATE` table into $GITHUB_STEP_SUMMARY whenever the list is non-empty. (4) The `--divergence-log` CLI option and its shadow-mode unit test (scripts/tests/test_cone_coverage.py:365) are deliberately left in place and remain valid for shadow/local runs, so no dead code or stale docs are left behind (the usage header at cone_coverage.py:53 documents it as optional). Test validity: the new test is NOT vacuous \u2014 mutation-checked by re-inserting `--divergence-log dead.json` into the step's run block, which turns the assertion red; at HEAD it is green, and the step lookup resolves to exactly one step with a non-empty run string containing the real command. Full suites pass locally: test_ci_select_wiring.py 89/89 OK, test_cone_coverage.py 49/49 OK; ci.yml still parses as valid YAML. No security or soundness impact; n\u2026 [truncated 109 chars]",
+  "verdict": "approve"
+ }
+}
