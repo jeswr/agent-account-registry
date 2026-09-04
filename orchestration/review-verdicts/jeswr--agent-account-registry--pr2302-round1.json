@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2302,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "10a484ae2ae2c8a7822828b215c1a94a50f2d89c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is narrowly scoped to the stale re-admission diagnostic and leaves the arm/refusal decision unchanged. The new helper derives its wording from the same aggregator grade used by the census and absent-CI alarm, and the production call site passes that live grade. Tests independently pin the absent-vs-readable message split, shared head/budget facts, the production wiring, continued arming on absence, and the readable-gate control; expected wording is locally specified rather than read from the implementation. No fail-open control, trust check, permission, token path, or workflow surface is weakened.",
+  "verdict": "approve"
+ }
+}
