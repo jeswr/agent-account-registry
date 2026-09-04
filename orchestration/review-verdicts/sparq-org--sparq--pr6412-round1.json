@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 6412,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f93480420440418f145f9f9fc536e29fae907adf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "test_flow_on_rules_and_selftest_select_empty_closure covers the rule table and the self-test but not the third new entry, scripts/flow-on.py \u2014 the engine itself and the most likely of the three to be edited alone. It is still covered indirectly (OrchestrationSafeInertnessTests iterates the whole list for the Rust-CI reference grep, and test_orch_safe_scripts_exist_on_disk pins its existence), so a regression would not go unnoticed; but no test pins that an engine-only diff actually reaches mode=selected with an empty closure. Purely additive polish, not a correctness gap.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Add \"scripts/flow-on.py\" to the path list in the new test (or add a one-line sibling case), so all three entries are pinned to the orchestration-only empty-closure outcome by a selection test rather than only by the inertness/existence tests.",
+    "severity": "nit",
+    "title": "New selection test omits scripts/flow-on.py from the exercised path set"
+   }
+  ],
+  "progress": null,
+  "summary": "Adds three entries (scripts/flow-on.py, scripts/flow-on-rules.toml, scripts/tests/test_flow_on.py) to the _ORCHESTRATION_SAFE inert allowlist in scripts/ci_select.py, amends the adjacent 'NOT here' comment, and adds one selection test. The change is correct and complete.\n\nI verified the load-bearing soundness obligation empirically rather than trusting the diff's prose:\n\n1. INERTNESS. None of the three new entries is referenced by any of the 17 workflows in OrchestrationSafeInertnessTests._RUST_CI_WORKFLOWS. An independent grep of .github/workflows shows flow-on references only in flow-on.yml (runs scripts/flow-on.py), flow-on-gates.yml (runs scripts/tests/test_flow_on.py), and prose comments in retriage.yml / drift-scan.yml / selection-alarm.yml / bead-autoclose.yml / merge-group-doorbell.yml / formal-alarm.yml \u2014 none of which are Rust-CI workflows or ci-select consumers. The diff's claim ('the engine runs in flow-on.yml and the test in flow-on-gates.yml; neither feeds the Rust matrix') is accurate.\n\n2. NO GREP BYPASS. The exact-string inertness grep could be defeated by a glob-based runner; I checked for one (unittest discover / pytest / scripts/tests/* globs) in the Rust-CI workflows and found none \u2014 only exact per-file invocations. No crate include_str!/include_bytes! reads these paths (the single crates/sparq-zk-compose/tests/gate_count.rs hit is a doc comment naming a rule id, not a file read). No ruff/py_compile/mypy lane over scripts/ exists in ci.yml / ci-summary.yml / supply-chain.yml, so no python-lint coverage is lost by skipping.\n\n3. NO SELF-DEFEAT. flow-on-gates.yml triggers unconditionally on pull_request/merge_group with no ci-select guard, so a PR changing test_flow_on.py or flow-on-rules.toml still runs the self-test and the flow-on engine's own validation. Note flow-on.yml / flow-on-gates.yml themselves are deliberately NOT allowlisted, so changing them still forces full \u2014 correctly fail-closed.\n\n4. TEST VALIDITY (non-vacuou\u2026 [truncated 576 chars]",
+  "verdict": "approve"
+ }
+}
