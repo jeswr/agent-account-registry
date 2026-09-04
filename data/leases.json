@@ -3,12 +3,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "adced2e406e8432d937a81658644d1a4",
-   "holder": "sparq-org/sparq#6298@dispatch-33896356958.1",
+   "holder": "sparq-org/sparq#6298@33897166427.1",
    "package": "ci,docs",
    "role": "ci",
    "model": "sol",
-   "issued_at": 1788540490,
-   "expires_at": 1788546790
+   "issued_at": 1788540525,
+   "expires_at": 1788546825
   }
  ]
 }
