@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6360,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fcc630b4c8181cbfaeae069a9cd96a78e384bd06",
+  "round": 8
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The group authorization change remains correct and complete on the supplied diff. Membership can widen access only for an authenticated WebID after an applicable, origin-compatible ACL rule names a group and a local, successfully parsed group document contains the exact full-group-IRI vcard:hasMember triple. Missing, malformed, remote, over-cap, unrelated, and anonymous cases remain fail-closed; non-NotFound store failures propagate. Document reads are de-duplicated and bounded, public permissions cannot inherit group grants, and both sequential and planned real authorization paths are exercised. Public documentation matches the implementation. No review-instruction injection was present in the diff. Round 7 also had no findings, so progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
