@@ -946,6 +946,36 @@ def auto_readmission_stamps(comments, bot_login, log=print):
     return [record["at"] for record in auto_readmission_records(comments, bot_login, log)]
 
 
+def budget_round_charge(comments, bot_login, human_cutoff, round_n, log=print):
+    """(charged_rounds, window) — the rounds the REVIEW ROUND BUDGET is charged for.
+
+    [registry #446] The window is the human unlabel COMPOSED with this PR's own automatic
+    re-admission receipts (park_policy.readmission_window), not the human unlabel alone. The
+    docstring one function up has always said the automatic stamps are the budget windows
+    `effective_readmission_cutoff` composes — and park_policy's own self-test asserts "an
+    automatic re-admission grants the SAME real budget" — but the round-budget call site read
+    the bare human cutoff, so a machine re-admission granted a PR ZERO rounds: it re-entered the
+    loop at `rounds_used` past the hard cap and decide_budget re-parked it on the very next
+    outcome without a single round having run. That is what makes an automatic re-admission
+    (and the adjudicated re-entry scripts/adjudicate-stuck.py mints from one) VACUOUS rather
+    than merely cheap.
+
+    The composition cannot manufacture unbounded budget: automatic re-admissions are capped
+    per PR at park_policy.AUTO_READMISSION_MAX, counted over MARKERS (a corrupt receipt still
+    spends cap), and a re-admitted PR that exhausts its budget again lands on the #797 MACHINE
+    ladder, which retires it rather than paging.
+
+    Fail direction, unchanged and conservative in both legs: no window at all keeps the FULL
+    historical count (`round_n`), and an unreadable/unparseable window reaches
+    count_rounds_since, which logs loudly and also keeps the full count. Unproven time never
+    buys budget."""
+    window = _park_policy().readmission_window(
+        human_cutoff, auto_readmission_stamps(comments, bot_login, log=log), log=log)
+    if not window["cutoff"]:
+        return (round_n, window)
+    return (count_rounds_since(comments, bot_login, window["cutoff"], log=log), window)
+
+
 # The evidence-key namespace model-health stamps on its AGED-OUT park exit
 # (model-health.SUSTAINED_HEALTH_KEY_PREFIX, registry #691). The receipt below must not claim the
 # strong gate's finding when the weak one released the park: "the account that was failing when
@@ -953,6 +983,28 @@ def auto_readmission_stamps(comments, bot_login, log=print):
 # 48 h window, and a receipt is the durable, public record of why automation acted. Keyed off the
 # namespace rather than a new parameter so no caller can post the wrong sentence by omission.
 AUTO_READMIT_HEURISTIC_PREFIX = "fleet-health/"
+
+
+def auto_readmission_marker(evidence_key, recovered_at):
+    """The MARKER LINE of an automatic-readmission receipt — ONE writer for the artefact three
+    separate readers depend on (auto_readmission_marker_count's cap counter,
+    auto_readmission_stamps' budget window, and the #797 ladder's window authority).
+
+    Extracted from auto_readmission_receipt because a SECOND caller with a different finding to
+    state now exists — scripts/adjudicate-stuck.py (registry #446) re-admits a park that reached
+    the HUMAN terminal, which the receipt prose below explicitly says it never does. Splitting
+    the PROSE while keeping ONE marker writer is what stops that caller from inventing a second
+    spelling of the marker the cap and the budget window are counted from. Both fields are
+    validated here, so no caller can write an unparseable receipt.
+
+    Raises WorkerPrError on an unsafe evidence key or a non-ISO-8601 recovery stamp."""
+    policy = _park_policy()
+    if not policy.valid_timestamp(recovered_at):
+        raise WorkerPrError("automatic-readmission receipt needs a strict ISO-8601 recovery stamp")
+    if not isinstance(evidence_key, str) or not policy.safe_receipt_part(evidence_key):
+        raise WorkerPrError("automatic-readmission receipt evidence key is unsafe")
+    return (f"{AUTO_READMIT_MARKER} evidence={evidence_key} "
+            f"at={policy.canonical_ts(recovered_at)} -->")
 
 
 def auto_readmission_receipt(evidence_key, recovered_at):
@@ -963,11 +1015,8 @@ def auto_readmission_receipt(evidence_key, recovered_at):
     actually has, and the #691 aged-out exit states, in as many words, that it is a HEURISTIC
     about fleet health and not a proof about this park's own cause."""
     policy = _park_policy()
-    if not policy.valid_timestamp(recovered_at):
-        raise WorkerPrError("automatic-readmission receipt needs a strict ISO-8601 recovery stamp")
+    marker = auto_readmission_marker(evidence_key, recovered_at)
     stamp = policy.canonical_ts(recovered_at)
-    if not isinstance(evidence_key, str) or not policy.safe_receipt_part(evidence_key):
-        raise WorkerPrError("automatic-readmission receipt evidence key is unsafe")
     if evidence_key.startswith(AUTO_READMIT_HEURISTIC_PREFIX):
         finding = (
             "> 🤖 SPARQ agent — automatically re-admitted this MACHINE capacity park: its own "
@@ -1002,7 +1051,7 @@ def auto_readmission_receipt(evidence_key, recovered_at):
             f"this bot's OWN park-reason receipt already classified the episode `class=capacity` "
             f"— the machine never clears a park it never classified. To place a hold no machine "
             f"may lift, use `{'` / `'.join(HUMAN_OWNED_LABELS)}`.\n\n"
-            f"{AUTO_READMIT_MARKER} evidence={evidence_key} at={stamp} -->")
+            f"{marker}")
 
 
 def marker_runs(comments, bot_login, kind, round_n):
@@ -6521,15 +6570,20 @@ def review_outcome(args):
     budget_rounds = args.round
     if args.round >= args.max_rounds and not document["injection_detected"]:
         comments = _paginated_comments(args.repo, args.pr)
-        cutoff = _park_policy().readmission_cutoff(
-            args.repo, args.pr, args.issue, _issue_timeline,
-            is_human=lambda login: _is_human_maintainer(args.repo, login))
-        if cutoff:
-            budget_rounds = count_rounds_since(comments, args.bot_login, cutoff)
-            if budget_rounds != args.round:
-                print(f"readmission window open for {args.repo}#{args.pr}: a human unlabeled "
-                      f"a park label at {cutoff}; the round budget charges {budget_rounds} of "
-                      f"{args.round} recorded round(s)")
+        # [registry #446] The window composes the human unlabel with this PR's OWN automatic
+        # re-admission receipts (budget_round_charge) — a machine-minted window grants the same
+        # real budget a human gesture does, which is what stops an automatic (or adjudicated)
+        # re-admission from re-parking before a single round has run.
+        budget_rounds, window = budget_round_charge(
+            comments, args.bot_login,
+            _park_policy().readmission_cutoff(
+                args.repo, args.pr, args.issue, _issue_timeline,
+                is_human=lambda login: _is_human_maintainer(args.repo, login)),
+            args.round)
+        if window["cutoff"] and budget_rounds != args.round:
+            print(f"readmission window open for {args.repo}#{args.pr}: a "
+                  f"{window['authority']}-minted re-admission at {window['cutoff']}; the round "
+                  f"budget charges {budget_rounds} of {args.round} recorded round(s)")
         models = sorted({model
                          for models in fix_round_models(comments, args.bot_login).values()
                          for model in models})
@@ -7217,6 +7271,75 @@ def _self_test():
         except WorkerPrError:
             check(f"the receipt writer refuses ({unsafe_key!r}, {unsafe_stamp!r})",
                   "raised", "raised")
+    for unsafe_key, unsafe_stamp in ((f"{auto_key} -->", "2026-07-25T03:10:00Z"),
+                                     ("openai/a b/1", "2026-07-25T03:10:00Z"),
+                                     (None, "2026-07-25T03:10:00Z"),
+                                     (auto_key, "yesterday")):
+        try:
+            auto_readmission_marker(unsafe_key, unsafe_stamp)
+            check(f"the MARKER writer refuses ({unsafe_key!r}, {unsafe_stamp!r}) too — the "
+                  "second caller cannot skip the validation by skipping the prose",
+                  "no error", "WorkerPrError")
+        except WorkerPrError:
+            check(f"the MARKER writer refuses ({unsafe_key!r}, {unsafe_stamp!r}) too — the "
+                  "second caller cannot skip the validation by skipping the prose",
+                  "raised", "raised")
+    check("[#446] the extracted marker writer is BYTE-IDENTICAL to the line the receipt ends "
+          "with — one artefact, one spelling, whatever prose wraps it",
+          auto_readmission_receipt(auto_key, "2026-07-25T03:10:00+00:00").endswith(
+              auto_readmission_marker(auto_key, "2026-07-25T03:10:00Z")), True)
+    check("[#446] ...and a marker written by the second caller round-trips through the SAME "
+          "reader, cap counter and budget-stamp reader the receipt does",
+          (auto_readmission_records(
+              [{"user": {"login": bot},
+                "body": "prose the receipt writer never wrote\n\n"
+                        + auto_readmission_marker("adjudication/none",
+                                                  "2026-07-25T05:00:00Z")}], bot),
+           auto_readmission_marker_count(
+               [{"user": {"login": bot},
+                 "body": auto_readmission_marker("adjudication/none",
+                                                 "2026-07-25T05:00:00Z")}], bot)),
+          ([{"key": "adjudication/none", "at": "2026-07-25T05:00:00Z"}], 1))
+
+    # ---- [registry #446] THE ROUND BUDGET WINDOW COMPOSES THE MACHINE'S OWN RE-ADMISSIONS.
+    # Before #446 the budget call site read the bare HUMAN cutoff, so an automatic (or
+    # adjudicated) re-admission handed the PR back to the loop with `rounds_used` still past the
+    # hard cap: decide_budget re-parked it on the next outcome with ZERO rounds run. Each check
+    # below flips red if the composition is reverted to the human cutoff alone. ----
+    auto_window = "2026-07-25T09:00:00Z"
+    human_window = "2026-07-25T12:00:00Z"
+
+    def budget_round(round_n, created):
+        return {"user": {"login": bot}, "created_at": created,
+                "body": f"x {ROUND_MARKER} n={round_n} run={round_n}.1 -->"}
+
+    # Rounds 4 and 5 burned BEFORE the machine re-admission, round 6 after it. `round_n=6` is
+    # the global recorded count the old call site charged unconditionally.
+    budget_rounds_only = [budget_round(4, "2026-07-25T08:00:00Z"),
+                          budget_round(5, "2026-07-25T08:30:00Z"),
+                          budget_round(6, "2026-07-25T10:00:00Z")]
+    auto_row = [{"user": {"login": bot}, "created_at": auto_window,
+                 "body": auto_readmission_marker("adjudication/none", auto_window)}]
+    charged, window = budget_round_charge(auto_row + budget_rounds_only, bot, None, 6)
+    check("[#446] a MACHINE-minted re-admission opens a REAL budget window: rounds burned "
+          "before it are not charged, and the window reports machine authority",
+          (charged, window["authority"]), (1, _park_policy().WINDOW_AUTHORITY_MACHINE))
+    check("[#446] with NO window of either kind the charge is the full recorded count "
+          "(behaviour unchanged — this is the leg the old call site always took)",
+          budget_round_charge(budget_rounds_only, bot, None, 6)[0], 6)
+    check("[#446] a HUMAN unlabel LATER than the machine window still wins — composing an "
+          "automatic stamp never shrinks a human's re-admission",
+          budget_round_charge(auto_row + budget_rounds_only, bot, human_window, 6)[0], 0)
+    check("[#446] an UNREADABLE human window is contagious: a machine stamp can never mask "
+          "it, and the charge falls back to the full count (unproven time never buys budget)",
+          budget_round_charge(auto_row + budget_rounds_only, bot,
+                              _park_policy().WINDOW_UNREADABLE, 6,
+                              log=lambda *_a, **_k: None)[0], 6)
+    check("[#446] a THIRD-PARTY comment cannot mint a budget window",
+          budget_round_charge(
+              [{"user": {"login": "drive-by"}, "created_at": auto_window,
+                "body": auto_readmission_marker("adjudication/x", auto_window)}]
+              + budget_rounds_only, bot, None, 6)[0], 6)
 
     # ---- marker_runs_since (#555 recurrence gap): the missed/nochange/gatefail marker
     # budgets are windowed by the readmission cutoff exactly like the round budget. The
