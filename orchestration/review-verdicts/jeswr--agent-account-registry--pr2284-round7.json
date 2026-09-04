@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2284,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cfca770e6946cb39768fc1a19515a5bfd9656677",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The design-only change is internally coherent and is supported by the referenced implementation. It correctly rejects receipt-head reachability as unsound recovery/terminal evidence, distinguishes absent provenance from the already-repairable present-but-inadmissible class, keeps unavailable or platform-owned evidence fail-closed, and places the authoritative unmintability decision with the existing run-log parser rather than duplicating that trust parser in groom. The proposed sequence also appropriately requires a durable author-filtered receipt, measurement before action, exact code matching, retention of the machine park alongside the human hold, and negative-path tests before any escalation ships. The document clearly discloses the unavailable live measurements and does not change behavior, tests, workflows, policy, or trust checks in this PR.",
+  "verdict": "approve"
+ }
+}
