@@ -53,12 +53,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "5584fa53a7ac4d11a41fab19f7fd6b46",
-   "holder": "jeswr/agent-account-registry#866@dispatch-33833069741.1",
+   "holder": "jeswr/agent-account-registry#866@33833827569.1",
    "package": "dashboard",
    "role": "impl",
    "model": "sol",
-   "issued_at": 1788492985,
-   "expires_at": 1788495685
+   "issued_at": 1788493012,
+   "expires_at": 1788495712
   },
   {
    "account": "dc2d751954080e13",
