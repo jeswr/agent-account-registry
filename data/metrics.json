@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-04T21:19:20Z",
+  "generated_at": "2026-09-04T21:28:53Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -69,6 +69,28 @@
       }
     },
     {
+      "target": "sparq-org/sparq",
+      "classification": "worker-failing",
+      "fire": true,
+      "summary": "worker success rate 40% < 50% floor over 2 snapshots (5 attempts this hour)",
+      "metrics": {
+        "worker_success_rate_1h": 0.4,
+        "worker_attempts_1h": 5
+      }
+    },
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "backlog-growing",
+      "fire": true,
+      "summary": "open PRs 51 > 12 and net PR flow +1.0/hr (open 1.0 > close 0.0) sustained over 2 snapshots",
+      "metrics": {
+        "prs_open": 51,
+        "net_pr_flow": 1.0,
+        "pr_open_rate": 1.0,
+        "pr_close_rate": 0.0
+      }
+    },
+    {
       "target": "jeswr/agent-account-registry",
       "classification": "ready-starved",
       "fire": true,
@@ -76,6 +98,16 @@
       "metrics": {
         "issues_ready": 710,
         "issues_closed_1h": 0
+      }
+    },
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "worker-failing",
+      "fire": true,
+      "summary": "worker success rate 0% < 50% floor over 2 snapshots (3 attempts this hour)",
+      "metrics": {
+        "worker_success_rate_1h": 0.0,
+        "worker_attempts_1h": 3
       }
     }
   ]
