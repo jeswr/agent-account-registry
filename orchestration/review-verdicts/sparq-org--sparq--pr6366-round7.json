@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6366,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "eca1e085678751198a32dbd16ef7d78d8b745e86",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The feature is correctly default-off, dependency-neutral, and narrowly reuses PodStore's cached fail-closed accessible set. Source decisions preserve input order, return only the intersection of declared and readable named graphs, sort/deduplicate that subset, and skip empty or wholly unauthorized declarations. The focused tests exercise the real materialized WAC path, partial authorization, mode/session separation, reserved-principal rejection, pre-materialization behavior, ordering, and duplicate declarations. Public API documentation and the access-control skill are updated, and the MPC/security language remains appropriately caveated as plan-time-only, caller-asserted, semi-honest, and externally unaudited.",
+  "verdict": "approve"
+ }
+}
