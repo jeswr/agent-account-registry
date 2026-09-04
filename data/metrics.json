@@ -1,19 +1,19 @@
 {
-  "generated_at": "2026-09-04T15:43:30Z",
+  "generated_at": "2026-09-04T16:24:06Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 2422,
-      "issues_ready": 241,
+      "issues_ready": 240,
       "issues_closed_1h": 0,
       "issues_closed_24h": 6,
-      "prs_open": 168,
-      "prs_draft": 141,
+      "prs_open": 169,
+      "prs_draft": 142,
       "prs_opened_1h": 2,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
       "prs_merged_24h": 0,
-      "review_changes_backlog": 18,
+      "review_changes_backlog": 16,
       "needs_user_parked": 16,
       "review_lane_health": "idle",
       "review_lane_runs_1h": 0,
@@ -50,9 +50,9 @@
       "target": "sparq-org/sparq",
       "classification": "backlog-growing",
       "fire": true,
-      "summary": "open PRs 168 > 40 and net PR flow +2.0/hr (open 2.0 > close 0.0) sustained over 2 snapshots",
+      "summary": "open PRs 169 > 40 and net PR flow +2.0/hr (open 2.0 > close 0.0) sustained over 2 snapshots",
       "metrics": {
-        "prs_open": 168,
+        "prs_open": 169,
         "net_pr_flow": 2.0,
         "pr_open_rate": 2.0,
         "pr_close_rate": 0.0
@@ -62,9 +62,9 @@
       "target": "sparq-org/sparq",
       "classification": "ready-starved",
       "fire": true,
-      "summary": "ready frontier 241 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "ready frontier 240 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
       "metrics": {
-        "issues_ready": 241,
+        "issues_ready": 240,
         "issues_closed_1h": 0
       }
     }
