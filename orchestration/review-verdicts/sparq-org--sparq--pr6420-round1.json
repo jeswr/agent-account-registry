@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 6420,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b94c1972af49544ddba1e25d27007f0f3fe9ade0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The step is named \"Self-test bench-triage.py (dedupe predicate + exhaustive listing)\", but neither half holds:\n\n- \"dedupe predicate\": the actual issue-dedupe predicate is `find_open_issue()` (scripts/bench-triage.py:401-415) \u2014 the `gh issue list --search 'in:title \"<marker> <key>\"'` call plus the `marker in title and key in title` re-check. It is entirely UNTESTED by `--self-test`, and necessarily so: the self-test is hermetic and shells out to no `gh`. What IS covered is the dedupe KEY bucketing (`suite_of`) and a name-collision filter (`merge_hardzone_rows`) \u2014 related, but not the predicate the name advertises.\n- \"exhaustive listing\": `metric_crates` is asserted on 6 named prefixes plus the fallback, while `_PREFIX_CRATES` (scripts/bench-triage.py:73) holds 29 entries. That is a ~21% sample, not an exhaustive listing, and nothing asserts the map is fully covered.\n\nThis matters because the CI step list is read as coverage evidence. A future maintainer scanning these step names will reasonably conclude the issue-dedupe path is guarded on every PR when it is not \u2014 the same class of false-safety the long comment directly above this step exists to prevent. It also sits awkwardly against the repo's no-overclaim honesty norm (AGENTS.md).",
+    "file": ".github/workflows/docs-quality.yml",
+    "fix_hint": "Rename the step to describe what the self-test actually exercises, e.g. `Self-test bench-triage.py (zone partition + numeric admission + issue-body sanitizer)`. Optionally, if genuinely exhaustive listing is wanted, add an assertion in `self_test()` that every key of `_PREFIX_CRATES` resolves through `metric_crates` to a non-fallback crate list, e.g. `assert all(metric_crates(p + '_x_us') != _FALLBACK_CRATES for p in _PREFIX_CRATES)` \u2014 then the name becomes accurate.",
+    "severity": "minor",
+    "title": "Step name overclaims coverage: the self-test does not test the issue-dedupe predicate, and its listing is not exhaustive"
+   },
+   {
+    "body": "The comment block immediately after the new step opens: \"# ...and the WIRING of that gate: the step above must exist and stay unconditional, the bench.yml lane must keep `set -euo pipefail`...\". That block belongs to the `Self-test bench hard-zone WIRING` step and its \"the step above\" was written to point at the `Self-test bench hard-zone gate` step.\n\nThe new bench-triage step was inserted directly between them, so \"the step above\" now resolves to `Self-test bench-triage.py`, which is not the gate the paragraph goes on to describe (hard-zone, `set -euo pipefail`, Store ordering, anti-laundering). The prose and the code it annotates no longer agree.\n\nThis is doc drift only \u2014 `test_bench_hardzone_wiring.py` locates its steps by name, not by index, so all 20 of its tests still pass (I ran them). But the comment is now actively misleading at exactly the seam the repo has invested heavily in keeping self-documenting.",
+    "file": ".github/workflows/docs-quality.yml",
+    "fix_hint": "Move the new bench-triage step so it does not split the hard-zone gate step from its WIRING comment + step \u2014 either place it BEFORE the `Self-test bench hard-zone gate` step, or AFTER the `Self-test bench hard-zone WIRING` step. Alternatively keep the position and reword the orphaned comment to name its referent explicitly, e.g. \"the `Self-test bench hard-zone gate` step above must exist and stay unconditional\".",
+    "severity": "minor",
+    "title": "Insertion point orphans the following comment's \"the step above\" back-reference"
+   },
+   {
+    "body": "Every sibling gate in this block is protected against silent un-wiring: `test_bench_hardzone_wiring.py` carries `TestSelfAnchoring.test_this_test_runs_in_quick_gates` (\"MUTANT: delete THIS test's own step from docs-quality => RED\") and `TestSelfTestRunsOnPullRequests.test_step_is_not_conditioned_away` (\"MUTANT: add an `if:` to the step so it silently never runs => RED\").\n\nThe new bench-triage step has no equivalent. Nothing goes red if a later PR deletes it, adds an `if:` that never fires, or appends `|| true` to the `run:` line \u2014 the gate would stop guarding PRs with no signal, which is precisely the failure mode described in the `[OPUS-5] sq-jxeqz / #4559` comment a few lines above (\"a regression in the gate ITSELF is caught here, before the gate is trusted\").\n\nNot blocking \u2014 it is strictly better than the status quo of no PR coverage at all \u2014 but the protection is one assertion away.",
+    "file": ".github/workflows/docs-quality.yml",
+    "fix_hint": "Extend the existing `scripts/tests/test_bench_hardzone_wiring.py` (or add a small sibling test) with an assertion that the `quick-gates` job contains a step whose `run:` invokes `python3 scripts/bench-triage.py --self-test`, that the step carries no `if:`, and that the run line contains no `|| true` / `set +e` \u2014 mirroring `test_self_test_call_site_present` and `test_step_is_not_conditioned_away`.",
+    "severity": "minor",
+    "title": "New self-test step has no self-anchoring guard, so it can be silently deleted or conditioned away"
+   },
+   {
+    "body": "Each of the seven neighbouring self-test steps is preceded by a tagged comment explaining WHY it is PR-gated and what regression it catches \u2014 e.g. `# [FABLE-5] sq-6vshe.6: ...`, `# [OPUS-5] sq-jxeqz / #4559: ...`, `# [FABLE-5] #3419: ...`. Several cite the specific incident that motivated them.\n\nThe new step is added bare, with no comment. Since the value of these gates is largely institutional memory (why this cheap step must not be dropped), the omission makes this the easiest step in the block for a future editor to delete as apparent noise.",
+    "file": ".github/workflows/docs-quality.yml",
+    "fix_hint": "Add a short tagged comment above the step in the established style: which bench-triage behaviours the self-test pins (zone partition, numeric admission, Markdown/HTML issue-body sanitizer), that it is hermetic (no gh/network/repo writes), and why it must run on PRs \u2014 the triage script only executes on the scheduled bench lane, so without this a regression would first surface by mis-filing or mis-rendering a live GitHub issue.",
+    "severity": "nit",
+    "title": "Missing the house-style rationale comment carried by every other self-test step in this block"
+   }
+  ],
+  "progress": null,
+  "summary": "Two-line change: wires the pre-existing `scripts/bench-triage.py --self-test` into the docs-quality.yml `quick-gates` job so the bench-triage logic is exercised on every PR, matching the established pattern of the seven neighbouring self-test steps.\n\nVerified: (1) `--self-test` exists on main (argparse flag at scripts/bench-triage.py:1040, dispatched at :1043) so the step cannot fail on a missing entrypoint; (2) it runs clean and hermetically here (exit 0, ~0.6s, stdlib-only, tempdirs only, no gh/git/network/repo writes), so it honours the 'same stdlib-only pattern as the lints above' claim in the surrounding comment; (3) it is genuinely NON-VACUOUS \u2014 I mutated the merge dedupe predicate (`merge_hardzone_rows` name-collision filter) and the @-mention defusal in the sanitizer, and the self-test went RED on both; (4) the step landed in the right job (`quick-gates`), is unconditional (no `if:`), and the YAML parses; (5) it does NOT break the adjacent `test_bench_hardzone_wiring.py` meta-lint \u2014 I ran it and all 20 tests pass, since its ordering assertions target bench.yml, not docs-quality.yml step adjacency.\n\nNet effect is a real, cheap safety gain with no runtime or security risk. Remaining findings are all minor/cosmetic: the step NAME overclaims what the self-test covers, the insertion point orphans a nearby 'the step above' reference, the new step lacks the house-style rationale comment every sibling carries, and unlike its hard-zone neighbour it has no self-anchoring wiring guard. None affect correctness, so I am not blocking.",
+  "verdict": "approve"
+ }
+}
