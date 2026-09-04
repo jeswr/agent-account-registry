@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2282,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f084d31ce2911676bfb0878d05e440e625740457",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`arm_stale_readmission_note` selects its sentence from `arm_ci_evidence(arm_gate)`, which only describes whether a gate check exists at the reviewed SHA. The ability of a `ready_for_review` event to create a pull_request run instead depends on the PR's current mergeability/merge-ref availability. A gate may exist from before the base advanced and the PR became DIRTY; in that case this helper takes the non-absent branch and still asserts that undrafting queues a fresh gate, although no merge ref exists. Conversely, absence also has causes other than a conflict, as the existing alarm itself notes. The added test labels a gated fixture \"mergeable\" without giving the fixture or production call site any mergeability evidence, so it cannot catch this case.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Derive the message from a fresh, explicit mergeability/merge-ref signal at the arm boundary, with a fail-honest unknown state, rather than inferring mergeability from the historical gate grade. Add call-site tests where an existing green/pending gate is paired with a currently conflicting PR, plus mergeable and unknown controls, and assert the re-admission line for each.",
+    "severity": "major",
+    "title": "Aggregator absence does not determine whether undrafting can queue a run"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new diagnostic is keyed to whether an aggregator check exists, but the claim it is trying to make depends on the pull request's current mergeability. Those states are not equivalent: an existing check can predate a base advance that makes the PR conflicting, while an absent check can also reflect degraded Actions. Consequently the normal branch can still promise a ready_for_review run that GitHub cannot create. The tests reproduce the same conflation and do not exercise current mergeability, so they cannot establish the marquee claim.",
+  "verdict": "request_changes"
+ }
+}
