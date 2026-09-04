@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 6337,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e7c8a6c2285c96a3aa1c50d4ad99a9b71b58a828",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "When the open-PR result has exactly OPEN_PR_LIMIT rows, the script emits a warning but continues using the truncated PR_BLOB. The oldest open PRs can therefore still be omitted from in-flight subtraction and their beads re-dispatched. Making the failure visible does not preserve the decision invariant, and the self-test only proves that text is emitted; it does not prove dispatch is stopped or made conservative. The gh-absent degradation policy does not justify accepting a detected incomplete snapshot: absence is an explicit degraded mode, while here the script knows its decision input may be unsound.",
+    "file": "scripts/push-frontier.sh",
+    "fix_hint": "Fail closed before frontier selection when the count reaches the cap, or conservatively withhold dispatch when completeness cannot be established. Extend the end-to-end self-test to show that a ceiling-hit snapshot cannot emit/re-dispatch candidates, while a below-ceiling snapshot still can.",
+    "severity": "major",
+    "title": "Truncated in-flight enumeration still drives dispatch decisions"
+   },
+   {
+    "body": "The new comment explicitly acknowledges that a constituent still open after 50 later omnibus merges is never closed by this path. The claim that cleanup happens on the next tick assumes the process runs successfully often enough; downtime, repeated failures, or a burst of more than 50 merges can push an unprocessed omnibus out of the window permanently. Because this path performs reconciliation rather than merely presenting recent history, the bounded window is still an enumerate-for-decision correctness hazard.",
+    "file": "scripts/batch-merge.py",
+    "fix_hint": "Use a resumable cursor/watermark or enumerate all relevant merged omnibus PRs with a fail-closed ceiling, and add a test where an unprocessed omnibus lies beyond the first 50 results but its open constituent is still discovered and closed.",
+    "severity": "major",
+    "title": "Bounded merged-omnibus window can permanently miss cleanup"
+   }
+  ],
+  "progress": null,
+  "summary": "The ceiling guards are generally well targeted and their boundary tests are discriminating, but two enumeration paths remain knowingly incomplete. Most importantly, push-frontier only logs when its decision input is truncated and then continues with the partial set, so the exact double-dispatch failure the change describes remains possible. The omnibus cleanup likewise treats a bounded window as sufficient even though missed ticks can permanently strand constituents. These are correctness issues in the audited enumeration class, so the change is not complete as scoped.",
+  "verdict": "request_changes"
+ }
+}
