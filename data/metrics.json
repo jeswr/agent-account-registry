@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-04T09:36:41Z",
+  "generated_at": "2026-09-04T09:45:32Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -7,27 +7,27 @@
       "issues_ready": 256,
       "issues_closed_1h": 0,
       "issues_closed_24h": 8,
-      "prs_open": 164,
-      "prs_draft": 137,
+      "prs_open": 163,
+      "prs_draft": 136,
       "prs_opened_1h": 0,
-      "prs_closed_1h": 5,
+      "prs_closed_1h": 2,
       "prs_merged_1h": 0,
       "prs_merged_24h": 1,
       "review_changes_backlog": 19,
       "needs_user_parked": 16,
       "review_lane_health": "stalled",
-      "review_lane_runs_1h": 6,
+      "review_lane_runs_1h": 3,
       "worker_attempts_1h": 2,
       "worker_success_rate_1h": 0.5,
       "pr_open_rate": 0.0,
-      "pr_close_rate": 5.0,
-      "net_pr_flow": -5.0
+      "pr_close_rate": 2.0,
+      "net_pr_flow": -2.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 1056,
+      "issues_open": 1055,
       "issues_ready": 709,
-      "issues_closed_1h": 1,
-      "issues_closed_24h": 6,
+      "issues_closed_1h": 2,
+      "issues_closed_24h": 7,
       "prs_open": 49,
       "prs_draft": 33,
       "prs_opened_1h": 0,
@@ -53,7 +53,7 @@
       "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=19 waits",
       "metrics": {
         "review_changes_backlog": 19,
-        "review_lane_runs_1h": 6,
+        "review_lane_runs_1h": 3,
         "prs_merged_1h": 0
       }
     },
