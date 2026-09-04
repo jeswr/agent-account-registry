@@ -5253,6 +5253,12 @@ def _arm_hold_recheck(repo, pr_number, issue):
 # a naturally-fresh gate can land without spending a re-review, and what the BOUND buys is the
 # guarantee that this can never become a terminal park. It writes no label, opens no needs:user,
 # and re-derives from live state every tick.
+#
+# [registry #1210] "GitHub queues a ready_for_review `gate`" above holds wherever the aggregator is
+# REACHABLE, and not at a head with no aggregator run at all — a DIRTY PR has no merge ref, so the
+# undraft fires no `pull_request` workflow either. The bound and the decision are unaffected (the
+# arm still proceeds; #892/#940 both measured why), but what the re-admission SAYS is class-aware:
+# see `arm_stale_readmission_notice`.
 ARM_DECLINE_GATE_STALE = "gate-stale"
 ARM_STALE_MARKER_PREFIX = "<!-- sparq-arm-stale-gate:v1 sha="
 ARM_FRESHNESS_CENSUS_PREFIX = "arm-freshness census:"
@@ -5352,6 +5358,59 @@ def arm_ci_absent_alarm(repo, pr_number, reviewed_sha, repair_gate):
             "degraded Actions is the other. Absence is NOT a pass — any review verdict bound to "
             "this commit is weaker than a verdict on a gated head, and the merge latch cannot "
             "fire without the required `gate` context either way.")
+
+
+# ---- registry #1210: THE RE-ADMISSION MUST NOT PROMISE A RUN THAT CANNOT HAPPEN --------------
+# The staleness re-admission (#940) spends the one-per-head deferral budget and arms on a gate
+# that graded a superseded base. The sentence printed next to it IS the justification for doing
+# so, and it used to be unconditional: "the undraft below queues a ready_for_review `gate`
+# against the CURRENT base and the latch waits on that run, which is what actually re-derives the
+# green".
+#
+# That is FALSE for exactly the population #853 named. GitHub computes no merge ref for a DIRTY
+# pull request, so a conflicting PR publishes no `pull_request` workflow run on any head pushed
+# while the conflict stands: the `ready_for_review` event queues NOTHING, and the promised fresh
+# `gate` does not appear until the conflict clears. #853 made that state visible next to the arm
+# (`ci=absent` on the census row, plus the `arm-ci-absent:` annotation) and deliberately left
+# what the arm SAYS alone; this closes that half.
+#
+# THE FIX IS A MESSAGE, NOT A REFUSAL, and keeping it that way is what keeps it proportionate:
+# #892 and #940 both measured why an absent or pending aggregator must still arm (refusing here
+# re-opens the 25.3%-pending stall and removes the very undraft that would produce a real gate),
+# so the DECISION is untouched. Only the justification changes.
+#
+# Note this population is NOT the one #1211's conflict exit takes: that exit fires on an explicit
+# `mergeable is False`, and the head that reaches here is one whose mergeability GitHub returned
+# as null/unknown (still computing, or unreadable) while the aggregator run is nonetheless absent.
+# Which is precisely why the message has to be honest — the machine could not prove the conflict,
+# so the operator reading this line is the one who has to.
+def arm_stale_readmission_notice(reviewed_sha, repair_gate):
+    """PURE: the line printed when a staleness deferral is RE-ADMITTED, told truthfully for the
+    CI-evidence CLASS actually read at this head (registry #1210).
+
+    Two forms sharing one head, differing in the TAIL — the clause that claims what the undraft
+    below will produce. Wherever the aggregator is reachable the undraft really does queue a
+    `ready_for_review` run against the current base, and that run is what re-derives the green.
+    At an ARM_CI_ABSENT head it does not: absence is the #853 class, whose commonest member is a
+    CONFLICTING PR with no merge ref and therefore no `pull_request` run at all, so the tail says
+    the undraft may queue nothing and names the conflict as the reason instead of asserting a
+    mechanism that did not fire.
+
+    Keyed off `arm_ci_evidence` — the one place the four classes are named apart — so this
+    message cannot drift from the `ci=` the census row on the same run reports."""
+    head = (f"arm RE-ADMITTED at {reviewed_sha[:12]}: this head's arm was already deferred once "
+            "for a gate that graded a superseded base, and no fresher run appeared — the "
+            f"{ARM_STALE_MAX_PER_HEAD}-deferral budget is spent, so the arm proceeds. ")
+    if arm_ci_evidence(repair_gate) == ARM_CI_ABSENT:
+        return (head + "The undraft below MAY QUEUE NO RUN AT ALL: this head has no aggregator "
+                "check-run whatsoever, and the commonest cause is a CONFLICTING pull request "
+                "(registry #853) — GitHub computes no merge ref for a DIRTY PR, so the "
+                "ready_for_review event fires no `pull_request` workflow either and no fresh "
+                "`gate` appears until the conflict clears. Nothing re-derives a green here; the "
+                "latch waits on a required context that is not being produced, and the "
+                f"`{ARM_CI_ABSENT_PREFIX}` annotation on this run is the record of it")
+    return (head + "The undraft below queues a ready_for_review `gate` against the CURRENT base "
+            "and the latch waits on that run, which is what actually re-derives the green")
 
 
 # ---- registry #1211: THE ARM MUST NOT UNDRAFT A PR THE REBASE LANE ALREADY OWNS --------------
@@ -6079,11 +6138,13 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
             return
         if stale_readmitted:
             stale = ""
-            print(f"arm RE-ADMITTED at {reviewed_sha[:12]}: this head's arm was already deferred "
-                  "once for a gate that graded a superseded base, and no fresher run appeared — "
-                  f"the {ARM_STALE_MAX_PER_HEAD}-deferral budget is spent, so the arm proceeds. "
-                  "The undraft below queues a ready_for_review `gate` against the CURRENT base "
-                  "and the latch waits on that run, which is what actually re-derives the green")
+            # [registry #1210] `arm_gate` — the grade read at the REVIEWED sha, the same one the
+            # census row above reports as `ci=` and the same one the absent-CI annotation keys
+            # off. Passing anything else (a constant, or the freshness state) would let the line
+            # promise a ready_for_review `gate` at a head that publishes no workflow run at all.
+            # Pinned by an assertion over the CALL SITE, because a direct test of
+            # `arm_stale_readmission_notice` can only pin its own argument.
+            print(arm_stale_readmission_notice(reviewed_sha, arm_gate))
         if stale and not declined:
             # Ordering: a CONCLUDED red (#892) is the stronger statement and keeps its own exit
             # and its own receipt, so it is reported when both fire. This branch is the
@@ -13034,6 +13095,69 @@ def _self_test():
               ("readmitted=true" in raa_prints[-1], "refused=false" in raa_prints[-1],
                "verdict=stale" in raa_prints[-1]),
               (True, True, True))
+        # ---- [registry #1210] THE RE-ADMISSION SAYS SOMETHING TRUE AT AN ABSENT HEAD ---------
+        # The line above is the whole justification for spending the budget and arming, and at a
+        # head with NO aggregator run it asserted a mechanism that does not fire: a DIRTY PR has
+        # no merge ref, so the undraft's ready_for_review event queues no `pull_request` run and
+        # the promised fresh `gate` never appears. Pinned as a PAIR — the reachable classes keep
+        # the promise, the absent class replaces it and names the conflict — because ONE
+        # unconditional message (the shipped defect, or an over-corrected one that warns at every
+        # head) satisfies neither half. Note (b): every expected substring is spelled here as a
+        # local literal, never read back out of the function under test.
+        _PROMISE_1210 = "queues a ready_for_review `gate` against the CURRENT base"
+        _NO_RUN_1210 = "MAY QUEUE NO RUN AT ALL"
+        check("[#1210] the re-admission promises the fresh `gate` ONLY where the aggregator is "
+              "reachable, and at an ABSENT head warns it may queue nothing and names the "
+              "conflict",
+              {str(g): (_PROMISE_1210 in arm_stale_readmission_notice("b" * 40, g),
+                        _NO_RUN_1210 in arm_stale_readmission_notice("b" * 40, g),
+                        "CONFLICTING pull request" in arm_stale_readmission_notice("b" * 40, g))
+               for g in ("green:merge-required", "green:draft-tier", "failure", "pending",
+                         "unknown", "success", "", None, "missing")},
+              {"green:merge-required": (True, False, False),
+               "green:draft-tier": (True, False, False),
+               "failure": (True, False, False), "pending": (True, False, False),
+               "unknown": (True, False, False), "success": (True, False, False),
+               "": (True, False, False), str(None): (True, False, False),
+               "missing": (False, True, True)})
+        # BOTH forms still carry the head and the spent budget — the two facts an operator needs
+        # to tie the line to an object and to know why the arm proceeded. A rewrite that returns
+        # only the differing tail reds here. `1` is spelled as a local literal and the constant is
+        # pinned to it in the same assertion, so neither half can be satisfied by reading the
+        # other.
+        check("[#1210] ...and BOTH forms name the reviewed head and the spent one-per-head budget",
+              (ARM_STALE_MAX_PER_HEAD,
+               tuple(arm_stale_readmission_notice("b" * 40, g).startswith(
+                   "arm RE-ADMITTED at bbbbbbbbbbbb: ")
+                   and "1-deferral budget is spent" in arm_stale_readmission_notice("b" * 40, g)
+                   for g in ("green:merge-required", _GATE_ABSENT))),
+              (1, (True, True)))
+        # THE CALL SITE. The table above can only pin the function's own argument (the P12 blind
+        # spot); this pins that `ready_and_arm` hands it the AGGREGATOR GRADE it read at the
+        # reviewed sha. Wiring a constant, or the freshness state, passes every check above and
+        # re-ships the defect. The freshness verdict is stale and the receipt is present, so this
+        # is the re-admission path exactly; `mergeable` is left UNKNOWN, which is what makes this
+        # head reachable at all (an explicit False exits through #1211 far above).
+        run_raa(benign_diff=True, arm_gate=_GATE_ABSENT, arm_freshness=stale_752,
+                comments=(stale_receipt,))
+        check("[#1210] CALL SITE: a re-admission at a head with NO aggregator run warns the "
+              "undraft may queue nothing, names the conflict — and still ARMS (#892/#940 "
+              "unchanged)",
+              (_NO_RUN_1210 in raa_prints[-1], "CONFLICTING pull request" in raa_prints[-1],
+               _PROMISE_1210 in raa_prints[-1], f"ci={ARM_CI_ABSENT}" in raa_prints[-1],
+               "readmitted=true" in raa_prints[-1], bool(raa_latches()),
+               raa_outputs.get("armed"), raa_outputs.get("arm_declined")),
+              (True, True, False, True, True, True, True, None))
+        # THE CONTROL, and the load-bearing half: without it a message hard-wired to warn at
+        # EVERY re-admission passes the check above. A head whose gate is READABLE keeps the
+        # original promise verbatim and raises no conflict wording.
+        run_raa(benign_diff=True, arm_gate="green:merge-required", arm_freshness=stale_752,
+                comments=(stale_receipt,))
+        check("[#1210] CONTROL: at a head whose gate IS readable the promise stands unchanged",
+              (_PROMISE_1210 in raa_prints[-1], _NO_RUN_1210 in raa_prints[-1],
+               "CONFLICTING pull request" in raa_prints[-1], bool(raa_latches()),
+               raa_outputs.get("armed")),
+              (True, False, False, True, True))
         # THE TWO BUDGETS ARE SEPARATE. A #892 gate-red receipt must not re-admit a staleness
         # refusal (or a PR deferred for a red aggregator would arm on a stale green next tick),
         # and the converse must hold too. Collapsing the two markers into one turns these red.
