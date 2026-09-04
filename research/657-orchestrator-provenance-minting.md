@@ -551,3 +551,57 @@ population inside the lane, §10.3 is the record to reopen.
 What #1115 changes for this population instead is **visibility**: `pr-gate.yml`'s advisory now names
 the draft refusal on the pull itself, with its reason and the one-click fix, so a drafted
 orchestrator PR is no longer silently outside a lane its author believes it is in.
+
+### 10.4 Population 3 — 1 of 17: `reference-is-a-pull-request` stays OFFLINE-INVISIBLE — **decision**
+
+> 🤖 **SPARQ agent** — design decision record, registry issue #1254. §10.2 recorded that the
+> advisory is sound and one-sided and *accepts false negatives*. This section owns the one false
+> negative the same census measured, and says what was done about it instead.
+
+`check` warns only where the reader is guaranteed to refuse, which offline is exactly **0** raw
+closing references and **2+**. The third refusal in §10.1's census — **`reference-is-a-pull-request`,
+1 of 17**, the #710 `fixed #729` shape where #729 is a pull request — is invisible to it. Deciding
+that case needs a live `GET /repos/{repo}/issues/{n}` to read GitHub's own `pull_request`
+discriminator, and `pr-gate.yml` runs with `contents: read`, no `gh` and no network.
+
+**The decision is that the read does not move into pr-gate, and the advisory keeps the false
+negative.** `pr-body-ref.py` already implements the predicate (`resolve_source_issue` /
+`source_is_pull_request`); what it does not have, and deliberately still does not have, is a
+PR-time place to run it.
+
+* **The no-network property is load-bearing, not incidental.** It is most of why this step is safe
+  to run on *every* pull including forks: nothing author-controlled reaches a shell, no token is
+  used, and a bug in it cannot exfiltrate or mutate anything. pr-gate's `permissions:` block already
+  records one refusal of exactly this shape (#1353 step 3, declined in
+  `research/1373-pr-time-workflow-dispatch-probe.md`), and trading a standing property for a
+  1-in-17 diagnosis is the wrong side of that trade.
+* **The refusal is already named, already commented, already censused** — one tick later, by
+  `auto-mint-provenance`, with `REASON_HINTS[reference-is-a-pull-request]` posted on the pull. The
+  gap was never that the class is undiagnosed; it is that the diagnosis is late.
+
+**The two rejected alternatives**, stated so a future reader does not re-derive them:
+
+1. *A separate low-privilege job (not the required `gate`) that makes the one read.* Genuinely
+   possible — a read scope, and a fork `pull_request` token is read-only anyway, so it is not the
+   privilege escalation #1353 was. It is rejected on **proportion**: it is a second checkout, a
+   second Python setup and a token-bearing job on every pull in the repository, standing, to move a
+   1-in-17 diagnosis earlier by one tick. If the class ever grows, this is the option to reopen.
+2. *Make `auto-mint-provenance`'s census surface it louder.* Already true: the reason is in
+   `PR_REFUSAL_REASONS`, counted by name in `refusals` and `standing_refusals`, carries its own
+   `REASON_HINTS` entry and is not in `SILENT_REASONS`, so the sweep comments it on the pull. There
+   was nothing to add.
+
+**What #1254 changes instead is the same thing #1115 changed for the draft population: visibility
+of the boundary.** At exactly one closing reference the advisory used to print the *identical*
+`nothing to advise` line it prints for a pull outside the lane entirely — so the one row it cannot
+decide read exactly like approval, and the author had no way to tell "checked and clean" from "not
+checkable here". `lane_pending_checks` now emits a **`::notice::`** for that row naming, in the
+reader's own spellings, the refusals a live read still decides (`reference-is-a-pull-request`,
+`reference-is-closed`, and `no-issue-reference` when GitHub's rendering declares nothing after all)
+and pointing at `pr-body-ref.py compose`, which makes the same read from a context that has a token.
+
+It is a notice and not a warning **because it decides nothing**: the one-sidedness §10.2 records is
+the property that makes the *warnings* worth reading, and folding an undecidable row into them would
+retire it silently. `lane_advisory` is therefore unchanged and the pending rows live in their own
+function — `--self-test` asserts the warning half's output for every body the pending half speaks
+about, so the two cannot be conflated by a later edit.

@@ -175,9 +175,14 @@ unkillable.
     object.
 
     **You do not have to remember any of this.** `pr-gate` runs `pr-body-ref.py check` on every
-    pull and annotates yours with the refusal by name when it is CERTAIN of one — declaring none,
-    or declaring two. It is advisory, it never fails the gate, and it stays quiet when it cannot be
-    certain, so **a clean run is not proof that you bound**; only the mint census is.
+    pull and **warns** with the refusal by name when it is CERTAIN of one — declaring none, or
+    declaring two. It is advisory and it never fails the gate. When you declare exactly ONE it
+    cannot decide anything: whether that number is an issue rather than a pull request, whether it
+    is open, and whether GitHub's own rendering declares it at all all need a live read, and the
+    gate has no network by design. So it emits a **`::notice::`** naming those outstanding reads
+    instead (#1254) — **that notice is not approval and a clean run is not proof that you bound**;
+    only the mint census is. To settle it yourself, run `pr-body-ref.py compose`, which makes the
+    live read and refuses `source-is-a-pull-request` rather than writing.
 
     **And your PR must not be a DRAFT.** Re-measured for #1115: 6 of the 17 orchestrator-class open
     pulls were drafts, and the lane refuses every one of them —

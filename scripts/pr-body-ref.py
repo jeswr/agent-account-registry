@@ -82,10 +82,25 @@
 #     2+ raw closing refs =>  |all_refs| >= 2          => `ambiguous-issue-reference`, always
 #     exactly 1           =>  UNDECIDABLE offline — the rendered half may still drop it
 #
-# The third row is why `check` says NOTHING at 1 rather than "looks good": a body whose only
-# reference sits in a fenced block is raw-declared and rendered-invisible, and an advisory that
+# The third row is why `check` WARNS about nothing at 1 rather than saying "looks good": a body whose
+# only reference sits in a fenced block is raw-declared and rendered-invisible, and an advisory that
 # called that fine would be worse than silence. So `check` has NO false alarms by construction and
 # accepts false NEGATIVES, which is the only asymmetry an advisory may have.
+#
+# THE THIRD ROW IS A NOTICE, NOT A VERDICT (registry issue #1254). The soundness argument above is
+# unchanged and #1254 adds NO warning — rows one and two are still the only things `check` warns on.
+# What it fixes is that row three used to be INDISTINGUISHABLE FROM "outside the lane": both printed
+# the same `nothing to advise` line, so the one shape this file cannot decide read exactly like
+# approval. #1115's own census measured that shape refusing live — `reference-is-a-pull-request`,
+# 1 of 17, the #710 `fixed #729` case where #729 is a pull request. Deciding it needs a live
+# `GET /repos/{repo}/issues/{n}` to read GitHub's own `pull_request` discriminator, and pr-gate runs
+# with `contents: read`, no `gh` and no network BY DESIGN — which is most of why this step is safe to
+# run on every pull including forks — so the read does NOT move here (the decision, and the two
+# rejected alternatives, are recorded in research/657-orchestrator-provenance-minting.md §10.4).
+# `lane_pending_checks` instead NAMES, as a `::notice::`, the refusals a single reference still
+# leaves open and says who reads them. It decides nothing, so it cannot false-alarm; the sole
+# authority is still `auto-mint-provenance`, which makes that read one tick later and posts the
+# refusal by name.
 #
 # IT NEVER BLOCKS, and it sits inside a REQUIRED gate, so it also never RAISES: every failure path
 # returns 0 with a `::notice::`. That is not a weakened trust check — `check` grants nothing,
@@ -196,6 +211,26 @@ ADVISORY_AMBIGUOUS = _auto_mint.REASON_AMBIGUOUS                 # "ambiguous-is
 ADVISORY_DRAFT = "draft-not-enumerable"
 
 ADVISORY_CODES = (ADVISORY_DRAFT, ADVISORY_NO_REFERENCE, ADVISORY_AMBIGUOUS)
+
+# ---- the PENDING half (#1254) --------------------------------------------------------------------
+# A PENDING code is NOT a refusal code, and it is spelled so that it can never be mistaken for one in
+# a log scrape or correlated with the mint census as if it were: offline, nothing at all is known
+# about whether this pull will refuse. It is carried in its own tuple, and returned by its own
+# function, so `lane_advisory`'s "every note names a CERTAIN refusal" contract stays literally true.
+PENDING_UNVERIFIED = "reference-unverified-offline"
+PENDING_CODES = (PENDING_UNVERIFIED,)
+
+# What the LIVE read still decides for a single reference, in the READER'S OWN spellings — imported
+# for the same reason the two advisory codes are, so a notice can be correlated with the census that
+# names the outcome one tick later. All three are measured, not hypothesised: the first is #1115's
+# 1-of-17 (`fixed #729`, where #729 is a pull request), and the third is what the reader answers for
+# a raw-declared, rendered-invisible reference — `--self-test` drives that one through the real
+# reader rather than restating it.
+LIVE_ONLY_REASONS = (
+    _auto_mint.REASON_REFERENCE_IS_PULL,   # "reference-is-a-pull-request" — the #710 shape
+    _auto_mint.REASON_REFERENCE_CLOSED,    # "reference-is-closed"
+    ADVISORY_NO_REFERENCE,                 # GitHub's rendering declares nothing after all
+)
 
 
 def proven_issue_number(value):
@@ -377,6 +412,47 @@ def lane_advisory(pull, repo, enrolled_authors):
     return notes
 
 
+def lane_pending_checks(pull, repo, enrolled_authors):
+    """What a SINGLE closing reference still leaves OPEN for the live reader, as `(code, message)`.
+
+    A SEPARATE FUNCTION FROM `lane_advisory`, deliberately (#1254). Every note that one returns is a
+    refusal that is CERTAIN offline, and that one-sidedness is the whole reason it is worth warning
+    on; folding an undecidable row into the same list would retire that property silently. These
+    rows decide NOTHING, so they cannot false-alarm, and `_cmd_check` emits them at NOTICE level —
+    never as a warning.
+
+    WHY THEY EXIST. At exactly one raw reference `check` used to print the identical
+    `nothing to advise` line it prints for a pull that is outside the lane entirely, so the one
+    shape it cannot decide was indistinguishable from approval. The #1115 census measured that shape
+    refusing live 1 time in 17 (`reference-is-a-pull-request`), and pr-gate cannot see it: that
+    needs GitHub's own `pull_request` discriminator over the network, which this job has none of by
+    design. Naming the outstanding read is the part that CAN be delivered from here.
+
+    Same silence rule outside the orchestrator class as `lane_advisory`, for the same reason, and
+    the same rule on content: every value that reaches the message is an int or a constant."""
+    if orchestrator_class_error(pull, repo, enrolled_authors) is not None:
+        return []
+    declared = declared_closing_numbers(pull.get("title"), pull.get("body"))
+    # 0 and 2+ are DECIDED offline and are `lane_advisory`'s warnings already; a notice there would
+    # be a second, weaker voice on a question that has an answer.
+    if len(declared) != 1:
+        return []
+    named = ", ".join(f"`{reason}`" for reason in LIVE_ONLY_REASONS)
+    return [(PENDING_UNVERIFIED,
+             f"pull #{pull.get('number')} declares exactly one closing reference "
+             f"(#{declared[0]}), which is as far as this check can see: pr-gate runs with "
+             "contents:read, no gh and no network by design, so whether that number is an ISSUE is "
+             "not knowable here. auto-mint-provenance resolves it live and can still refuse the "
+             f"pull as {named} — a pull request rather than an issue (measured once in the #1115 "
+             "census), a closed issue, or a reference GitHub's own rendering of this body does not "
+             "declare at all, because a closing keyword inside a fenced block, a code span, a "
+             "blockquote or an HTML comment is quoted context. NOTHING IS DECIDED HERE and this is "
+             "not a refusal: the sweep makes that read one tick later and posts the reason by name. "
+             f"To make the same read now — it refuses `{REASON_SOURCE_IS_PULL}` before writing "
+             f"anything — run: python3 scripts/pr-body-ref.py compose --issue <n> --repo {repo} "
+             "--body-file <f>")]
+
+
 def enrolled_authors_of(repo, policy_path):
     """This repo's master-protected `review_enrolment_authors`, or an empty frozenset.
 
@@ -424,13 +500,22 @@ def _cmd_check(args, *, enrolled=None):
             return 0
         authors = enrolled_authors_of(args.repo, args.policy) if enrolled is None else enrolled
         notes = lane_advisory(pull, args.repo, authors)
-        if not notes:
-            _annotate("notice", "pr-body-ref check: nothing to advise — this pull is either "
-                                "outside the orchestrator review lane, or ready and declaring "
-                                "exactly one closing reference")
-            return 0
+        pending = lane_pending_checks(pull, args.repo, authors)
         for code, message in notes:
             _annotate("warning", f"review lane [{code}]: {message}")
+        # NOTICE level, always, and after the warnings. These name what is still OPEN, not what is
+        # wrong; a `::warning::` on an undecided row would be exactly the false alarm this half
+        # exists not to have (#1254).
+        for code, message in pending:
+            _annotate("notice", f"review lane [{code}]: {message}")
+        if not notes and not pending:
+            # ONE state now, not two. Every orchestrator-class pull declares 0, 1 or 2+ raw closing
+            # references and each of those emits a row above, so reaching here means the class
+            # predicate refused — which is the only thing this line may claim. It used to also
+            # cover "ready and declaring exactly one", which made the row `check` cannot decide
+            # read as approval.
+            _annotate("notice", "pr-body-ref check: nothing to advise — this pull is outside the "
+                                "orchestrator review lane the sweep mints for")
     except Exception as exc:                           # noqa: BLE001 — an advisory never reds a gate
         _annotate("notice", f"pr-body-ref check did not run ({type(exc).__name__}); it is advisory "
                             "and auto-mint-provenance remains the authority")
@@ -823,6 +908,16 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
     def advice(**over):
         return [code for code, _ in lane_advisory(pull_payload(**over), ORACLE_REPO, ENROLLED)]
 
+    def pending_rows(pull, enrolled=ENROLLED):
+        return lane_pending_checks(pull, ORACLE_REPO, enrolled)
+
+    def pending(**over):
+        return [code for code, _ in pending_rows(pull_payload(**over))]
+
+    def pending_message(**over):
+        rows = pending_rows(pull_payload(**over))
+        return rows[0][1] if len(rows) == 1 else f"({len(rows)} rows, wanted 1)"
+
     # CONTROL both ways, BEFORE any advisory row: an instrument that cannot say "this one is fine"
     # makes every agreement below vacuous, and one that answers `render-unavailable` is answering
     # about the oracle rather than about the grammar.
@@ -850,6 +945,64 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
     # mode that would make authors stop reading these notes.
     chk("the advisory is silent where it cannot be certain, and the reader still refuses",
         (advice(body=quoted), reader_verdict(pull_payload(body=quoted))), ([], ADVISORY_NO_REFERENCE))
+
+    # ---- #1254: the UNDECIDABLE row is NAMED — and is still never decided ------------------------
+    # `check` cannot see `reference-is-a-pull-request` (the #710 `fixed #729` shape, 1 of 17 in the
+    # #1115 census): that needs GitHub's own `pull_request` discriminator over the network, and this
+    # job has neither by design. What it stops doing is printing the same `nothing to advise` line
+    # for the row it cannot decide as for a pull outside the lane. Every row below is a NOTICE; the
+    # WARNING half above is unchanged, which the paired `advice(...)` values assert directly.
+    chk("#1254 a single closing reference is NAMED as unverified rather than called fine",
+        pending(body=composed), [PENDING_UNVERIFIED])
+    # The number is READ FROM THE BODY, not fixed: two different single-reference bodies, two
+    # different numbers. A message that hard-coded either one reds exactly one of these.
+    chk("#1254 ...and the number it names comes from the body under test",
+        (f"(#{ORACLE_ISSUE})" in pending_message(body=composed),
+         "(#700)" in pending_message(body=quoted),
+         "(#700)" in pending_message(body=composed)), (True, True, False))
+    # EXACT membership against a literal written HERE, then each literal against the message. An
+    # earlier form of this row iterated `LIVE_ONLY_REASONS` and looked each member up in the
+    # message: dropping a member shortened BOTH sides at once and the row stayed green — AGENTS.md
+    # pre-flight item 2b, an expectation sourced from the code under test cannot fail. Measured:
+    # that mutant survived this battery until the expectation was written out.
+    LIVE_ONLY_LITERAL = ("reference-is-a-pull-request", "reference-is-closed", "no-issue-reference")
+    chk("#1254 the notice names EXACTLY the refusals a live read still decides",
+        LIVE_ONLY_REASONS, LIVE_ONLY_LITERAL)
+    chk("#1254 ...and every one of them reaches the message the author actually sees",
+        [r for r in LIVE_ONLY_LITERAL if f"`{r}`" not in pending_message(body=composed)], [])
+    # ...and those spellings are the READER'S OWN OBJECTS, not local copies that could drift out of
+    # correlation with the census — the property the CLOSING_REF_RE row asserts for the grammar.
+    chk("#1254 ...and the spellings are auto-mint's own constants, not copies",
+        LIVE_ONLY_REASONS == (_auto_mint.REASON_REFERENCE_IS_PULL,
+                              _auto_mint.REASON_REFERENCE_CLOSED, _auto_mint.REASON_NO_REFERENCE),
+        True)
+    # THE CERTAIN ROWS STAY `lane_advisory`'S. 0 and 2+ are decided offline, so there is nothing
+    # outstanding to name and a notice there would be a second, weaker voice on a settled question.
+    chk("#1254 zero references is CERTAIN — warned, never pended",
+        (pending(), advice()), ([], [ADVISORY_NO_REFERENCE]))
+    chk("#1254 two references are CERTAIN — warned, never pended",
+        (pending(body=two), advice(body=two)), ([], [ADVISORY_AMBIGUOUS]))
+    # ONE-SIDEDNESS PRESERVED, driven through the REAL reader rather than restated: `quoted` is
+    # raw-declared and rendered-invisible, so the reader refuses it, this half still does NOT warn,
+    # and the refusal it produces is one of the three the notice names.
+    chk("#1254 the undecidable body gets a notice, no warning, and the reader still refuses",
+        (advice(body=quoted), pending(body=quoted), reader_verdict(pull_payload(body=quoted))),
+        ([], [PENDING_UNVERIFIED], ADVISORY_NO_REFERENCE))
+    chk("#1254 ...and that refusal is one the notice actually names",
+        reader_verdict(pull_payload(body=quoted)) in LIVE_ONLY_REASONS, True)
+    chk("#1254 draftness and the reference are INDEPENDENT — a draft with one reference gets both",
+        (advice(body=composed, draft=True), pending(body=composed, draft=True)),
+        ([ADVISORY_DRAFT], [PENDING_UNVERIFIED]))
+    # SILENCE OUTSIDE THE CLASS holds for this half too, or the notice lands on the pull requests of
+    # people who are not in this lane. Each row uses `composed` — the body that DOES pend in-class —
+    # so a predicate that stopped being consulted could not pass by having nothing to say anyway.
+    chk("#1254 SILENT outside the class, on the very body that pends INSIDE it",
+        ([c for c, _ in pending_rows(pull_payload(body=composed,
+                                                  user={"login": "someone-else"}))],
+         [c for c, _ in pending_rows(pull_payload(body=composed), enrolled=frozenset())],
+         [c for c, _ in pending_rows("not a dict")],
+         pending(body=composed)),
+        ([], [], [], [PENDING_UNVERIFIED]))
 
     # SILENCE OUTSIDE THE CLASS. Each row is a pull `pr_mint_refusal` refuses for a reason that is
     # not draftness, so the lane was never open to it and there is nothing to advise. If any of
@@ -897,17 +1050,30 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
             with contextlib.redirect_stdout(out):
                 code = _cmd_check(args, enrolled=enrolled)
             text = out.getvalue()
-            return code, [c for c in ADVISORY_CODES if f"[{c}]" in text], text
+            return code, [c for c in ADVISORY_CODES + PENDING_CODES if f"[{c}]" in text], text
 
     code, codes, text = run_check(pull_payload())
     chk("ENTRY check exits 0 and warns with the reader's code", (code, codes),
         (0, [ADVISORY_NO_REFERENCE]))
     chk("ENTRY ...as a WARNING, never an error — it must not read as a gate failure",
         (text.count("::warning::"), "::error::" in text), (1, False))
-    chk("ENTRY a clean pull still SAYS SO — silence and a disabled step must be distinguishable",
-        run_check(pull_payload(body=composed))[0:2] + ("::notice::" in
-                                                       run_check(pull_payload(body=composed))[2],),
-        (0, [], True))
+    # A pull that is READY and declares exactly one reference. It still SAYS SO — silence and a
+    # disabled step must be distinguishable — and since #1254 what it says is the pending notice,
+    # at notice level only.
+    ready_one = run_check(pull_payload(body=composed))
+    chk("ENTRY a ready pull with one reference gets a NOTICE naming the live-only reads (#1254)",
+        (ready_one[0], ready_one[1], ready_one[2].count("::notice::"),
+         "::warning::" in ready_one[2]),
+        (0, [PENDING_UNVERIFIED], 1, False))
+    # THE TWO STATES THIS LINE USED TO CONFLATE. Before #1254 an undecidable single reference and a
+    # pull outside the lane printed the identical `nothing to advise` line, so the one row `check`
+    # cannot decide read exactly like approval. They have to be distinguishable in the OUTPUT, which
+    # is the only place an author sees them — asserting the codes alone leaves a mutant that reverts
+    # `_cmd_check` to its early `if not notes: … return 0` invisible.
+    outside = run_check(pull_payload(body=composed, user={"login": "someone-else"}))
+    chk("ENTRY ...and it is DISTINGUISHABLE from a pull outside the lane, which still says so",
+        ("nothing to advise" in ready_one[2], "nothing to advise" in outside[2],
+         outside[0:2]), (False, True, (0, [])))
     # The TEXT is asserted, not just `(0, [])`. Both this and "nothing to advise" exit 0 and warn
     # about nothing, so a mutant that drops the payload-shape branch is invisible to the codes and
     # destroys only the diagnosis — the same class `run_cmd` above carries its own note about.
@@ -933,6 +1099,13 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
     _, codes, text = run_check(pull_payload(body=forged, title="::error::forged title"))
     chk("INJECTION a body's own annotation directive is never echoed",
         ("forged" in text, "::endgroup::" in text, codes), (False, False, [ADVISORY_NO_REFERENCE]))
+    # ...and the #1254 notice is held to the same rule. The rows above all carry ZERO closing
+    # references, so none of them ever reaches the pending path; this one does.
+    forged_one = run_check(pull_payload(body=f"{forged}\nCloses #{ORACLE_ISSUE}\n",
+                                        title="::error::forged title"))
+    chk("INJECTION the pending notice echoes no author text either",
+        ("forged" in forged_one[2], "::endgroup::" in forged_one[2], forged_one[1]),
+        (False, False, [PENDING_UNVERIFIED]))
     chk("INJECTION every annotation line is exactly one line",
         all(line.count("::") == 1 or line.startswith("::")
             for line in text.splitlines() if line), True)
