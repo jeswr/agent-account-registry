@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-04T06:55:01Z",
+  "generated_at": "2026-09-04T07:09:44Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -24,10 +24,10 @@
       "net_pr_flow": 0.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 1055,
+      "issues_open": 1057,
       "issues_ready": 709,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 9,
+      "issues_closed_24h": 7,
       "prs_open": 50,
       "prs_draft": 34,
       "prs_opened_1h": 0,
@@ -37,8 +37,8 @@
       "review_changes_backlog": 6,
       "needs_user_parked": 17,
       "review_lane_health": "stalled",
-      "review_lane_runs_1h": 4,
-      "worker_attempts_1h": 2,
+      "review_lane_runs_1h": 6,
+      "worker_attempts_1h": 3,
       "worker_success_rate_1h": 0.0,
       "pr_open_rate": 0.0,
       "pr_close_rate": 0.0,
@@ -74,7 +74,7 @@
       "summary": "review lane STALLED over 2 snapshots: review-fix runs concluded with 0 successes while review:changes=6 waits",
       "metrics": {
         "review_changes_backlog": 6,
-        "review_lane_runs_1h": 4,
+        "review_lane_runs_1h": 6,
         "prs_merged_1h": 0
       }
     },
