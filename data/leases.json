@@ -11,26 +11,6 @@
    "expires_at": 1788560291
   },
   {
-   "account": "f79434c3ffba014f",
-   "claim_id": "d7ec5ed721b244858c6e21c0164c4d0a",
-   "holder": "jeswr/agent-account-registry#1088@33916872207.1",
-   "package": "groom",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1788554064,
-   "expires_at": 1788556764
-  },
-  {
-   "account": "f79434c3ffba014f",
-   "claim_id": "53e105ef14924c11b1170d7ef91a4ee2",
-   "holder": "jeswr/agent-account-registry#77@33916890939.1",
-   "package": "dashboard",
-   "role": "research",
-   "model": "opus5",
-   "issued_at": 1788554076,
-   "expires_at": 1788556776
-  },
-  {
    "account": "c0ac92ebee2c590e",
    "claim_id": "2b5aafba477d403b9f0a6493f9dc0fdf",
    "holder": "review:sparq-org/sparq#6148@33917712551.1",
