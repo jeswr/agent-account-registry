@@ -855,6 +855,15 @@ Two halves, both in `scripts/no_change_routing.py` (the single declaration; `wor
   the reason rides the existing sanitized `no-change-v1` envelope as its **vocabulary index**, never
   as text, so nothing model-authored can reach the public ledger or an alert body. Absent, malformed,
   or out-of-vocabulary ⇒ `unspecified`, which is the value the router treats as *no signal*.
+- **The census** (issue #1595). Every `model-health.py decide` tick — the groom cron — prints
+  `model-health.no_change_reason_census` over the **retained** window: one count per vocabulary
+  word, plus `declared` / `undeclared` totals. `unspecified` is a **declared** value (the recorder
+  stored index 0); `undeclared` means the record carries no `why_no_diff` at all, i.e. the evidence
+  seam itself did not deliver one, so the two are counted separately and both are published. It
+  emits unconditionally, including the all-zero row on a quiet tick and on a tick whose alert
+  delivery fails — "nothing declared anything" is the answer to the question a quiet tick raises,
+  and it is what makes the #738 §7 M4 reason-distribution measurement standing rather than a
+  hand-run query against the raw ledger blob.
 - **The decision**, taken in `dispatch()` on the deferred-retry path **before `allocator.claim()`**
   picks a model (the claim is what would otherwise walk the resolved chain from its head again):
   dispatch on an **untried** tier of the same chain, or — when no untried tier remains, or the

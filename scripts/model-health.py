@@ -1121,6 +1121,75 @@ def _no_change_limit_view(records, now):
     return derived, evidence
 
 
+# --- [registry #1595] THE why_no_diff CENSUS ----------------------------------------------------
+# `why_no_diff` is WRITTEN by worker-live.sh, VALIDATED here, and consumed PER RECORD by
+# no_change_routing/dispatch-claim to pick the next tier. Nothing AGGREGATED it, so the registry
+# #738 §7 M4 question — which reason dominates, and does the routing each reason drives match what
+# happens next — had to be answered by hand against the raw public ledger blob every time it was
+# asked. This makes it a standing measurement instead.
+#
+# THE DENOMINATOR IS THE POINT. `unspecified` (vocabulary index 0) is a DECLARED value: it is what
+# the recorder stores when the model's own declaration was absent or unparseable. A record with NO
+# `why_no_diff` key at all is a different fact — the RECORDER attached nothing, which means the
+# evidence seam itself (worker.yml's exit-class step -> the no-change envelope -> this ledger) did
+# not carry a reason. Folding the two together would report a healthy declaration rate over a
+# broken seam, so they are counted separately and `undeclared` is published alongside the totals.
+NO_CHANGE_CENSUS_UNDECLARED = "undeclared"
+
+
+def no_change_reason_census(records):
+    """PURE census of the `why_no_diff` distribution over a window of health records.
+
+        {"total": <no_change records>, "declared": <that carry a readable reason>,
+         "undeclared": <that carry none>, "reasons": {<every vocabulary word>: count}}
+
+    `records` is any window of health records (the caller passes the RETAINED one — `prune`'s
+    output — so the census describes exactly the evidence the routing decision can still see).
+    Only `exit_class == no_change` rows are population; every other class contributes nothing.
+
+    FAIL-CLOSED, in the one direction that matters: a `why_no_diff` the vocabulary does not contain
+    is counted as UNDECLARED, never folded into a vocabulary bucket. `_validate_record` already
+    refuses such a value at both read and write, so it is unreachable through the validated reader
+    — but a census that invented a reason for an unreadable value would be exactly the fabricated
+    measurement this exists to replace. Nothing here raises: a diagnostic that can abort the decide
+    tick is worse than no diagnostic.
+
+    EVERY VOCABULARY WORD IS A KEY, always, including on an empty window — a reason with zero
+    occurrences is a measurement ("nothing declared this"), not an absence, and a census that
+    silently drops its zero rows cannot be read as a distribution.
+
+    WHAT THIS CANNOT SEE, stated because a denominator read as complete when it is not is worse
+    than no denominator: the population is the no_change rows that REACHED the ledger. A worker
+    whose health record never got recorded at all — the workflow seam cut, not the reason field
+    dropped — never enters this census and so cannot move its `undeclared` count. That seam has its
+    own detector (`dispatch-claim._no_change_seam_violations`, which pins the parsed workflow
+    nodes); this census measures declaration quality, never seam liveness."""
+    reasons = {name: 0 for name in NO_CHANGE_REASONS}
+    total = undeclared = 0
+    for record in records or ():
+        if not isinstance(record, dict) or record.get("exit_class") != CLASS_NO_CHANGE:
+            continue
+        total += 1
+        why = record.get("why_no_diff")
+        if isinstance(why, str) and why in reasons:
+            reasons[why] += 1
+        else:
+            undeclared += 1
+    return {"total": total, "declared": total - undeclared,
+            "undeclared": undeclared, "reasons": reasons}
+
+
+def format_no_change_reason_census(census):
+    """One log line for `no_change_reason_census`, in vocabulary order (the WIRE order — reading a
+    shifted distribution against a shifted vocabulary is how a renumbering would hide). Carries no
+    account, provider or fleet cardinality, so it is safe on the PUBLIC workflow log (decision 22):
+    every number in it is already derivable from the public ledger blob."""
+    distribution = ", ".join(f"{name}={census['reasons'][name]}" for name in NO_CHANGE_REASONS)
+    return (f"model-health no_change-reason census: {census['total']} no_change record(s) in the "
+            f"retained window — {census['declared']} declared / {census['undeclared']} "
+            f"{NO_CHANGE_CENSUS_UNDECLARED} (no why_no_diff recorded at all); {distribution}")
+
+
 def auth_cooldowns(records, now):
     """PURE per-account AUTH COOLDOWN (registry #596), derived from the same health window as
     account_backoffs. Walks ts-ordered records: a SUCCESS clears the account's auth run (and any
@@ -3054,6 +3123,11 @@ def _cmd_decide(args):
         # while this step goes visibly red.
         print(f"::error::model-health decide: cannot read ledger ({exc})")
         return 1
+    # [#1595] The standing why_no_diff census, emitted UNCONDITIONALLY over the retained window —
+    # before any alert routing, so it survives a delivery failure that returns nonzero below, and
+    # with no "only when there is something to say" guard: an all-zero census is the answer to
+    # "is anything declaring a reason at all?", which is precisely the question a quiet tick raises.
+    print(format_no_change_reason_census(no_change_reason_census(records)))
     provider_accounts = _enabled_provider_accounts(
         api, registry_repo, args.policy_file, salt)
     # Currently-open alert markers on EVERY route this system may have delivered to (issues #205,
@@ -4898,6 +4972,9 @@ def _self_test():
     ok = _test_provider_status(chk) and ok
     ok = _test_probe_fetch(chk) and ok
     ok = _test_decide_annotation(chk) and ok
+
+    # ---- #1595: the why_no_diff distribution is aggregated AND emitted every decide tick --------
+    ok = _test_no_change_reason_census(chk) and ok
 
     print("model-health self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
@@ -7131,6 +7208,177 @@ def _test_decide_annotation(chk):
     finally:
         GitHubAPI, probe_provider_status, _upsert_alert = real_api, real_probe, real_upsert
         _open_alert_markers = real_markers
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_no_change_reason_census(chk):
+    """[registry #1595] The why_no_diff distribution is AGGREGATED and EMITTED.
+
+    Two properties, and the second is the one a reviewer should mutate first (pre-flight item 9 —
+    the marquee claim must be checked on the EVIDENCE path, not on the object it names):
+
+      * the census counts what it says it counts, and keeps `unspecified` (a DECLARED reason)
+        distinct from `undeclared` (the recorder attached no reason at all); and
+      * `_cmd_decide` actually emits it, over the RETAINED window, on EVERY tick — including a tick
+        with zero no_change records, and including a tick whose alert delivery fails.
+
+    Every expected value below is a literal written out here, never read back from the module under
+    test (pre-flight item 2b), and the fixtures name vocabulary words literally rather than
+    indexing NO_CHANGE_REASONS (item 2c), so a renumbered vocabulary cannot keep this green."""
+    import argparse as _ap
+    import contextlib as _ctx
+    import io as _io
+    salt, now = "s3cret", int(time.time())
+    acct = account_hash("acct01", salt)
+
+    def nc(issue, why=None, dt=-60):
+        return make_record("anthropic", acct, "opus5", CLASS_NO_CHANGE, "1", now + dt,
+                           issue=issue, why_no_diff=why)
+
+    # ---- (1) the PURE census. Distinct counts everywhere they could be swapped for one another.
+    window = ([nc(500, "too_large"), nc(501, "too_large"), nc(502, "too_large")]
+              + [nc(503, "underspecified"), nc(504, "underspecified")]
+              + [nc(505, "unspecified")]                       # DECLARED index 0, not "undeclared"
+              + [nc(506), nc(507)]                             # recorder attached nothing
+              + [nc(508, "already_done"), nc(509, "already_done"),
+                 nc(510, "already_done"), nc(511, "already_done")]
+              + [make_record("anthropic", acct, "opus5", SUCCESS, "1", now - 30),
+                 make_record("openai", acct, "sol", CLASS_LIMIT, "1", now - 30)])
+    census = no_change_reason_census(window)
+    chk("census counts ONLY no_change rows (the success + limit rows are not population)",
+        census["total"], 12)
+    chk("census splits declared from undeclared",
+        (census["declared"], census["undeclared"]), (10, 2))
+    chk("census reports the per-reason distribution", census["reasons"],
+        {"unspecified": 1, "underspecified": 2, "blocked_on_decision": 0,
+         "too_large": 3, "already_done": 4, "other": 0})
+    # THE DISCRIMINATOR. Folding a missing key into `unspecified` (or the reverse) reports a
+    # healthy declaration rate over a seam that recorded nothing — both directions must go red.
+    # (`.get` everywhere a bucket is read, so a census that DROPPED the key reads as a red row
+    # rather than a KeyError — an exception raised by the mutated line itself is malformedness,
+    # not detection, and it aborts every check below it. Pre-flight item 4.)
+    chk("a DECLARED `unspecified` is not counted as undeclared",
+        (no_change_reason_census([nc(500, "unspecified")])["undeclared"],
+         no_change_reason_census([nc(500, "unspecified")])["reasons"].get("unspecified")), (0, 1))
+    chk("an UNDECLARED row is not counted as `unspecified`",
+        (no_change_reason_census([nc(500)])["undeclared"],
+         no_change_reason_census([nc(500)])["reasons"].get("unspecified")), (1, 0))
+
+    # ---- (2) the ZERO row. A census that drops the reasons nobody declared cannot be read as a
+    # distribution, and "nothing declared anything" is the answer to the question a quiet tick asks.
+    empty = no_change_reason_census([])
+    chk("an empty window still totals zero rather than raising",
+        (empty["total"], empty["declared"], empty["undeclared"]), (0, 0, 0))
+    chk("...and every vocabulary word is still a key, at zero",
+        (empty["reasons"].get("unspecified"), empty["reasons"].get("too_large"),
+         empty["reasons"].get("already_done"), empty["reasons"].get("other")), (0, 0, 0, 0))
+    # (This one DOES read its expected from the module — deliberately, and it is the weak form of
+    # the row above, which pins literal words. It exists only as a drift guard: appending a reason
+    # to the vocabulary must extend the census, and re-declaring the whole word list here would be
+    # the #958 second-definition shape, not a stronger test.)
+    chk("...with no word silently dropped from the map",
+        len(empty["reasons"]), len(NO_CHANGE_REASONS))
+    chk("the rendered line carries the zero rows too",
+        [token for token in ("too_large=0", "already_done=0", "blocked_on_decision=0")
+         if token not in format_no_change_reason_census(empty)], [])
+
+    # ---- (3) FAIL-CLOSED: an unreadable reason is UNDECLARED, never invented into a bucket.
+    # _validate_record refuses this value at read AND write, so it is built by hand on purpose.
+    forged = {"ts": now, "provider": "anthropic", "account": acct, "model_alias": "opus5",
+              "exit_class": CLASS_NO_CHANGE, "run_id": "1", "issue": 500,
+              "why_no_diff": "too_large_ish"}
+    chk("an out-of-vocabulary reason counts as undeclared, inventing no reason",
+        (no_change_reason_census([forged])["undeclared"],
+         no_change_reason_census([forged])["reasons"].get("too_large")), (1, 0))
+    chk("a non-string reason counts as undeclared",
+        no_change_reason_census([dict(forged, why_no_diff=3)])["undeclared"], 1)
+    chk("a non-dict row is not population at all",
+        no_change_reason_census([None, "x", 7, nc(500, "other")])["total"], 1)
+    # The last two go through `_outcome` on purpose: their guards fail by CRASHING, and a crash
+    # aborts every check below it instead of reddening one row (pre-flight item 4). An UNHASHABLE
+    # reason is what makes the `isinstance(why, str)` test load-bearing rather than decorative —
+    # `why in reasons` alone raises TypeError on a list, taking down the decide tick this census is
+    # only a diagnostic on.
+    chk("a None window is an empty census, not a crash",
+        _outcome(lambda: no_change_reason_census(None)["total"]), 0)
+    chk("an unhashable reason value counts as undeclared instead of crashing the tick",
+        _outcome(lambda: no_change_reason_census(
+            [dict(forged, why_no_diff=["too_large"])])["undeclared"]), 1)
+
+    # ---- (4) THE EMISSION PATH. Drive the real _cmd_decide and read its stdout.
+    global GitHubAPI, _upsert_alert, _open_alert_markers, annotate_provider_status, _deliver_alerts
+    real = (GitHubAPI, _upsert_alert, _open_alert_markers, annotate_provider_status,
+            _deliver_alerts)
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "GH_TOKEN", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN",
+              "PROVENANCE_SALT")}
+
+    def decide_lines():
+        """(exit code, stdout lines) for one real decide tick against the stubbed ledger."""
+        buffer = _io.StringIO()
+        with _ctx.redirect_stdout(buffer):
+            rc = _cmd_decide(_ap.Namespace(policy_file="/nonexistent/repos.toml"))
+        return rc, buffer.getvalue().splitlines()
+
+    def census_lines(lines):
+        """Line-ANCHORED extraction (pre-flight item 7): never a substring grep — decide's other
+        output would otherwise be able to satisfy or defeat these assertions."""
+        return [line for line in lines
+                if line.startswith("model-health no_change-reason census:")]
+
+    try:
+        os.environ.update(REGISTRY_REPO="o/r", GH_TOKEN="tok")
+        for key in ("ALERT_REPO", "ALERT_TOKEN", "PROVENANCE_SALT"):
+            os.environ.pop(key, None)
+        _open_alert_markers = lambda repo, token: set()          # hermetic: no gh subprocess
+        _upsert_alert = lambda action, repo, token, maintainer, redact=False: True
+        annotate_provider_status = lambda actions, probe=None: None
+
+        # The seed deliberately contains a no_change record OUTSIDE the 48 h window: the census
+        # must describe the RETAINED window, so a call site handed the raw ledger reads 5, not 4.
+        seeded = [nc(500, "too_large"), nc(501, "too_large"), nc(502, "already_done"), nc(503),
+                  nc(504, "too_large", dt=-(WINDOW_SECONDS + 3600))]
+        stub = _StubAPI(seed=seeded)
+        GitHubAPI = lambda token: stub
+        rc, lines = decide_lines()
+        chk("decide EMITS the census, over the pruned window, with the expected distribution",
+            census_lines(lines),
+            ["model-health no_change-reason census: 4 no_change record(s) in the retained window "
+             "— 3 declared / 1 undeclared (no why_no_diff recorded at all); unspecified=0, "
+             "underspecified=0, blocked_on_decision=0, too_large=2, already_done=1, other=0"])
+        chk("...on a tick that is otherwise healthy (rc unchanged)", rc, 0)
+
+        # A QUIET tick must still emit: wrapping the emission in `if census["total"]` (the #938
+        # conditionally-inert mutant) hides the distribution on exactly the tick an operator
+        # interrogates — "is anything declaring a reason at all?".
+        stub = _StubAPI(seed=[make_record("anthropic", acct, "opus5", SUCCESS, "1", now - 30)])
+        GitHubAPI = lambda token: stub
+        rc, lines = decide_lines()
+        chk("a tick with NO no_change records still emits the all-zero census",
+            census_lines(lines),
+            ["model-health no_change-reason census: 0 no_change record(s) in the retained window "
+             "— 0 declared / 0 undeclared (no why_no_diff recorded at all); unspecified=0, "
+             "underspecified=0, blocked_on_decision=0, too_large=0, already_done=0, other=0"])
+        chk("...and that tick is still a clean exit", rc, 0)
+
+        # The measurement must not be lost to an unrelated failure: it is emitted BEFORE alert
+        # routing, so a tick that exits nonzero on an undeliverable alert still publishes it.
+        stub = _StubAPI(seed=[nc(500, "other")])
+        GitHubAPI = lambda token: stub
+        _deliver_alerts = lambda actions, maintainer, fallback_open=frozenset(): [
+            {"condition": "provider-outage", "provider": "anthropic"}]
+        rc, lines = decide_lines()
+        chk("an UNDELIVERABLE alert tick still publishes the census (and still exits nonzero)",
+            (rc, sum(1 for line in census_lines(lines)
+                     if line.startswith("model-health no_change-reason census: 1 "))), (1, 1))
+    finally:
+        (GitHubAPI, _upsert_alert, _open_alert_markers, annotate_provider_status,
+         _deliver_alerts) = real
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
