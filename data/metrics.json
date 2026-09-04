@@ -1,27 +1,27 @@
 {
-  "generated_at": "2026-09-04T13:31:43Z",
+  "generated_at": "2026-09-04T13:43:30Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 2422,
-      "issues_ready": 248,
+      "issues_ready": 247,
       "issues_closed_1h": 0,
       "issues_closed_24h": 8,
-      "prs_open": 162,
-      "prs_draft": 135,
-      "prs_opened_1h": 1,
+      "prs_open": 163,
+      "prs_draft": 136,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
       "prs_merged_24h": 1,
       "review_changes_backlog": 18,
       "needs_user_parked": 16,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 1,
-      "worker_attempts_1h": 2,
-      "worker_success_rate_1h": 0.5,
-      "pr_open_rate": 1.0,
+      "review_lane_runs_1h": 2,
+      "worker_attempts_1h": 3,
+      "worker_success_rate_1h": 0.6667,
+      "pr_open_rate": 2.0,
       "pr_close_rate": 0.0,
-      "net_pr_flow": 1.0
+      "net_pr_flow": 2.0
     },
     "jeswr/agent-account-registry": {
       "issues_open": 1055,
@@ -50,11 +50,11 @@
       "target": "sparq-org/sparq",
       "classification": "backlog-growing",
       "fire": true,
-      "summary": "open PRs 162 > 40 and net PR flow +1.0/hr (open 1.0 > close 0.0) sustained over 2 snapshots",
+      "summary": "open PRs 163 > 40 and net PR flow +2.0/hr (open 2.0 > close 0.0) sustained over 2 snapshots",
       "metrics": {
-        "prs_open": 162,
-        "net_pr_flow": 1.0,
-        "pr_open_rate": 1.0,
+        "prs_open": 163,
+        "net_pr_flow": 2.0,
+        "pr_open_rate": 2.0,
         "pr_close_rate": 0.0
       }
     },
@@ -62,9 +62,19 @@
       "target": "sparq-org/sparq",
       "classification": "ready-starved",
       "fire": true,
-      "summary": "ready frontier 248 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "ready frontier 247 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
       "metrics": {
-        "issues_ready": 248,
+        "issues_ready": 247,
+        "issues_closed_1h": 0
+      }
+    },
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "ready-starved",
+      "fire": true,
+      "summary": "ready frontier 708 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "metrics": {
+        "issues_ready": 708,
         "issues_closed_1h": 0
       }
     }
