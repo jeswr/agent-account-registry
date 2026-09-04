@@ -1,12 +1,12 @@
 {
-  "generated_at": "2026-09-04T15:22:26Z",
+  "generated_at": "2026-09-04T15:31:40Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 2422,
-      "issues_ready": 242,
+      "issues_ready": 241,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 7,
+      "issues_closed_24h": 6,
       "prs_open": 167,
       "prs_draft": 140,
       "prs_opened_1h": 2,
@@ -17,8 +17,8 @@
       "needs_user_parked": 16,
       "review_lane_health": "idle",
       "review_lane_runs_1h": 0,
-      "worker_attempts_1h": 3,
-      "worker_success_rate_1h": 0.3333,
+      "worker_attempts_1h": 2,
+      "worker_success_rate_1h": 0.5,
       "pr_open_rate": 2.0,
       "pr_close_rate": 0.0,
       "net_pr_flow": 2.0
@@ -62,9 +62,9 @@
       "target": "sparq-org/sparq",
       "classification": "ready-starved",
       "fire": true,
-      "summary": "ready frontier 242 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "ready frontier 241 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
       "metrics": {
-        "issues_ready": 242,
+        "issues_ready": 241,
         "issues_closed_1h": 0
       }
     },
