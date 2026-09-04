@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6363,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8e4cae15faf265615526e4ee441ff9cf646f6a15",
+  "round": 8
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The bounded max-parallel settings preserve both complete nightly matrices and fail-fast:false while limiting their concurrent hosted-runner admissions. The audit consistently accounts for capped matrix legs and plain jobs, enforces per-lane and combined ceilings, rejects critical-path triggers, verifies Miri partition coverage, and is wired into docs-quality. Its fixture, live-workflow, and mutation tests exercise the real audit path and are non-vacuous. No correctness, soundness, security, or test-validity defect is evident. Round 8 is materially unchanged from round 7, with no findings in either round.",
+  "verdict": "approve"
+ }
+}
