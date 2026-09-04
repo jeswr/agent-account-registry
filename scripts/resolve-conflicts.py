@@ -1506,6 +1506,92 @@ class ConflictResolver:
         if self.apply:
             self.api.remove_label(repo, number, MACHINE_PARK_LABEL)
 
+    def _detail_without_our_park(self, detail):
+        """`detail` with ONLY our own machine park label filtered out of ``labels``.
+
+        A shallow copy — the author, head ref, head repository, base and every OTHER label are
+        the live ones, so the predicate below is answering "what would the review lane say about
+        THIS PR once our park is gone", not about some idealised PR.
+        """
+        kept = [
+            label for label in detail.get("labels") or []
+            if (label.get("name") if isinstance(label, dict) else label) != MACHINE_PARK_LABEL
+        ]
+        return {**detail, "labels": kept}
+
+    def _park_blocks_review_repair(self, repo, detail):
+        """Is OUR OWN park the ONLY thing refusing this PR to the lane that actually repairs it?
+
+        THE FIXED POINT THIS BREAKS (registry #1295). `stuck_park_cause_recovered` clears the
+        grace-window park on two facts, and both of them require somebody to have already moved
+        the head. For a worker-branch PR carrying our `review:parked`, nobody can:
+
+          * dispatch's review enumeration refuses the PR at `MACHINE_PARK_PR_LABEL` before any
+            state is emitted (dispatch-claim `review_items`), so the needs-rebase/rebase repair
+            lane never sees it;
+          * and PR #1294 — correctly — stopped this program CEDING to a lane that would refuse,
+            which reads that same label and so refuses too.
+
+        The label doing the refusing is OURS. So the park is not a hold with an owner elsewhere;
+        it is the thing that removed the only owner. That is a fixed point, and its exit cannot
+        be a new cause — the cause has not recovered — it is the discovery that the park is
+        self-blocking.
+
+        WHY THE HAND-OVER IS WORTH MAKING, measured rather than assumed. The mechanical rebaser
+        cannot repair this population: across all 130 open PRs of the two policy repos on
+        2026-07-30, every one of the 44 whose base conflicts also conflicts under a plain merge,
+        under `-X patience`, `-X diff-algorithm=histogram`, `-X ignore-all-space`, `-X no-renames`
+        and `-X find-renames=20%`; and holding each head fixed while walking the base back over
+        325 commits of the default branch, conflict is MONOTONE in base advance in 13 of 13 cases
+        (clean against every older base, conflicting against every newer one, one transition, no
+        flapping). So no content-agnostic operation and no amount of base movement repairs these.
+        The AGENT lane does: `review-fix fix sparq-org/sparq#3598` (run 30508516835) resolved a
+        CONFLICTING worker PR with the commit "fix: merge main into #3598 to resolve conflicts"
+        and took it from `dirty` to `mergeable: true`. #3598 reached that lane for exactly one
+        reason — it carried no refusing label.
+
+        THE CEDE PREDICATE IS NOT RE-SPELLED. Both answers come from the live
+        `owned_by_review_rebase_lane`, so every gate #1294 put there — fork, producer shape,
+        `[bot]` author, and the lane's OWN hold set read from `claim` — governs this hand-over
+        too. The day the lane grows a fourth refusing label, the second call starts answering
+        False and this exit narrows itself. A local copy of the label set is how that guarantee
+        would rot, which is why there isn't one.
+
+        ONE TEST, NOT TWO, AND THE MISSING ONE IS WRITTEN DOWN. The symmetrical-looking guard —
+        "first check the lane does not ALREADY take this PR" — is deliberately absent, because it
+        could never fire: the only caller reaches here having already proven `MACHINE_PARK_LABEL`
+        is live (`_stuck_park_phase` returns ``"none"`` otherwise), and that label is itself a
+        member of `review_lane_refusing_labels`, so `owned_by_review_rebase_lane` on the UNMODIFIED
+        detail is False by construction at this point. Writing it anyway would be a conjunct that
+        can never fire — the dead guard dressed as a control that `owned_by_review_rebase_lane`'s
+        own docstring refuses one paragraph further up. What IS asserted instead, executably, is
+        the justification: `--self-test` requires the unmodified detail to be refused.
+
+        THE ONE REFUSAL THAT IS REAL. A PR the lane would STILL refuse with our park gone stays
+        parked. Handing that one over is the silent no-exit #1294 closed, and it is strictly worse
+        than a visible park.
+
+        AND NO HAND-OVER UNDER ANY HARD EXCLUSION, which is WIDER than this phase's own
+        `human_owned_holds` gate and deliberately so. This phase runs BEFORE `_classify_holds`
+        (it must — one of the recovery facts is "the PR stopped conflicting", which the
+        `not-conflicting` return would strand), so at this point nothing has been proven about who
+        applied a `trust-surface`, `trust:untrusted` or `needs:design` hold. `human_owned_holds`
+        does not match any of the three, and the review lane's own hold set does not either — so
+        without this the hand-over would route a PR wearing a live trust classification into a
+        rebase dispatch on the strength of nobody having checked. Live instance, which is why this
+        guard is not decoration: sparq-org/sparq#3661 sits in this exact state under
+        `trust-surface`. Deciding a trust classification is not this program's call, and a PR whose
+        hold provenance is unread is not a PR to hand anywhere.
+        """
+        if _label_names(detail) & HARD_EXCLUDE_LABELS:
+            return ""
+        if not owned_by_review_rebase_lane(
+                self._detail_without_our_park(detail), repo, self.claim):
+            return ""
+        return ("our own machine park is the ONLY label refusing this worker PR to the "
+                "needs-rebase/rebase repair lane, which is the only mechanism that repairs "
+                "this conflict class")
+
     def _stuck_park_phase(self, repo, number, detail):
         """THE MACHINE EXIT of the grace-window park. Returns ``(status, detail)`` where status is
         ``"none"`` (no live park of ours), ``"cleared"`` or ``"stands"``.
@@ -1554,8 +1640,34 @@ class ConflictResolver:
             return "cleared", "converging an already-receipted re-admission"
         recovered, why = stuck_park_cause_recovered(park["cause"], detail, park["head"])
         if not recovered:
-            self.current.stuck_park_stands += 1
-            return "stands", why
+            handover = self._park_blocks_review_repair(repo, detail)
+            if not handover:
+                self.current.stuck_park_stands += 1
+                return "stands", why
+            # RECEIPT FIRST, on exactly the ordering the recovered path below uses: the grant
+            # carries the SAME (cause, head, gen) triple, so this exit is consume-EXACTLY-once and
+            # a crash between the two writes leaves receipt-with-label, which the next tick's
+            # `grant is not None` branch converges — never label-without-receipt, which would let
+            # the same exit be earned twice.
+            self._post(repo, number, (
+                "> 🤖 SPARQ agent — the machine-owned grace-window park on this PR is cleared "
+                f"WITHOUT its cause recovering: {handover}. Keeping it was therefore not a hold "
+                "with an owner somewhere else — it was the absence of one. The needs-rebase "
+                "repair lane owns this PR from here; this program will cede it from the next "
+                "sweep on.\n\n"
+                f"{stuck_receipt(STUCK_UNPARK_MARKER, park['head'], park['gen'])}"))
+            self._clear_stuck_park(repo, number)
+            self._record("stuck-park-handover", repo, number, handover)
+            self.current.stuck_readmitted += 1
+            # KEEP THIS TICK'S OWN VIEW TRUE. The label is gone from the PR now, and if `detail`
+            # keeps claiming otherwise the rest of THIS sweep re-derives the state we just left:
+            # `_process_pr` reads the stale label at the cede predicate, refuses to cede, walks
+            # into the attempt path, finds its own attempt marker on an unmoved head, and
+            # re-parks at the NEXT generation — undoing the hand-over and spending a re-admission
+            # generation to do it. Mutating the copy we were handed is what makes the in-memory
+            # PR agree with the write that just happened.
+            detail["labels"] = self._detail_without_our_park(detail)["labels"]
+            return "cleared", handover
         self._post(repo, number, (
             "> 🤖 SPARQ agent — the machine-owned grace-window park on this PR is cleared: "
             f"{why}. This is the CAUSE-GATED exit, not a timer — no amount of further waiting "
@@ -3496,6 +3608,101 @@ def _self_test():
          held.census[0]["skipped"].get("stuck-park-stands")),
         (0, [], 1, 0, 0, 0, 1),
     )
+
+    # (k4b) THE PARK THAT WAS ITS OWN REFUSAL (registry #1295) ---------------------------------
+    # A worker-branch PR wearing our machine park is refused by dispatch's review enumeration AT
+    # THAT LABEL, and #1294 correctly stopped this program ceding to a lane that refuses — so the
+    # label we wrote is the entire reason no mechanism owns the PR. In every sweep below the CAUSE
+    # has not recovered (same head, still conflicting): the exit is the discovery that the park is
+    # self-blocking, and it is gated on the LIVE cede predicate, never on a re-spelled label set.
+    def parked_worker_api(*, author="sparq-orchestrator[bot]",
+                          ref="sparq-agent/issue-77-30000000000-1", head_repo=None,
+                          head="b" * 40, generation=1, now=base_now, extra_labels=()):
+        """The k4 park, on a PR shaped like one the needs-rebase repair lane WOULD take."""
+        parked = pull(83, head, labels=(MACHINE_PARK_LABEL, *extra_labels), author=author, ref=ref,
+                      head_repo=head_repo)
+        api = FakeAPI([parked], now=now)
+        api.comment_rows[83] = [
+            attempt_comment(head, iso(now)),
+            {"body": stuck_receipt(STUCK_PARK_MARKER, head, generation),
+             "user": {"login": bot_login}, "created_at": iso(now)},
+        ]
+        return api
+
+    # THE JUSTIFICATION for the guard `_park_blocks_review_repair` deliberately does NOT write:
+    # with the park live, the lane refuses the PR by construction, so an "does the lane already
+    # take it?" conjunct could never fire. Asserted rather than asserted-in-prose.
+    check(
+        "[#1295] the absent guard could never fire: with our park live the cede predicate is "
+        "False by construction, so testing it first would be a dead conjunct",
+        owned_by_review_rebase_lane(parked_worker_api().prs[83], repo, claim),
+        False,
+    )
+
+    ho_rc, ho, ho_api = exit_sweep(parked_worker_api(), elapsed_hours=1000.0)
+    check(
+        "[#1295] HAND-OVER: our own park was the ONLY label refusing this worker PR to the "
+        "needs-rebase lane, so it is cleared and the PR is ceded — cause unrecovered, and NOT "
+        "re-parked, NOT rebased, on the very same tick",
+        (ho_rc, ho_api.labels_removed,
+         ho.census[0]["stuck_readmitted"], ho.census[0]["stuck_park_stands"],
+         ho.census[0]["escalated"], ho.census[0]["attempted"], ho.census[0]["resolved"],
+         ho.census[0]["no_exit"],
+         ho.census[0]["skipped"].get("review-lane-owned"),
+         ho.census[0]["skipped"].get("stuck-park-stands"),
+         any(STUCK_UNPARK_MARKER in body for body in _comment_bodies(ho_api.comment_rows[83])),
+         [kind for kind, *_ in ho.actions]),
+        (0, [(83, MACHINE_PARK_LABEL)], 1, 0, 0, 0, 0, 0, 1, None, True,
+         ["stuck-park-handover"]),
+    )
+    ho_events = [event for event in ho_api.events if event[0] == 83]
+    check(
+        "[#1295] the hand-over inherits RECEIPT-FIRST: the grant is durable BEFORE the label is "
+        "deleted, so a crash leaves the residue the convergence branch completes — never a "
+        "cleared label with no record of who cleared it",
+        [event for event in ho_events
+         if event[2] in ("unpark-receipt", MACHINE_PARK_LABEL)],
+        [(83, "comment", "unpark-receipt"), (83, "remove-label", MACHINE_PARK_LABEL)],
+    )
+
+    # THE THREE SHAPE REFUSALS THAT MUST STILL STAND. Each fails a DIFFERENT gate inside the live
+    # `owned_by_review_rebase_lane`, and for each one clearing our park would hand the PR to a lane
+    # that still says no — the silent no-exit #1294 closed, which is worse than a visible park.
+    for label, kwargs in (
+        ("a human author fails the `[bot]` gate", {"author": "alice"}),
+        ("a non-worker head ref fails HEAD_REF_RE", {"ref": "topic-83"}),
+        ("a fork head fails the fork gate", {"head_repo": "fork/repo"}),
+    ):
+        st_rc, st, st_api = exit_sweep(parked_worker_api(**kwargs), elapsed_hours=1000.0)
+        check(
+            f"[#1295] the park STANDS when the lane would refuse the PR anyway — {label}",
+            (st_rc, st_api.labels_removed, st.census[0]["stuck_readmitted"],
+             st.census[0]["stuck_park_stands"],
+             st.census[0]["skipped"].get("stuck-park-stands")),
+            (0, [], 0, 1, 1),
+        )
+
+    # AND THE HOLD REFUSAL, on the three HARD_EXCLUDE labels this phase's own `human_owned_holds`
+    # gate does NOT match. Live instance: sparq-org/sparq#3661 wears `trust-surface` in exactly
+    # this state. Asserted narrowly — the park must stand and our label must survive; what
+    # `_classify_holds` then decides about the hold's provenance is a different test's business.
+    # `stands` says WHICH gate refused, and the split is the point: the two trust labels reach the
+    # hard-exclusion guard inside `_park_blocks_review_repair` and are counted as a standing park
+    # (1), while `needs:design` never gets that far — `human_owned_holds` matches every `needs:*`
+    # and stands the whole phase down before it (0). Collapsing the two into one loose assertion
+    # would let the trust guard be deleted while the check stayed green on the `needs:*` path.
+    for hold, stands in (("trust-surface", 1), ("trust:untrusted", 1), ("needs:design", 0)):
+        tr_rc, tr, tr_api = exit_sweep(
+            parked_worker_api(extra_labels=(hold,)), elapsed_hours=1000.0)
+        check(
+            f"[#1295] NO hand-over under a live hard exclusion whose provenance nothing has read "
+            f"yet — {hold}: our label survives and no PR is ceded",
+            (tr_api.labels_removed, tr.census[0]["stuck_readmitted"],
+             tr.census[0]["stuck_park_stands"],
+             [kind for kind, *_ in tr.actions if kind == "stuck-park-handover"]),
+            ([], 0, stands, []),
+        )
+
     # RECOVERY 1: the head moved — the author did the thing the window was waiting for.
     moved_api = parked_pr_api()
     moved_api.set_head(83, "e" * 40)
