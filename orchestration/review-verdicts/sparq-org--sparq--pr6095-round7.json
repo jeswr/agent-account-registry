@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 6095,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0883db681c73ddc338643f135c770c5a036ac3a4",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The negative lookbehind correctly prevents declaration keywords from matching as suffixes of words, underscore-delimited identifiers, or hyphenated compounds while preserving the documented declaration forms. The new regression tests exercise both rejection and acceptance through the real classify path, and the partition checks prevent the two scope-property loops from passing with an empty or incomplete helper partition. No correctness, soundness, test-validity, or security issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
