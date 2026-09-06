@@ -418,7 +418,27 @@ class Watchdog:
         # `gh gh api ...` -> `unknown command "gh" for "gh"` -> rc=1 on every read, which is
         # exactly how this tool failed 16/16 runs (#1137). The write seam is the opposite: it
         # execs the argv verbatim, so `_default_write` argvs DO carry "gh". Block (r) pins both.
-        result = _load_gh_retry().run_gh(list(args), env=self._env(token))
+        listed = list(args)
+        result = _load_gh_retry().run_gh(listed, env=self._env(token))
+        if result.returncode != 0:
+            # The shared retry layer has already scrubbed GH_DEBUG's request/response trace from
+            # stderr. Do not print the document, token, headers, body, or even the caller-supplied
+            # argv here; only its closed endpoint kind and the retry layer's structured verdict
+            # are safe and necessary to distinguish a throttle from a permanent refusal or a
+            # statusless GraphQL failure (registry #2297).
+            endpoint = "graphql" if listed[:2] == ["api", "graphql"] else "api"
+            print(
+                "::error::latch-watchdog GitHub read failed "
+                "endpoint=%s http=%s attempts=%s reason=%s read_scoped=%s"
+                % (
+                    endpoint,
+                    getattr(result, "gh_http_status", None) or "unknown",
+                    getattr(result, "gh_attempts", 1),
+                    getattr(result, "gh_retry_reason", None) or "none",
+                    str(bool(getattr(result, "gh_read_scoped", False))).lower(),
+                ),
+                file=sys.stderr,
+            )
         return result.returncode, result.stdout or ""
 
     def _default_write(self, args, token):
@@ -1446,6 +1466,37 @@ def _self_test():
         ((live_prs[0] or {}).get("number"), (live_prs[0] or {}).get("head_sha"),
          (live_gate or {}).get("total"), live_markers),
         (999000617, "cd0ca3f", 1, (0, None)))
+
+    # A final read failure used to lose every structured observation gh_retry had already made:
+    # the live log said only rc=1, so operators could not tell a primary-budget 403 from a
+    # permission refusal or a statusless GraphQL failure. Drive the REAL `_default_read` through
+    # a fatal failure (no sleeps), then prove the diagnostic is useful AND credential-free. The
+    # response text deliberately contains an alarming payload marker too; neither it nor the token
+    # may cross the logging seam.
+    def _refused_read(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="gh: private-response-body (HTTP 403)")
+
+    read_diag, refused_code, refused_out = "", None, None
+    try:
+        subprocess.run = _refused_read
+        diag_buffer = io.StringIO()
+        with contextlib.redirect_stderr(diag_buffer):
+            refused_code, refused_out = live._default_read(
+                ["api", "graphql", "-f", "query=query { viewer { login } }"],
+                "super-secret-worker-token",
+            )
+        read_diag = diag_buffer.getvalue()
+    finally:
+        subprocess.run = real_run
+    chk("READ FAILURE DIAGNOSTIC: the final retry verdict is emitted without request, response, "
+        "or credential material",
+        (refused_code, refused_out, "endpoint=graphql" in read_diag,
+         "http=403" in read_diag, "attempts=1" in read_diag,
+         "reason=refused-http-403" in read_diag, "read_scoped=true" in read_diag,
+         "viewer" in read_diag, "private-response-body" in read_diag,
+         "super-secret-worker-token" in read_diag),
+        (1, "", True, True, True, True, True, False, False, False))
     # ...AND WHAT THE FIX DELIVERS INTO. Correct argv is only worth anything because the census
     # depends on it: the shipped tool emitted `CENSUS-TOTAL {"considered":0,"errors":2}` on all 16
     # runs, i.e. it never reached `classify` at all. Same production seam, now driven through the
