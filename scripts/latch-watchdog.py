@@ -1497,6 +1497,48 @@ def _self_test():
          "viewer" in read_diag, "private-response-body" in read_diag,
          "super-secret-worker-token" in read_diag),
         (1, "", True, True, True, True, True, False, False, False))
+
+    # [SPARQ agent] #2304: a nonempty response belongs to the caller, never the diagnostic.
+    # Exercise success and an exhausted statusless read through the real retry layer; replacing
+    # only process execution and sleeping keeps the fixture offline and immediate.
+    response_text = '{"private-response-2304":"must-stay-off-the-log"}\n'
+
+    def _capture_read(args, code, message):
+        processes, sleeps = [], []
+        stdout_buffer, stderr_buffer = io.StringIO(), io.StringIO()
+        original_run, original_sleep = subprocess.run, time.sleep
+
+        def _response(cmd, **kwargs):
+            processes.append(cmd)
+            return subprocess.CompletedProcess(cmd, code, stdout=response_text, stderr=message)
+
+        try:
+            subprocess.run = _response
+            time.sleep = sleeps.append
+            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+                returned = live._default_read(args, "diagnostic-fixture-worker-token")
+        finally:
+            subprocess.run, time.sleep = original_run, original_sleep
+        return returned, stdout_buffer.getvalue(), stderr_buffer.getvalue(), len(processes), len(sleeps)
+
+    successful_read = _capture_read(["api", "repos/o/r/pulls/123"], 0, "")
+    chk("READ DIAGNOSTIC SUCCESS: return the nonempty response unchanged and emit nothing",
+        successful_read, ((0, response_text), "", "", 1, 0))
+
+    returned, logged_out, logged_err, process_count, sleep_count = _capture_read(
+        ["api", "graphql", "-f", "query=query { viewer { login } }"],
+        1, "gh: private-statusless-message-2304")
+    final_diagnostics = [line for line in logged_err.splitlines()
+                         if line.startswith("::error::latch-watchdog ")]
+    chk("READ DIAGNOSTIC STATUSLESS: report the final unknown-status retry verdict exactly once",
+        (returned, logged_out, process_count, sleep_count, final_diagnostics),
+        ((1, response_text), "", 5, 4,
+         ["::error::latch-watchdog GitHub read failed endpoint=graphql http=unknown "
+          "attempts=5 reason=statusless read_scoped=true"]))
+    chk("READ DIAGNOSTIC PAYLOAD: neither output stream exposes the response, request, or token",
+        any(marker in logged_out + logged_err for marker in
+            ("private-response-2304", "private-statusless-message-2304", "viewer",
+             "diagnostic-fixture-worker-token")), False)
     # ...AND WHAT THE FIX DELIVERS INTO. Correct argv is only worth anything because the census
     # depends on it: the shipped tool emitted `CENSUS-TOTAL {"considered":0,"errors":2}` on all 16
     # runs, i.e. it never reached `classify` at all. Same production seam, now driven through the
